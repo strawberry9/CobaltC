@@ -1,0 +1,227 @@
+// Hash Map
+//
+// Shows: how a hash table is built in CobaltC, with String keys and any
+// value type -- numbers, or resources such as String. The map owns its
+// keys, so it works for text read at run time, not only literals.
+// Programs use `std`'s HashMap<K, V> (spec/21 §2g), built the same way;
+// this one is written out to show the parts. FNV-1a hashing multiplies modulo
+// 2^64, and in CobaltC that has to be asked for: `wrapping_mul`, because
+// a plain `*` that overflowed would fault. Entries are kept in insertion
+// order and the table holds their indices, with `max_value<usize>()`
+// marking an empty slot, so no value is ever moved out of a slot, and
+// iteration order is the order of insertion.
+
+import std;
+
+module map
+{
+    import std;
+
+    struct Entry<V>
+    {
+        String key;
+        V value;
+    }
+
+    // Both fields private: a Map changes only through the functions below.
+    export struct Map<V>
+    {
+        Vec<Entry<V>> entries;          // in insertion order
+        Vec<usize> slots;               // indices into entries; max_value<usize>() when empty
+    }
+
+    // FNV-1a, 64-bit. The multiplication is meant to wrap.
+    fn hash(ref<String, shared> key) : u64
+    {
+        auto bytes = String::as_bytes(key);
+        u64 h = 0xCBF2_9CE4_8422_2325;           // FNV-1a's offset basis
+        foreach (b in bytes)
+        {
+            h = h ^ widen<u64>(*b);
+            h = wrapping_mul(h, 0x100_0000_01B3);    // and its prime
+        }
+        h
+    }
+
+    // Two Strings hold the same text when they hold the same bytes.
+    fn same(ref<String, shared> a, ref<String, shared> b) : bool
+    {
+        auto x = String::as_bytes(a);
+        auto y = String::as_bytes(b);
+        if (Vec::len(x) != Vec::len(y))
+        {
+            return false;
+        }
+        usize i = 0;
+        while (i < Vec::len(x))
+        {
+            if (*Vec::index_shared(x, i) != *Vec::index_shared(y, i))
+            {
+                return false;
+            }
+            i = i + 1;
+        }
+        true
+    }
+
+    fn empty_slots(usize n) : Vec<usize>
+    {
+        Vec<usize> s = Vec::new();
+        usize i = 0;
+        while (i < n)
+        {
+            Vec::push(&mut s, max_value<usize>());
+            i = i + 1;
+        }
+        s
+    }
+
+    export fn Map::new<V>() : Map<V>
+    {
+        Map { .entries = Vec::new(), .slots = empty_slots(8) }
+    }
+
+    export fn Map::len<V>(ref<Map<V>, shared> m) : usize
+    {
+        Vec::len(&m.entries)
+    }
+
+    export fn Map::capacity<V>(ref<Map<V>, shared> m) : usize
+    {
+        Vec::len(&m.slots)
+    }
+
+    // The slot holding key, or the empty slot where it belongs
+    // (linear probing; the table is never full).
+    fn find<V>(ref<Map<V>, shared> m, ref<String, shared> key) : usize
+    {
+        usize mask = Vec::len(&m.slots) - 1;
+        usize i = narrow_wrapping<usize>(hash(key)) & mask;
+        bool searching = true;
+        while (searching)
+        {
+            usize e = *Vec::index_shared(&m.slots, i);
+            if (e == max_value<usize>())
+            {
+                searching = false;
+            }
+            else if (same(Map::key_at(m, e), key))
+            {
+                searching = false;
+            }
+            else
+            {
+                i = (i + 1) & mask;
+            }
+        }
+        i
+    }
+
+    // Doubles the table and re-slots every entry. The entries themselves
+    // do not move: only their indices are placed again.
+    fn grow<V>(ref<Map<V>, exclusive> m)
+    {
+        // Reset the table in place and double it. Assigning a new Vec to
+        // m.slots would be diag.overwrite-of-live-resource: the old one
+        // still owns its buffer.
+        usize n = Vec::len(&m.slots);
+        usize i = 0;
+        while (i < n)
+        {
+            *Vec::index_exclusive(&mut m.slots, i) = max_value<usize>();
+            Vec::push(&mut m.slots, max_value<usize>());
+            i = i + 1;
+        }
+        usize e = 0;
+        while (e < Vec::len(&m.entries))
+        {
+            usize s = find(&*m, Map::key_at(&*m, e));   // &*m: a shared reborrow
+            *Vec::index_exclusive(&mut m.slots, s) = e;
+            e = e + 1;
+        }
+    }
+
+    // The value for key. If key is absent, it and `fresh` are inserted
+    // first; if it is present, neither is needed and both are destroyed here.
+    export fn Map::entry<V>(ref<Map<V>, exclusive> m, String key, V fresh) : ref<V, exclusive>
+    {
+        if ((Vec::len(&m.entries) + 1) * 4 > Vec::len(&m.slots) * 3)
+        {
+            grow(m);                    // keep the table at most three-quarters full
+        }
+        usize s = find(&*m, &key);
+        usize e = *Vec::index_shared(&m.slots, s);
+        if (e == max_value<usize>())
+        {
+            e = Vec::len(&m.entries);
+            Vec::push(&mut m.entries, Entry { .key = key, .value = fresh });
+            *Vec::index_exclusive(&mut m.slots, s) = e;
+        }
+        auto entry = Vec::index_exclusive(&mut m.entries, e);
+        &mut entry.value                // a reference into m, handed to the caller
+    }
+
+    export fn Map::get<V>(ref<Map<V>, shared> m, ref<String, shared> key) : Option<ref<V, shared>>
+    {
+        usize e = *Vec::index_shared(&m.slots, find(m, key));
+        if (e == max_value<usize>())
+        {
+            return None;
+        }
+        auto entry = Vec::index_shared(&m.entries, e);
+        Some(&entry.value)
+    }
+
+    // Entries in insertion order.
+    export fn Map::key_at<V>(ref<Map<V>, shared> m, usize i) : ref<String, shared>
+    {
+        auto entry = Vec::index_shared(&m.entries, i);
+        &entry.key
+    }
+
+    export fn Map::value_at<V>(ref<Map<V>, shared> m, usize i) : ref<V, shared>
+    {
+        auto entry = Vec::index_shared(&m.entries, i);
+        &entry.value
+    }
+}
+
+import map::Map;
+
+fn main()
+{
+    array<str, 26> words = [
+        "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
+        "and", "the", "dog", "sleeps", "while", "the", "fox", "runs", "over",
+        "the", "hill", "and", "the", "fox", "is", "quick", "again"
+    ];
+    Map<u64> counts = Map::new();
+    foreach (w in words)
+    {
+        auto c = Map::entry(&mut counts, String::from_str(w), 0: u64);   // the key, copied
+        *c = *c + 1;
+    }
+    printf("%d distinct words in %d slots:\n", Map::len(&counts), Map::capacity(&counts));
+    usize i = 0;
+    while (i < Map::len(&counts))                  // map is this program's own type: indexed by hand
+    {
+        printf("  %s %d\n", Map::key_at(&counts, i), *Map::value_at(&counts, i));
+        i = i + 1;
+    }
+
+    // Resources as values: the map owns these Strings and destroys them.
+    Map<String> phones = Map::new();
+    Map::entry(&mut phones, String::from_str("alice"), String::from_str("555-0101"));
+    Map::entry(&mut phones, String::from_str("bob"), String::from_str("555-0199"));
+    Map::entry(&mut phones, String::from_str("alice"), String::from_str("555-9999"));   // alice exists: both Strings are destroyed
+    array<str, 3> who = ["alice", "bob", "carol"];
+    foreach (person in who)
+    {
+        String name = String::from_str(person);
+        match (Map::get(&phones, &name))
+        {
+            Some(number) : printf("%s: %s\n", &name, number),
+            None : printf("%s: no entry\n", &name),
+        }
+    }
+}

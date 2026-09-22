@@ -1,0 +1,254 @@
+// PNG chunks
+//
+// Shows: random access in a binary format. A PNG file is an 8-byte
+// signature and then chunks: a 4-byte big-endian length, a 4-byte type,
+// the data, and a CRC-32 of type and data. The chunk list is found with
+// `File::seek` alone, jumping over each chunk's data without reading it;
+// a second pass reads everything and checks each CRC. Then a copy of the
+// file with one byte changed is written into the directory given
+// (`read_bytes`, `write_bytes`), and the check finds the damaged chunk.
+// Every read is a `match` on `Result<usize, FileError>`; a file that is
+// not a PNG is told apart from a missing one.
+//
+//   coby pngchunks.cb FILE.png DIR
+
+import std;
+
+enum PngError
+{
+    Open(FileError),
+    NotPng,
+    Truncated(u64),                   // where the file ended too early
+}
+
+// Appends exactly `n` bytes of `f` to `buf`, or says where the file ended.
+fn read_exact(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf, usize n, u64 at) : Result<void, PngError>
+{
+    usize got = 0;
+    while (got < n)
+    {
+        match (File::read(f, buf, n - got))
+        {
+            Ok(k) :
+            {
+                if (k == 0)
+                {
+                    return Err(Truncated(at + widen<u64>(got)));
+                }
+                got += k;
+            },
+            Err(e) : return Err(Open(e)),
+        }
+    }
+    Ok(())
+}
+
+fn be32(ref<Vec<u8>, shared> b, usize i) : u32
+{
+    (widen<u32>(b[i]) << 24) | (widen<u32>(b[i + 1]) << 16) | (widen<u32>(b[i + 2]) << 8) | widen<u32>(b[i + 3])
+}
+
+// CRC-32 (the one PNG and zip use), continued over `b[from..]`.
+fn crc_update(u32 crc, ref<Vec<u8>, shared> b, usize from) : u32
+{
+    u32 c = crc;
+    usize i = from;
+    while (i < Vec::len(b))
+    {
+        c = c ^ widen<u32>(b[i]);
+        usize k = 0;
+        while (k < 8)
+        {
+            if ((c & 1) != 0)
+            {
+                c = (c >> 1) ^ 0xEDB8_8320;
+            }
+            else
+            {
+                c = c >> 1;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    c
+}
+
+fn open_png(ref<String, shared> path) : Result<File, PngError>
+{
+    File f = match (File::open(path))
+    {
+        Ok(f) : f,
+        Err(e) : return Err(Open(e)),
+    };
+    Vec<u8> sig = Vec::new();
+    read_exact(&mut f, &mut sig, 8, 0)?;
+    if (sig[0] != 0x89 || sig[1] != b'P' || sig[2] != b'N' || sig[3] != b'G')
+    {
+        return Err(NotPng);
+    }
+    Ok(f)
+}
+
+// The type of the chunk whose header is `h`, as text.
+fn chunk_type(ref<Vec<u8>, shared> h) : String
+{
+    String t = String::new();
+    usize i = 4;
+    while (i < 8)
+    {
+        String::push_ascii(&mut t, h[i]);
+        i += 1;
+    }
+    t
+}
+
+// Pass 1: each chunk's header, and a seek past its data and CRC.
+fn list_chunks(ref<String, shared> path) : Result<void, PngError>
+{
+    File f = open_png(path)?;
+    u64 size = match (File::len(&f))
+    {
+        Ok(n) : n,
+        Err(e) : return Err(Open(e)),
+    };
+    u64 at = 8;
+    Vec<u8> h = Vec::new();
+    while (at < size)
+    {
+        Vec::clear(&mut h);
+        read_exact(&mut f, &mut h, 8, at)?;
+        u32 len = be32(&h, 0);
+        String t = chunk_type(&h);
+        printf("  %-4s at %3v, %3v bytes of data\n", &t, at, len);
+        if (&t[0..$] == "IHDR")
+        {
+            Vec<u8> d = Vec::new();
+            read_exact(&mut f, &mut d, 8, at + 8)?;
+            printf("       %v x %v pixels\n", be32(&d, 0), be32(&d, 4));
+        }
+        at = at + 12 + widen<u64>(len);
+        match (File::seek(&mut f, at))
+        {
+            Ok(_) :
+            {
+            },
+            Err(e) : return Err(Open(e)),
+        }
+    }
+    Ok(())
+}
+
+// Pass 2: every chunk read whole, its CRC recomputed; how many are bad.
+fn check_chunks(ref<String, shared> path) : Result<usize, PngError>
+{
+    File f = open_png(path)?;
+    u64 at = 8;
+    usize bad = 0;
+    Vec<u8> chunk = Vec::new();
+    while (true)
+    {
+        Vec::clear(&mut chunk);
+        match (File::read(&mut f, &mut chunk, 8))
+        {
+            Ok(k) :
+            {
+                if (k == 0)
+                {
+                    break;                            // no more chunks
+                }
+            },
+            Err(e) : return Err(Open(e)),
+        }
+        read_exact(&mut f, &mut chunk, 8 - Vec::len(&chunk), at)?;
+        usize len = widen<usize>(be32(&chunk, 0));
+        read_exact(&mut f, &mut chunk, len + 4, at + 8)?;
+        u32 want = be32(&chunk, 8 + len);
+        Vec::pop(&mut chunk);
+        Vec::pop(&mut chunk);
+        Vec::pop(&mut chunk);
+        Vec::pop(&mut chunk);
+        u32 got = crc_update(0xFFFF_FFFF, &chunk, 4) ^ 0xFFFF_FFFF;
+        String t = chunk_type(&chunk);
+        if (got == want)
+        {
+            printf("  %-4s crc %08x ok\n", &t, got);
+        }
+        else
+        {
+            printf("  %-4s crc %08x, stored %08x: DAMAGED\n", &t, got, want);
+            bad += 1;
+        }
+        at = at + 12 + widen<u64>(len);
+    }
+    Ok(bad)
+}
+
+fn report(ref<String, shared> path, PngError e) : u8
+{
+    match (e)
+    {
+        Open(NotFound) : eprintf("pngchunks: %s: no such file\n", path),
+        Open(_) : eprintf("pngchunks: %s: cannot read it\n", path),
+        NotPng : eprintf("pngchunks: %s: not a PNG file\n", path),
+        Truncated(at) : eprintf("pngchunks: %s: ends early, at byte %v\n", path, at),
+    }
+    1
+}
+
+fn main() : u8
+{
+    if (arg_count() != 2)
+    {
+        eprintf("usage: pngchunks FILE.png DIR\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    String dir = Result::unwrap_or(arg(1), String::new());
+
+    printf("%s:\n", &path);
+    match (list_chunks(&path))
+    {
+        Ok(_) :
+        {
+        },
+        Err(e) : return report(&path, e),
+    }
+    match (check_chunks(&path))
+    {
+        Ok(_) :
+        {
+        },
+        Err(e) : return report(&path, e),
+    }
+
+    // A copy with one byte of the image data changed.
+    Vec<u8> bytes = match (read_bytes(&path))
+    {
+        Ok(b) : b,
+        Err(e) : return report(&path, Open(e)),
+    };
+    bytes[50] ^= 0x01;
+    String copy = sprintf("%s/damaged.png", &dir);
+    match (write_bytes(&copy, &bytes[0..$]))
+    {
+        Ok(_) :
+        {
+        },
+        Err(_) :
+        {
+            eprintf("pngchunks: cannot write the copy\n");
+            return 1;
+        },
+    }
+    printf("a copy with byte 50 changed:\n");
+    match (check_chunks(&copy))
+    {
+        Ok(bad) :
+        {
+            printf("%v damaged chunk(s)\n", bad);
+            0
+        },
+        Err(e) : report(&copy, e),
+    }
+}

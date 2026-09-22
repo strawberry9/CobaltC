@@ -1,0 +1,165 @@
+// Log scan
+//
+// Shows: logs read a line at a time, the way tools read them. Each log
+// is a `File` read with `File::read_line`, buffered, so a log of any
+// size is never held whole; one `match` with nested patterns tells a
+// line (`Ok(Some(line))`) from the end (`Ok(None)`) and from a line that
+// is not UTF-8 (`Err(Utf8(e))`), which is reported with its line number
+// and skipped, and reading goes on. Levels are counted in a `HashMap`.
+// The ERROR lines go to a report written with `File::create` and
+// `File::write_str`, closed with `File::close` so a failed write is
+// reported; each log adds a line to a history opened with
+// `File::append`, which keeps what earlier logs wrote.
+//
+//   coby logscan.cb DIR LOG...
+
+import std;
+
+// The level of a line `DATE TIME LEVEL message`: its third word.
+fn level_of(ref<String, shared> line) : StringView
+{
+    Vec<StringView> words = StringView::split(&line[0..$], " ");
+    usize seen = 0;
+    foreach (w in &words)
+    {
+        if (StringView::len(*w) > 0)
+        {
+            seen += 1;
+            if (seen == 3)
+            {
+                return *w;
+            }
+        }
+    }
+    &line[0..0]
+}
+
+// Reads one log; its ERROR lines are written to `report`. Returns the
+// number of lines, or None when the log cannot be opened.
+fn scan(ref<String, shared> path, ref<HashMap<String, usize>, exclusive> levels, ref<File, exclusive> report) : Option<usize>
+{
+    File log = match (File::open(path))
+    {
+        Ok(f) : f,
+        Err(NotFound) :
+        {
+            eprintf("logscan: %s: no such file\n", path);
+            return None;
+        },
+        Err(_) :
+        {
+            eprintf("logscan: %s: cannot open it\n", path);
+            return None;
+        },
+    };
+    usize n = 0;
+    while (true)
+    {
+        match (File::read_line(&mut log))
+        {
+            Ok(Some(line)) :
+            {
+                n += 1;
+                StringView level = level_of(&line);
+                String key = String::from_view(level);
+                *HashMap::entry(levels, key, 0) += 1;
+                if (level == "ERROR")
+                {
+                    String entry = sprintf("%s:%v: %s\n", path, n, &line);
+                    Result::unwrap_or(File::write_str(report, &entry), ());
+                }
+            },
+            Ok(None) :
+            {
+                break;
+            },
+            Err(Utf8(e)) :
+            {
+                n += 1;
+                eprintf("logscan: %s:%v: not UTF-8 at byte %v, skipped\n", path, n, e.offset);
+            },
+            Err(_) :
+            {
+                eprintf("logscan: %s: read error after line %v\n", path, n);
+                break;
+            },
+        }
+    }
+    Some(n)
+}
+
+fn main() : u8
+{
+    if (arg_count() < 2)
+    {
+        eprintf("usage: logscan DIR LOG...\n");
+        return 2;
+    }
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String report_path = sprintf("%s/errors.txt", &dir);
+    String history_path = sprintf("%s/history.txt", &dir);
+    File report = match (File::create(&report_path))
+    {
+        Ok(f) : f,
+        Err(_) :
+        {
+            eprintf("logscan: cannot create %s\n", &report_path);
+            return 1;
+        },
+    };
+
+    u8 status = 0;
+    usize i = 1;
+    while (i < arg_count())
+    {
+        String path = Result::unwrap_or(arg(i), String::new());
+        HashMap<String, usize> levels = HashMap::new();
+        match (scan(&path, &mut levels, &mut report))
+        {
+            Some(n) :
+            {
+                String summary = sprintf("%s: %v lines", &path, n);
+                foreach (level, count in &levels)
+                {
+                    String::appendf(&mut summary, ", %s %v", level, *count);
+                }
+                String::push_ascii(&mut summary, b'\n');
+                printf("%s", &summary);
+                // Opened for appending each time: earlier lines stay.
+                match (File::append(&history_path))
+                {
+                    Ok(h) :
+                    {
+                        Result::unwrap_or(File::write_str(&mut h, &summary), ());
+                    },
+                    Err(_) :
+                    {
+                        status = 1;
+                    },
+                }
+            },
+            None :
+            {
+                status = 1;
+            },
+        }
+        i += 1;
+    }
+    match (File::close(report))
+    {
+        Ok(_) :
+        {
+        },
+        Err(_) :
+        {
+            eprintf("logscan: %s was not written completely\n", &report_path);
+            return 1;
+        },
+    }
+
+    String errors = Result::unwrap_or(read_file(&report_path), String::new());
+    printf("--- errors.txt\n%s", &errors);
+    String history = Result::unwrap_or(read_file(&history_path), String::new());
+    printf("--- history.txt\n%s", &history);
+    status
+}

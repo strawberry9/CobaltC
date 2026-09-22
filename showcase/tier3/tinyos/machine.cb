@@ -1,0 +1,87 @@
+// machine.cb -- the simulated hardware: 64 KB of RAM and a CPU's registers.
+//
+// RAM is one raw block, as physical memory is: this module is the only
+// place that touches it through a raw pointer, and it checks every
+// address against the block's size before it does.
+
+import std;
+
+export fn ram_size() : u32
+{
+    65536
+}
+
+export fn page_size() : u32
+{
+    256
+}
+
+// 64 KB of physical memory. Its bytes start uninitialized, as real RAM
+// does; the page allocator zeroes a page before any process sees it.
+export resource struct Ram
+{
+    rawptr<u8> base;
+}
+
+fn Ram::drop(ref<Ram, exclusive> self)
+{
+    unsafe
+    {
+        deallocate(self.base, 65536, 256);
+    }
+}
+
+export fn Ram::new() : Option<Ram>
+{
+    match (allocate(65536, 256))
+    {
+        Ok(p) : Some(Ram { .base = p }),
+        Err(_) : None,
+    }
+}
+
+export fn Ram::read(ref<Ram, shared> r, u32 addr) : u8
+{
+    if (addr >= ram_size())
+    {
+        fault_bus(addr);
+    }
+    unsafe
+    {
+        *(r.base + narrow<isize>(addr))           // trusted: in the block, and written first
+    }
+}
+
+export fn Ram::write(ref<Ram, exclusive> r, u32 addr, u8 v)
+{
+    if (addr >= ram_size())
+    {
+        fault_bus(addr);
+    }
+    unsafe
+    {
+        *(r.base + narrow<isize>(addr)) = v;      // trusted: in the block
+    }
+}
+
+// A physical address outside RAM is a kernel bug, not a user error: stop.
+fn fault_bus(u32 addr)
+{
+    printf("machine: bus error at physical address %v\n", addr);
+    u32 zero = 0;
+    zero / zero;
+}
+
+// The registers of one CPU: eight general registers, a program counter and
+// a stack pointer. Saving a process means copying this struct.
+export struct Cpu
+{
+    export array<u32, 8> r;
+    export u32 pc;
+    export u32 sp;
+}
+
+export fn Cpu::reset(u32 pc, u32 sp) : Cpu
+{
+    Cpu { .r = [0, 0, 0, 0, 0, 0, 0, 0], .pc = pc, .sp = sp }
+}

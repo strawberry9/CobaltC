@@ -1,0 +1,213 @@
+// Shortest Paths
+//
+// Shows: Dijkstra's algorithm under the aliasing rules. The priority queue
+// is a binary heap in a Vec, and swapping two of its elements is where
+// the rules bite: two `&mut` into one Vec at the same time would be an
+// aliasing conflict, so a swap reads both elements (plain values copy)
+// and writes them back one at a time. Distances are `Option<u64>`, not
+// a sentinel "infinity", so an unreachable town is a `None` the program
+// must handle, and every path cost is summed with `checked_add`.
+
+import std;
+
+struct Edge
+{
+    usize to;
+    u64 km;
+}
+
+struct Item
+{
+    u64 dist;
+    usize node;
+}
+
+// ---- a binary min-heap of Items, ordered by dist ----
+
+fn swap(ref<Vec<Item>, exclusive> h, usize i, usize j)
+{
+    Item a = *Vec::index_shared(&*h, i);                     // copies: Item is plain data
+    Item b = *Vec::index_shared(&*h, j);
+    *Vec::index_exclusive(h, i) = b;                         // one exclusive borrow at a time
+    *Vec::index_exclusive(h, j) = a;
+}
+
+fn dist_at(ref<Vec<Item>, shared> h, usize i) : u64
+{
+    Vec::index_shared(h, i).dist
+}
+
+fn heap_push(ref<Vec<Item>, exclusive> h, Item x)
+{
+    Vec::push(h, x);
+    usize i = Vec::len(&*h) - 1;
+    while (i > 0 && dist_at(&*h, (i - 1) / 2) > dist_at(&*h, i))
+    {
+        swap(h, i, (i - 1) / 2);
+        i = (i - 1) / 2;
+    }
+}
+
+fn heap_pop(ref<Vec<Item>, exclusive> h) : Option<Item>
+{
+    usize n = Vec::len(&*h);
+    if (n == 0)
+    {
+        return None;
+    }
+    swap(h, 0, n - 1);
+    Option<Item> top = Vec::pop(h);                          // the minimum, now at the end
+    usize i = 0;
+    bool sifting = true;
+    while (sifting)
+    {
+        usize l = 2 * i + 1;
+        usize r = l + 1;
+        usize m = i;
+        if (l < Vec::len(&*h) && dist_at(&*h, l) < dist_at(&*h, m))
+        {
+            m = l;
+        }
+        if (r < Vec::len(&*h) && dist_at(&*h, r) < dist_at(&*h, m))
+        {
+            m = r;
+        }
+        if (m == i)
+        {
+            sifting = false;
+        }
+        else
+        {
+            swap(h, i, m);
+            i = m;
+        }
+    }
+    top
+}
+
+// ---- the graph ----
+
+fn road(ref<Vec<Vec<Edge>>, exclusive> g, usize a, usize b, u64 km)
+{
+    Vec::push(Vec::index_exclusive(g, a), Edge { .to = b, .km = km });
+    Vec::push(Vec::index_exclusive(g, b), Edge { .to = a, .km = km });
+}
+
+fn main()
+{
+    array<str, 8> towns = ["Ashford", "Bramley", "Cotton", "Dunmore", "Elstow", "Fairley", "Glenn", "Harrow"];
+    Vec<Vec<Edge>> g = Vec::new();
+    usize t = 0;
+    while (t < 8)
+    {
+        Vec::push(&mut g, Vec::new());
+        t = t + 1;
+    }
+    road(&mut g, 0, 1, 7);
+    road(&mut g, 0, 2, 9);
+    road(&mut g, 0, 5, 14);
+    road(&mut g, 1, 2, 10);
+    road(&mut g, 1, 3, 15);
+    road(&mut g, 2, 3, 11);
+    road(&mut g, 2, 5, 2);
+    road(&mut g, 3, 4, 6);
+    road(&mut g, 4, 5, 9);
+    // Harrow (7) has no roads at all; Glenn (6) only to Harrow.
+    road(&mut g, 6, 7, 3);
+
+    Vec<Option<u64>> dist = Vec::new();
+    Vec<Option<usize>> prev = Vec::new();
+    Vec<bool> done = Vec::new();
+    t = 0;
+    while (t < 8)
+    {
+        Vec::push(&mut dist, None);
+        Vec::push(&mut prev, None);
+        Vec::push(&mut done, false);
+        t = t + 1;
+    }
+
+    usize start = 0;
+    *Vec::index_exclusive(&mut dist, start) = Some(0);
+    Vec<Item> heap = Vec::new();
+    heap_push(&mut heap, Item { .dist = 0, .node = start });
+    bool running = true;
+    while (running)
+    {
+        match (heap_pop(&mut heap))
+        {
+            None : running = false,
+            Some(it) :
+            {
+                if (!*Vec::index_shared(&done, it.node))
+                {
+                    *Vec::index_exclusive(&mut done, it.node) = true;
+                    auto edges = Vec::index_shared(&g, it.node);
+                    foreach (e in edges)
+                    {
+                        match (checked_add(it.dist, e.km))
+                        {
+                            None : printf("a path length overflowed u64\n"),
+                            Some(d) :
+                            {
+                                bool better = match (*Vec::index_shared(&dist, e.to))
+                                {
+                                    None : true,
+                                    Some(old) : d < old,
+                                };
+                                if (better)
+                                {
+                                    *Vec::index_exclusive(&mut dist, e.to) = Some(d);
+                                    *Vec::index_exclusive(&mut prev, e.to) = Some(it.node);
+                                    heap_push(&mut heap, Item { .dist = d, .node = e.to });
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    printf("from %v:\n", towns[start]);
+    foreach (t, town in &towns)
+    {
+        printf("  %v", town);
+        match (*Vec::index_shared(&dist, t))
+        {
+            None : printf(": unreachable\n"),
+            Some(d) :
+            {
+                printf(": %v km via ", d);
+                // Walk the predecessors back to the start, collecting the route.
+                Vec<usize> route = Vec::new();
+                usize at = t;
+                Vec::push(&mut route, at);
+                bool walking = true;
+                while (walking)
+                {
+                    match (*Vec::index_shared(&prev, at))
+                    {
+                        None : walking = false,
+                        Some(p) :
+                        {
+                            Vec::push(&mut route, p);
+                            at = p;
+                        },
+                    }
+                }
+                usize r = Vec::len(&route);
+                while (r > 0)
+                {
+                    r = r - 1;
+                    printf("%v", towns[*Vec::index_shared(&route, r)]);
+                    if (r > 0)
+                    {
+                        printf(" > ");
+                    }
+                }
+                printf("\n");
+            },
+        }
+    }
+}

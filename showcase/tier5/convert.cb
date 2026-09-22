@@ -1,0 +1,156 @@
+// convert -- an integer in decimal, hexadecimal and binary, and which of
+// CobaltC's integer types can hold it.
+//
+//     convert 255
+//     convert -170141183460469231731687303715884105728
+//
+// Shows: `parse<T>` at ten different `T`, one generic function checked
+// at each instantiation, deciding "fits" exactly (`OutOfRange` is the
+// answer, not an overflow); `reinterpret` and `wrapping_sub` to get a
+// negative number's magnitude even for `i128`'s minimum, which has no
+// `i128` negation; digits built into a `String` with `append`.
+
+import std;
+
+// Whether `text` is a value of `T`: `parse<T>` decides, for any integer
+// type, with nothing to overflow.
+fn fits<T>(ref<String, shared> text) : bool
+{
+    match (parse<T>(text))
+    {
+        Ok(_) : true,
+        Err(_) : false,
+    }
+}
+
+fn add_if(ref<String, exclusive> s, bool yes, str name)
+{
+    if (yes)
+    {
+        String::append(s, " ");
+        String::append(s, name);
+    }
+}
+
+// `m` in base `base` (2 or 16), most significant digit first: the
+// digits come out last first, as ASCII bytes, and are put in order
+// into a `Vec<u8>` that `String::from_utf8` accepts.
+fn digits(u128 m, u128 base) : String
+{
+    Vec<u8> rev = Vec::new();
+    u128 x = m;
+    while (true)
+    {
+        u8 d = narrow<u8>(x % base);
+        Vec::push(&mut rev, if (d < 10)
+        {
+            b'0' + d
+        }
+        else
+        {
+            b'a' + (d - 10)
+        });
+        x = x / base;
+        if (x == 0)
+        {
+            break;
+        }
+    }
+    Vec<u8> ordered = Vec::new();
+    usize i = Vec::len(&rev);
+    while (i > 0)
+    {
+        i = i - 1;
+        Vec::push(&mut ordered, *Vec::index_shared(&rev, i));
+    }
+    Result::unwrap_or(String::from_utf8(ordered), String::new())
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: convert INTEGER\n");
+        return 3;
+    }
+    String text = Result::unwrap_or(arg(0), String::new());
+    // The magnitude, and whether there is a minus sign: an `i128` for a
+    // negative number (its magnitude by two's complement, which is right
+    // even for i128's minimum), a `u128` otherwise.
+    bool negative = String::len(&text) > 0 && *Vec::index_shared(String::as_bytes(&text), 0) == b'-';
+    Result<u128, ParseError> magnitude = if (negative)
+    {
+        match (parse<i128>(&text))
+        {
+            Ok(v) : Ok(wrapping_sub<u128>(0, reinterpret<u128>(v))),
+            Err(e) : Err(e),
+        }
+    }
+    else
+    {
+        parse<u128>(&text)
+    };
+    u128 m = match (magnitude)
+    {
+        Ok(m) : m,
+        Err(e) :
+        {
+            String msg = String::from_str("convert: \"");
+            String::append(&mut msg, &text);
+            match (e)
+            {
+                Empty :
+                {
+                    String::append(&mut msg, "\" is empty\n");
+                },
+                Invalid(k) :
+                {
+                    String::append(&mut msg, "\" is not an integer (byte ");
+                    String::append(&mut msg, k);
+                    String::append(&mut msg, ")\n");
+                },
+                OutOfRange :
+                {
+                    String::append(&mut msg, "\" is beyond every integer type\n");
+                    eprintf("%v", &msg);
+                    return 2;
+                },
+            }
+            eprintf("%v", &msg);
+            return 1;
+        },
+    };
+    String sign = String::from_str(if (negative)
+    {
+        "-"
+    }
+    else
+    {
+        ""
+    });
+    String out = String::new();
+    String::append(&mut out, "dec  ");
+    String::append(&mut out, &text);
+    String::append(&mut out, "\nhex  ");
+    String::append(&mut out, &sign);
+    String h = digits(m, 16);
+    String::append(&mut out, &h);
+    String::append(&mut out, "\nbin  ");
+    String::append(&mut out, &sign);
+    String bits = digits(m, 2);
+    String::append(&mut out, &bits);
+    String::append(&mut out, "\nfits");
+    add_if(&mut out, fits<i8>(&text), "i8");
+    add_if(&mut out, fits<u8>(&text), "u8");
+    add_if(&mut out, fits<i16>(&text), "i16");
+    add_if(&mut out, fits<u16>(&text), "u16");
+    add_if(&mut out, fits<i32>(&text), "i32");
+    add_if(&mut out, fits<u32>(&text), "u32");
+    add_if(&mut out, fits<i64>(&text), "i64");
+    add_if(&mut out, fits<u64>(&text), "u64");
+    add_if(&mut out, fits<i128>(&text), "i128");
+    add_if(&mut out, fits<u128>(&text), "u128");
+    String::append(&mut out, "\n");
+    printf("%v", &out);
+    0
+}

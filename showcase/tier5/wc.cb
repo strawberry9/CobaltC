@@ -1,0 +1,113 @@
+// wc -- lines, words and bytes of each file named as an argument, as
+// the Unix tool counts them, and their totals.
+//
+//     wc wc_data/fog.txt wc_data/fruit.csv
+//
+// Shows: `read_file` and the `FileError` it gives for a file that is
+// missing or not UTF-8; one failing file reported without stopping the
+// others, and the exit status saying some failed (1) or none were
+// named (2); counting over a `String`'s bytes with byte literals; the
+// columns written with `printf`.
+
+import std;
+
+struct Counts
+{
+    usize lines;
+    usize words;
+    usize bytes;
+}
+
+fn count(ref<String, shared> text) : Counts
+{
+    auto b = String::as_bytes(text);
+    Counts c = Counts { .lines = 0, .words = 0, .bytes = Vec::len(b) };
+    bool in_word = false;
+    foreach (byte in b)
+    {
+        u8 x = *byte;
+        if (x == b'\n')
+        {
+            c.lines = c.lines + 1;
+        }
+        bool space = x == b' ' || x == b'\n' || x == b'\t' || x == b'\r';
+        if (!space && !in_word)
+        {
+            c.words = c.words + 1;
+        }
+        in_word = !space;
+    }
+    c
+}
+
+// One line of counts, each right-aligned in 7 columns, as Unix `wc`.
+fn show(Counts c, ref<String, shared> name)
+{
+    printf("%7d%7d%7d %s\n", c.lines, c.words, c.bytes, name);
+}
+
+fn main() : u8
+{
+    usize n = arg_count();
+    if (n == 0)
+    {
+        eprintf("usage: wc FILE...\n");
+        return 2;
+    }
+    Counts total = Counts { .lines = 0, .words = 0, .bytes = 0 };
+    u8 status = 0;
+    usize i = 0;
+    while (i < n)
+    {
+        String name = Result::unwrap_or(arg(i), String::new());
+        match (read_file(&name))
+        {
+            Ok(text) :
+            {
+                Counts c = count(&text);
+                total = Counts
+                {
+                    .lines = total.lines + c.lines,
+                    .words = total.words + c.words,
+                    .bytes = total.bytes + c.bytes,
+                };
+                show(c, &name);
+            },
+            Err(e) :
+            {
+                String m = String::from_str("wc: ");
+                String::append(&mut m, &name);
+                match (e)
+                {
+                    NotFound :
+                    {
+                        String::append(&mut m, ": no such file\n");
+                    },
+                    Denied :
+                    {
+                        String::append(&mut m, ": permission denied\n");
+                    },
+                    Io :
+                    {
+                        String::append(&mut m, ": cannot be read\n");
+                    },
+                    Utf8(u) :
+                    {
+                        String::append(&mut m, ": not UTF-8 text (byte ");
+                        String::append(&mut m, u.offset);
+                        String::append(&mut m, ")\n");
+                    },
+                }
+                eprintf("%v", &m);
+                status = 1;
+            },
+        }
+        i = i + 1;
+    }
+    if (n > 1)
+    {
+        String t = String::from_str("total");
+        show(total, &t);
+    }
+    status
+}

@@ -1,0 +1,158 @@
+// Tiny Serializer
+//
+// Shows: explicit, checked conversions at every width change --
+// `narrow<u8>`, `widen<u32>`, `reinterpret<u16>` for the sign -- so a
+// wire format is spelled out byte by byte, and decoding is a `Result`
+// that names what was wrong. The round trip is verified with `==` on
+// plain structs.
+
+import std;
+
+struct Reading
+{
+    u32 station;
+    i16 tenths;        // temperature in tenths of a degree
+    bool calibrated;
+}
+
+enum DecodeError
+{
+    Truncated(usize),  // needed more bytes at this offset
+    BadTag(u8)
+}
+
+fn put_u16(ref<Vec<u8>, exclusive> o, u16 v)
+{
+    Vec::push(o, narrow<u8>(v & 255));
+    Vec::push(o, narrow<u8>(v >> 8));
+}
+
+fn put_u32(ref<Vec<u8>, exclusive> o, u32 v)
+{
+    put_u16(o, narrow<u16>(v & 65535));
+    put_u16(o, narrow<u16>(v >> 16));
+}
+
+// 'R', station (4 bytes, little-endian), tenths (2), calibrated (1).
+fn encode(ref<Vec<u8>, exclusive> o, Reading r)
+{
+    Vec::push(o, 82);
+    put_u32(o, r.station);
+    put_u16(o, reinterpret<u16>(r.tenths));
+    u8 flag = if (r.calibrated) { 1 } else { 0 };
+    Vec::push(o, flag);
+}
+
+fn get(ref<Vec<u8>, shared> b, usize at) : Result<u8, DecodeError>
+{
+    if (at >= Vec::len(b))
+    {
+        return Err(Truncated(at));
+    }
+    Ok(*Vec::index_shared(b, at))
+}
+
+fn get_u16(ref<Vec<u8>, shared> b, usize at) : Result<u16, DecodeError>
+{
+    u16 lo = widen<u16>(get(b, at)?);
+    u16 hi = widen<u16>(get(b, at + 1)?);
+    Ok(lo | (hi << 8))                 // parentheses needed: in CobaltC `|` binds tighter than `<<`
+}
+
+fn decode(ref<Vec<u8>, shared> b, usize at) : Result<Reading, DecodeError>
+{
+    u8 tag = get(b, at)?;
+    if (tag != 82)
+    {
+        return Err(BadTag(tag));
+    }
+    u32 lo = widen<u32>(get_u16(b, at + 1)?);
+    u32 hi = widen<u32>(get_u16(b, at + 3)?);
+    i16 tenths = reinterpret<i16>(get_u16(b, at + 5)?);
+    bool calibrated = get(b, at + 7)? != 0;
+    Ok(Reading { .station = lo | (hi << 16), .tenths = tenths, .calibrated = calibrated })
+}
+
+fn explain(str what, Result<Reading, DecodeError> r)
+{
+    printf("decoding %v: ", what);
+    match (r)
+    {
+        Ok(_) :
+        {
+            printf("a reading");
+        },
+        Err(e) :
+        {
+            match (e)
+            {
+                Truncated(at) :
+                {
+                    printf("truncated, byte %v is missing", at);
+                },
+                BadTag(t) :
+                {
+                    printf("not a record (tag %v)", t);
+                },
+            }
+        },
+    }
+    printf("\n");
+}
+
+fn main()
+{
+    array<Reading, 3> readings = [
+        Reading { .station = 7, .tenths = 215, .calibrated = true },
+        Reading { .station = 70000, .tenths = -42, .calibrated = false },
+        Reading { .station = 4294967295, .tenths = -32768, .calibrated = true }
+    ];
+    Vec<u8> wire = Vec::new();
+    foreach (r in readings)
+    {
+        encode(&mut wire, r);
+    }
+    printf("encoded %v bytes:", Vec::len(&wire));
+    foreach (k, byte in &wire)
+    {
+        if (k % 8 == 0)
+        {
+            printf("\n ");
+        }
+        printf(" %02x", byte);
+    }
+    printf("\n");
+
+    bool all_equal = true;
+    foreach (i, original in &readings)
+    {
+        match (decode(&wire, i * 8))
+        {
+            Ok(r) :
+            {
+                if (r != *original)
+                {
+                    all_equal = false;
+                }
+            },
+            Err(_) :
+            {
+                all_equal = false;
+            },
+        }
+    }
+    printf("decoded all three and they equal the originals? ");
+    printf("%v", if (all_equal) { "yes" } else { "no" });
+    printf("\n");
+
+    // Two broken inputs: a record cut short, and bytes that are not a record.
+    Vec<u8> cut = Vec::new();
+    usize k = 0;
+    while (k < 5)
+    {
+        Vec::push(&mut cut, *Vec::index_shared(&wire, k));
+        k = k + 1;
+    }
+    explain("the first 5 bytes", decode(&cut, 0));
+    explain("from offset 1", decode(&wire, 1));
+}

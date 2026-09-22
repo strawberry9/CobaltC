@@ -1,0 +1,126 @@
+// Word Frequencies
+//
+// Shows: a HashMap<String, u32> counting the words of a file named on
+// the command line. `HashMap::entry` adds a word the first time and
+// returns its count either way; `foreach (word, n in &counts)` visits
+// the entries in the order the words first appeared, so the output is
+// the same on every run and in both implementations, whatever the
+// words hash to. A stable sort by count then keeps that order for ties.
+//
+//   coby wordfreq.cb FILE [TOP]
+
+import std;
+
+// The words of `text`: runs of ASCII letters, lower-cased, and of bytes
+// above 127 (so a word with an accented letter stays whole). Everything
+// else separates words.
+fn words(ref<String, shared> text) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    Vec<u8> current = Vec::new();
+    foreach (b in String::as_bytes(text))
+    {
+        u8 c = *b;
+        bool letter = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c >= 128;
+        if (letter)
+        {
+            Vec::push(&mut current, if (c >= b'A' && c <= b'Z') { c + 32 } else { c });
+        }
+        else if (Vec::len(&current) > 0)
+        {
+            match (String::from_utf8(current))          // current moves in
+            {
+                Ok(w) : Vec::push(&mut out, w),
+                Err(_) : eprintf("wordfreq: a word that is not UTF-8 was skipped\n"),
+            }
+            current = Vec::new();                        // and gets a new value
+        }
+    }
+    if (Vec::len(&current) > 0)
+    {
+        match (String::from_utf8(current))
+        {
+            Ok(w) : Vec::push(&mut out, w),
+            Err(_) : eprintf("wordfreq: a word that is not UTF-8 was skipped\n"),
+        }
+    }
+    out
+}
+
+fn main() : u8
+{
+    usize n = arg_count();
+    if (n < 1 || n > 2)
+    {
+        eprintf("usage: wordfreq FILE [TOP]\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    usize top = 10;
+    if (n == 2)
+    {
+        String t = Result::unwrap_or(arg(1), String::new());
+        match (parse<usize>(&t))
+        {
+            Ok(v) : top = v,
+            Err(_) :
+            {
+                eprintf("wordfreq: TOP must be a number, not \"%s\"\n", &t);
+                return 2;
+            },
+        }
+    }
+    String text = match (read_file(&path))
+    {
+        Ok(t) : t,
+        Err(_) :
+        {
+            eprintf("wordfreq: cannot read %s\n", &path);
+            return 1;
+        },
+    };
+
+    HashMap<String, u32> counts = HashMap::new();
+    usize total = 0;
+    foreach (w in words(&text))                         // each word moves into the map, or is dropped
+    {
+        *HashMap::entry(&mut counts, w, 0) += 1;
+        total += 1;
+    }
+
+    // Entry positions, sorted by count, most frequent first. Insertion
+    // sort is stable: equal counts keep first-appearance order.
+    Vec<usize> order = Vec::new();
+    for (usize i = 0; i < HashMap::len(&counts); i += 1)
+    {
+        Vec::push(&mut order, i);
+    }
+    for (usize i = 1; i < Vec::len(&order); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && *HashMap::value_at(&counts, *Vec::index_shared(&order, j - 1)) < *HashMap::value_at(&counts, *Vec::index_shared(&order, j)))
+        {
+            usize a = *Vec::index_shared(&order, j - 1);
+            *Vec::index_exclusive(&mut order, j - 1) = *Vec::index_shared(&order, j);
+            *Vec::index_exclusive(&mut order, j) = a;
+            j -= 1;
+        }
+    }
+
+    printf("%s: %d words, %d different\n", &path, total, HashMap::len(&counts));
+    foreach (rank, e in &order)
+    {
+        if (rank == top)
+        {
+            break;
+        }
+        u32 c = *HashMap::value_at(&counts, *e);
+        String bar = String::new();
+        for (u32 k = 0; k < c; k += 1)
+        {
+            String::append(&mut bar, "#");
+        }
+        printf("%2d. %-10s %3d %s\n", rank + 1, HashMap::key_at(&counts, *e), c, &bar);
+    }
+    0
+}

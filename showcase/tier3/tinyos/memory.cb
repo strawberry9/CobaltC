@@ -1,0 +1,172 @@
+// memory.cb -- physical pages and the virtual address spaces built on them.
+
+import std;
+
+// Owns every free physical page. A page leaves the free list only through
+// `alloc`, zeroed, and comes back only through `free`.
+export struct Allocator
+{
+    Vec<u16> free;
+    u32 handed_out;
+}
+
+// Pages [first, first + count) are free; the ones below `first` belong to
+// the kernel.
+export fn Allocator::new(u16 first, u16 count) : Allocator
+{
+    Vec<u16> free = Vec::new();
+    u16 p = first + count;
+    while (p > first)
+    {
+        p = p - 1;
+        Vec::push(&mut free, p);                      // pop hands out the lowest page first
+    }
+    Allocator { .free = free, .handed_out = 0 }
+}
+
+export fn Allocator::available(ref<Allocator, shared> a) : usize
+{
+    Vec::len(&a.free)
+}
+
+export fn Allocator::handed_out(ref<Allocator, shared> a) : u32
+{
+    a.handed_out
+}
+
+// A free page, zeroed so that no process can read what the last one left.
+export fn Allocator::alloc(ref<Allocator, exclusive> a, ref<machine::Ram, exclusive> ram) : Option<u16>
+{
+    match (Vec::pop(&mut a.free))
+    {
+        None : None,
+        Some(p) :
+        {
+            u32 base = widen<u32>(p) * machine::page_size();
+            u32 i = 0;
+            while (i < machine::page_size())
+            {
+                machine::Ram::write(ram, base + i, 0);
+                i = i + 1;
+            }
+            a.handed_out = a.handed_out + 1;
+            Some(p)
+        },
+    }
+}
+
+export fn Allocator::free(ref<Allocator, exclusive> a, u16 p)
+{
+    Vec::push(&mut a.free, p);
+}
+
+// A process's view of memory: 16 virtual pages of 256 bytes (4 KB), each
+// mapped to a physical page or not. It owns the pages it maps, so it is a
+// resource: they must go back to the allocator, through `release_all`,
+// before it is destroyed.
+export resource struct AddressSpace
+{
+    array<u16, 16> table;             // physical page per virtual page; max_value<u16>() when unmapped
+    u32 mapped;
+}
+
+fn AddressSpace::drop(ref<AddressSpace, exclusive> self)
+{
+    if (self.mapped != 0)
+    {
+        printf("memory: BUG: an address space was destroyed with %v", self.mapped);
+        printf(" pages still mapped\n");
+    }
+}
+
+export fn AddressSpace::new() : AddressSpace
+{
+    u16 none = max_value<u16>();
+    AddressSpace {
+        .table = [none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none],
+        .mapped = 0
+    }
+}
+
+export fn AddressSpace::mapped(ref<AddressSpace, shared> s) : u32
+{
+    s.mapped
+}
+
+export fn AddressSpace::is_mapped(ref<AddressSpace, shared> s, u32 vpn) : bool
+{
+    vpn < 16 && s.table[narrow<usize>(vpn)] != max_value<u16>()
+}
+
+// Maps a fresh page at virtual page `vpn`. False if there is no free page.
+export fn AddressSpace::map_new(ref<AddressSpace, exclusive> s, u32 vpn, ref<Allocator, exclusive> a, ref<machine::Ram, exclusive> ram) : bool
+{
+    match (Allocator::alloc(a, ram))
+    {
+        None : false,
+        Some(p) :
+        {
+            s.table[narrow<usize>(vpn)] = p;
+            s.mapped = s.mapped + 1;
+            true
+        },
+    }
+}
+
+export fn AddressSpace::unmap(ref<AddressSpace, exclusive> s, u32 vpn, ref<Allocator, exclusive> a)
+{
+    u16 p = s.table[narrow<usize>(vpn)];
+    Allocator::free(a, p);
+    s.table[narrow<usize>(vpn)] = max_value<u16>();
+    s.mapped = s.mapped - 1;
+}
+
+// Gives every mapped page back; returns how many there were.
+export fn AddressSpace::release_all(ref<AddressSpace, exclusive> s, ref<Allocator, exclusive> a) : u32
+{
+    u32 n = 0;
+    u32 vpn = 0;
+    while (vpn < 16)
+    {
+        if (AddressSpace::is_mapped(&*s, vpn))
+        {
+            AddressSpace::unmap(s, vpn, a);
+            n = n + 1;
+        }
+        vpn = vpn + 1;
+    }
+    n
+}
+
+// The physical address of virtual address `va`, or None: a page fault.
+export fn AddressSpace::translate(ref<AddressSpace, shared> s, u32 va) : Option<u32>
+{
+    u32 vpn = va / machine::page_size();
+    if (!AddressSpace::is_mapped(s, vpn))
+    {
+        return None;
+    }
+    Some(widen<u32>(s.table[narrow<usize>(vpn)]) * machine::page_size() + va % machine::page_size())
+}
+
+export fn AddressSpace::load(ref<AddressSpace, shared> s, ref<machine::Ram, shared> ram, u32 va) : Option<u8>
+{
+    match (AddressSpace::translate(s, va))
+    {
+        None : None,
+        Some(pa) : Some(machine::Ram::read(ram, pa)),
+    }
+}
+
+export fn AddressSpace::store(ref<AddressSpace, shared> s, ref<machine::Ram, exclusive> ram, u32 va, u8 v) : bool
+{
+    match (AddressSpace::translate(s, va))
+    {
+        None : false,
+        Some(pa) :
+        {
+            machine::Ram::write(ram, pa, v);
+            true
+        },
+    }
+}

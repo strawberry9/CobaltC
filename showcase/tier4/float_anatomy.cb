@@ -1,0 +1,55 @@
+// The Anatomy of a Double
+//
+// Shows: CobaltC fixes the representation of an f64 (IEEE-754 binary64,
+// little-endian), so reading its eight bytes through a raw pointer is
+// meaningful. Each value is taken apart into sign, exponent and mantissa
+// by shifting and masking -- with parentheses, since in CobaltC `&`
+// binds tighter than `>>` -- and then rebuilt with the C library's
+// `ldexp`, which must give back the very same bits. The same bits come
+// without `unsafe` from `reinterpret<u64>(x)` (D-0051); the raw read
+// agrees with it, as the fixed representation says it must.
+
+import std;
+
+extern fn ldexp(f64 x, i32 exp) : f64;
+
+fn bits_of(f64 x) : u64
+{
+    f64 copy = x;
+    unsafe
+    {
+        *reinterpret_ptr<u64>(rawptr_of(&copy))
+    }
+}
+
+fn show(str label, f64 x)
+{
+    u64 one = 1;
+    u64 b = bits_of(x);
+    if (b != reinterpret<u64>(x))
+    {
+        printf("bits disagree\n");
+    }
+    u64 sign = b >> 63;
+    u64 exponent = (b >> 52) & 2047;
+    u64 mantissa = b & ((one << 52) - 1);
+    printf("%v  sign %v  exponent %v  mantissa 0x%013x", label, sign, reinterpret<i64>(exponent) - 1023, mantissa);
+
+    // value = (-1)^sign * (1 + mantissa / 2^52) * 2^(exponent - 1023)
+    f64 fraction = 1.0 + to_float<f64>(mantissa) / unsafe { ldexp(1.0, 52) };
+    f64 rebuilt = unsafe { ldexp(fraction, narrow<i32>(reinterpret<i64>(exponent) - 1023)) };
+    if (sign == 1)
+    {
+        rebuilt = -rebuilt;
+    }
+    printf("%v", if (bits_of(rebuilt) == b) { "  rebuilt exactly\n" } else { "  MISMATCH\n" });
+}
+
+fn main()
+{
+    show("   1.0  ", 1.0);
+    show("  -2.5  ", -2.5);
+    show("   0.1  ", 0.1);
+    show(" 1234.5 ", 1234.5);
+    show(" 1/3    ", 1.0 / 3.0);
+}

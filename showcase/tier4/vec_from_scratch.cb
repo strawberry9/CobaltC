@@ -1,0 +1,260 @@
+// A Vec From Scratch
+//
+// Shows: a growable vector written in plain CobaltC over raw memory, with
+// nothing the compiler does for it that it would not do for any other
+// code. `allocate` gives bytes, pointer arithmetic and writes through a
+// `rawptr` are `unsafe`, and `reclaim` turns an element's bytes back into
+// a typed object -- so a reference to an element is an ordinary reference,
+// the aliasing rules apply to it, and a resource element is destroyed
+// exactly once. The bounds check is the vector's own `if`: an index past
+// the end stops the program at its `fault`. The version here is used
+// side by side with `std::Vec` and gives the same answers.
+//
+// Where it runs differently: under `cobc`, `std::Vec`'s element access,
+// `push` and `drop` are not compiled from their CobaltC bodies. The
+// compiler substitutes native code with the same checks and the same
+// results. It may, because what a library function does is fixed, not how
+// it does it. It does, because run literally, every element access makes
+// a typed object for that element through `reclaim`, and keeps track of
+// it; the native code skips that bookkeeping, which made a
+// million-element sieve five times faster in a fraction of the memory.
+// Nothing in this file is substituted -- a program's own code is always
+// compiled as written -- so this `Vec` runs as you see it under both
+// `coby` and `cobc`.
+
+import std;
+
+module handmade
+{
+    import std;
+
+    export resource struct Vec<T>
+    {
+        rawptr<T> ptr;                      // private: only this module sees the fields
+        usize len;
+        usize cap;
+    }
+
+    export fn Vec::new<T>() : Vec<T>
+    {
+        Vec { .ptr = dangling<T>(), .len = 0, .cap = 0 }    // no allocation until the first push
+    }
+
+    export fn Vec::len<T>(ref<Vec<T>, shared> v) : usize
+    {
+        v.len
+    }
+
+    // Something std's Vec does not offer: our own module can add it.
+    export fn Vec::capacity<T>(ref<Vec<T>, shared> v) : usize
+    {
+        v.cap
+    }
+
+    export fn Vec::push<T>(ref<Vec<T>, exclusive> v, T x)
+    {
+        if (v.len == v.cap)
+        {
+            Vec::grow(v);
+        }
+        unsafe
+        {
+            *(v.ptr + reinterpret<isize>(v.len)) = x;
+        }
+        v.len = v.len + 1;
+    }
+
+    export fn Vec::pop<T>(ref<Vec<T>, exclusive> v) : Option<T>
+    {
+        if (v.len == 0)
+        {
+            return None;
+        }
+        v.len = v.len - 1;
+        unsafe
+        {
+            rawptr<T> p = v.ptr + reinterpret<isize>(v.len);
+            auto x = *p;                                    // moves the element out
+            release(reinterpret_ptr<u8>(p), sizeof<T>());   // its bytes no longer hold an object
+            Some(x)
+        }
+    }
+
+    export fn Vec::index_shared<T>(ref<Vec<T>, shared> v, usize i) : ref<T, shared>
+    {
+        if (i >= v.len)
+        {
+            fault(index_out_of_bounds);
+        }
+        unsafe
+        {
+            &reclaim<T>(v.ptr + reinterpret<isize>(i))
+        }
+    }
+
+    export fn Vec::index_exclusive<T>(ref<Vec<T>, exclusive> v, usize i) : ref<T, exclusive>
+    {
+        if (i >= v.len)
+        {
+            fault(index_out_of_bounds);
+        }
+        unsafe
+        {
+            &mut reclaim<T>(v.ptr + reinterpret<isize>(i))
+        }
+    }
+
+    // Not exported: callers cannot grow a Vec except by pushing.
+    fn Vec::grow<T>(ref<Vec<T>, exclusive> v)
+    {
+        usize new_cap = if (v.cap == 0)
+        {
+            4
+        }
+        else
+        {
+            v.cap * 2
+        };
+        usize bytes = new_cap * sizeof<T>();
+        rawptr<u8> p = match (allocate(bytes, alignof<T>()))
+        {
+            Ok(p) : p,
+            Err(_) : fault(alloc_failure),
+        };
+        unsafe
+        {
+            copy_raw(p, reinterpret_ptr<u8>(v.ptr), v.len * sizeof<T>());
+            if (v.cap > 0)
+            {
+                deallocate(reinterpret_ptr<u8>(v.ptr), v.cap * sizeof<T>(), alignof<T>());
+            }
+        }
+        v.ptr = reinterpret_ptr<T>(p);
+        v.cap = new_cap;
+    }
+
+    export fn Vec::drop<T>(ref<Vec<T>, exclusive> self)
+    {
+        usize i = 0;
+        while (i < self.len)
+        {
+            unsafe
+            {
+                drop(reclaim<T>(self.ptr + reinterpret<isize>(i)));    // each element's destructor runs
+            }
+            i = i + 1;
+        }
+        if (self.cap > 0)
+        {
+            unsafe
+            {
+                deallocate(reinterpret_ptr<u8>(self.ptr), self.cap * sizeof<T>(), alignof<T>());
+            }
+        }
+    }
+}
+
+resource struct Ticket
+{
+    u32 id;
+}
+
+fn Ticket::drop(ref<Ticket, exclusive> self)
+{
+    printf("  ticket %v destroyed\n", self.id);
+}
+
+fn main()
+{
+    handmade::Vec<i64> mine = handmade::Vec::new();
+    std::Vec<i64> theirs = std::Vec::new();
+
+    // Growth: the capacity doubles when a push finds the buffer full.
+    printf("pushing the first ten squares\n");
+    usize cap = handmade::Vec::capacity(&mine);
+    i64 k = 1;
+    while (k <= 10)
+    {
+        handmade::Vec::push(&mut mine, k * k);
+        std::Vec::push(&mut theirs, k * k);
+        if (handmade::Vec::capacity(&mine) != cap)
+        {
+            cap = handmade::Vec::capacity(&mine);
+            printf("  capacity %v at length ", cap);
+            printf("%v", handmade::Vec::len(&mine));
+            printf("\n");
+        }
+        k = k + 1;
+    }
+
+    // Writes go through a fresh exclusive borrow of one element.
+    *handmade::Vec::index_exclusive(&mut mine, 3) = -16;
+    *std::Vec::index_exclusive(&mut theirs, 3) = -16;
+
+    // Reads: two shared references to the same element may coexist. They
+    // live until their block ends; the pops below need them gone.
+    {
+        auto first = handmade::Vec::index_shared(&mine, 0);
+        auto again = handmade::Vec::index_shared(&mine, 0);
+        printf("element 0 read twice: %v\n", *first + *again);
+    }
+
+    i64 sum_mine = 0;
+    i64 sum_theirs = 0;
+    usize i = 0;
+    while (i < handmade::Vec::len(&mine))
+    {
+        sum_mine = sum_mine + *handmade::Vec::index_shared(&mine, i);
+        sum_theirs = sum_theirs + *std::Vec::index_shared(&theirs, i);
+        i = i + 1;
+    }
+    printf("sums: handmade %v, std %v\n", sum_mine, sum_theirs);
+
+    printf("popping three:");
+    i = 0;
+    while (i < 3)
+    {
+        match (handmade::Vec::pop(&mut mine))
+        {
+            Some(x) :
+            {
+                printf(" %v", x);
+            },
+            None :
+            {
+                printf(" (empty)");
+            },
+        }
+        std::Vec::pop(&mut theirs);
+        i = i + 1;
+    }
+    printf("; lengths now ");
+    printf("%v", handmade::Vec::len(&mine));
+    printf(" and ");
+    printf("%v", std::Vec::len(&theirs));
+    printf("\n");
+
+    // Resources as elements: they move in, one moves back out, and the
+    // Vec's destructor destroys the rest -- each exactly once.
+    printf("tickets\n");
+    {
+        handmade::Vec<Ticket> queue = handmade::Vec::new();
+        u32 id = 1;
+        while (id <= 3)
+        {
+            handmade::Vec::push(&mut queue, Ticket { .id = id });
+            id = id + 1;
+        }
+        match (handmade::Vec::pop(&mut queue))
+        {
+            Some(t) :
+            {
+                printf("  served ticket %v\n", t.id);
+            },                              // `t` ends here
+            None :
+            {
+            },
+        }
+        printf("  the queue goes out of scope\n");
+    }                                       // Vec::drop destroys the two left
+}

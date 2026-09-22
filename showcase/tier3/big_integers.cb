@@ -1,0 +1,175 @@
+// Big Integers
+//
+// Shows: arithmetic past 64 bits with no hidden conversions. A number is
+// a Vec<u32> of base-2^32 limbs, least significant first. Every carry is
+// computed in u64 with an explicit `widen`, and split back into a limb
+// with `narrow_wrapping` (keep the low 32 bits) and `>> 32` (the carry):
+// nothing converts between widths on its own, and plain `+` or `*` would
+// fault rather than lose the high bits. A Big owns its limbs, so it is a
+// resource: it is updated in place, never silently overwritten.
+
+import std;
+
+struct Big
+{
+    Vec<u32> limbs;                    // least significant first; no leading zero limbs
+}
+
+fn Big::from(u32 n) : Big
+{
+    Vec<u32> limbs = Vec::new();
+    if (n != 0)
+    {
+        Vec::push(&mut limbs, n);
+    }
+    Big { .limbs = limbs }
+}
+
+fn Big::is_zero(ref<Big, shared> a) : bool
+{
+    Vec::len(&a.limbs) == 0
+}
+
+// a = a * m + add, for small m and add.
+fn Big::mul_add(ref<Big, exclusive> a, u32 m, u32 add)
+{
+    u64 carry = widen<u64>(add);
+    foreach (limb in &mut a.limbs)
+    {
+        u64 t = widen<u64>(*limb) * widen<u64>(m) + carry;   // at most (2^32-1)^2 + 2^32-1: fits u64
+        *limb = narrow_wrapping<u32>(t);                      // the low 32 bits
+        carry = t >> 32;                                      // the high 32 bits
+    }
+    if (carry != 0)
+    {
+        Vec::push(&mut a.limbs, narrow<u32>(carry));          // checked: carry < 2^32 here
+    }
+}
+
+// a = a + b.
+fn Big::add(ref<Big, exclusive> a, ref<Big, shared> b)
+{
+    u64 carry = 0;
+    usize i = 0;
+    while (i < Vec::len(&b.limbs) || carry != 0)
+    {
+        if (i == Vec::len(&a.limbs))
+        {
+            Vec::push(&mut a.limbs, 0);
+        }
+        u64 bi = if (i < Vec::len(&b.limbs)) { widen<u64>(*Vec::index_shared(&b.limbs, i)) } else { 0 };
+        auto limb = Vec::index_exclusive(&mut a.limbs, i);
+        u64 t = widen<u64>(*limb) + bi + carry;
+        *limb = narrow_wrapping<u32>(t);
+        carry = t >> 32;
+        i = i + 1;
+    }
+}
+
+// Divides a by d in place and returns the remainder.
+fn Big::div_small(ref<Big, exclusive> a, u32 d) : u32
+{
+    u64 rem = 0;
+    usize i = Vec::len(&a.limbs);
+    while (i > 0)
+    {
+        i = i - 1;
+        auto limb = Vec::index_exclusive(&mut a.limbs, i);
+        u64 cur = (rem << 32) | widen<u64>(*limb);
+        *limb = narrow<u32>(cur / widen<u64>(d));             // checked: rem < d, so the quotient fits
+        rem = cur % widen<u64>(d);
+    }
+    while (Vec::len(&a.limbs) > 0 && *Vec::index_shared(&a.limbs, Vec::len(&a.limbs) - 1) == 0)
+    {
+        Vec::pop(&mut a.limbs);                               // drop leading zero limbs
+    }
+    narrow<u32>(rem)
+}
+
+// Prints a in decimal. Consumes it: the digits come out by division, in
+// groups of nine, least significant group first.
+fn Big::print(Big a)
+{
+    Big n = a;
+    if (Big::is_zero(&n))
+    {
+        printf("0");
+        return;
+    }
+    Vec<u32> groups = Vec::new();
+    while (!Big::is_zero(&n))
+    {
+        Vec::push(&mut groups, Big::div_small(&mut n, 1_000_000_000));
+    }
+    usize i = Vec::len(&groups) - 1;
+    printf("%v", *Vec::index_shared(&groups, i));                   // the leading group has no padding
+    while (i > 0)
+    {
+        i = i - 1;
+        u32 g = *Vec::index_shared(&groups, i);
+        u32 pad = 100_000_000;
+        while (pad > 1 && g < pad)                            // zero-pad to nine digits
+        {
+            printf("0");
+            pad = pad / 10;
+        }
+        printf("%v", g);
+    }
+}
+
+fn factorial(u32 n) : Big
+{
+    Big r = Big::from(1);
+    u32 k = 2;
+    while (k <= n)
+    {
+        Big::mul_add(&mut r, k, 0);
+        k = k + 1;
+    }
+    r
+}
+
+fn main()
+{
+    printf("u64 stops at ");
+    printf("%v", max_value<u64>());
+    printf("; checked_mul(max, 2) is ");
+    match (checked_mul(max_value<u64>(), 2))
+    {
+        Some(_) : printf("a value\n"),
+        None : printf("None, so Big takes over\n"),
+    }
+
+    printf("30! = ");
+    Big::print(factorial(30));
+    printf("\n100! = ");
+    Big::print(factorial(100));
+    printf("\n");
+
+    Big p = Big::from(1);
+    u32 i = 0;
+    while (i < 256)
+    {
+        Big::mul_add(&mut p, 2, 0);
+        i = i + 1;
+    }
+    printf("2^256 = ");
+    Big::print(p);
+    printf("\n");
+
+    // Fibonacci by additions, updated in place: x, y = F(2k), F(2k+1).
+    // Assigning a new Big over x would be diag.overwrite-of-live-resource
+    // (x owns its limbs), so each step adds into an existing number.
+    Big x = Big::from(0);
+    Big y = Big::from(1);
+    u32 k = 0;
+    while (k < 150)
+    {
+        Big::add(&mut x, &y);                                 // F(2k+2)
+        Big::add(&mut y, &x);                                 // F(2k+3)
+        k = k + 1;
+    }
+    printf("fib(300) = ");
+    Big::print(x);
+    printf("\n");
+}

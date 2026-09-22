@@ -1,0 +1,86 @@
+// A Linked List in Raw Memory
+//
+// Shows: manual memory, the part of CobaltC that trusts you. `allocate`
+// returns a `Result` (running out of memory is a value, not a crash);
+// writing and reading through a `rawptr` and `reclaim`-ing the bytes as
+// a typed object are `unsafe`; `deallocate` hands them back. Everything
+// the language *can* still check -- arithmetic, conversions, the
+// Option-based end of the list -- it still checks.
+
+import std;
+
+struct Node
+{
+    i64 value;
+    rawptr<Node> next;                       // the null address means "end of list"
+}
+
+fn push_front(rawptr<Node> head, i64 value) : Option<rawptr<Node>>
+{
+    match (allocate(sizeof<Node>(), alignof<Node>()))
+    {
+        Ok(bytes) :
+        {
+            rawptr<Node> n = reinterpret_ptr<Node>(bytes);
+            unsafe
+            {
+                *n = Node { .value = value, .next = head };
+            }
+            Some(n)
+        },
+        Err(_) : None,
+    }
+}
+
+fn main()
+{
+    rawptr<Node> end = reinterpret_ptr<Node>(dangling<u8>());   // a non-null sentinel, never dereferenced
+    rawptr<Node> head = end;
+    i64 v = 1;
+    while (v <= 6)
+    {
+        match (push_front(head, v * v))
+        {
+            Some(n) :
+            {
+                head = n;
+            },
+            None :
+            {
+                printf("out of memory\n");
+                return;
+            },
+        }
+        v = v + 1;
+    }
+
+    // Walk it: each node's bytes are read back as a Node value.
+    printf("list:");
+    i64 sum = 0;
+    u64 length = 0;
+    rawptr<Node> p = head;
+    while (p != end)
+    {
+        Node n = unsafe { *p };
+        printf(" %v", n.value);
+        sum = sum + n.value;
+        length = length + 1;
+        p = n.next;
+    }
+    printf("\nlength %v, sum %v\n", length, sum);
+
+    // Free every node, reading its link before the memory is returned.
+    u64 freed = 0;
+    p = head;
+    while (p != end)
+    {
+        rawptr<Node> next = unsafe { (*p).next };
+        unsafe
+        {
+            deallocate(reinterpret_ptr<u8>(p), sizeof<Node>(), alignof<Node>());
+        }
+        freed = freed + 1;
+        p = next;
+    }
+    printf("freed %v nodes\n", freed);
+}

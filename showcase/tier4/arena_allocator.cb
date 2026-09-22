@@ -1,0 +1,136 @@
+// An Arena Allocator
+//
+// Shows: building an allocator on raw memory, wrapped so that safe code
+// cannot misuse it. The arena is a `resource struct`: its destructor
+// returns the block, so the memory is freed exactly once, at a known
+// point, even though every allocation inside it is manual. Alignment is
+// computed, running out of space is an `Option`, and `copy_raw` moves
+// bytes the language then reads back as typed values.
+
+import std;
+
+resource struct Arena
+{
+    rawptr<u8> base;
+    usize size;
+    usize used;
+}
+
+fn Arena::drop(ref<Arena, exclusive> self)
+{
+    unsafe
+    {
+        deallocate(self.base, self.size, 16);
+    }
+    printf("arena released (%v of %v bytes were in use)\n", self.used, self.size);
+}
+
+fn Arena::new(usize size) : Option<Arena>
+{
+    match (allocate(size, 16))
+    {
+        Ok(p) : Some(Arena { .base = p, .size = size, .used = 0 }),
+        Err(_) : None,
+    }
+}
+
+// `n` bytes aligned to `align`, or None when the arena is full.
+fn Arena::alloc(ref<Arena, exclusive> a, usize n, usize align) : Option<rawptr<u8>>
+{
+    usize start = (a.used + align - 1) / align * align;
+    usize end = checked_add(start, n)?;
+    if (end > a.size)
+    {
+        return None;
+    }
+    a.used = end;
+    // Pointer arithmetic is itself trusted: the language cannot know that
+    // `start` stays inside the block, so the check above is ours to make.
+    Some(unsafe { a.base + reinterpret<isize>(start) })
+}
+
+struct Point
+{
+    i32 x;
+    i32 y;
+}
+
+fn main()
+{
+    auto arena = match (Arena::new(64))
+    {
+        Some(a) : a,
+        None :
+        {
+            printf("no memory\n");
+            return;
+        },
+    };
+
+    // Three Points and a u64, placed by the arena.
+    array<rawptr<Point>, 3> pts = [reinterpret_ptr<Point>(dangling<u8>()), reinterpret_ptr<Point>(dangling<u8>()), reinterpret_ptr<Point>(dangling<u8>())];
+    usize i = 0;
+    while (i < 3)
+    {
+        match (Arena::alloc(&mut arena, sizeof<Point>(), alignof<Point>()))
+        {
+            Some(p) :
+            {
+                pts[i] = reinterpret_ptr<Point>(p);
+                i32 k = narrow<i32>(i);
+                unsafe
+                {
+                    *pts[i] = Point { .x = k * 10, .y = k * 10 + 1 };
+                }
+            },
+            None :
+            {
+                printf("arena full\n");
+            },
+        }
+        i = i + 1;
+    }
+    rawptr<u64> total = match (Arena::alloc(&mut arena, sizeof<u64>(), alignof<u64>()))
+    {
+        Some(p) : reinterpret_ptr<u64>(p),
+        None :
+        {
+            printf("arena full\n");
+            return;
+        },
+    };
+    printf("u64 slot at offset %v (aligned to ", arena.used - sizeof<u64>());
+    printf("%v", alignof<u64>());
+    printf(")\n");
+
+    unsafe
+    {
+        *total = 0;
+        i = 0;
+        while (i < 3)
+        {
+            Point p = *pts[i];
+            *total = *total + reinterpret<u64>(widen<i64>(p.x + p.y));
+            i = i + 1;
+        }
+        printf("sum of all coordinates: %v\n", *total);
+
+        // Copy the first point's bytes over the third, then read it back.
+        copy_raw(reinterpret_ptr<u8>(pts[2]), reinterpret_ptr<u8>(pts[0]), sizeof<Point>());
+        Point third = *pts[2];
+        printf("after copy_raw the third point is (%v, %v)\n", third.x, third.y);
+    }
+
+    // 40 more bytes do not fit in what is left of 64.
+    match (Arena::alloc(&mut arena, 40, 8))
+    {
+        Some(_) :
+        {
+            printf("unexpected room\n");
+        },
+        None :
+        {
+            printf("a 40-byte request is refused: only %v bytes remain\n", arena.size - arena.used);
+        },
+    }
+}                                           // the arena's destructor frees the whole block

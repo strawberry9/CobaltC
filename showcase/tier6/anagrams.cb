@@ -1,0 +1,123 @@
+// Anagram Groups
+//
+// Shows: a HashMap whose values are themselves resources. Each word's
+// key is its letters in sorted order ("listen" -> "eilnst"); `entry`
+// finds or creates that key's Vec<String>, and the word moves into it.
+// The map owns every Vec and every String and destroys them when it
+// is destroyed. Removing while looping over a map is a borrow conflict,
+// so the words with no anagram are removed in a second pass, with
+// `remove_ordered` so the groups keep the order their first words had.
+//
+//   coby anagrams.cb FILE
+
+import std;
+
+// The key shared by all anagrams of `w`: its bytes, sorted.
+fn sorted_key(ref<String, shared> w) : String
+{
+    Vec<u8> b = Vec::new();
+    foreach (c in String::as_bytes(w))
+    {
+        Vec::push(&mut b, *c);
+    }
+    for (usize i = 1; i < Vec::len(&b); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && *Vec::index_shared(&b, j - 1) > *Vec::index_shared(&b, j))
+        {
+            u8 t = *Vec::index_shared(&b, j - 1);
+            *Vec::index_exclusive(&mut b, j - 1) = *Vec::index_shared(&b, j);
+            *Vec::index_exclusive(&mut b, j) = t;
+            j -= 1;
+        }
+    }
+    Result::unwrap_or(String::from_utf8(b), String::new())    // sorted UTF-8 bytes of ASCII words stay UTF-8
+}
+
+// Adds the word in `bytes` (if any) to `out`; `bytes` is used up.
+fn flush(ref<Vec<String>, exclusive> out, Vec<u8> bytes)
+{
+    if (Vec::len(&bytes) > 0)
+    {
+        match (String::from_utf8(bytes))
+        {
+            Ok(w) : Vec::push(out, w),
+            Err(e) : eprintf("anagrams: a word that is not UTF-8 (byte %d) was skipped\n", e.offset),
+        }
+    }
+}
+
+// The words of `text`, separated by spaces and newlines.
+fn split_words(ref<String, shared> text) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    Vec<u8> current = Vec::new();
+    foreach (c in String::as_bytes(text))
+    {
+        if (*c == b' ' || *c == b'\n')
+        {
+            flush(&mut out, current);
+            current = Vec::new();
+        }
+        else
+        {
+            Vec::push(&mut current, *c);
+        }
+    }
+    flush(&mut out, current);
+    out
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: anagrams FILE\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    String text = match (read_file(&path))
+    {
+        Ok(t) : t,
+        Err(_) :
+        {
+            eprintf("anagrams: cannot read %s\n", &path);
+            return 1;
+        },
+    };
+
+    HashMap<String, Vec<String>> groups = HashMap::new();
+    usize words = 0;
+    foreach (w in split_words(&text))
+    {
+        String key = sorted_key(&w);
+        Vec::push(HashMap::entry(&mut groups, key, Vec::new()), w);
+        words += 1;
+    }
+
+    // Keys of the groups of one: collected first, removed after.
+    Vec<String> lonely = Vec::new();
+    foreach (key, ws in &groups)
+    {
+        if (Vec::len(ws) == 1)
+        {
+            Vec::push(&mut lonely, String::clone(key));
+        }
+    }
+    foreach (key in &lonely)
+    {
+        HashMap::remove_ordered(&mut groups, key);
+    }
+
+    printf("%d words, %d groups of anagrams, %d words alone\n", words, HashMap::len(&groups), Vec::len(&lonely));
+    foreach (key, ws in &groups)
+    {
+        String line = sprintf("%-8s", key);
+        foreach (i, w in ws)
+        {
+            String::appendf(&mut line, "%s%s", if (i == 0) { "" } else { ", " }, w);
+        }
+        printf("%s\n", &line);
+    }
+    0
+}

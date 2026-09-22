@@ -1,0 +1,205 @@
+// Mini Interpreter
+//
+// Shows: a bytecode stack machine whose failures are values. Every
+// instruction's failure mode -- stack underflow, arithmetic overflow, a
+// jump outside the program -- is an enum variant carrying the program
+// counter, and `?` threads it out of the run loop. The interpreter
+// itself cannot crash on a bad program; CobaltC's own checks stand
+// behind it anyway.
+
+import std;
+
+enum Instr
+{
+    Push(i64),
+    Add,
+    Sub,
+    Mul,
+    Dup,
+    Swap,
+    Over,
+    JumpIfZero(usize),
+    Jump(usize),
+    Print,
+    Halt
+}
+
+enum VmError
+{
+    Underflow(usize),
+    Overflow(usize),
+    BadJump(usize)
+}
+
+fn pop(ref<Vec<i64>, exclusive> s, usize pc) : Result<i64, VmError>
+{
+    match (Vec::pop(s))
+    {
+        Some(v) : Ok(v),
+        None : Err(Underflow(pc)),
+    }
+}
+
+fn arith(Option<i64> r, usize pc) : Result<i64, VmError>
+{
+    match (r)
+    {
+        Some(v) : Ok(v),
+        None : Err(Overflow(pc)),
+    }
+}
+
+// Runs to `Halt`; returns how many instructions executed.
+fn run(ref<Vec<Instr>, shared> prog) : Result<u64, VmError>
+{
+    Vec<i64> stack = Vec::new();
+    usize pc = 0;
+    u64 steps = 0;
+    while (true)
+    {
+        if (pc >= Vec::len(prog))
+        {
+            return Err(BadJump(pc));
+        }
+        Instr ins = *Vec::index_shared(prog, pc);
+        steps = steps + 1;
+        pc = pc + 1;
+        match (ins)
+        {
+            Push(v) :
+            {
+                Vec::push(&mut stack, v);
+            },
+            Add :
+            {
+                i64 b = pop(&mut stack, pc - 1)?;
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, arith(checked_add(a, b), pc - 1)?);
+            },
+            Sub :
+            {
+                i64 b = pop(&mut stack, pc - 1)?;
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, arith(checked_sub(a, b), pc - 1)?);
+            },
+            Mul :
+            {
+                i64 b = pop(&mut stack, pc - 1)?;
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, arith(checked_mul(a, b), pc - 1)?);
+            },
+            Dup :
+            {
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, a);
+                Vec::push(&mut stack, a);
+            },
+            Swap :
+            {
+                i64 b = pop(&mut stack, pc - 1)?;
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, b);
+                Vec::push(&mut stack, a);
+            },
+            Over :
+            {
+                i64 b = pop(&mut stack, pc - 1)?;
+                i64 a = pop(&mut stack, pc - 1)?;
+                Vec::push(&mut stack, a);
+                Vec::push(&mut stack, b);
+                Vec::push(&mut stack, a);
+            },
+            JumpIfZero(target) :
+            {
+                if (pop(&mut stack, pc - 1)? == 0)
+                {
+                    pc = target;
+                }
+            },
+            Jump(target) :
+            {
+                pc = target;
+            },
+            Print :
+            {
+                printf("  out: ");
+                printf("%v", pop(&mut stack, pc - 1)?);
+                printf("\n");
+            },
+            Halt :
+            {
+                return Ok(steps);
+            },
+        }
+    }
+    Ok(steps)
+}
+
+// acc = 1; while (n != 0) { acc = acc * n; n = n - 1; } print acc
+fn factorial(i64 n) : Vec<Instr>
+{
+    Vec<Instr> p = Vec::new();
+    Vec::push(&mut p, Push(1));          // 0  [acc]
+    Vec::push(&mut p, Push(n));          // 1  [acc n]
+    Vec::push(&mut p, Dup);              // 2  [acc n n]         loop:
+    Vec::push(&mut p, JumpIfZero(11));   // 3  [acc n]
+    Vec::push(&mut p, Swap);             // 4  [n acc]
+    Vec::push(&mut p, Over);             // 5  [n acc n]
+    Vec::push(&mut p, Mul);              // 6  [n acc*n]
+    Vec::push(&mut p, Swap);             // 7  [acc*n n]
+    Vec::push(&mut p, Push(1));          // 8
+    Vec::push(&mut p, Sub);              // 9  [acc*n n-1]
+    Vec::push(&mut p, Jump(2));          // 10
+    Vec::push(&mut p, Swap);             // 11 [0 acc]           end:
+    Vec::push(&mut p, Print);            // 12
+    Vec::push(&mut p, Halt);             // 13
+    p
+}
+
+fn report(str name, ref<Vec<Instr>, shared> prog)
+{
+    printf("%v:\n", name);
+    match (run(prog))
+    {
+        Ok(steps) :
+        {
+            printf("  halted after %v steps\n", steps);
+        },
+        Err(e) :
+        {
+            match (e)
+            {
+                Underflow(pc) :
+                {
+                    printf("  error: stack underflow at pc %v", pc);
+                },
+                Overflow(pc) :
+                {
+                    printf("  error: arithmetic overflow at pc %v", pc);
+                },
+                BadJump(pc) :
+                {
+                    printf("  error: jump outside the program to %v", pc);
+                },
+            }
+            printf("\n");
+        },
+    }
+}
+
+fn main()
+{
+    Vec<Instr> f10 = factorial(10);
+    report("factorial(10)", &f10);
+    Vec<Instr> f25 = factorial(25);
+    report("factorial(25)", &f25);
+
+    Vec<Instr> broken = Vec::new();
+    Vec::push(&mut broken, Push(2));
+    Vec::push(&mut broken, Add);
+    report("add with one operand", &broken);
+
+    Vec<Instr> runaway = Vec::new();
+    Vec::push(&mut runaway, Jump(40));
+    report("jump into nowhere", &runaway);
+}

@@ -1,0 +1,729 @@
+// TinyOS
+//
+// Shows: a small operating-system kernel, run on simulated hardware. The
+// hardware (tinyos/machine.cb) is 64 KB of RAM and a CPU's registers. The
+// kernel below owns everything: the RAM, the page allocator, the
+// processes, the filesystem and a pipe. Each process owns its address
+// space (tinyos/memory.cb), a page table over pages it borrows from the
+// allocator, and its program is machine code in those pages
+// (tinyos/cpu.cb), fetched and run one instruction at a time. A timer
+// interrupt every 12 instructions hands the CPU to the next process;
+// processes reach the kernel only through system calls, and a bad
+// address is a page fault that kills the process, not the kernel.
+//
+// The ownership is real, and checked. The scheduler borrows one process
+// and the allocator mutably at the same time -- different fields of the
+// kernel, so no conflict. An address space is a resource: its pages must
+// be given back before it ends, and its destructor would report any
+// that were not. The kernel's modules keep their fields private, so user
+// memory is reachable only through a page table.
+
+import std;
+
+module machine "./tinyos/machine.cb";
+module memory "./tinyos/memory.cb";
+module cpu "./tinyos/cpu.cb";
+module fs "./tinyos/fs.cb";
+
+import machine;
+import memory;
+import cpu;
+import fs;
+
+// ---- processes ----
+
+enum State
+{
+    Ready,
+    Blocked,
+    Done,
+}
+
+struct Process
+{
+    u32 pid;
+    str name;
+    Cpu cpu;                              // the registers, saved while it is not running
+    AddressSpace space;                   // owned: the pages it maps are its own
+    State state;
+    Vec<u8> line;                         // output, written out a line at a time
+}
+
+// Bytes sent by one process and received by another, two at a time.
+struct Pipe
+{
+    array<u8, 2> buf;
+    u32 head;
+    u32 len;
+}
+
+struct Stats
+{
+    u32 switches;
+    u32 syscalls;
+    u32 instructions;
+    u32 faults;
+    u32 shown;                            // trace lines printed so far
+}
+
+resource struct Kernel
+{
+    Ram ram;
+    Allocator pages;
+    Vec<Process> procs;
+    Fs files;
+    Pipe pipe;
+    Stats stats;
+}
+
+fn quantum() : u32
+{
+    12                                    // instructions between timer interrupts
+}
+
+fn trace_limit() : u32
+{
+    48
+}
+
+// ---- system calls: number in the `sys` instruction, arguments r1..r3, result r0 ----
+
+fn syscall_name(u8 n) : str
+{
+    auto names = ["exit", "puts", "putn", "open", "write", "read", "alloc", "free", "send", "recv", "yield"];
+    if (n > 10)
+    {
+        return "?";
+    }
+    names[widen<usize>(n)]
+}
+
+enum After
+{
+    Continue,
+    Block,
+    Exit(u32),
+    Kill(str),
+}
+
+// The next trace line may be printed: the first `trace_limit` are.
+fn tracing(ref<Stats, exclusive> st) : bool
+{
+    st.shown = st.shown + 1;
+    if (st.shown == trace_limit() + 1)
+    {
+        printf("        ... (tracing stops here; kernel messages and process output continue)\n");
+    }
+    st.shown <= trace_limit()
+}
+
+// Output is line-buffered per process, like a terminal: a newline writes it.
+fn out_byte(ref<Process, exclusive> p, u8 b)
+{
+    if (b != 10)
+    {
+        Vec::push(&mut p.line, b);
+        return;
+    }
+    Vec<u8> text = Vec::new();
+    foreach (b in &p.line)
+    {
+        Vec::push(&mut text, *b);
+    }
+    while (Vec::len(&p.line) > 0)
+    {
+        Vec::pop(&mut p.line);
+    }
+    printf("[PID %v] ", p.pid);
+    match (String::from_utf8(text))                   // user bytes become text only if valid
+    {
+        Ok(s) : printf("%v", &s),
+        Err(_) : printf("(not UTF-8)"),
+    }
+    printf("\n");
+}
+
+fn out_number(ref<Process, exclusive> p, u32 v)
+{
+    if (v >= 10)
+    {
+        out_number(p, v / 10);
+    }
+    out_byte(p, narrow<u8>(v % 10) + 48);
+}
+
+// Copies `len` bytes from the process's memory, or None for a bad pointer.
+// The kernel reads user memory only through the process's page table.
+fn copy_in(ref<Process, shared> p, ref<Ram, shared> ram, u32 va, u32 len) : Option<Vec<u8>>
+{
+    Vec<u8> out = Vec::new();
+    u32 i = 0;
+    while (i < len)
+    {
+        match (AddressSpace::load(&p.space, ram, va + i))
+        {
+            None : return None,
+            Some(b) : Vec::push(&mut out, b),
+        }
+        i = i + 1;
+    }
+    Some(out)
+}
+
+fn syscall(ref<Process, exclusive> p, u8 n, ref<Ram, exclusive> ram, ref<Allocator, exclusive> pages, ref<Fs, exclusive> files, ref<Pipe, exclusive> pipe) : After
+{
+    u32 a1 = p.cpu.r[1];
+    u32 a2 = p.cpu.r[2];
+    u32 a3 = p.cpu.r[3];
+    if (n == 0)
+    {
+        return Exit(a1);
+    }
+    if (n == 1 || n == 3 || n == 4)
+    {
+        u32 va = if (n == 4) { a2 } else { a1 };
+        u32 len = if (n == 4) { a3 } else { a2 };
+        Vec<u8> bytes = match (copy_in(&*p, &*ram, va, len))
+        {
+            Some(b) : b,
+            None : return Kill("bad pointer passed to the kernel"),
+        };
+        if (n == 1)
+        {
+            foreach (b in &bytes)
+            {
+                out_byte(p, *b);
+            }
+        }
+        else if (n == 3)
+        {
+            p.cpu.r[0] = Fs::open(files, bytes);
+        }
+        else
+        {
+            if (!Fs::valid(&*files, a1))
+            {
+                return Kill("bad file descriptor");
+            }
+            foreach (b in &bytes)
+            {
+                Fs::append(files, a1, *b);
+            }
+            p.cpu.r[0] = len;
+        }
+        return Continue;
+    }
+    if (n == 2)
+    {
+        out_number(p, a1);
+        return Continue;
+    }
+    if (n == 5)
+    {
+        if (!Fs::valid(&*files, a1))
+        {
+            return Kill("bad file descriptor");
+        }
+        u32 size = Fs::size(&*files, a1);
+        u32 count = if (a3 < size) { a3 } else { size };
+        u32 i = 0;
+        while (i < count)
+        {
+            if (!AddressSpace::store(&p.space, ram, a2 + i, Fs::byte_at(&*files, a1, i)))
+            {
+                return Kill("bad pointer passed to the kernel");
+            }
+            i = i + 1;
+        }
+        p.cpu.r[0] = count;
+        return Continue;
+    }
+    if (n == 6)
+    {
+        u32 vpn = 9;                                  // heap pages are virtual pages 9 to 14
+        while (vpn < 15 && AddressSpace::is_mapped(&p.space, vpn))
+        {
+            vpn = vpn + 1;
+        }
+        p.cpu.r[0] = if (vpn < 15 && AddressSpace::map_new(&mut p.space, vpn, pages, ram)) { vpn * machine::page_size() } else { 0 };
+        return Continue;
+    }
+    if (n == 7)
+    {
+        u32 vpn = a1 / machine::page_size();
+        if (vpn < 9 || vpn > 14 || !AddressSpace::is_mapped(&p.space, vpn))
+        {
+            return Kill("freeing a page it does not own");
+        }
+        AddressSpace::unmap(&mut p.space, vpn, pages);
+        return Continue;
+    }
+    if (n == 8)
+    {
+        if (pipe.len == 2)
+        {
+            p.cpu.pc = p.cpu.pc - 2;                  // run the `sys` again when woken
+            return Block;
+        }
+        pipe.buf[narrow<usize>((pipe.head + pipe.len) % 2)] = narrow_wrapping<u8>(a1);
+        pipe.len = pipe.len + 1;
+        return Continue;
+    }
+    if (n == 9)
+    {
+        if (pipe.len == 0)
+        {
+            p.cpu.pc = p.cpu.pc - 2;
+            return Block;
+        }
+        p.cpu.r[0] = widen<u32>(pipe.buf[narrow<usize>(pipe.head)]);
+        pipe.head = (pipe.head + 1) % 2;
+        pipe.len = pipe.len - 1;
+        return Continue;
+    }
+    if (n == 10)
+    {
+        return Continue;
+    }
+    Kill("unknown system call")
+}
+
+// Ends a process: its pages go back to the allocator.
+fn finish(ref<Process, exclusive> p, ref<Allocator, exclusive> pages, str why)
+{
+    u32 freed = AddressSpace::release_all(&mut p.space, pages);
+    p.state = Done;
+    printf("kernel: PID %v (%v) %v, %v pages freed\n", p.pid, p.name, why, freed);
+}
+
+// Runs process i until its time slice ends, it blocks, or it stops.
+// Returns true if it moved data through the pipe.
+fn run_slice(ref<Kernel, exclusive> k, usize i) : bool
+{
+    auto p = Vec::index_exclusive(&mut k.procs, i);   // this process, borrowed mutably...
+    bool piped = false;
+    u32 budget = quantum();
+    while (budget > 0)
+    {
+        k.stats.instructions = k.stats.instructions + 1;
+        // ...while the RAM, the allocator and the files are borrowed too:
+        // they are other fields of the kernel, so there is no conflict.
+        match (cpu::step(&mut p.cpu, &p.space, &mut k.ram))
+        {
+            None : budget = budget - 1,
+            Some(trap) :
+            {
+                u32 left = budget - 1;                // what remains of the slice
+                budget = 0;
+                match (trap)
+                {
+                    Sys(n) :
+                    {
+                        k.stats.syscalls = k.stats.syscalls + 1;
+                        if (tracing(&mut k.stats))
+                        {
+                            printf("[PID %v] syscall: ", p.pid);
+                            printf("%v", syscall_name(n));
+                            printf("\n");
+                        }
+                        match (syscall(p, n, &mut k.ram, &mut k.pages, &mut k.files, &mut k.pipe))
+                        {
+                            Continue :
+                            {
+                                piped = piped || n == 8 || n == 9;
+                                if (n != 10)
+                                {
+                                    budget = left;        // not a yield: the slice goes on
+                                }
+                            },
+                            Block : p.state = Blocked,
+                            Exit(code) :
+                            {
+                                if (code == 0)
+                                {
+                                    finish(p, &mut k.pages, "exited");
+                                }
+                                else
+                                {
+                                    finish(p, &mut k.pages, "exited with an error");
+                                }
+                            },
+                            Kill(why) :
+                            {
+                                printf("kernel: PID %v: %v\n", p.pid, why);
+                                finish(p, &mut k.pages, "killed");
+                            },
+                        }
+                    },
+                    PageFault(va) :
+                    {
+                        k.stats.faults = k.stats.faults + 1;
+                        printf("kernel: PID %v: page fault at 0x%04x\n", p.pid, va);
+                        finish(p, &mut k.pages, "killed");
+                    },
+                    Illegal(op) :
+                    {
+                        printf("kernel: PID %v: illegal instruction %v\n", p.pid, op);
+                        finish(p, &mut k.pages, "killed");
+                    },
+                }
+            },
+        }
+    }
+    piped
+}
+
+fn state_of(ref<Kernel, shared> k, usize i) : State
+{
+    Vec::index_shared(&k.procs, i).state
+}
+
+fn pid_of(ref<Kernel, shared> k, usize i) : u32
+{
+    Vec::index_shared(&k.procs, i).pid
+}
+
+// Round robin: the next ready process after `cur`, or None.
+fn next_ready(ref<Kernel, shared> k, usize cur) : Option<usize>
+{
+    usize n = Vec::len(&k.procs);
+    usize t = 1;
+    while (t <= n)
+    {
+        usize i = (cur + t) % n;
+        if (state_of(k, i) == Ready)
+        {
+            return Some(i);
+        }
+        t = t + 1;
+    }
+    None
+}
+
+fn schedule(ref<Kernel, exclusive> k)
+{
+    usize n = Vec::len(&k.procs);
+    usize cur = n - 1;
+    u32 last = 0;
+    bool running = true;
+    while (running)
+    {
+        match (next_ready(&*k, cur))
+        {
+            None :
+            {
+                // Nothing can run. If something is still blocked, it waits
+                // for a process that will never come: a deadlock.
+                usize i = 0;
+                while (i < n)
+                {
+                    if (state_of(&*k, i) == Blocked)
+                    {
+                        auto p = Vec::index_exclusive(&mut k.procs, i);
+                        finish(p, &mut k.pages, "killed: deadlocked");
+                    }
+                    i = i + 1;
+                }
+                running = false;
+            },
+            Some(i) :
+            {
+                cur = i;
+                u32 pid = pid_of(&*k, i);
+                if (pid != last && last != 0)
+                {
+                    k.stats.switches = k.stats.switches + 1;
+                    if (tracing(&mut k.stats))
+                    {
+                        printf("[SCHED] %v → %v\n", last, pid);
+                    }
+                }
+                last = pid;
+                if (run_slice(k, i))
+                {
+                    usize j = 0;                      // pipe data moved: wake the blocked
+                    while (j < n)
+                    {
+                        auto q = Vec::index_exclusive(&mut k.procs, j);
+                        if (q.state == Blocked)
+                        {
+                            q.state = Ready;
+                        }
+                        j = j + 1;
+                    }
+                }
+            },
+        }
+    }
+}
+
+// Loads a program into a fresh address space: code from virtual address 0,
+// data at 0x800, and a stack page at the top (0xf00 to 0xfff).
+fn spawn(ref<Kernel, exclusive> k, str name, Asm prog)
+{
+    u32 pid = narrow<u32>(Vec::len(&k.procs)) + 1;
+    AddressSpace space = AddressSpace::new();
+    u32 code_pages = (narrow<u32>(Vec::len(&prog.code)) + 255) / 256;
+    u32 vpn = 0;
+    while (vpn < code_pages)
+    {
+        AddressSpace::map_new(&mut space, vpn, &mut k.pages, &mut k.ram);
+        vpn = vpn + 1;
+    }
+    AddressSpace::map_new(&mut space, 8, &mut k.pages, &mut k.ram);
+    AddressSpace::map_new(&mut space, 15, &mut k.pages, &mut k.ram);
+    foreach (i, b in &prog.code)
+    {
+        AddressSpace::store(&space, &mut k.ram, narrow<u32>(i), *b);
+    }
+    foreach (i, b in &prog.data)
+    {
+        AddressSpace::store(&space, &mut k.ram, cpu::data_base() + narrow<u32>(i), *b);
+    }
+    printf("kernel: spawning PID %v (%v): %v bytes of code, ", pid, name, Vec::len(&prog.code));
+    printf("%v", AddressSpace::mapped(&space));
+    printf(" pages\n");
+    Vec::push(&mut k.procs, Process {
+        .pid = pid,
+        .name = name,
+        .cpu = Cpu::reset(prog.entry, 4096),
+        .space = space,                               // the process owns it now
+        .state = Ready,
+        .line = Vec::new()
+    });
+}
+
+// ---- the programs, in the machine's own code ----
+
+// Prints a string placed in the program's data.
+fn puts(ref<Asm, exclusive> a, str s)
+{
+    u32 at = Asm::string(a, s);
+    Asm::li(a, 1, at);
+    Asm::li(a, 2, narrow<u32>(str_len(s)));
+    Asm::sys(a, 1);
+}
+
+fn exit_ok(ref<Asm, exclusive> a)
+{
+    Asm::li(a, 1, 0);
+    Asm::sys(a, 0);
+}
+
+// PID 1: Fibonacci numbers, through a subroutine that uses the stack.
+fn fib_program() : Asm
+{
+    Asm a = Asm::new();
+    u32 fib = Asm::here(&a);                          // r0 = fib(r1)
+    Asm::push(&mut a, 5);                             // save the caller's r5
+    Asm::li(&mut a, 2, 0);
+    Asm::li(&mut a, 3, 1);
+    Asm::li(&mut a, 5, 1);
+    u32 top = Asm::here(&a);
+    u32 done = Asm::jz(&mut a, 1);
+    Asm::add(&mut a, 4, 2, 3);
+    Asm::mov(&mut a, 2, 3);
+    Asm::mov(&mut a, 3, 4);
+    Asm::sub(&mut a, 1, 1, 5);
+    Asm::jmp(&mut a, top);
+    Asm::land(&mut a, done);
+    Asm::mov(&mut a, 0, 2);
+    Asm::pop(&mut a, 5);
+    Asm::ret(&mut a);
+
+    Asm::start_here(&mut a);
+    array<u32, 3> ns = [10, 24, 40];
+    foreach (n in ns)
+    {
+        puts(&mut a, "fib(");
+        Asm::li(&mut a, 1, n);
+        Asm::sys(&mut a, 2);
+        puts(&mut a, ") = ");
+        Asm::li(&mut a, 1, n);
+        Asm::call(&mut a, fib);
+        Asm::mov(&mut a, 1, 0);
+        Asm::sys(&mut a, 2);
+        puts(&mut a, "\n");
+    }
+    exit_ok(&mut a);
+    a
+}
+
+// PID 2: writes a file, opens it again, and reads it back.
+fn files_program() : Asm
+{
+    Asm a = Asm::new();
+    u32 name = Asm::string(&mut a, "notes.txt");
+    str text = "written to notes.txt, opened again, read back\n";
+    u32 body = Asm::string(&mut a, text);
+    u32 buffer = cpu::data_base() + 128;
+    Asm::li(&mut a, 1, name);
+    Asm::li(&mut a, 2, 9);
+    Asm::sys(&mut a, 3);                              // open
+    Asm::mov(&mut a, 1, 0);
+    Asm::li(&mut a, 2, body);
+    Asm::li(&mut a, 3, narrow<u32>(str_len(text)));
+    Asm::sys(&mut a, 4);                              // write
+    Asm::li(&mut a, 1, name);
+    Asm::li(&mut a, 2, 9);
+    Asm::sys(&mut a, 3);                              // open again: the same file
+    Asm::mov(&mut a, 1, 0);
+    Asm::li(&mut a, 2, buffer);
+    Asm::li(&mut a, 3, 100);
+    Asm::sys(&mut a, 5);                              // read
+    Asm::li(&mut a, 1, buffer);
+    Asm::mov(&mut a, 2, 0);
+    Asm::sys(&mut a, 1);                              // print what came back
+    exit_ok(&mut a);
+    a
+}
+
+// PID 3: allocates two pages, uses them, frees them -- then reads freed
+// memory, and the page table catches it.
+fn memory_program() : Asm
+{
+    Asm a = Asm::new();
+    Asm::sys(&mut a, 6);                              // alloc
+    Asm::mov(&mut a, 6, 0);
+    Asm::sys(&mut a, 6);
+    Asm::mov(&mut a, 7, 0);
+    Asm::li(&mut a, 5, 1);
+    Asm::mov(&mut a, 2, 6);                           // fill 64 bytes with 64, 63, ..., 1
+    Asm::li(&mut a, 1, 64);
+    u32 fill = Asm::here(&a);
+    Asm::sb(&mut a, 2, 1);
+    Asm::addi(&mut a, 2, 1);
+    Asm::sub(&mut a, 1, 1, 5);
+    Asm::jnz_to(&mut a, 1, fill);
+    Asm::mov(&mut a, 2, 6);                           // sum them back
+    Asm::li(&mut a, 1, 64);
+    Asm::li(&mut a, 3, 0);
+    u32 add = Asm::here(&a);
+    Asm::lb(&mut a, 4, 2);
+    Asm::add(&mut a, 3, 3, 4);
+    Asm::addi(&mut a, 2, 1);
+    Asm::sub(&mut a, 1, 1, 5);
+    Asm::jnz_to(&mut a, 1, add);
+    puts(&mut a, "sum of 64 bytes on a heap page = ");
+    Asm::mov(&mut a, 1, 3);
+    Asm::sys(&mut a, 2);
+    puts(&mut a, "\n");
+    Asm::mov(&mut a, 1, 6);
+    Asm::sys(&mut a, 7);                              // free both pages
+    Asm::mov(&mut a, 1, 7);
+    Asm::sys(&mut a, 7);
+    puts(&mut a, "freed both pages; now reading one anyway\n");
+    Asm::lb(&mut a, 4, 6);                            // use after free: a page fault
+    exit_ok(&mut a);
+    a
+}
+
+// PID 4: sends 1 to 6 down the pipe, which holds two at a time.
+fn producer_program() : Asm
+{
+    Asm a = Asm::new();
+    Asm::li(&mut a, 6, 1);
+    Asm::li(&mut a, 7, 7);
+    u32 top = Asm::here(&a);
+    Asm::mov(&mut a, 1, 6);
+    Asm::sys(&mut a, 8);                              // send (blocks while the pipe is full)
+    Asm::addi(&mut a, 6, 1);
+    Asm::slt(&mut a, 4, 6, 7);
+    Asm::jnz_to(&mut a, 4, top);
+    puts(&mut a, "sent 1 to 6\n");
+    exit_ok(&mut a);
+    a
+}
+
+// PID 5: receives six numbers and adds them up.
+fn consumer_program() : Asm
+{
+    Asm a = Asm::new();
+    Asm::li(&mut a, 6, 0);
+    Asm::li(&mut a, 7, 6);
+    Asm::li(&mut a, 5, 1);
+    u32 top = Asm::here(&a);
+    Asm::sys(&mut a, 9);                              // recv (blocks while the pipe is empty)
+    Asm::add(&mut a, 6, 6, 0);
+    Asm::sub(&mut a, 7, 7, 5);
+    Asm::jnz_to(&mut a, 7, top);
+    puts(&mut a, "received six numbers, sum = ");
+    Asm::mov(&mut a, 1, 6);
+    Asm::sys(&mut a, 2);
+    puts(&mut a, "\n");
+    exit_ok(&mut a);
+    a
+}
+
+// ---- boot ----
+
+fn ok(str what)
+{
+    printf("[ OK ] %v\n", what);
+}
+
+fn main()
+{
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║         COBALTC TINYOS v0.1          ║\n");
+    printf("╚══════════════════════════════════════╝\n\n");
+
+    Ram ram = match (Ram::new())
+    {
+        Some(r) : r,
+        None :
+        {
+            printf("no memory for the machine\n");
+            return;
+        },
+    };
+    ok("64 KB physical memory: 256 pages of 256 bytes");
+    Allocator pages = Allocator::new(16, 240);        // pages 0-15 hold the kernel
+    ok("page allocator: 240 free pages, zeroed when handed out");
+    ok("virtual memory: a 16-page (4 KB) address space per process");
+    ok("process manager");
+    ok("scheduler: round robin, timer interrupt every 12 instructions");
+    ok("filesystem");
+    printf("\n");
+
+    Kernel k = Kernel {
+        .ram = ram,
+        .pages = pages,
+        .procs = Vec::new(),
+        .files = Fs::new(),
+        .pipe = Pipe { .buf = [0, 0], .head = 0, .len = 0 },
+        .stats = Stats { .switches = 0, .syscalls = 0, .instructions = 0, .faults = 0, .shown = 0 }
+    };
+    spawn(&mut k, "fib", fib_program());
+    spawn(&mut k, "files", files_program());
+    spawn(&mut k, "memory", memory_program());
+    spawn(&mut k, "producer", producer_program());
+    spawn(&mut k, "consumer", consumer_program());
+    printf("\n");
+
+    schedule(&mut k);
+
+    printf("\nkernel: all processes exited\n");
+    usize f = 0;
+    while (f < Fs::count(&k.files))
+    {
+        printf("kernel: file ");
+        match (String::from_utf8(Fs::name(&k.files, narrow<u32>(f))))
+        {
+            Ok(s) : printf("%v", &s),
+            Err(_) : printf("?"),
+        }
+        printf(", ");
+        printf("%v", Fs::size(&k.files, narrow<u32>(f)));
+        printf(" bytes\n");
+        f = f + 1;
+    }
+    printf("kernel: shutting down\n\n");
+    printf("pages handed out:  ");
+    printf("%v", Allocator::handed_out(&k.pages));
+    printf("\nfree pages now:    ");
+    printf("%v", Allocator::available(&k.pages));
+    printf(" of 240\ncontext switches:  %v\nsystem calls:      ", k.stats.switches);
+    printf("%v\ninstructions:      %v", k.stats.syscalls, k.stats.instructions);
+    printf("\npage faults:       %v\n", k.stats.faults);
+}                                                     // k ends: every address space, then the RAM

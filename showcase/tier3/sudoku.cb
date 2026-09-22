@@ -1,0 +1,180 @@
+// Sudoku
+//
+// Shows: arrays are values. The board is an `array<array<u8, 9>, 9>`, and
+// each guess works on its own copy (`Board next = board;` copies all 81
+// cells), so backtracking needs no undo step: a failed guess simply drops
+// its copy. Every `b[r][c]` is bounds-checked; with a literal index the
+// check happens before the program runs. The counter of guesses is passed
+// down by `&mut`, the one thing all the copies share. Candidate digits are
+// bit sets; `fit & bit != 0` means `(fit & bit) != 0` in CobaltC.
+
+import std;
+
+// The digits already used in each row, column and 3x3 box, one bit per
+// digit (bit v for digit v).
+struct Used
+{
+    array<u16, 9> rows;
+    array<u16, 9> cols;
+    array<u16, 9> boxes;
+}
+
+fn used(ref<array<array<u8, 9>, 9>, shared> b) : Used
+{
+    Used u = Used { .rows = [0, 0, 0, 0, 0, 0, 0, 0, 0], .cols = [0, 0, 0, 0, 0, 0, 0, 0, 0], .boxes = [0, 0, 0, 0, 0, 0, 0, 0, 0] };
+    usize r = 0;
+    while (r < 9)
+    {
+        usize c = 0;
+        while (c < 9)
+        {
+            u16 bit = (1: u16) << widen<u32>(b[r][c]);  // a shift amount is always a u32
+            u.rows[r] = u.rows[r] | bit;
+            u.cols[c] = u.cols[c] | bit;
+            u.boxes[r / 3 * 3 + c / 3] = u.boxes[r / 3 * 3 + c / 3] | bit;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    u
+}
+
+// The digits that fit at (r, c), as bits 1..9.
+fn candidates(ref<Used, shared> u, usize r, usize c) : u16
+{
+    ~(u.rows[r] | u.cols[c] | u.boxes[r / 3 * 3 + c / 3]) & 1022   // 1022: bits 1..9
+}
+
+fn count_bits(u16 x) : u8
+{
+    u8 n = 0;
+    u16 y = x;
+    while (y != 0)
+    {
+        n = n + narrow<u8>(y & 1);
+        y = y >> 1;
+    }
+    n
+}
+
+// The solved board, or None if this board has no solution. Each step
+// fills the empty cell with the fewest digits that fit, which keeps the
+// search small.
+fn solve(array<array<u8, 9>, 9> board, ref<u64, exclusive> guesses) : Option<array<array<u8, 9>, 9>>
+{
+    Used u = used(&board);
+    usize best_r = 9;                            // 9: no empty cell found yet
+    usize best_c = 0;
+    u8 best_count = 10;
+    usize r = 0;
+    while (r < 9)
+    {
+        usize c = 0;
+        while (c < 9)
+        {
+            if (board[r][c] == 0)
+            {
+                u8 count = count_bits(candidates(&u, r, c));
+                if (count == 0)
+                {
+                    return None;                 // a cell nothing fits: backtrack
+                }
+                if (count < best_count)
+                {
+                    best_count = count;
+                    best_r = r;
+                    best_c = c;
+                }
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    if (best_r == 9)
+    {
+        return Some(board);                      // no empty cell left
+    }
+    u16 fit = candidates(&u, best_r, best_c);
+    u8 v = 1;
+    while (v <= 9)
+    {
+        if (fit & ((1: u16) << widen<u32>(v)) != 0)
+        {
+            *guesses = *guesses + 1;
+            array<array<u8, 9>, 9> next = board; // a copy: board is untouched
+            next[best_r][best_c] = v;
+            match (solve(next, guesses))
+            {
+                Some(done) :
+                {
+                    return Some(done);
+                },
+                None : {},
+            }
+        }
+        v = v + 1;
+    }
+    None
+}
+
+fn show(ref<array<array<u8, 9>, 9>, shared> b)
+{
+    usize r = 0;
+    while (r < 9)
+    {
+        if (r == 3 || r == 6)
+        {
+            printf("  ------+-------+------\n");
+        }
+        printf(" ");
+        usize c = 0;
+        while (c < 9)
+        {
+            if (c == 3 || c == 6)
+            {
+                printf(" |");
+            }
+            printf(" ");
+            if (b[r][c] == 0)
+            {
+                printf(".");
+            }
+            else
+            {
+                printf("%v", b[r][c]);
+            }
+            c = c + 1;
+        }
+        printf("\n");
+        r = r + 1;
+    }
+}
+
+fn main()
+{
+    array<array<u8, 9>, 9> puzzle = [
+        [5, 3, 0, 0, 7, 0, 0, 0, 0],
+        [6, 0, 0, 1, 9, 5, 0, 0, 0],
+        [0, 9, 8, 0, 0, 0, 0, 6, 0],
+        [8, 0, 0, 0, 6, 0, 0, 0, 3],
+        [4, 0, 0, 8, 0, 3, 0, 0, 1],
+        [7, 0, 0, 0, 2, 0, 0, 0, 6],
+        [0, 6, 0, 0, 0, 0, 2, 8, 0],
+        [0, 0, 0, 4, 1, 9, 0, 0, 5],
+        [0, 0, 0, 0, 8, 0, 0, 7, 9]
+    ];
+    printf("puzzle:\n");
+    show(&puzzle);
+    u64 guesses = 0;
+    match (solve(puzzle, &mut guesses))          // puzzle is copied in, and stays as it was
+    {
+        Some(solved) :
+        {
+            printf("\nsolved after %v guesses:\n", guesses);
+            show(&solved);
+        },
+        None : printf("\nno solution\n"),
+    }
+    printf("\nthe puzzle is unchanged: its top-left cells are still %v, ", puzzle[0][0]);
+    printf("%v, %v\n", puzzle[0][1], puzzle[0][2]);
+}

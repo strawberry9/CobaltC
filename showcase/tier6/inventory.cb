@@ -1,0 +1,163 @@
+// Inventory
+//
+// Shows: a ledger file applied to a HashMap<String, i64> of stock, the
+// way a real tool reports problems. Each line is `item,change`; a line
+// that does not parse, or a sale of more than is in stock, is reported
+// on standard error with its line number (`eprintf`) and skipped, and
+// the program's exit status says whether there were any. An item that
+// reaches zero is removed from the map (`remove_ordered`, so the others
+// keep their order) and remembered in a HashSet of sold-out items.
+//
+//   coby inventory.cb LEDGER
+
+import std;
+
+enum LineError
+{
+    NoComma,
+    BadNumber(String),                // the item whose change is not a number
+}
+
+struct Entry
+{
+    String item;
+    i64 change;
+}
+
+// `item,change`: the text before the first comma, and the number after it.
+fn split_line(ref<Vec<u8>, shared> line) : Result<Entry, LineError>
+{
+    Vec<u8> name = Vec::new();
+    Vec<u8> number = Vec::new();
+    bool comma = false;
+    foreach (b in line)
+    {
+        if (!comma && *b == b',')
+        {
+            comma = true;
+        }
+        else if (comma)
+        {
+            Vec::push(&mut number, *b);
+        }
+        else
+        {
+            Vec::push(&mut name, *b);
+        }
+    }
+    if (!comma)
+    {
+        return Err(NoComma);
+    }
+    String item = Result::unwrap_or(String::from_utf8(name), String::new());
+    String n = Result::unwrap_or(String::from_utf8(number), String::new());
+    match (parse<i64>(&n))
+    {
+        Ok(v) : Ok(Entry { .item = item, .change = v }),
+        Err(_) : Err(BadNumber(item)),
+    }
+}
+
+// The lines of `text`, as bytes, without their newlines.
+fn lines(ref<String, shared> text) : Vec<Vec<u8>>
+{
+    Vec<Vec<u8>> out = Vec::new();
+    Vec<u8> current = Vec::new();
+    foreach (b in String::as_bytes(text))
+    {
+        if (*b == b'\n')
+        {
+            Vec::push(&mut out, current);
+            current = Vec::new();
+        }
+        else
+        {
+            Vec::push(&mut current, *b);
+        }
+    }
+    if (Vec::len(&current) > 0)
+    {
+        Vec::push(&mut out, current);
+    }
+    out
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: inventory LEDGER\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    String text = match (read_file(&path))
+    {
+        Ok(t) : t,
+        Err(_) :
+        {
+            eprintf("inventory: cannot read %s\n", &path);
+            return 2;
+        },
+    };
+
+    HashMap<String, i64> stock = HashMap::new();
+    HashSet<String> sold_out = HashSet::new();
+    u32 problems = 0;
+    foreach (n, line in lines(&text))
+    {
+        match (split_line(&line))
+        {
+            Err(e) :
+            {
+                match (e)
+                {
+                    NoComma : eprintf("%s:%d: expected item,change\n", &path, n + 1),
+                    BadNumber(item) : eprintf("%s:%d: the change for %s is not a number\n", &path, n + 1, &item),
+                }
+                problems += 1;
+            },
+            Ok(entry) :
+            {
+                Entry { item, change } = entry;             // the String and the number, taken apart
+                i64 have = match (HashMap::get(&stock, &item))
+                {
+                    Some(q) : *q,
+                    None : 0,
+                };
+                if (have + change < 0)
+                {
+                    eprintf("%s:%d: cannot take %d %s, only %d in stock\n", &path, n + 1, -change, &item, have);
+                    problems += 1;
+                }
+                else if (have + change == 0)
+                {
+                    HashMap::remove_ordered(&mut stock, &item);
+                    HashSet::insert(&mut sold_out, item);
+                }
+                else
+                {
+                    HashSet::remove_ordered(&mut sold_out, &item);
+                    HashMap::insert(&mut stock, item, have + change);
+                }
+            },
+        }
+    }
+
+    printf("in stock:\n");
+    foreach (item, q in &stock)
+    {
+        printf("  %-10s %5d\n", item, q);
+    }
+    printf("sold out:");
+    foreach (item in &sold_out)
+    {
+        printf(" %s", item);
+    }
+    printf("\n");
+    if (problems > 0)
+    {
+        eprintf("inventory: %d line(s) skipped\n", problems);
+        return 1;
+    }
+    0
+}

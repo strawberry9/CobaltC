@@ -1,0 +1,56 @@
+// 09_threads.cb -- Threads, join, and a mutex.
+//
+// `spawn(f, args...)` starts f on a new thread and returns a handle;
+// `join` waits and yields f's return value. Shared state goes behind
+// a mutex: `lock` returns a guard, `*g` is the value, and the guard
+// releases the lock when it is destroyed at the end of its block.
+// A handle that is never joined is waited for when it goes out of
+// scope, so a thread can never outlive the frame that owns it.
+
+import std;
+
+// Sum of the integers in [lo, hi): each worker computes its own range
+// and returns the partial sum through join.
+fn range_sum(u64 lo, u64 hi) : u64
+{
+    u64 acc = 0;
+    u64 i = lo;
+    while (i < hi)
+    {
+        acc = acc + i;
+        i = i + 1;
+    }
+    acc
+}
+
+// Each worker adds `n` to the shared counter one step at a time.
+fn bump(ref<mutex<u64>, shared> m, u64 n) : u64
+{
+    u64 i = 0;
+    while (i < n)
+    {
+        auto g = lock(m);
+        *g = *g + 1;
+        i = i + 1;
+    }                                // guard destroyed: lock released
+    n
+}
+
+fn main()
+{
+    // Parallel partial sums, combined by the main thread.
+    auto h1 = spawn(range_sum, 0, 250);
+    auto h2 = spawn(range_sum, 250, 500);
+    auto h3 = spawn(range_sum, 500, 750);
+    auto h4 = spawn(range_sum, 750, 1000);
+    u64 total = join(h1) + join(h2) + join(h3) + join(h4);
+    printf("%d\n", total);         // 499500
+
+    // A shared counter behind a mutex.
+    auto counter = Mutex::new(0: u64);
+    {
+        auto a = spawn(bump, &counter, 300);
+        auto b = spawn(bump, &counter, 200);
+    }                                // both handles swept here: both threads finished
+    printf("%d\n", *lock(&counter)); // 500, whatever the interleaving
+}

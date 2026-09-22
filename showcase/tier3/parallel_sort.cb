@@ -1,0 +1,150 @@
+// Parallel Merge Sort
+//
+// Shows: data parallelism by moving ownership. Each half of the list is
+// *moved* into a thread by `spawn`, sorted there, and moved back by
+// `join`; no two threads ever touch the same Vec, so there is nothing to
+// lock and no data race to rule out. After `spawn(psort, left, …)` the
+// spawning thread cannot use `left` at all: the move is checked like any
+// other. The random numbers come from a linear congruential generator,
+// whose arithmetic is meant to wrap, so it says `wrapping_mul`.
+
+import std;
+
+// The next value of a 64-bit LCG (Knuth's MMIX constants).
+fn next_random(ref<u64, exclusive> state) : u64
+{
+    *state = wrapping_add(wrapping_mul(*state, 6364136223846793005), 1442695040888963407);
+    *state >> 33
+}
+
+// A copy of v's elements [from, to).
+fn copy_range(ref<Vec<u64>, shared> v, usize from, usize to) : Vec<u64>
+{
+    Vec<u64> out = Vec::new();
+    usize i = from;
+    while (i < to)
+    {
+        Vec::push(&mut out, *Vec::index_shared(v, i));
+        i = i + 1;
+    }
+    out
+}
+
+// Merges two sorted lists, consuming both.
+fn merge(Vec<u64> a, Vec<u64> b) : Vec<u64>
+{
+    Vec<u64> out = Vec::new();
+    usize i = 0;
+    usize j = 0;
+    while (i < Vec::len(&a) || j < Vec::len(&b))
+    {
+        bool take_a = j == Vec::len(&b) || (i < Vec::len(&a) && *Vec::index_shared(&a, i) <= *Vec::index_shared(&b, j));
+        if (take_a)
+        {
+            Vec::push(&mut out, *Vec::index_shared(&a, i));
+            i = i + 1;
+        }
+        else
+        {
+            Vec::push(&mut out, *Vec::index_shared(&b, j));
+            j = j + 1;
+        }
+    }
+    out
+}                                               // a and b are destroyed here
+
+fn sort(Vec<u64> v) : Vec<u64>
+{
+    usize n = Vec::len(&v);
+    if (n < 2)
+    {
+        return v;
+    }
+    Vec<u64> left = copy_range(&v, 0, n / 2);
+    Vec<u64> right = copy_range(&v, n / 2, n);
+    merge(sort(left), sort(right))
+}
+
+// Splits `depth` times, sorting one half of each split in a new thread.
+fn psort(Vec<u64> v, u32 depth) : Vec<u64>
+{
+    usize n = Vec::len(&v);
+    if (depth == 0 || n < 2)
+    {
+        return sort(v);
+    }
+    Vec<u64> left = copy_range(&v, 0, n / 2);
+    Vec<u64> right = copy_range(&v, n / 2, n);
+    auto h = spawn(psort, left, depth - 1);     // left moves into the new thread
+    // Vec::len(&left) here would be diag.stale-binding: left is no longer ours.
+    Vec<u64> sorted_right = psort(right, depth - 1);
+    merge(join(h), sorted_right)                // the sorted left half moves back
+}
+
+fn is_sorted(ref<Vec<u64>, shared> v) : bool
+{
+    usize i = 1;
+    while (i < Vec::len(v))
+    {
+        if (*Vec::index_shared(v, i - 1) > *Vec::index_shared(v, i))
+        {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn show_ends(ref<Vec<u64>, shared> v)
+{
+    usize n = Vec::len(v);
+    usize i = 0;
+    while (i < 5)
+    {
+        printf("%v ", *Vec::index_shared(v, i));
+        i = i + 1;
+    }
+    printf("... ");
+    i = n - 5;
+    while (i < n)
+    {
+        printf("%v", *Vec::index_shared(v, i));
+        printf("%v", if (i + 1 < n) { " " } else { "\n" });
+        i = i + 1;
+    }
+}
+
+fn sum(ref<Vec<u64>, shared> v) : u64
+{
+    u64 total = 0;
+    foreach (x in v)
+    {
+        total = total + *x;
+    }
+    total
+}
+
+fn main()
+{
+    u64 state = 2026;
+    Vec<u64> data = Vec::new();
+    usize i = 0;
+    while (i < 250)
+    {
+        Vec::push(&mut data, next_random(&mut state) % 100000);
+        i = i + 1;
+    }
+    usize count = Vec::len(&data);
+    u64 total = sum(&data);
+    printf("unsorted: ");
+    show_ends(&data);
+
+    Vec<u64> sorted = psort(data, 2);           // 2 levels of splits: 4 sorts, 3 of them in new threads
+    printf("sorted:   ");
+    show_ends(&sorted);
+    printf("in order: ");
+    printf("%v", is_sorted(&sorted));
+    printf(", same count: %v, same sum: ", Vec::len(&sorted) == count);
+    printf("%v", sum(&sorted) == total);
+    printf("\n");
+}

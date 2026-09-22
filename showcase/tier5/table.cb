@@ -1,0 +1,159 @@
+// table -- CSV rows given as arguments, checked, aligned and totalled.
+//
+//     table "item,qty,price" "apple,3,0.5" "pear,12,1.25"
+//
+// The first row names the columns; `qty` must be a whole number (a
+// `u32`) and `price` a number (an `f64`). Shows: splitting a `String`
+// at `b','` through `String::as_bytes`, one buffer handing its value on
+// and taking a new one, rows kept as `Vec<Vec<String>>`
+// (resources inside resources, all freed together), `parse` at two
+// types, where its strictness does the checking (`-2` is not a `u32`,
+// ` 3` is not a number), `checked_add` for the quantity total, and an
+// error naming the row and column, with exit status 1.
+
+import std;
+
+// `line` split at every comma. Each piece is a run of the line's own
+// bytes between ASCII commas, so it is UTF-8 whenever the line is. The
+// bytes gather in `cur`, which hands its value to the cell and then
+// takes a new, empty one.
+fn split(ref<String, shared> line) : Vec<String>
+{
+    auto b = String::as_bytes(line);
+    Vec<String> cells = Vec::new();
+    Vec<u8> cur = Vec::new();
+    usize i = 0;
+    while (i <= Vec::len(b))
+    {
+        if (i == Vec::len(b) || *Vec::index_shared(b, i) == b',')
+        {
+            Vec::push(&mut cells, Result::unwrap_or(String::from_utf8(cur), String::new()));
+            cur = Vec::new();
+        }
+        else
+        {
+            Vec::push(&mut cur, *Vec::index_shared(b, i));
+        }
+        i = i + 1;
+    }
+    cells
+}
+
+fn cell(ref<Vec<Vec<String>>, shared> rows, usize r, usize c) : ref<String, shared>
+{
+    Vec::index_shared(Vec::index_shared(rows, r), c)
+}
+
+// `s`, then spaces up to `width` bytes.
+fn pad(ref<String, exclusive> out, ref<String, shared> s, usize width)
+{
+    String::append(out, s);
+    usize n = String::len(s);
+    while (n < width)
+    {
+        String::append(out, " ");
+        n = n + 1;
+    }
+}
+
+fn fail(usize row, str column, ref<String, shared> text, str what) : u8
+{
+    eprintf("table: row %d, %s: \"%s\" %s\n", row + 1, column, text, what);
+    1
+}
+
+fn main() : u8
+{
+    usize n = arg_count();
+    if (n < 2)
+    {
+        eprintf("usage: table \"item,qty,price\" ROW...\n");
+        return 2;
+    }
+    Vec<Vec<String>> rows = Vec::new();
+    usize r = 0;
+    while (r < n)
+    {
+        String line = Result::unwrap_or(arg(r), String::new());
+        Vec<String> cells = split(&line);
+        if (Vec::len(&cells) != 3)
+        {
+            eprintf("table: row %d has %d cells, not 3\n", r + 1, Vec::len(&cells));
+            return 1;
+        }
+        Vec::push(&mut rows, cells);
+        r = r + 1;
+    }
+
+    // Check and total every data row before printing any of them.
+    u32 total_qty = 0;
+    f64 total_value = 0.0;
+    r = 1;
+    while (r < n)
+    {
+        u32 qty = match (parse<u32>(cell(&rows, r, 1)))
+        {
+            Ok(q) : q,
+            Err(_) :
+            {
+                return fail(r, "qty", cell(&rows, r, 1), "is not a whole number");
+            },
+        };
+        f64 price = match (parse<f64>(cell(&rows, r, 2)))
+        {
+            Ok(p) : p,
+            Err(_) :
+            {
+                return fail(r, "price", cell(&rows, r, 2), "is not a number");
+            },
+        };
+        total_qty = match (checked_add(total_qty, qty))
+        {
+            Some(t) : t,
+            None :
+            {
+                eprintf("table: the quantities add up to more than a u32 holds\n");
+                return 1;
+            },
+        };
+        total_value = total_value + to_float<f64>(qty) * price;
+        r = r + 1;
+    }
+
+    // Column widths, in bytes (the data here is ASCII).
+    array<usize, 3> width = [5, 0, 0];
+    r = 0;
+    while (r < n)
+    {
+        usize c = 0;
+        while (c < 3)
+        {
+            usize len = String::len(cell(&rows, r, c));
+            if (len > width[c])
+            {
+                width[c] = len;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    String out = String::new();
+    r = 0;
+    while (r < n)
+    {
+        pad(&mut out, cell(&rows, r, 0), width[0] + 2);
+        pad(&mut out, cell(&rows, r, 1), width[1] + 2);
+        String::append(&mut out, cell(&rows, r, 2));
+        String::append(&mut out, "\n");
+        r = r + 1;
+    }
+    String total = String::from_str("total");
+    pad(&mut out, &total, width[0] + 2);
+    String q = String::new();
+    String::append(&mut q, total_qty);
+    pad(&mut out, &q, width[1] + 2);
+    String::append(&mut out, total_value);
+    String::append(&mut out, "\n");
+    printf("%v", &out);
+    0
+}

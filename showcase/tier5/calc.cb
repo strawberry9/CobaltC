@@ -1,0 +1,241 @@
+// calc -- evaluates the arithmetic expression given as its argument.
+//
+//     calc "2 * (3 + 4.5) / -0.5"
+//
+// Shows: a recursive-descent parser over a `String`'s bytes
+// (`String::as_bytes`, compared with byte literals like `b'('`), numbers read by `parse<f64>` with its error
+// offset turned into a column, every error a value carried up by `?`,
+// and the exit status saying which kind of failure it was: 0 for a
+// value, 1 for a syntax error (with a caret under the column), 2 for
+// division by zero, 3 for a usage error.
+
+import std;
+
+enum CalcError
+{
+    Unexpected(usize),          // the column of a byte that cannot come next
+    UnexpectedEnd,
+    BadNumber(usize),           // the column where a number stops being one
+    DivideByZero,
+}
+
+// The expression's bytes, and how far the parser has read.
+struct Cursor
+{
+    usize pos;
+}
+
+fn peek(ref<Vec<u8>, shared> b, ref<Cursor, exclusive> c) : Option<u8>
+{
+    while (c.pos < Vec::len(b) && *Vec::index_shared(b, c.pos) == b' ')
+    {
+        c.pos = c.pos + 1;
+    }
+    if (c.pos < Vec::len(b))
+    {
+        Some(*Vec::index_shared(b, c.pos))
+    }
+    else
+    {
+        None
+    }
+}
+
+fn is_number_byte(u8 x) : bool
+{
+    (x >= b'0' && x <= b'9') || x == b'.' || x == b'e' || x == b'E'
+}
+
+// A number: the longest run of digits, `.`, `e` and `E` (and a sign
+// straight after an `e`), handed to `parse<f64>`, which decides.
+fn number(ref<Vec<u8>, shared> b, ref<Cursor, exclusive> c) : Result<f64, CalcError>
+{
+    usize start = c.pos;
+    Vec<u8> digits = Vec::new();
+    while (c.pos < Vec::len(b))
+    {
+        u8 x = *Vec::index_shared(b, c.pos);
+        bool sign_of_exponent = (x == b'+' || x == b'-') && Vec::len(&digits) > 0
+            && (*Vec::index_shared(&digits, Vec::len(&digits) - 1) == b'e'
+                || *Vec::index_shared(&digits, Vec::len(&digits) - 1) == b'E');
+        if (!is_number_byte(x) && !sign_of_exponent)
+        {
+            break;
+        }
+        Vec::push(&mut digits, x);
+        c.pos = c.pos + 1;
+    }
+    String text = Result::unwrap_or(String::from_utf8(digits), String::new());
+    match (parse<f64>(&text))
+    {
+        Ok(v) : Ok(v),
+        Err(e) : match (e)
+        {
+            Invalid(k) : Err(BadNumber(start + k)),
+            _ : Err(BadNumber(start)),
+        },
+    }
+}
+
+// factor := '-' factor | '(' expr ')' | number
+fn factor(ref<Vec<u8>, shared> b, ref<Cursor, exclusive> c) : Result<f64, CalcError>
+{
+    match (peek(b, c))
+    {
+        None : Err(UnexpectedEnd),
+        Some(x) :
+        {
+            if (x == b'-')
+            {
+                c.pos = c.pos + 1;
+                return Ok(-factor(b, c)?);
+            }
+            if (x == b'(')
+            {
+                c.pos = c.pos + 1;
+                f64 v = expr(b, c)?;
+                match (peek(b, c))
+                {
+                    Some(y) :
+                    {
+                        if (y != b')')
+                        {
+                            return Err(Unexpected(c.pos));
+                        }
+                    },
+                    None :
+                    {
+                        return Err(UnexpectedEnd);
+                    },
+                }
+                c.pos = c.pos + 1;
+                return Ok(v);
+            }
+            if (is_number_byte(x))
+            {
+                return number(b, c);
+            }
+            Err(Unexpected(c.pos))
+        },
+    }
+}
+
+// term := factor (('*' | '/') factor)*
+fn term(ref<Vec<u8>, shared> b, ref<Cursor, exclusive> c) : Result<f64, CalcError>
+{
+    f64 v = factor(b, c)?;
+    while (true)
+    {
+        u8 op = Option::unwrap_or(peek(b, c), 0);
+        if (op != b'*' && op != b'/')
+        {
+            break;
+        }
+        c.pos = c.pos + 1;
+        f64 w = factor(b, c)?;
+        if (op == b'*')
+        {
+            v = v * w;
+        }
+        else
+        {
+            if (w == 0.0)
+            {
+                return Err(DivideByZero);
+            }
+            v = v / w;
+        }
+    }
+    Ok(v)
+}
+
+// expr := term (('+' | '-') term)*
+fn expr(ref<Vec<u8>, shared> b, ref<Cursor, exclusive> c) : Result<f64, CalcError>
+{
+    f64 v = term(b, c)?;
+    while (true)
+    {
+        u8 op = Option::unwrap_or(peek(b, c), 0);
+        if (op != b'+' && op != b'-')
+        {
+            break;
+        }
+        c.pos = c.pos + 1;
+        f64 w = term(b, c)?;
+        v = if (op == b'+')
+        {
+            v + w
+        }
+        else
+        {
+            v - w
+        };
+    }
+    Ok(v)
+}
+
+// The whole argument is one expression: anything left over is an error.
+fn evaluate(ref<String, shared> text) : Result<f64, CalcError>
+{
+    auto b = String::as_bytes(text);
+    Cursor c = Cursor { .pos = 0 };
+    f64 v = expr(b, &mut c)?;
+    match (peek(b, &mut c))
+    {
+        Some(_) : Err(Unexpected(c.pos)),
+        None : Ok(v),
+    }
+}
+
+// The expression, and a caret under column `col`.
+fn point_at(ref<String, shared> text, usize col, str why) : u8
+{
+    String m = String::from_str("calc: ");
+    String::append(&mut m, why);
+    String::append(&mut m, "\n  ");
+    String::append(&mut m, text);
+    String::append(&mut m, "\n  ");
+    usize i = 0;
+    while (i < col)
+    {
+        String::append(&mut m, " ");
+        i = i + 1;
+    }
+    String::append(&mut m, "^\n");
+    eprintf("%v", &m);
+    1
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: calc EXPRESSION   (one argument; quote it)\n");
+        return 3;
+    }
+    String text = Result::unwrap_or(arg(0), String::new());
+    match (evaluate(&text))
+    {
+        Ok(v) :
+        {
+            String line = String::new();
+            String::append(&mut line, &text);
+            String::append(&mut line, " = ");
+            String::append(&mut line, v);
+            String::append(&mut line, "\n");
+            printf("%v", &line);
+            0
+        },
+        Err(e) : match (e)
+        {
+            Unexpected(col) : point_at(&text, col, "unexpected character"),
+            BadNumber(col) : point_at(&text, col, "malformed number"),
+            UnexpectedEnd : point_at(&text, String::len(&text), "the expression ends too early"),
+            DivideByZero :
+            {
+                eprintf("calc: division by zero\n");
+                2
+            },
+        },
+    }
+}

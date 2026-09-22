@@ -1,0 +1,57 @@
+// 10_shared_rc.cb -- Shared ownership with Rc.
+//
+// Rc<T> gives several owners to one allocation; the payload is freed
+// when the last Rc is dropped. Rc::get returns a shared reference, so
+// the payload is read-only through it. Here a table of words is shared
+// between two readers that each hold their own handle.
+
+import std;
+
+struct Reader
+{
+    Rc<Vec<u64>> table;
+    usize cursor;
+}
+
+fn Reader::next(ref<Reader, exclusive> r) : Option<u64>
+{
+    auto t = Rc::get(&r.table);
+    if (r.cursor >= Vec::len(t))
+    {
+        return None;
+    }
+    u64 v = *Vec::index_shared(t, r.cursor);
+    r.cursor = r.cursor + 1;
+    Some(v)
+}
+
+fn drain(ref<Reader, exclusive> r) : u64
+{
+    u64 sum = 0;
+    bool more = true;
+    while (more)
+    {
+        match (Reader::next(r))
+        {
+            Some(v) : sum = sum + v,
+            None : more = false,
+        }
+    }
+    sum
+}
+
+fn main()
+{
+    Vec<u64> data = Vec::new();
+    Vec::push(&mut data, 10);
+    Vec::push(&mut data, 20);
+    Vec::push(&mut data, 30);
+    auto shared = Rc::new(data);     // data moved into the Rc
+
+    Reader a = Reader { .table = Rc::clone(&shared), .cursor = 0 };
+    Reader b = Reader { .table = Rc::clone(&shared), .cursor = 1 };
+    drop(shared);                    // two owners remain; nothing freed yet
+
+    printf("%d\n", drain(&mut a));   // 60
+    printf("%d\n", drain(&mut b));   // 50
+}                                    // b then a destroyed; the last drops the Vec

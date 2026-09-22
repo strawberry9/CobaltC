@@ -1,0 +1,178 @@
+// Build Order
+//
+// Shows: HashMap<String, Vec<String>> as a dependency graph and two
+// HashSets as the marks of a depth-first search, producing an order in
+// which everything is built after what it depends on. A module named
+// only as a dependency still gets built. A dependency cycle is
+// reported on standard error, naming the modules on it, with exit
+// status 1. Since maps and sets keep insertion order, the order printed
+// is the same every time: it follows the file.
+//
+//   coby build_order.cb DEPS
+//
+// DEPS has one line per module: `name: dependency dependency ...`
+
+import std;
+
+// The whitespace-separated words of `bytes`, as Strings.
+fn words(ref<Vec<u8>, shared> bytes) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    Vec<u8> current = Vec::new();
+    foreach (b in bytes)
+    {
+        if (*b == b' ' || *b == b'\t')
+        {
+            if (Vec::len(&current) > 0)
+            {
+                Vec::push(&mut out, Result::unwrap_or(String::from_utf8(current), String::new()));
+                current = Vec::new();
+            }
+        }
+        else
+        {
+            Vec::push(&mut current, *b);
+        }
+    }
+    if (Vec::len(&current) > 0)
+    {
+        Vec::push(&mut out, Result::unwrap_or(String::from_utf8(current), String::new()));
+    }
+    out
+}
+
+// `name: deps` lines into a graph. Returns false for a malformed line.
+fn read_graph(ref<String, shared> text, ref<HashMap<String, Vec<String>>, exclusive> g) : bool
+{
+    Vec<u8> head = Vec::new();
+    Vec<u8> tail = Vec::new();
+    bool colon = false;
+    usize line = 1;
+    foreach (b in String::as_bytes(text))
+    {
+        if (*b == b'\n')
+        {
+            if (Vec::len(&head) > 0 && !colon)
+            {
+                eprintf("line %d: expected `name: dependencies`\n", line);
+                return false;
+            }
+            if (colon)
+            {
+                String name = Result::unwrap_or(String::from_utf8(head), String::new());   // head moves
+                auto deps = HashMap::entry(g, name, Vec::new());
+                foreach (d in words(&tail))
+                {
+                    Vec::push(deps, d);
+                }
+                head = Vec::new();            // a moved-from binding takes a new value
+            }
+            Vec::clear(&mut tail);            // emptied in place, its buffer kept
+            colon = false;
+            line += 1;
+        }
+        else if (!colon && *b == b':')
+        {
+            colon = true;
+        }
+        else if (colon)
+        {
+            Vec::push(&mut tail, *b);
+        }
+        else
+        {
+            Vec::push(&mut head, *b);
+        }
+    }
+    true
+}
+
+enum Visit
+{
+    Done,
+    Cycle(String),                    // a module on the cycle, as found
+}
+
+// Depth-first: `name` goes into `order` after everything it depends on.
+// `active` holds the modules on the current path; meeting one again is a
+// cycle, reported on the way back out.
+fn visit(ref<String, shared> name, ref<HashMap<String, Vec<String>>, shared> g, ref<HashSet<String>, exclusive> active, ref<HashSet<String>, exclusive> done, ref<Vec<String>, exclusive> order) : Visit
+{
+    if (HashSet::contains(&*done, name))
+    {
+        return Done;
+    }
+    if (HashSet::contains(&*active, name))
+    {
+        return Cycle(String::clone(name));
+    }
+    HashSet::insert(active, String::clone(name));
+    match (HashMap::get(g, name))
+    {
+        Some(deps) :
+        {
+            foreach (d in deps)
+            {
+                match (visit(d, g, active, done, order))
+                {
+                    Done : {},
+                    Cycle(path) :
+                    {
+                        return Cycle(sprintf("%s -> %s", name, &path));
+                    },
+                }
+            }
+        },
+        None : {},
+    }
+    HashSet::remove(active, name);
+    HashSet::insert(done, String::clone(name));
+    Vec::push(order, String::clone(name));
+    Done
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: build_order DEPS\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    String text = match (read_file(&path))
+    {
+        Ok(t) : t,
+        Err(_) :
+        {
+            eprintf("build_order: cannot read %s\n", &path);
+            return 2;
+        },
+    };
+    HashMap<String, Vec<String>> g = HashMap::new();
+    if (!read_graph(&text, &mut g))
+    {
+        return 2;
+    }
+
+    HashSet<String> active = HashSet::new();
+    HashSet<String> done = HashSet::new();
+    Vec<String> order = Vec::new();
+    foreach (name, _deps in &g)
+    {
+        match (visit(name, &g, &mut active, &mut done, &mut order))
+        {
+            Done : {},
+            Cycle(path) :
+            {
+                eprintf("build_order: dependency cycle: %s\n", &path);
+                return 1;
+            },
+        }
+    }
+    printf("%d modules, built in this order:\n", Vec::len(&order));
+    foreach (i, m in &order)
+    {
+        printf("  %2d  %s\n", i + 1, m);
+    }
+    0
+}

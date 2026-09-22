@@ -1,0 +1,165 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.file-handle [File-Open] [File-Read] [File-Read-Line] [File-Write] [File-Seek] [File-Close]; D-0054; conf.file-handle-round-trip
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6c656e2032310a5b737461727420315d0a5b7365636f6e645d0a5b00015d0a5b656e645d0a726561642033207468656e2031302c206c617374203130300a72772072656164205b737461727420315d0a32312062797465732c207461696c205b5345434f4e445d0a5574663820320a4e6f74466f756e640a
+// args: $TMP file_fixtures/not_utf8.txt
+//
+// Argument 0 is a fresh, empty directory. A log is created, closed,
+// reopened for appending with bytes that are not text, and read back
+// line by line, in pieces, after a seek, and whole; `open_rw` overwrites
+// in place; the fixture's line is `Utf8(e)` with `e.offset = 2`; a
+// missing file is `NotFound`. Prints one line per step.
+
+import std;
+
+fn path_in(ref<String, shared> dir, str name) : String
+{
+    String p = String::new();
+    String::append(&mut p, dir);
+    String::append(&mut p, "/");
+    String::append(&mut p, name);
+    p
+}
+
+fn check(Result<void, FileError> r)
+{
+    match (r)
+    {
+        Ok(_) :
+        {
+        },
+        Err(_) :
+        {
+            1 / (1 - 1);
+        },
+    }
+}
+
+fn opened(Result<File, FileError> r) : File
+{
+    match (r)
+    {
+        Ok(f) : f,
+        Err(_) : fault(assertion_failed),
+    }
+}
+
+// Prints every line left in `f`, or why one could not be read.
+fn print_lines(ref<File, exclusive> f)
+{
+    while (true)
+    {
+        match (File::read_line(f))
+        {
+            Ok(line) :
+            {
+                match (line)
+                {
+                    Some(s) :
+                    {
+                        printf("[%s]\n", &s);
+                    },
+                    None :
+                    {
+                        break;
+                    },
+                }
+            },
+            Err(e) :
+            {
+                match (e)
+                {
+                    Utf8(u) :
+                    {
+                        printf("Utf8 %v\n", u.offset);
+                    },
+                    _ :
+                    {
+                        1 / (1 - 1);
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn main()
+{
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String fixture = Result::unwrap_or(arg(1), String::new());
+    String log = path_in(&dir, "app.log");
+
+    File w = opened(File::create(&log));
+    String first = sprintf("start %v\n", 1);
+    check(File::write_str(&mut w, &first));
+    String second = String::from_str("second\n");
+    check(File::write_str(&mut w, &second));
+    check(File::close(w));
+
+    File a = opened(File::append(&log));
+    Vec<u8> raw = Vec::new();
+    Vec::push(&mut raw, 0: u8);
+    Vec::push(&mut raw, 1: u8);
+    Vec::push(&mut raw, 10: u8);
+    Vec::push(&mut raw, 101: u8);
+    Vec::push(&mut raw, 110: u8);
+    Vec::push(&mut raw, 100: u8);
+    check(File::write(&mut a, &raw[0..$]));
+    check(File::close(a));
+
+    File r = opened(File::open(&log));
+    printf("len %v\n", Result::unwrap_or(File::len(&r), 0));
+    print_lines(&mut r);
+
+    check(File::seek(&mut r, 8));
+    Vec<u8> got = Vec::new();
+    usize n = Result::unwrap_or(File::read(&mut r, &mut got, 3), 0);
+    usize m = Result::unwrap_or(File::read_to_end(&mut r, &mut got), 0);
+    printf("read %v then %v, last %v\n", n, m, got[Vec::len(&got) - 1]);
+    if (Result::unwrap_or(File::read(&mut r, &mut got, 5), 9) != 0)
+    {
+        1 / (1 - 1);
+    }
+
+    File rw = opened(File::open_rw(&log));
+    Option<String> o = Result::unwrap_or(File::read_line(&mut rw), None);
+    String line = Option::unwrap_or(o, String::new());
+    printf("rw read [%s]\n", &line);
+    String up = String::from_str("SECOND");
+    check(File::write_str(&mut rw, &up));
+    check(File::close(rw));
+
+    Vec<u8> all = Result::unwrap_or(read_bytes(&log), Vec::new());
+    String copy = path_in(&dir, "tail.bin");
+    check(write_bytes(&copy, &all[8..14]));
+    String tail = Result::unwrap_or(read_file(&copy), String::new());
+    printf("%v bytes, tail [%s]\n", Vec::len(&all), &tail);
+
+    File bad = opened(File::open(&fixture));
+    print_lines(&mut bad);
+
+    String missing = path_in(&dir, "missing.log");
+    match (File::open(&missing))
+    {
+        Ok(_) :
+        {
+            1 / (1 - 1);
+        },
+        Err(e) :
+        {
+            match (e)
+            {
+                NotFound :
+                {
+                    printf("NotFound\n");
+                },
+                _ :
+                {
+                    1 / (1 - 1);
+                },
+            }
+        },
+    }
+}
