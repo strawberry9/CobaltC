@@ -1,0 +1,128 @@
+// CRC-32 and Run-Length Encoding
+//
+// Shows: bit-level code whose every result the language defines. The
+// CRC-32 table and checksum use `^`, `&` and `>>` on u32, with the byte
+// widened explicitly before it meets a u32 and every table index a
+// checked `narrow` to usize; `std`'s own `crc32` agrees with it. A
+// run-length encoder and decoder round-trip some text, and the checksum
+// catches a corrupted copy.
+
+import std;
+
+fn crc_table() : Vec<u32>
+{
+    Vec<u32> table = Vec::new();
+    foreach (n in 0..256: u32)
+    {
+        u32 c = n;
+        foreach (k in 0..8)
+        {
+            c = if (c & 1 != 0) { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };   // means (c & 1) != 0
+        }
+        Vec::push(&mut table, c);
+    }
+    table
+}
+
+fn table_crc32(ref<Vec<u32>, shared> table, ref<Vec<u8>, shared> data) : u32
+{
+    u32 c = 0xFFFF_FFFF;
+    foreach (byte in data)
+    {
+        u32 b = widen<u32>(*byte);
+        c = table[narrow<usize>((c ^ b) & 0xFF)] ^ (c >> 8);
+    }
+    c ^ 0xFFFF_FFFF
+}
+
+fn bytes_of(str s) : Vec<u8>
+{
+    String::into_bytes(String::from_str(s))
+}
+
+// One byte as a character: bytes become text only through a validated String.
+fn print_char(u8 b)
+{
+    Vec<u8> one = Vec::new();
+    Vec::push(&mut one, b);
+    match (String::from_utf8(one))
+    {
+        Ok(s)  : printf("%v", &s),
+        Err(_) : printf("?"),
+    }
+}
+
+// Runs of up to 255 equal bytes become (count, byte) pairs.
+fn rle_encode(ref<Vec<u8>, shared> data) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    usize i = 0;
+    while (i < Vec::len(data))
+    {
+        u8 b = data[i];
+        u8 run = 1;
+        while (i + widen<usize>(run) < Vec::len(data) && run < 255 && data[i + widen<usize>(run)] == b)
+        {
+            run += 1;
+        }
+        Vec::push(&mut out, run);
+        Vec::push(&mut out, b);
+        i += widen<usize>(run);
+    }
+    out
+}
+
+fn rle_decode(ref<Vec<u8>, shared> enc) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    usize i = 0;
+    while (i + 1 < Vec::len(enc))
+    {
+        u8 b = enc[i + 1];
+        foreach (k in 0..enc[i])                              // the run's count
+        {
+            Vec::push(&mut out, b);
+        }
+        i += 2;
+    }
+    out
+}
+
+fn print_pairs(ref<Vec<u8>, shared> enc)
+{
+    usize i = 0;
+    while (i + 1 < Vec::len(enc))
+    {
+        printf("%v", enc[i]);
+        print_char(enc[i + 1]);
+        i += 2;
+    }
+}
+
+fn main()
+{
+    Vec<u32> table = crc_table();
+
+    Vec<u8> check = bytes_of("123456789");
+    u32 c = table_crc32(&table, &check);
+    printf("crc32(\"123456789\") = %08x", c);
+    printf("%v", if (c == 0xCBF4_3926) { "  (the standard check value cbf43926)\n" } else { "  (WRONG)\n" });
+    printf("std's crc32 %v\n", if (crc32(&check[0..$]) == c) { "agrees" } else { "DISAGREES" });
+
+    Vec<u8> text = bytes_of("WWWWWWWWWWWWBWWWWWWWWWWWWBBBWWWWWWWWWWWWWWWWWWWWWWWWBWWWWWWWWWWWWWW");
+    u32 original = table_crc32(&table, &text);
+    Vec<u8> enc = rle_encode(&text);
+    printf("encoded: ");
+    print_pairs(&enc);
+    printf("\n");
+    printf("%v bytes became %v\n", Vec::len(&text), Vec::len(&enc));
+
+    Vec<u8> dec = rle_decode(&enc);
+    printf("decoded crc %08x", table_crc32(&table, &dec));
+    printf("%v", if (table_crc32(&table, &dec) == original) { " matches the original\n" } else { " DIFFERS\n" });
+
+    enc[2] = 11;                  // corrupt one count: 12W 1B 12W -> 12W 11B 12W
+    Vec<u8> bad = rle_decode(&enc);
+    printf("after corrupting one byte: crc %08x", table_crc32(&table, &bad));
+    printf("%v", if (table_crc32(&table, &bad) == original) { " matches (undetected!)\n" } else { " differs: corruption detected\n" });
+}

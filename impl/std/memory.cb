@@ -1,0 +1,226 @@
+// `std::memory` (spec/21 §3, §3a): `Box`, `Rc` and `Weak`.
+
+// D-0125: `count` strong handles keep `value`; `weak` handles keep the
+// box. The value ends when `count` reaches 0, the box when both do.
+struct RcBox<T>
+{
+    usize count;
+    usize weak;
+    Option<T> value;
+}
+
+export resource struct Rc<T>
+{
+    rawptr<RcBox<T>> ptr;
+}
+
+export fn Rc::new<T>(T v) : Rc<T>
+{
+    rawptr<u8> p = match (allocate(sizeof<RcBox<T>>(), alignof<RcBox<T>>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<RcBox<T>> bp = reinterpret_ptr<RcBox<T>>(p);
+    unsafe
+    {
+        *bp = RcBox { .count = 1, .weak = 0, .value = Some(v) };
+    }
+    Rc { .ptr = bp }
+}
+
+export fn Rc::clone<T>(ref<Rc<T>, shared> r) : Rc<T>
+{
+    unsafe
+    {
+        // Only the count: a reference into the value (`Rc::get` of
+        // another handle) may be live, and is disjoint from it.
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(r.ptr).count;
+        *c = *c + 1;
+    }
+    Rc { .ptr = r.ptr }
+}
+
+export fn Rc::get<T>(ref<Rc<T>, shared> r) : ref<T, shared>
+{
+    unsafe
+    {
+        match (&reclaim<RcBox<T>>(r.ptr).value)
+        {
+            Some(v) : v,
+            None    : fault(unwrap_failed, "an Rc whose value has ended"), // never: a live Rc keeps its value
+        }
+    }
+}
+
+export fn Rc::drop<T>(ref<Rc<T>, exclusive> self)
+{
+    bool last = false;
+    unsafe
+    {
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(self.ptr).count;
+        *c = *c - 1;
+        last = *c == 0;
+    }
+    if (last)
+    {
+        bool unwatched = false;
+        unsafe
+        {
+            overwrite(&mut reclaim<RcBox<T>>(self.ptr).value, None);   // the value ends now (D-0125)
+            unwatched = reclaim<RcBox<T>>(self.ptr).weak == 0;
+        }
+        if (unwatched)
+        {
+            unsafe
+            {
+                drop(reclaim<RcBox<T>>(self.ptr));
+                deallocate(reinterpret_ptr<u8>(self.ptr), sizeof<RcBox<T>>(), alignof<RcBox<T>>());
+            }
+        }
+    }
+}
+
+// D-0125: a handle that does not keep the value alive.
+export resource struct Weak<T>
+{
+    rawptr<RcBox<T>> ptr;
+}
+
+export fn Rc::downgrade<T>(ref<Rc<T>, shared> r) : Weak<T>
+{
+    unsafe
+    {
+        ref<usize, exclusive> w = &mut reclaim<RcBox<T>>(r.ptr).weak;
+        *w = *w + 1;
+    }
+    Weak { .ptr = r.ptr }
+}
+
+export fn Weak::upgrade<T>(ref<Weak<T>, shared> w) : Option<Rc<T>>
+{
+    bool alive = false;
+    unsafe
+    {
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(w.ptr).count;
+        if (*c > 0)
+        {
+            *c = *c + 1;
+            alive = true;
+        }
+    }
+    if (alive) { Some(Rc { .ptr = w.ptr }) } else { None }
+}
+
+export fn Weak::clone<T>(ref<Weak<T>, shared> w) : Weak<T>
+{
+    unsafe
+    {
+        ref<usize, exclusive> k = &mut reclaim<RcBox<T>>(w.ptr).weak;
+        *k = *k + 1;
+    }
+    Weak { .ptr = w.ptr }
+}
+
+export fn Weak::drop<T>(ref<Weak<T>, exclusive> self)
+{
+    bool last = false;
+    unsafe
+    {
+        ref<usize, exclusive> k = &mut reclaim<RcBox<T>>(self.ptr).weak;
+        *k = *k - 1;
+        last = *k == 0 && reclaim<RcBox<T>>(self.ptr).count == 0;
+    }
+    if (last)
+    {
+        unsafe
+        {
+            drop(reclaim<RcBox<T>>(self.ptr));
+            deallocate(reinterpret_ptr<u8>(self.ptr), sizeof<RcBox<T>>(), alignof<RcBox<T>>());
+        }
+    }
+}
+
+// A value on the heap with one owner (`rule.stdlib.box`, spec/21 §3a,
+// D-0045): `Rc` without the count. It gives recursive types their
+// indirection (`struct Node { i32 v; Option<Box<Node>> next; }`) and
+// moves a large value as a pointer.
+export resource struct Box<T>
+{
+    rawptr<T> ptr;
+    bool full;                          // false once into_inner has taken the value
+}
+
+// The size Box allocates: at least one byte, so every Box has an address.
+fn Box::cells<T>() : usize
+{
+    if (sizeof<T>() == 0)
+    {
+        1
+    }
+    else
+    {
+        sizeof<T>()
+    }
+}
+
+export fn Box::new<T>(T v) : Box<T>
+{
+    rawptr<u8> p = match (allocate(Box::cells<T>(), alignof<T>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<T> bp = reinterpret_ptr<T>(p);
+    unsafe
+    {
+        *bp = v;
+    }
+    Box { .ptr = bp, .full = true }
+}
+
+export fn Box::get<T>(ref<Box<T>, shared> b) : ref<T, shared>
+{
+    unsafe
+    {
+        &reclaim<T>(b.ptr)
+    }
+}
+
+export fn Box::get_mut<T>(ref<Box<T>, exclusive> b) : ref<T, exclusive>
+{
+    unsafe
+    {
+        &mut reclaim<T>(b.ptr)
+    }
+}
+
+// D-0116: a Box of a copy of the value.
+export fn Box::clone<T: clone>(ref<Box<T>, shared> b) : Box<T>
+{
+    Box::new(clone(Box::get(b)))
+}
+
+// The value, moved out; the Box's memory is freed.
+export fn Box::into_inner<T>(Box<T> b) : T
+{
+    b.full = false;
+    unsafe
+    {
+        auto v = *b.ptr;
+        release(reinterpret_ptr<u8>(b.ptr), sizeof<T>());
+        v
+    }
+}
+
+export fn Box::drop<T>(ref<Box<T>, exclusive> self)
+{
+    unsafe
+    {
+        if (self.full)
+        {
+            drop(reclaim<T>(self.ptr));
+        }
+        deallocate(reinterpret_ptr<u8>(self.ptr), Box::cells<T>(), alignof<T>());
+    }
+}

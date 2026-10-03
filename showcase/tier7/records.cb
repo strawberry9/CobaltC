@@ -1,0 +1,167 @@
+// Records
+//
+// Shows: a file used as a small database of fixed-size records, the way
+// systems software uses one: record k lives at byte 32 * k, so any
+// record is one `File::seek` away. The store is opened with
+// `File::open_rw` (read and write, created if missing, kept if not);
+// a record is encoded little-endian into a `Vec<u8>` (`Vec::push_le`,
+// read back with `read_le`) and written with `File::write`; a result
+// that is not needed is discarded with `_ = …;`; a sale changes 4 bytes
+// in the middle of the file and
+// nothing else; a new record goes at `File::len`. A lookup returns
+// `Result<Option<Record>, FileError>`, and one `match` with nested
+// patterns takes the three outcomes apart; a sale's `Result<bool, …>`
+// is matched as `Ok(true)`, `Ok(false)`, `Err(_)`. Positions are `u64`, so the
+// same code addresses a store larger than memory.
+//
+//   coby records.cb DIR
+
+import std;
+
+const usize RECORD = 32;              // 4 id, 4 quantity, 24 name (zero-padded)
+
+struct Record
+{
+    u32 id;
+    i32 qty;
+    String name;
+}
+
+fn encode(u32 id, i32 qty, str name) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push_le(&mut b, id);                     // 4 bytes, low first
+    Vec::push_le(&mut b, qty);                    // an i32: two's complement
+    foreach (i in 0..24)
+    {
+        Vec::push(&mut b, if (i < str_len(name)) { str_byte(name, i) } else { 0 });
+    }
+    b
+}
+
+fn decode(ref<Vec<u8>, shared> b) : Record
+{
+    String name = String::new();
+    usize i = 8;
+    while (i < RECORD && b[i] != 0)
+    {
+        String::push_ascii(&mut name, b[i]);
+        i += 1;
+    }
+    Record { .id = read_le<u32>(&b[0 .. $], 0), .qty = read_le<i32>(&b[0 .. $], 4), .name = name }
+}
+
+fn position(usize k) : u64
+{
+    widen<u64>(k * RECORD)
+}
+
+// Record k, None past the last one.
+fn lookup(ref<File, exclusive> f, usize k) : Result<Option<Record>, FileError>
+{
+    File::seek(f, position(k))?;
+    Vec<u8> b = Vec::new();
+    while (Vec::len(&b) < RECORD)
+    {
+        usize n = File::read(f, &mut b, RECORD - Vec::len(&b))?;
+        if (n == 0)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(decode(&b)))
+}
+
+// A sale: only the 4 bytes of record k's quantity are rewritten.
+fn sell(ref<File, exclusive> f, usize k, i32 amount) : Result<bool, FileError>
+{
+    Record r = if (Some(r) = lookup(f, k)?) { r } else { return Ok(false); };
+    Vec<u8> qty = Vec::new();
+    Vec::push_le(&mut qty, r.qty - amount);
+    File::seek(f, position(k) + 4)?;
+    File::write(f, &qty[0..$])?;
+    Ok(true)
+}
+
+fn show(ref<File, exclusive> f, usize k)
+{
+    match (lookup(f, k))
+    {
+        Ok(Some(r)) : printf("  #%v  id %4v  qty %4v  %s\n", k, r.id, r.qty, &r.name),
+        Ok(None)    : printf("  #%v  no such record\n", k),
+        Err(_)      : printf("  #%v  read error\n", k),
+    }
+}
+
+fn open_store(ref<String, shared> path) : Result<File, FileError>
+{
+    File::open_rw(&path[0..$])
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: records DIR\n");
+        return 2;
+    }
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String path = sprintf("%s/stock.db", &dir);
+
+    // Build the store: five records written in order, then closed with
+    // its result checked.
+    File f = if (Ok(f) = open_store(&path)) { f } else { eprintf("records: cannot open %s\n", &path); return 1; };
+    Vec<u8> r0 = encode(1001, 40, "hex bolts");
+    Vec<u8> r1 = encode(1002, 12, "washers, 10 mm");
+    Vec<u8> r2 = encode(1003, 7, "hinge");
+    Vec<u8> r3 = encode(1004, 150, "wood screws");
+    Vec<u8> r4 = encode(1005, 3, "drill bit set");
+    _ = File::write(&mut f, &r0[0..$]);           // a failed write shows at `close`
+    _ = File::write(&mut f, &r1[0..$]);
+    _ = File::write(&mut f, &r2[0..$]);
+    _ = File::write(&mut f, &r3[0..$]);
+    _ = File::write(&mut f, &r4[0..$]);
+    if (Err(_) = File::close(f))
+    {
+        eprintf("records: the store was not stored\n");
+        return 1;
+    }
+
+    // Reopen it: the records are kept, and any one can be reached.
+    File db = if (Ok(f) = open_store(&path)) { f } else { return 1; };
+    printf("%v bytes, %v records\n", Result::unwrap_or(File::len(&db), 0), Result::unwrap_or(File::len(&db), 0) / position(1));
+    show(&mut db, 3);
+    show(&mut db, 0);
+    show(&mut db, 9);
+
+    printf("selling 5 of #2 and 30 of #3:\n");
+    _ = sell(&mut db, 2, 5);
+    _ = sell(&mut db, 3, 30);
+    match (sell(&mut db, 9, 1))
+    {
+        Ok(true)  : printf("  #9: sold\n"),
+        Ok(false) : printf("  #9: no such record, nothing sold\n"),
+        Err(_)    : printf("  #9: read error\n"),
+    }
+
+    // A new record goes at the end.
+    u64 end = Result::unwrap_or(File::len(&db), 0);
+    _ = File::seek(&mut db, end);
+    Vec<u8> r5 = encode(1006, 25, "shelf brackets");
+    _ = File::write(&mut db, &r5[0..$]);
+
+    printf("all records:\n");
+    usize k = 0;
+    while (true)
+    {
+        match (lookup(&mut db, k))
+        {
+            Ok(Some(r)) : printf("  #%v  id %4v  qty %4v  %s\n", k, r.id, r.qty, &r.name),
+            Ok(None)    : break,
+            Err(_)      : return 1,
+        }
+        k += 1;
+    }
+    printf("%v bytes\n", Result::unwrap_or(File::len(&db), 0));
+    0
+}

@@ -1,0 +1,89 @@
+// Parallel Quicksort, in Place
+//
+// Shows: several threads writing to one buffer at the same time, safely.
+// After partitioning, the two sides of the pivot are two exclusive
+// slices of the same Vec, `&mut s[0 .. p]` and `&mut s[p + 1 .. $]`: a
+// slice borrows only its own range of elements, so the two are disjoint
+// and may be alive together (D-0070). One side is sorted by a new thread
+// while this thread sorts the other; nothing is copied, nothing is
+// locked, and every element is still reached only through the one slice
+// whose range holds it. Compare `parallel_sort.cb`, which moves copies of
+// the halves into the threads instead. A slice's range is checked when
+// it is formed: had the two ranges overlapped by one element, the second
+// `&mut` would have been an aliasing fault, not a data race.
+
+import std;
+
+// Lomuto partition around the last element; returns the pivot's place.
+fn partition(slice<u64, exclusive> s) : usize
+{
+    usize n = slice_len(s);
+    u64 pivot = s[n - 1];
+    usize store = 0;
+    foreach (i in 0..n - 1)                              // every element but the pivot
+    {
+        if (s[i] < pivot)
+        {
+            slice_swap(s, i, store);
+            store += 1;
+        }
+    }
+    slice_swap(s, store, n - 1);
+    store
+}
+
+// Sorts `s` in place; below `depth` 0, or for a short run, on this
+// thread alone. Returns how many threads the sort used, itself included.
+fn sort(slice<u64, exclusive> s, u32 depth) : u32
+{
+    usize n = slice_len(s);
+    if (n < 2)
+    {
+        return 1;
+    }
+    usize p = partition(s);
+    slice<u64, exclusive> left = &mut s[0 .. p];         // elements before the pivot
+    slice<u64, exclusive> right = &mut s[p + 1 .. $];    // elements after it: disjoint
+    if (depth == 0 || n < 300)                           // (s itself is not read now: its
+                                                         //  two parts are borrowed)
+    {
+        return sort(left, 0) + sort(right, 0) - 1;
+    }
+    auto helper = spawn(sort, left, depth - 1);          // the left side on a new thread...
+    u32 mine = sort(right, depth - 1);                   // ...while this one sorts the right
+    join(helper) + mine
+}
+
+fn is_sorted(slice<u64, shared> s) : bool
+{
+    foreach (i in 1..slice_len(s))
+    {
+        if (s[i - 1] > s[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn main()
+{
+    Rng rng = Rng::new(2026);                            // std's generator: the same numbers every run
+    Vec<u64> data = Vec::new();
+    u64 sum = 0;
+    foreach (i in 0..4000)
+    {
+        u64 x = Rng::below(&mut rng, 100000);              // 0 ≤ x < 100000
+        Vec::push(&mut data, x);
+        sum += x;
+    }
+    u32 threads = sort(&mut data[0 .. $], 2);             // up to 2 levels of splitting: 4 threads
+    u64 after = 0;
+    foreach (x in &data)
+    {
+        after += *x;
+    }
+    printf("%v values sorted by %v threads, in place\n", Vec::len(&data), threads);
+    printf("sorted: %v, same total: %v\n", is_sorted(&data[0 .. $]), after == sum);
+    printf("smallest %v, median %v, largest %v\n", data[0], data[2000], data[3999]);
+}

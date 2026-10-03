@@ -1,0 +1,461 @@
+// `std::io` (spec/21 §2b, §2e, §2f): standard output, error and input,
+// and files. `printf`, `eprintf` and `File::printf` are realized natively
+// by both implementations.
+
+// D-0134: the one error of input and output, for files and for standard
+// input alike.
+export enum FileError
+{
+    NotFound,
+    Denied,
+    Io,
+    Utf8(Utf8Error),
+}
+
+// D-0033 (6): the value, or `d` when there is none; an unused `d` (or
+// `Err` payload) is destroyed like any other.
+// D-0117: each std error as a sentence for a person, a `str` (the
+// offsets inside `Utf8Error` and `ParseError::Invalid` stay reachable by
+// `match`).
+export fn FileError::text(ref<FileError, shared> e) : str
+{
+    match (e)
+    {
+        NotFound : "not found",
+        Denied   : "permission denied",
+        Io       : "input/output error",
+        Utf8(_)  : "not UTF-8",
+    }
+}
+
+export extern fn stdout_write(rawptr<u8> buf, usize len) : isize;
+
+export extern fn stdin_read(rawptr<u8> buf, usize len) : isize;
+
+export fn read_line() : Result<Option<String>, FileError>
+{
+    rawptr<u8> cell = match (allocate(1, 1))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    Vec<u8> bytes = Vec::new();
+    isize n = 0;
+    bool any = false;
+    while (true)
+    {
+        n = unsafe
+        {
+            stdin_read(cell, 1)
+        };
+        if (n <= 0)
+        {
+            break;
+        }
+        any = true;
+        u8 c = unsafe
+        {
+            *cell
+        };
+        if (c == 10)
+        {
+            if (bytes.len > 0 && bytes[bytes.len - 1] == 13)
+            {
+                Vec::pop(&mut bytes);
+            }
+            break;
+        }
+        Vec::push(&mut bytes, c);
+    }
+    unsafe
+    {
+        deallocate(cell, 1, 1);
+    }
+    if (n < 0)
+    {
+        return Err(FileError::Io);
+    }
+    if (!any)
+    {
+        return Ok(None);
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// `print<T>(T x)` is realized natively (`rule.stdlib.print`, spec/21
+// §2a). Its `str` and `ref<String, shared>` cases are these two
+// functions, which it calls; the others format in the implementation.
+fn print_str(str s)
+{
+    unsafe
+    {
+        stdout_write(str_ptr(s), str_len(s));
+    }
+}
+
+fn print_string(ref<String, shared> s)
+{
+    unsafe
+    {
+        stdout_write(reinterpret_ptr<u8>(s.bytes.ptr), s.bytes.len);
+    }
+}
+
+fn eprint_str(str s)
+{
+    unsafe
+    {
+        stderr_write(str_ptr(s), str_len(s));
+    }
+}
+
+export fn read_file(StringView path) : Result<String, FileError>
+{
+    rawptr<u8> p = StringView::ptr(path);
+    usize pn = StringView::len(path);
+    usize cap = 4096;
+    while (true)
+    {
+        rawptr<u8> buf = match (allocate(cap, 1))
+        {
+            Ok(b)  : b,
+            Err(_) : fault(alloc_failure),
+        };
+        isize n = unsafe
+        {
+            file_read(p, pn, buf, cap)
+        };
+        if (n >= 0 && reinterpret<usize>(n) <= cap)
+        {
+            usize len = reinterpret<usize>(n);
+            Vec<u8> bytes = Vec::new();
+            usize i = 0;
+            while (i < len)
+            {
+                u8 b = unsafe
+                {
+                    *(buf + reinterpret<isize>(i))
+                };
+                Vec::push(&mut bytes, b);
+                i = i + 1;
+            }
+            unsafe
+            {
+                deallocate(buf, cap, 1);
+            }
+            return match (String::from_utf8(bytes))
+            {
+                Ok(s)  : Ok(s),
+                Err(e) : Err(FileError::Utf8(e)),
+            };
+        }
+        unsafe
+        {
+            deallocate(buf, cap, 1);
+        }
+        if (n < 0)
+        {
+            return Err(file_error(n));
+        }
+        // Longer than `cap`: again, with room for all of it.
+        cap = reinterpret<usize>(n);
+    }
+    Err(FileError::Io)
+}
+
+export fn write_file(StringView path, StringView text) : Result<void, FileError>
+{
+    isize r = unsafe
+    {
+        file_write(StringView::ptr(path), StringView::len(path), StringView::ptr(text), StringView::len(text))
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// An open file (`rule.stdlib.file-handle`, spec/21 §2e, D-0054): its
+// bytes read and written in order from a position, which `seek` moves.
+// Its destructor closes it; `close` closes it and reports a failure.
+export resource struct File
+{
+    usize id;
+    bool open;                          // false once close has closed it
+}
+
+// `file_error` for `file_at`'s codes.
+fn file_error_at(i64 code) : FileError
+{
+    if (code == -1)
+    {
+        return FileError::NotFound;
+    }
+    if (code == -2)
+    {
+        return FileError::Denied;
+    }
+    FileError::Io
+}
+
+fn File::start(StringView path, usize mode) : Result<File, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(0, mode, StringView::ptr(path), StringView::len(path))
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(File { .id = reinterpret<usize>(r), .open = true })
+}
+
+// For reading; the file must exist.
+export fn File::open(StringView path) : Result<File, FileError>
+{
+    File::start(path, 0)
+}
+
+// For writing, from empty: created, or its contents discarded.
+export fn File::create(StringView path) : Result<File, FileError>
+{
+    File::start(path, 1)
+}
+
+// For writing at its end, created if it does not exist.
+export fn File::append(StringView path) : Result<File, FileError>
+{
+    File::start(path, 2)
+}
+
+// For reading and writing, created if it does not exist, its contents kept.
+export fn File::open_rw(StringView path) : Result<File, FileError>
+{
+    File::start(path, 3)
+}
+
+// Appends exactly `want` bytes of what `file_op` reads, or fewer at the end.
+fn File::take(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf, usize want) : Result<usize, FileError>
+{
+    while (buf.cap - buf.len < want)
+    {
+        Vec::grow(buf);
+    }
+    isize r = unsafe
+    {
+        file_op(3, f.id, reinterpret_ptr<u8>(buf.ptr + reinterpret<isize>(buf.len)), want)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    usize n = reinterpret<usize>(r);
+    buf.len = buf.len + n;
+    Ok(n)
+}
+
+// Appends up to `max` bytes to `buf` (at most a MiB, and fewer when fewer
+// are ready) and returns how many: 0 only at the end, when max > 0.
+export fn File::read(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, FileError>
+{
+    usize want = if (max > 1_048_576)
+    {
+        1_048_576
+    }
+    else
+    {
+        max
+    };
+    File::take(f, buf, want)
+}
+
+// Appends the rest of the file to `buf` and returns how many bytes.
+export fn File::read_to_end(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf) : Result<usize, FileError>
+{
+    usize total = 0;
+    while (true)
+    {
+        usize n = match (File::read(f, buf, 65_536))
+        {
+            Ok(n)  : n,
+            Err(e) : return Err(e),
+        };
+        if (n == 0)
+        {
+            break;
+        }
+        total = total + n;
+    }
+    Ok(total)
+}
+
+// The next line without its '\n', nor a '\r' just before it (D-0092),
+// as `read_line` reads standard input; None at the end of the file.
+export fn File::read_line(ref<File, exclusive> f) : Result<Option<String>, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(4, f.id, dangling<u8>(), 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = match (File::take(f, &mut bytes, reinterpret<usize>(r)))
+    {
+        Ok(n)  : n,
+        Err(e) : return Err(e),
+    };
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// Writes all of `data` at the file's position (at its end, for append).
+export fn File::write(ref<File, exclusive> f, slice<u8, shared> data) : Result<void, FileError>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return Ok(());
+    }
+    isize r = unsafe
+    {
+        file_op(5, f.id, rawptr_of(&data[0]), n)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// D-0134: writes the text at the file's position.
+export fn File::write_text(ref<File, exclusive> f, StringView text) : Result<void, FileError>
+{
+    File::write(f, text.bytes)
+}
+
+// `File::printf(f, format, …)` (D-0059) is `File::write_formatted(f,
+// $fmt(format, …))` after `modres`, as `String::appendf` is
+// `String::append` of it.
+fn File::write_formatted(ref<File, exclusive> f, str text) : Result<void, FileError>
+{
+    usize n = str_len(text);
+    if (n == 0)
+    {
+        return Ok(());
+    }
+    isize r = unsafe
+    {
+        file_op(5, f.id, str_ptr(text), n)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Moves the position to byte `pos` from the start.
+export fn File::seek(ref<File, exclusive> f, u64 pos) : Result<void, FileError>
+{
+    i64 r = unsafe
+    {
+        file_at(6, f.id, pos)
+    };
+    if (r < 0)
+    {
+        return Err(file_error_at(r));
+    }
+    Ok(())
+}
+
+// The file's length in bytes.
+export fn File::len(ref<File, shared> f) : Result<u64, FileError>
+{
+    i64 r = unsafe
+    {
+        file_at(7, f.id, 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error_at(r));
+    }
+    Ok(reinterpret<u64>(r))
+}
+
+// Closes the file. A file open for writing is first made durable, so a
+// failure the environment reports late is reported here.
+export fn File::close(File f) : Result<void, FileError>
+{
+    f.open = false;
+    isize r = unsafe
+    {
+        file_op(1, f.id, dangling<u8>(), 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+export fn File::drop(ref<File, exclusive> self)
+{
+    if (self.open)
+    {
+        isize r = unsafe
+        {
+            file_op(2, self.id, dangling<u8>(), 0)
+        };
+    }
+}
+
+// The whole file's bytes, as `read_file` reads its text.
+export fn read_bytes(StringView path) : Result<Vec<u8>, FileError>
+{
+    File f = match (File::open(path))
+    {
+        Ok(f)  : f,
+        Err(e) : return Err(e),
+    };
+    Vec<u8> bytes = Vec::new();
+    match (File::read_to_end(&mut f, &mut bytes))
+    {
+        Ok(_)  : Ok(bytes),
+        Err(e) : Err(e),
+    }
+}
+
+// Makes the file hold exactly `data`, as `write_file` does its text.
+export fn write_bytes(StringView path, slice<u8, shared> data) : Result<void, FileError>
+{
+    File f = match (File::create(path))
+    {
+        Ok(f)  : f,
+        Err(e) : return Err(e),
+    };
+    File::write(&mut f, data)
+}

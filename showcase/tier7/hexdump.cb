@@ -1,0 +1,122 @@
+// Hexdump
+//
+// Shows: a file read as bytes, not text, through a `File`: 16 bytes at a
+// time into one `Vec<u8>` that is emptied and reused (`File::read`
+// appends, `Vec::clear` keeps the buffer), starting from an offset with
+// `File::seek` and stopping after a count, like `xxd -s OFFSET -l COUNT`.
+// `File::len` sizes the file up front. A missing file and a denied one
+// are told apart by one `match` with nested patterns, and the end of the
+// file is the arm `Ok(0)`; the `File` closes itself when `main` returns.
+//
+//   coby hexdump.cb FILE [OFFSET [COUNT]]
+
+import std;
+
+// A number argument, or `d` when there is none; None when it is not a number.
+fn number_arg(usize i, u64 d) : Option<u64>
+{
+    if (i >= arg_count())
+    {
+        return Some(d);
+    }
+    String s = Result::unwrap_or(arg(i), String::new());
+    if (Ok(n) = String::parse<u64>(&s)) { Some(n) } else { None }
+}
+
+// One line: the offset, the bytes in hex (two groups of eight), and the
+// bytes that are printable ASCII, the rest as '.'.
+fn print_line(u64 offset, ref<Vec<u8>, shared> bytes)
+{
+    String hex = String::new();
+    String text = String::new();
+    foreach (i in 0..16)
+    {
+        if (i == 8)
+        {
+            String::push_ascii(&mut hex, b' ');
+        }
+        if (i < Vec::len(bytes))
+        {
+            u8 b = bytes[i];
+            String::appendf(&mut hex, "%02x ", b);
+            String::push_ascii(&mut text, if (b >= b' ' && b <= b'~') { b } else { b'.' });
+        }
+        else
+        {
+            String::append(&mut hex, "   ");
+        }
+    }
+    printf("%08x  %s |%s|\n", offset, &hex, &text);
+}
+
+fn main() : u8
+{
+    if (arg_count() == 0)
+    {
+        eprintf("usage: hexdump FILE [OFFSET [COUNT]]\n");
+        return 2;
+    }
+    String path = Result::unwrap_or(arg(0), String::new());
+    u64 offset = if (Some(n) = number_arg(1, 0)) { n } else { eprintf("hexdump: the offset is not a number\n"); return 2; };
+    u64 count = if (Some(n) = number_arg(2, max_value<u64>())) { n } else { eprintf("hexdump: the count is not a number\n"); return 2; };
+
+    File f = match (File::open(&path[0..$]))
+    {
+        Ok(f)         : f,
+        Err(NotFound) :
+        {
+            eprintf("hexdump: %s: no such file\n", &path);
+            return 1;
+        },
+        Err(Denied)   :
+        {
+            eprintf("hexdump: %s: permission denied\n", &path);
+            return 1;
+        },
+        Err(_)        :
+        {
+            eprintf("hexdump: %s: cannot open it\n", &path);
+            return 1;
+        },
+    };
+    u64 size = Result::unwrap_or(File::len(&f), 0);
+    if (offset > size)
+    {
+        eprintf("hexdump: offset %v is past the end (%v bytes)\n", offset, size);
+        return 1;
+    }
+    printf("%s: %v bytes, from %v\n", &path, size, offset);
+    _ = File::seek(&mut f, offset);                   // within the file: checked above
+
+    Vec<u8> line = Vec::new();
+    u64 at = offset;
+    u64 left = count;
+    while (left > 0)
+    {
+        Vec::clear(&mut line);
+        usize want = narrow<usize>(min(left, 16));
+        // A read may return fewer bytes than asked; fill the line first.
+        while (Vec::len(&line) < want)
+        {
+            usize room = want - Vec::len(&line);
+            match (File::read(&mut f, &mut line, room))
+            {
+                Ok(0)  : break,                   // the end of the file
+                Ok(_)  : {},
+                Err(_) :
+                {
+                    eprintf("hexdump: read error at %v\n", at);
+                    return 1;
+                },
+            }
+        }
+        if (Vec::len(&line) == 0)
+        {
+            break;
+        }
+        print_line(at, &line);
+        at += widen<u64>(Vec::len(&line));
+        left -= widen<u64>(Vec::len(&line));
+    }
+    0
+}

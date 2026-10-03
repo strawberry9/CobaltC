@@ -1,0 +1,41 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.rc (`Rc::clone`, `Rc::drop` update the count only); conf.rc-clone-while-value-borrowed
+// kind: positive
+// expect: ok
+//
+// A reference into the shared value (`Rc::get`) stays live while another
+// handle to the same box is cloned and dropped. `Rc::clone` and `Rc::drop`
+// used to borrow the whole box exclusively to change its count, which
+// conflicted with the reference into its value (cobc
+// `diag.aliasing-conflict`, coby `diag.destroy-while-aliased`); they
+// borrow only the count, which is disjoint from the value. Found by
+// real-world testing (a Lisp interpreter's shared cons cells).
+
+import std;
+
+struct Cons
+{
+    i64 car;
+    Option<Rc<Cons>> cdr;
+}
+
+fn main()
+{
+    Rc<Cons> tail = Rc::new(Cons { .car = 2, .cdr = None });
+    Rc<Cons> list = Rc::new(Cons { .car = 1, .cdr = Some(Rc::clone(&tail)) });
+    ref<Cons, shared> head = Rc::get(&list);
+    i64 sum = head.car;
+    match (&head.cdr)
+    {
+        Some(next) :
+        {
+            Rc<Cons> again = Rc::clone(next);       // while `head` refers into the box
+            sum += Rc::get(&again).car;
+        },                                          // `again` dropped here
+        None       : {},
+    }
+    Rc<Cons> other = Rc::clone(&list);
+    drop(other);                                    // while `head` is still live
+    assert(sum == 3 && head.car == 1);
+}

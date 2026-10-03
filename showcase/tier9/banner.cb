@@ -1,0 +1,139 @@
+// A Banner, Configured by the Environment
+//
+// Shows: a tool configured the way Unix tools are, by environment
+// variables with defaults. `env_var` answers `Ok(Some(value))`,
+// `Ok(None)` when the variable is not set, or `Err(e)` when its value is
+// not UTF-8 — three cases one `match` takes apart, so "not set" can
+// never be mistaken for "set to nothing". Each setting is checked
+// before anything is printed, and a bad one is named, with its value,
+// and refused with exit status 2. Widths are counted in characters
+// (`String::chars`), so a border of `═` lines up as one of `*` does.
+// With no TEXT, the banner shows the name of the current directory
+// (`current_dir`).
+//
+//   BANNER_WIDTH=N BANNER_CHAR=C BANNER_STYLE=box|rule coby banner.cb [TEXT]
+//
+// BANNER_WIDTH  the width in characters, 10 to 80 (default 30)
+// BANNER_CHAR   the one character the border is drawn with (default *)
+// BANNER_STYLE  `box` around the text, or a `rule` above and below (default box)
+
+import std;
+
+enum Style
+{
+    Box,
+    Rule,
+}
+
+struct Settings
+{
+    usize width;
+    String fill;            // one character, which may take several bytes
+    Style style;
+}
+
+// The variable's value, `fallback` when it is not set, or a message.
+fn setting(str name, str fallback) : Result<String, String>
+{
+    match (env_var(StringView::of(name)))
+    {
+        Ok(Some(v)) : Ok(v),
+        Ok(None)    : Ok(String::from_str(fallback)),
+        Err(e)      : Err(sprintf("%s is not UTF-8 (byte %v)", name, e.offset)),
+    }
+}
+
+fn settings() : Result<Settings, String>
+{
+    String w = setting("BANNER_WIDTH", "30")?;
+    usize width = match (String::parse<usize>(&w))
+    {
+        Ok(n)  : n,
+        Err(_) : return Err(sprintf("BANNER_WIDTH=%s is not a number", &w)),
+    };
+    if (width < 10 || width > 80)
+    {
+        return Err(sprintf("BANNER_WIDTH=%v is outside 10 to 80", width));
+    }
+    String fill = setting("BANNER_CHAR", "*")?;
+    if (Vec::len(&String::chars(&fill)) != 1)
+    {
+        return Err(sprintf("BANNER_CHAR=\"%s\" must be exactly one character", &fill));
+    }
+    String s = setting("BANNER_STYLE", "box")?;
+    Style style = if (&s[0..$] == "box") { Box } else if (&s[0..$] == "rule") { Rule } else
+    {
+        return Err(sprintf("BANNER_STYLE=%s is neither box nor rule", &s));
+    };
+    Ok(Settings { .width = width, .fill = fill, .style = style })
+}
+
+// The last part of a path, after its last `/` (or `\` on Windows).
+fn last_part(ref<String, shared> path) : String
+{
+    Vec<StringView> parts = String::split(path, "/");
+    StringView last = parts[Vec::len(&parts) - 1];
+    Vec<StringView> back = StringView::split(last, "\\");
+    String::from_view(back[Vec::len(&back) - 1])
+}
+
+fn repeat(ref<String, shared> s, usize n) : String
+{
+    String out = String::new();
+    foreach (i in 0..n)
+    {
+        String::append(&mut out, s);
+    }
+    out
+}
+
+fn main() : u8
+{
+    Settings c = match (settings())
+    {
+        Ok(c)  : c,
+        Err(m) :
+        {
+            eprintf("banner: %s\n", &m);
+            return 2;
+        },
+    };
+    String text = if (arg_count() > 0)
+    {
+        Result::unwrap_or(arg(0), String::new())
+    }
+    else
+    {
+        match (current_dir())
+        {
+            Ok(d)  : last_part(&d),
+            Err(_) : String::from_str("?"),
+        }
+    };
+    usize len = Vec::len(&String::chars(&text));
+    usize inner = c.width - 4;                     // a border and a space on each side
+    if (len > inner)
+    {
+        eprintf("banner: \"%s\" is %v characters; BANNER_WIDTH=%v leaves room for %v\n", &text, len, c.width, inner);
+        return 1;
+    }
+    usize left = (inner - len) / 2;
+    usize right = inner - len - left;
+    String line = repeat(&c.fill, c.width);
+    match (c.style)
+    {
+        Box  :
+        {
+            printf("%s\n", &line);
+            printf("%s %*s%s%*s %s\n", &c.fill, left, "", &text, right, "", &c.fill);
+            printf("%s\n", &line);
+        },
+        Rule :
+        {
+            printf("%s\n", &line);
+            printf("  %*s%s\n", left, "", &text);
+            printf("%s\n", &line);
+        },
+    }
+    0
+}

@@ -1,0 +1,160 @@
+// Pipeline
+//
+// Shows: threads passing owned values through channels. The main thread
+// sends each line of a text into a channel; three workers take lines
+// from it, summarise each, and send the summaries into a second
+// channel; a collector thread gathers those and hands them all back
+// through `join`. A `String` sent is moved in and moved out again: it
+// has one owner at every moment, so nothing is shared and nothing is
+// locked by hand. The channels are bounded, so a fast stage waits for a
+// slow one instead of piling values up; `close` tells the next stage
+// that nothing more is coming (`recv` then gives `None`), and a `send`
+// after `close` gives its value back instead of losing it. The workers
+// finish in any order, so the collector's results are sorted by line
+// before they are printed.
+
+import std;
+
+// What a worker reports about one line.
+struct Summary
+{
+    usize line;
+    u32 words;
+    String longest;
+}
+
+// A worker's own tally, returned through `join`.
+struct Tally
+{
+    u32 lines;
+    u32 words;
+}
+
+fn is_letter(u8 b) : bool
+{
+    ascii_is_alpha(b) || b == b'\''
+}
+
+// The number of words in `text` and the first of the longest.
+fn summarise(usize line, ref<String, shared> text) : Summary
+{
+    ref<Vec<u8>, shared> bytes = String::as_bytes(text);
+    usize n = Vec::len(bytes);
+    u32 words = 0;
+    usize best_at = 0;
+    usize best_len = 0;
+    usize i = 0;
+    while (i < n)
+    {
+        while (i < n && !is_letter(bytes[i]))
+        {
+            i += 1;
+        }
+        usize start = i;
+        while (i < n && is_letter(bytes[i]))
+        {
+            i += 1;
+        }
+        if (i > start)
+        {
+            words += 1;
+            if (i - start > best_len)
+            {
+                best_at = start;
+                best_len = i - start;
+            }
+        }
+    }
+    String longest = String::from_view(String::view(text, best_at, best_at + best_len));
+    Summary { .line = line, .words = words, .longest = longest }
+}
+
+// Stage 2: lines in, summaries out, until the lines channel is closed.
+fn worker(ref<Channel<Line>, shared> lines, ref<Channel<Summary>, shared> out) : Tally
+{
+    Tally t = Tally { .lines = 0, .words = 0 };
+    while (Some(l) = Channel::recv(lines))          // None: closed and empty
+    {
+        Summary s = summarise(l.number, &l.text);
+        t.lines += 1;
+        t.words += s.words;
+        if (Err(_) = Channel::send(out, s))
+        {
+            break;
+        }
+    }
+    t
+}
+
+// Stage 3: every summary, until the summaries channel is closed.
+fn collect(ref<Channel<Summary>, shared> summaries) : Vec<Summary>
+{
+    Vec<Summary> all = Vec::new();
+    while (Some(s) = Channel::recv(summaries))
+    {
+        Vec::push(&mut all, s);
+    }
+    all
+}
+
+struct Line
+{
+    usize number;
+    String text;
+}
+
+fn by_line(ref<Summary, shared> a, ref<Summary, shared> b) : bool
+{
+    a.line < b.line
+}
+
+fn main()
+{
+    array<str, 8> text = [
+        "It was the best of times, it was the worst of times,",
+        "it was the age of wisdom, it was the age of foolishness,",
+        "it was the epoch of belief, it was the epoch of incredulity,",
+        "it was the season of Light, it was the season of Darkness,",
+        "it was the spring of hope, it was the winter of despair,",
+        "we had everything before us, we had nothing before us,",
+        "we were all going direct to Heaven,",
+        "we were all going direct the other way."
+    ];
+
+    Channel<Line> lines = Channel::new(2);
+    Channel<Summary> summaries = Channel::new(2);
+    Vec<Summary> results;
+    Tally total = Tally { .lines = 0, .words = 0 };
+    {
+        auto collector = spawn(collect, &summaries);
+        {
+            auto a = spawn(worker, &lines, &summaries);
+            auto b = spawn(worker, &lines, &summaries);
+            auto c = spawn(worker, &lines, &summaries);
+            foreach (i, t in &text)
+            {
+                _ = Channel::send(&lines, Line { .number = i + 1, .text = String::from_str(*t) });
+            }
+            Channel::close(&lines);
+            match (Channel::send(&lines, Line { .number = 9, .text = String::from_str("(too late)") }))
+            {
+                Ok(_)     : printf("sent after close?\n"),
+                Err(back) : printf("the channel is closed: line %v came back: %v\n", back.number, &back.text),
+            }
+            Tally ta = join(a);
+            Tally tb = join(b);
+            Tally tc = join(c);
+            total.lines = ta.lines + tb.lines + tc.lines;
+            total.words = ta.words + tb.words + tc.words;
+        }
+        Channel::close(&summaries);
+        results = join(collector);
+    }
+
+    Vec::sort_by(&mut results, by_line);
+    foreach (s in &results)
+    {
+        printf("line %v: %v words, longest \"%v\"\n", s.line, s.words, &s.longest);
+    }
+    printf("the workers handled %v lines, %v words\n", total.lines, total.words);
+}

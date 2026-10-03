@@ -1,0 +1,264 @@
+// `std::sys` (spec/21 §2c, §2e′): the program's arguments, the file
+// system's directories, the environment, and the clocks.
+
+export extern fn arg_bytes(usize i, rawptr<u8> buf, usize len) : isize;
+
+export fn arg_count() : usize
+{
+    usize i = 0;
+    while (true)
+    {
+        isize n = unsafe
+        {
+            arg_bytes(i, dangling<u8>(), 0)
+        };
+        if (n < 0)
+        {
+            break;
+        }
+        i = i + 1;
+    }
+    i
+}
+
+export fn arg(usize i) : Result<String, Utf8Error>
+{
+    isize n = unsafe
+    {
+        arg_bytes(i, dangling<u8>(), 0)
+    };
+    if (n < 0)
+    {
+        fault(index_out_of_bounds);
+    }
+    usize len = reinterpret<usize>(n);
+    rawptr<u8> p = match (allocate(len, 1))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    Vec<u8> bytes = Vec::new();
+    unsafe
+    {
+        arg_bytes(i, p, len);
+    }
+    usize j = 0;
+    while (j < len)
+    {
+        u8 b = unsafe
+        {
+            *(p + reinterpret<isize>(j))
+        };
+        Vec::push(&mut bytes, b);
+        j = j + 1;
+    }
+    if (len > 0)
+    {
+        unsafe
+        {
+            deallocate(p, len, 1);
+        }
+    }
+    String::from_utf8(bytes)
+}
+
+// What a path names (`rule.stdlib.fs`, D-0061): a file and its length in
+// bytes, a directory, or something else (a device, a socket, …).
+export enum PathKind
+{
+    File(u64),
+    Dir,
+    Other,
+}
+
+fn fs_path_op(usize op, StringView a, StringView b) : isize
+{
+    unsafe
+    {
+        fs_op(op, StringView::ptr(a), StringView::len(a), StringView::ptr(b), StringView::len(b))
+    }
+}
+
+// The bytes of `fs_query`'s answer, or its failure code.
+fn fs_answer(usize op, rawptr<u8> a, usize an) : Result<Vec<u8>, isize>
+{
+    Vec<u8> out = Vec::new();
+    usize cap = 256;
+    while (true)
+    {
+        while (out.cap < cap)
+        {
+            Vec::grow(&mut out);
+        }
+        isize n = unsafe
+        {
+            fs_query(op, a, an, reinterpret_ptr<u8>(out.ptr), cap)
+        };
+        if (n < 0)
+        {
+            return Err(n);
+        }
+        usize len = reinterpret<usize>(n);
+        if (len <= cap)
+        {
+            out.len = len;
+            return Ok(out);
+        }
+        cap = len;
+    }
+    Err(-3)
+}
+
+// Makes a directory: Ok(true) when it was made, Ok(false) when a
+// directory was already there (so it is safe to call again).
+export fn make_dir(StringView path) : Result<bool, FileError>
+{
+    isize r = fs_path_op(0, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(r == 1)
+}
+
+export fn remove_file(StringView path) : Result<void, FileError>
+{
+    isize r = fs_path_op(1, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Removes an empty directory.
+export fn remove_dir(StringView path) : Result<void, FileError>
+{
+    isize r = fs_path_op(2, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Renames (moves) `from` to `to`, replacing a file at `to`.
+export fn rename(StringView from, StringView to) : Result<void, FileError>
+{
+    isize r = fs_path_op(3, from, to);
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// The names in a directory (not `.` or `..`), sorted by their bytes.
+export fn list_dir(StringView path) : Result<Vec<String>, FileError>
+{
+    Vec<u8> all = match (fs_answer(0, StringView::ptr(path), StringView::len(path)))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(file_error(c)),
+    };
+    Vec<String> names = Vec::new();
+    Vec<u8> name = Vec::new();
+    foreach (b in &all)
+    {
+        match (*b)
+        {
+            0 :
+            {
+                Vec<u8> done = replace(&mut name, Vec::new());
+                match (String::from_utf8(done))
+                {
+                    Ok(n)  : Vec::push(&mut names, n),
+                    Err(e) : return Err(FileError::Utf8(e)),
+                }
+            },
+            c : Vec::push(&mut name, c),
+        }
+    }
+    Ok(names)
+}
+
+// What `path` names; `Err(NotFound)` when nothing does.
+export fn path_kind(StringView path) : Result<PathKind, FileError>
+{
+    Vec<u8> b = match (fs_answer(1, StringView::ptr(path), StringView::len(path)))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(file_error(c)),
+    };
+    u64 len = 0;
+    usize i = 8;
+    while (i > 0)
+    {
+        len = (len << 8) | widen<u64>(b[i]);
+        i -= 1;
+    }
+    match (b[0])
+    {
+        0 : Ok(File(len)),
+        1 : Ok(Dir),
+        _ : Ok(Other),
+    }
+}
+
+// An environment variable's value; None when it is not set.
+export fn env_var(StringView name) : Result<Option<String>, Utf8Error>
+{
+    match (fs_answer(2, StringView::ptr(name), StringView::len(name)))
+    {
+        Ok(b) : match (String::from_utf8(b))
+        {
+            Ok(v)  : Ok(Some(v)),
+            Err(e) : Err(e),
+        },
+        Err(_) : Ok(None),
+    }
+}
+
+// The working directory, against which a relative path is resolved.
+export fn current_dir() : Result<String, FileError>
+{
+    Vec<u8> b = match (fs_answer(3, dangling<u8>(), 0))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(file_error(c)),
+    };
+    match (String::from_utf8(b))
+    {
+        Ok(s)  : Ok(s),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// A monotonic clock, in nanoseconds from an arbitrary start: for measuring
+// how long something takes; it never goes backwards.
+export fn monotonic_ns() : u64
+{
+    reinterpret<u64>(unsafe
+    {
+        clock_read(0)
+    })
+}
+
+// The wall clock: whole seconds since 1970-01-01 00:00 UTC.
+export fn unix_seconds() : i64
+{
+    unsafe
+    {
+        clock_read(1)
+    }
+}
+
+// D-0124: the calling thread does nothing for at least `ms` milliseconds;
+// other threads run meanwhile.
+export fn sleep_ms(u64 ms)
+{
+    i64 ignored = unsafe
+    {
+        sleep_ns(wrapping_mul(ms, 1000000))
+    };
+}

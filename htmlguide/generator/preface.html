@@ -1,0 +1,144 @@
+<!--
+  The guide's preface, placed at the top of <main> by gen.py before the
+  generated sections. Edit it here; index.html is regenerated from it.
+  The poster it shows is the repository's images/ copy. It is styled
+  with the guide's own components (figure.code, .callout, .blurb) so it
+  reads as part of the same book; the code samples are highlighted by
+  hand with the generator's span classes.
+-->
+<section id="preface">
+
+<div style="text-align: center; margin: 6px 0 26px;">
+  <img src="../images/CobaltC_Cyber_Guardian_Poster_small.png" alt="CobaltC"
+       style="max-width: min(520px, 100%);">
+</div>
+
+<h2>Preface</h2>
+
+<p class="blurb">Within the narrative and theoretical scope of <a href="index.html">the book</a>, this appendix serves primarily to demonstrate how a memory-safe, C-successor language ought to define its semantic boundaries, rather than to provide a drop-in replacement for a rigorous ISO-level standard.</p>
+
+<p>In this context, CobaltC can best be described as a systems language designed to address the safety problems of C while adopting a more robust structural model.</p>
+<p>If nothing else, it illustrates the exact pain points and formal guarantees required to make a safe systems programming language actually function.</p>
+
+<p>
+As argued throughout <em>The Wrong Memory</em> essays, attempting to tack a "safe subset"
+onto an inherently unsafe language usually fails because the core language semantics still
+allow invariant violations. By embedding ownership and borrowing into the core type system,
+CobaltC makes safety an intrinsic property of the language rather than an optional discipline
+imposed upon it.
+</p>
+
+<p>
+CobaltC unashamedly draws on the ownership and memory-safety techniques demonstrated by Rust.
+Although Rust isn't the origin of most of these ideas, its significant contribution was
+demonstrating how they could be combined into a practical, high-performance systems language.
+CobaltC adopts that safety architecture without attempting to reproduce Rust's syntax or
+overall language philosophy. Instead, it applies the broader body of ideas to the problem
+identified in Appendix II: making semantic invariants such as ownership, lifetime, aliasing,
+mutability, and bounds properties that the compiler can represent and enforce, rather than
+obligations the programmer must maintain by convention.
+</p>
+
+<h3>The CobaltC Proposition</h3>
+
+<p>
+The distinction is perhaps easiest to see in a deliberately small example.
+Allocate some storage, keep a second name for it, destroy the storage,
+and use the second name.
+</p>
+
+<figure class="code">
+<div class="code-head"><span class="code-title">C</span></div>
+<pre><code><span class="c">#include &lt;stdlib.h&gt;</span>
+
+<span class="t">int</span> <span class="p">main</span>(<span class="k">void</span>)
+{
+    <span class="t">int</span>* data = <span class="p">malloc</span>(<span class="n">3</span> * <span class="k">sizeof</span> *data);
+    data[<span class="n">0</span>] = <span class="n">7</span>;
+
+    <span class="t">int</span>* alias = data;    <span class="c">/* a second name for the same storage */</span>
+    <span class="p">free</span>(data);           <span class="c">/* the storage is gone... */</span>
+
+    <span class="k">return</span> alias[<span class="n">0</span>];      <span class="c">/* ...but this still compiles, and reads
+                             the wrong memory */</span>
+}</code></pre>
+</figure>
+
+<p>
+C accepts this program without complaint — GCC and Clang compile it
+silently even with every common warning enabled. At best, a modern
+compiler may warn about a case this obvious; move the <code>free</code>
+behind one function call and the warning disappears, while the bug does
+not. The program compiles, runs, and reads <em>the wrong memory</em>.
+The fact that <code>alias</code> still refers to freed storage exists
+only in the programmer's head.
+</p>
+
+<div class="callout warn"><div class="callout-title">C</div>
+<p><strong>"You have the power. Don't screw it up."</strong></p>
+</div>
+
+<figure class="code">
+<div class="code-head"><span class="code-title">CobaltC</span></div>
+<pre><code><span class="k">import</span> std;
+
+<span class="k">fn</span> main()
+{
+    <span class="p">Vec</span>&lt;<span class="t">i32</span>&gt; data = <span class="p">Vec</span>::new();
+    <span class="p">Vec</span>::push(&amp;<span class="k">mut</span> data, <span class="n">7</span>);
+
+    <span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">shared</span>&gt; alias = &amp;data[<span class="n">0</span>];   <span class="c">// a second name for the same storage</span>
+    <span class="p">drop</span>(data);                          <span class="c">// <span class="bad">&#10007;</span> rejected before the program runs:</span>
+                                         <span class="c">//   <span class="dg">diag.destroy-while-aliased</span></span>
+    <span class="p">printf</span>(<span class="s">"%v\n"</span>, *alias);
+}</code></pre>
+</figure>
+
+<p>
+The same program, the same shape — allocate, alias, destroy, use — and
+it does not run. The fact that <code>alias</code> still points into
+<code>data</code> lives in the language, so destroying <code>data</code>
+underneath it is refused before the program starts, with a named
+diagnostic: heuristic warnings on one side, a semantic guarantee on the
+other.
+</p>
+
+<div class="callout tip"><div class="callout-title">CobaltC</div>
+<p><strong>"You have the power. Let&rsquo;s prove you&rsquo;re exercising it correctly."</strong></p>
+</div>
+
+<p>
+The guarantee is not bought by removing capability. Below, two exclusive
+(mutable) references into the same array are held at once — something
+safety-minded languages commonly refuse — legal here because the
+compiler has proven they touch disjoint elements. CobaltC forbids the
+crime, not the capability.
+</p>
+
+<figure class="code">
+<div class="code-head"><span class="code-title">CobaltC</span></div>
+<pre><code><span class="k">import</span> std;
+<span class="k">fn</span> main()
+{
+    <span class="t">array</span>&lt;<span class="t">i32</span>, <span class="n">2</span>&gt; values = [<span class="n">0</span>, <span class="n">0</span>];
+
+    <span class="c">// Two mutable (exclusive) references into the same array, allowed</span>
+    <span class="c">// because their targets are statically proven to be disjoint</span>
+    <span class="c">// (pointing both at values[0] is rejected before the program runs:</span>
+    <span class="c">// <span class="dg">diag.aliasing-conflict</span>).</span>
+    <span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">exclusive</span>&gt; a = &amp;<span class="k">mut</span> values[<span class="n">0</span>];
+    <span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">exclusive</span>&gt; b = &amp;<span class="k">mut</span> values[<span class="n">1</span>];
+
+    *a = <span class="n">7</span>;
+    *b = <span class="n">8</span>;
+}</code></pre>
+</figure>
+
+<p>
+CobaltC retains the same fine-grained control, while allowing the compiler
+to establish the relevant safety properties: <code>a</code> and <code>b</code>
+refer to distinct elements of <code>values</code>, their mutable accesses
+are disjoint, and the underlying storage remains owned by <code>values</code>.
+</p>
+
+</section>

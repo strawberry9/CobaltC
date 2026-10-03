@@ -1,0 +1,55 @@
+// CONFORMANCE-CASE
+// spec: 08-alias-validity
+// facility: rule.alias.* (a reference's occurrences): a place that held `Some(&x)` and now holds `None` holds no reference
+// kind: positive
+// expect: ok
+//
+// A value whose reference is overwritten by one without it (`o = None`,
+// a struct assigned anew, `replace(&mut slot, None)` taking a value out of
+// a `Vec` slot or a channel's ring) no longer holds the reference, so
+// the referent may be destroyed. cobc's runtime kept the old reference
+// slot counted, and `drop(x)` (or the end of the scope, for a channel a
+// request had referred to) faulted `diag.destroy-while-aliased`. Found by
+// real-world testing (a server answering through reply channels named in
+// its requests).
+
+import std;
+
+struct Holder
+{
+    Option<ref<String, shared>> o;
+    u32 n;
+}
+
+struct Req
+{
+    u32 v;
+    ref<String, shared> reply;
+}
+
+fn main()
+{
+    Option<ref<String, shared>> o = None;
+    Holder h = Holder { .o = None, .n = 0 };
+    Vec<Option<Req>> slots = Vec::new();
+    Vec::push(&mut slots, None);
+    Channel<Req> ch = Channel::new(1);
+    String x = String::from_str("x");
+    o = Some(&x);
+    h.o = Some(&x);
+    slots[0] = Some(Req { .v = 1, .reply = &x });
+    Result::unwrap(Channel::send(&ch, Req { .v = 2, .reply = &x }));
+    o = None;
+    h = Holder { .o = None, .n = 1 };
+    Option<Req> none = None;
+    Req a = Option::unwrap(replace(&mut slots[0], none));
+    Req b = Option::unwrap(Channel::recv(&ch));
+    assert(a.v + b.v == 3 && h.n == 1 && Option::is_none(&o));
+    {
+        String y = String::from_str("y");       // declared after `slots` and `ch`:
+        slots[0] = Some(Req { .v = 3, .reply = &y });
+        Option<Req> gone = replace(&mut slots[0], None);
+        Result::unwrap(Channel::send(&ch, Req { .v = 4, .reply = &y }));
+        Req c = Option::unwrap(Channel::recv(&ch));
+    }                                           // y ends before them, with nothing left referring to it
+}

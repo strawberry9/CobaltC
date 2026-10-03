@@ -1,0 +1,156 @@
+// Saving a File Safely
+//
+// Shows: the directory operations a program needs to never leave a
+// half-written file behind. A save writes the new contents beside the
+// old file, as `NAME.tmp`, and only then `rename`s it over the old one:
+// a rename replaces a file whole, so a reader sees the old contents or
+// the new, never part of each. A save interrupted before the rename
+// leaves the old file as it was, and the stray `.tmp` is found with
+// `list_dir` and removed with `remove_file` the next time the program
+// starts. `make_dir` says whether it made the directory (`Ok(true)`) or
+// found one there (`Ok(false)`); `remove_dir` refuses a directory that
+// is not empty; each failure is a `FileError` the program names.
+//
+//   coby safe_save.cb DIR
+//
+// Works in DIR/notes, made if it is missing.
+
+import std;
+
+// Replaces the file at `path` with `text`: written to `path.tmp`, then
+// renamed over it. With `interrupted`, it stops before the rename, as a
+// crash or a full disk would stop it.
+fn save(ref<String, shared> path, StringView text, bool interrupted) : Result<void, FileError>
+{
+    String tmp = sprintf("%s.tmp", path);
+    write_file(&tmp[0..$], text)?;
+    if (interrupted)
+    {
+        return Ok(());
+    }
+    rename(&tmp[0..$], &path[0..$])
+}
+
+// Removes every `.tmp` an interrupted save left in `dir`; how many.
+fn recover(ref<String, shared> dir) : Result<usize, FileError>
+{
+    usize n = 0;
+    foreach (name in list_dir(&dir[0..$])?)
+    {
+        if (String::ends_with(&name, ".tmp"))
+        {
+            String p = sprintf("%s/%s", dir, &name);
+            remove_file(&p[0..$])?;
+            printf("  recovered: removed %s\n", &name);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn show(ref<String, shared> dir)
+{
+    printf("  notes/ holds:");
+    foreach (name in Result::unwrap_or(list_dir(&dir[0..$]), Vec::new()))
+    {
+        printf(" %s", &name);
+    }
+    printf("\n");
+}
+
+// Prints the file's lines, each under `label`'s line, indented.
+fn show_file(str label, ref<String, shared> path)
+{
+    printf("%s\n", label);
+    match (read_file(&path[0..$]))
+    {
+        Ok(t)  :
+        {
+            foreach (line in String::split(&t, "\n"))
+            {
+                if (StringView::len(line) > 0)
+                {
+                    printf("    | %s\n", line);
+                }
+            }
+        },
+        Err(e) : printf("    (%s)\n", FileError::text(&e)),
+    }
+}
+
+fn run(ref<String, shared> base) : Result<void, FileError>
+{
+    String dir = sprintf("%s/notes", base);
+    String file = sprintf("%s/today.txt", &dir);
+
+    match (make_dir(&dir[0..$]))
+    {
+        Ok(made)      : printf("make_dir notes: %v\n", made),
+        Err(NotFound) :
+        {
+            eprintf("safe_save: DIR does not exist, so notes cannot be made in it\n");
+            return Err(NotFound);
+        },
+        Err(e)        : return Err(e),
+    }
+    printf("make_dir notes again: %v\n", make_dir(&dir[0..$])?);
+    printf("recover: %v stray files\n", recover(&dir)?);
+
+    save(&file, "ferry at six\n", false)?;
+    show_file("saved version 1:", &file);
+    save(&file, "ferry at six\ngulls at seven\n", false)?;
+    show_file("saved version 2:", &file);
+    show(&dir);
+
+    printf("a save is interrupted before its rename:\n");
+    save(&file, "ferry at six\ngulls at sev", true)?;
+    show(&dir);
+    show_file("  today.txt still reads:", &file);
+
+    printf("the program starts again:\n");
+    printf("recover: %v stray files\n", recover(&dir)?);
+    show(&dir);
+
+    printf("make_dir where a file is: ");
+    match (make_dir(&file[0..$]))
+    {
+        Ok(b)  : printf("%v\n", b),
+        Err(e) : printf("Err(%s)\n", FileError::text(&e)),
+    }
+    printf("remove_dir notes while it holds a file: ");
+    match (remove_dir(&dir[0..$]))
+    {
+        Ok(_)  : printf("removed\n"),
+        Err(e) : printf("Err(%s)\n", FileError::text(&e)),
+    }
+    remove_file(&file[0..$])?;
+    remove_dir(&dir[0..$])?;
+    printf("after removing today.txt and notes: ");
+    match (path_kind(&dir[0..$]))
+    {
+        Err(NotFound) : printf("notes is gone\n"),
+        Ok(_)         : printf("notes is still there\n"),
+        Err(e)        : printf("Err(%s)\n", FileError::text(&e)),
+    }
+    Ok(())
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: safe_save DIR\n");
+        return 2;
+    }
+    String base = Result::unwrap_or(arg(0), String::new());
+    match (run(&base))
+    {
+        Ok(_)         : 0,
+        Err(NotFound) : 1,                  // reported already
+        Err(e)        :
+        {
+            eprintf("safe_save: %s\n", FileError::text(&e));
+            1
+        },
+    }
+}

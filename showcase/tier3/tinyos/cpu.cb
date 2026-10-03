@@ -1,0 +1,388 @@
+// cpu.cb -- the instruction set, the CPU that runs it, and an assembler.
+//
+// Instructions are bytes in a process's own memory, fetched through its
+// page table like every other access. Registers are u32 and arithmetic
+// wraps, as hardware does, so it says `wrapping_add`. The op codes are
+// those of `enum Op : u8`, and wider operands are little-endian
+// (`read_le`, `Vec::push_le`).
+//
+//   op  bytes  instruction
+//    1   6     li   rd, imm32         rd = imm
+//    2   4     add  rd, ra, rb        rd = ra + rb
+//    3   4     sub  rd, ra, rb        rd = ra - rb
+//    4   3     addi rd, imm8          rd = rd + imm
+//    5   3     lb   rd, ra            rd = mem[ra]
+//    6   3     sb   ra, rb            mem[ra] = rb (low byte)
+//    7   3     jmp  addr16
+//    8   4     jz   ra, addr16        jump if ra == 0
+//    9   4     jnz  ra, addr16        jump if ra != 0
+//   10   2     sys  n                 system call n: arguments r1..r3, result r0
+//   11   2     push ra                sp = sp - 4; mem32[sp] = ra
+//   12   2     pop  rd                rd = mem32[sp]; sp = sp + 4
+//   13   3     mov  rd, ra
+//   14   4     slt  rd, ra, rb        rd = 1 if ra < rb, else 0
+//   15   3     call addr16            push the return address, jump
+//   16   1     ret                    pop the return address, jump
+
+import std;
+
+// The operations, and their codes: `Op::code(Add)` is 2, and
+// `Op::from_code(b)` decodes a fetched byte (`None` for no operation).
+export enum Op : u8
+{
+    Li = 1,
+    Add,
+    Sub,
+    Addi,
+    Lb,
+    Sb,
+    Jmp,
+    Jz,
+    Jnz,
+    Sys,
+    Push,
+    Pop,
+    Mov,
+    Slt,
+    Call,
+    Ret,
+}
+
+// Why the CPU stopped: a system call, or a fault the kernel must handle.
+export enum Trap
+{
+    Sys(u8),
+    PageFault(u32),
+    Illegal(u8),
+}
+
+fn length(Op op) : u32
+{
+    array<u32, 17> lengths = [0, 6, 4, 4, 3, 3, 3, 3, 4, 4, 2, 2, 2, 3, 4, 3, 1];
+    lengths[widen<usize>(Op::code(op))]
+}
+
+fn reg(u8 b) : usize
+{
+    widen<usize>(b & 7)                               // a 3-bit register field
+}
+
+fn push32(ref<machine::Cpu, exclusive> c, ref<memory::AddressSpace, shared> s, ref<machine::Ram, exclusive> ram, u32 v) : bool
+{
+    c.sp = wrapping_sub(c.sp, 4);
+    foreach (i in 0..4: u32)
+    {
+        if (!memory::AddressSpace::store(s, ram, c.sp + i, narrow_wrapping<u8>(v >> (8 * i))))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn pop32(ref<machine::Cpu, exclusive> c, ref<memory::AddressSpace, shared> s, ref<machine::Ram, shared> ram, ref<bool, exclusive> ok) : u32
+{
+    u32 v = 0;
+    foreach (i in 0..4: u32)
+    {
+        if (Some(b) = memory::AddressSpace::load(s, ram, c.sp + i))
+        {
+            v |= widen<u32>(b) << (8 * i);
+        }
+        else
+        {
+            *ok = false;
+        }
+    }
+    c.sp += 4;
+    v
+}
+
+// Runs one instruction. None: carry on; Some(trap): the kernel's turn.
+export fn step(ref<machine::Cpu, exclusive> c, ref<memory::AddressSpace, shared> s, ref<machine::Ram, exclusive> ram) : Option<Trap>
+{
+    u32 pc = c.pc;
+    array<u8, 6> b = [0, 0, 0, 0, 0, 0];
+    if (Some(x) = memory::AddressSpace::load(s, &*ram, pc))
+    {
+        b[0] = x;
+    }
+    else
+    {
+        return Some(PageFault(pc));
+    }
+    Op op = if (Some(o) = Op::from_code(b[0])) { o } else { return Some(Illegal(b[0])); };
+    u32 len = length(op);
+    foreach (k in 1..len)
+    {
+        if (Some(x) = memory::AddressSpace::load(s, &*ram, pc + k))
+        {
+            b[narrow<usize>(k)] = x;
+        }
+        else
+        {
+            return Some(PageFault(pc + k));
+        }
+    }
+    c.pc = pc + len;
+    // Operands little-endian, as the assembler writes them.
+    u32 addr16 = widen<u32>(read_le<u16>(&b[1 .. 3], 0));
+    u32 branch = widen<u32>(read_le<u16>(&b[2 .. 4], 0));
+    match (op)
+    {
+        Li      : c.r[reg(b[1])] = read_le<u32>(&b[2 .. 6], 0),
+        Add     : c.r[reg(b[1])] = wrapping_add(c.r[reg(b[2])], c.r[reg(b[3])]),
+        Sub     : c.r[reg(b[1])] = wrapping_sub(c.r[reg(b[2])], c.r[reg(b[3])]),
+        Addi    : c.r[reg(b[1])] = wrapping_add(c.r[reg(b[1])], widen<u32>(b[2])),
+        Lb      :
+        {
+            u32 va = c.r[reg(b[2])];
+            if (Some(x) = memory::AddressSpace::load(s, &*ram, va))
+            {
+                c.r[reg(b[1])] = widen<u32>(x);
+            }
+            else
+            {
+                return Some(PageFault(va));
+            }
+        },
+        Sb      :
+        {
+            u32 va = c.r[reg(b[1])];
+            if (!memory::AddressSpace::store(s, ram, va, narrow_wrapping<u8>(c.r[reg(b[2])])))
+            {
+                return Some(PageFault(va));
+            }
+        },
+        Jmp     : c.pc = addr16,
+        Jz      :
+        {
+            if (c.r[reg(b[1])] == 0)
+            {
+                c.pc = branch;
+            }
+        },
+        Jnz     :
+        {
+            if (c.r[reg(b[1])] != 0)
+            {
+                c.pc = branch;
+            }
+        },
+        Op::Sys : return Some(Trap::Sys(b[1])),
+        Push    :
+        {
+            u32 v = c.r[reg(b[1])];
+            if (!push32(c, s, ram, v))
+            {
+                return Some(PageFault(c.sp));
+            }
+        },
+        Pop     :
+        {
+            bool ok = true;
+            u32 v = pop32(c, s, &*ram, &mut ok);
+            if (!ok)
+            {
+                return Some(PageFault(c.sp - 4));
+            }
+            c.r[reg(b[1])] = v;
+        },
+        Mov     : c.r[reg(b[1])] = c.r[reg(b[2])],
+        Slt     : c.r[reg(b[1])] = if (c.r[reg(b[2])] < c.r[reg(b[3])]) { 1 } else { 0 },
+        Call    :
+        {
+            u32 ret = c.pc;
+            if (!push32(c, s, ram, ret))
+            {
+                return Some(PageFault(c.sp));
+            }
+            c.pc = addr16;
+        },
+        Ret     :
+        {
+            bool ok = true;
+            u32 v = pop32(c, s, &*ram, &mut ok);
+            if (!ok)
+            {
+                return Some(PageFault(c.sp - 4));
+            }
+            c.pc = v;
+        },
+    }
+    None
+}
+
+// ---- an assembler: code at virtual address 0, data at 0x800 ----
+
+export fn data_base() : u32
+{
+    0x800
+}
+
+export struct Asm
+{
+    export Vec<u8> code;
+    export Vec<u8> data;
+    export u32 entry;                                 // where execution starts
+}
+
+export fn Asm::new() : Asm
+{
+    Asm { .code = Vec::new(), .data = Vec::new(), .entry = 0 }
+}
+
+// Execution starts at the next instruction.
+export fn Asm::start_here(ref<Asm, exclusive> a)
+{
+    a.entry = Asm::here(&*a);
+}
+
+// The address the next instruction will have.
+export fn Asm::here(ref<Asm, shared> a) : u32
+{
+    narrow<u32>(Vec::len(&a.code))
+}
+
+// An operation's code.
+fn emit(ref<Asm, exclusive> a, Op op)
+{
+    Vec::push(&mut a.code, Op::code(op));
+}
+
+// An operand byte: a register or a small immediate.
+fn operand(ref<Asm, exclusive> a, u32 x)
+{
+    Vec::push(&mut a.code, narrow<u8>(x));            // checked: every field fits a byte
+}
+
+fn operands(ref<Asm, exclusive> a, slice<u32, shared> xs)
+{
+    foreach (x in xs)
+    {
+        operand(a, *x);
+    }
+}
+
+fn emit16(ref<Asm, exclusive> a, u32 x)
+{
+    Vec::push_le(&mut a.code, narrow<u16>(x));        // checked: an address fits 16 bits
+}
+
+// Places a string in the data area; returns its virtual address.
+export fn Asm::string(ref<Asm, exclusive> a, str s) : u32
+{
+    u32 at = data_base() + narrow<u32>(Vec::len(&a.data));
+    Vec::append(&mut a.data, String::into_bytes(String::from_str(s)));
+    at
+}
+
+export fn Asm::li(ref<Asm, exclusive> a, u32 rd, u32 imm)
+{
+    emit(a, Li);
+    operand(a, rd);
+    Vec::push_le(&mut a.code, imm);
+}
+
+export fn Asm::add(ref<Asm, exclusive> a, u32 rd, u32 ra, u32 rb)
+{
+    emit(a, Add);
+    operands(a, &[rd, ra, rb][0 .. $]);
+}
+
+export fn Asm::sub(ref<Asm, exclusive> a, u32 rd, u32 ra, u32 rb)
+{
+    emit(a, Sub);
+    operands(a, &[rd, ra, rb][0 .. $]);
+}
+
+export fn Asm::addi(ref<Asm, exclusive> a, u32 rd, u32 imm)
+{
+    emit(a, Addi);
+    operands(a, &[rd, imm][0 .. $]);
+}
+
+export fn Asm::lb(ref<Asm, exclusive> a, u32 rd, u32 ra)
+{
+    emit(a, Lb);
+    operands(a, &[rd, ra][0 .. $]);
+}
+
+export fn Asm::sb(ref<Asm, exclusive> a, u32 ra, u32 rb)
+{
+    emit(a, Sb);
+    operands(a, &[ra, rb][0 .. $]);
+}
+
+export fn Asm::jmp(ref<Asm, exclusive> a, u32 target)
+{
+    emit(a, Jmp);
+    emit16(a, target);
+}
+
+// A conditional jump whose target is not known yet: returns where to patch.
+export fn Asm::jz(ref<Asm, exclusive> a, u32 ra) : u32
+{
+    emit(a, Jz);
+    operand(a, ra);
+    u32 at = Asm::here(&*a);
+    emit16(a, 0);
+    at
+}
+
+export fn Asm::jnz_to(ref<Asm, exclusive> a, u32 ra, u32 target)
+{
+    emit(a, Jnz);
+    operand(a, ra);
+    emit16(a, target);
+}
+
+// Points the jump at `at` to the current address.
+export fn Asm::land(ref<Asm, exclusive> a, u32 at)
+{
+    u32 target = Asm::here(&*a);
+    usize i = narrow<usize>(at);
+    a.code[i] = narrow<u8>(target & 0xFF);
+    a.code[i + 1] = narrow<u8>(target >> 8);
+}
+
+export fn Asm::sys(ref<Asm, exclusive> a, u32 n)
+{
+    emit(a, Op::Sys);
+    operand(a, n);
+}
+
+export fn Asm::push(ref<Asm, exclusive> a, u32 ra)
+{
+    emit(a, Push);
+    operand(a, ra);
+}
+
+export fn Asm::pop(ref<Asm, exclusive> a, u32 rd)
+{
+    emit(a, Pop);
+    operand(a, rd);
+}
+
+export fn Asm::mov(ref<Asm, exclusive> a, u32 rd, u32 ra)
+{
+    emit(a, Mov);
+    operands(a, &[rd, ra][0 .. $]);
+}
+
+export fn Asm::slt(ref<Asm, exclusive> a, u32 rd, u32 ra, u32 rb)
+{
+    emit(a, Slt);
+    operands(a, &[rd, ra, rb][0 .. $]);
+}
+
+export fn Asm::call(ref<Asm, exclusive> a, u32 target)
+{
+    emit(a, Call);
+    emit16(a, target);
+}
+
+export fn Asm::ret(ref<Asm, exclusive> a)
+{
+    emit(a, Ret);
+}
