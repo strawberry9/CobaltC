@@ -1,0 +1,338 @@
+// The standard library, `std` (spec/21, D-0024): this file is the body
+// of the root module `std`, and each `export module` below names the file
+// that holds one submodule's items (D-0136). `export import` passes every
+// exported item of each submodule on as `std`'s own, so `import std;`
+// brings in the whole library, and `std::Vec` and `std::collections::Vec`
+// are one type.
+//
+// The primitives here are private to `std`, so every submodule can call
+// them and no program can (`rule.module.visibility`).
+
+// Standard error (`rule.stdlib.format` `[Eprintf]`, D-0040): `stdout_write`'s
+// counterpart, private to `std`; `eprintf` writes through `eprint_str`.
+unsafe extern fn stderr_write(rawptr<u8> buf, usize len) : isize;
+
+// Standard output's buffer written out (D-0178); `flush_stdout` is the
+// safe function over it.
+unsafe extern fn stdout_flush() : isize;
+
+// Standard input's next bytes up to and including the next `\n`, at most
+// `len` of them; 0 at its end, -1 on an error. `read_line` reads through it
+// a line at a time instead of a byte at a time.
+unsafe extern fn stdin_read_line(rawptr<u8> buf, usize len) : isize;
+
+// Files (`rule.stdlib.file`, spec/21 §2e, CHG-0043): `read_file` and
+// `write_file` are realized over these two, private to `std`. The path
+// is the bytes of a `String`. `file_read` copies up to `cap` bytes of
+// the file into `buf` and returns its whole length; `file_write`
+// replaces the file's contents with `len` bytes and returns 0. Both
+// return -1 when the file does not exist, -2 when access is denied, -3
+// for any other failure (src/fileio.rs).
+unsafe extern fn file_read(rawptr<u8> path, usize path_len, rawptr<u8> buf, usize cap) : isize;
+
+unsafe extern fn file_write(rawptr<u8> path, usize path_len, rawptr<u8> buf, usize len) : isize;
+
+// `File` (`rule.stdlib.file-handle`, spec/21 §2e, D-0054) is written over
+// these two, private to `std`: `op` names the operation, `h` the open file
+// (or the mode, for opening), `buf`/`n` its bytes or its count; `file_at`
+// takes or gives a position. Each returns a handle, a count, a length or
+// 0, or a failure code as `file_read`'s (src/fileio.rs).
+unsafe extern fn file_op(usize op, usize h, rawptr<u8> buf, usize n) : isize;
+
+// The filesystem, the environment and the clocks (`rule.stdlib.fs`,
+// `rule.stdlib.env`, D-0061), over three primitives private to `std`
+// (src/fileio.rs): `fs_op` acts on one or two paths; `fs_query` copies up
+// to `cap` bytes of an answer into `buf` and returns its whole length
+// (asked again with room for all of it when longer); `clock_read` reads a
+// clock (0 monotonic nanoseconds, 1 wall-clock seconds, 2 wall-clock
+// milliseconds, D-0140). Failures are `file_read`'s codes.
+unsafe extern fn fs_op(usize op, rawptr<u8> a, usize an, rawptr<u8> b, usize bn) : isize;
+
+unsafe extern fn fs_query(usize op, rawptr<u8> a, usize an, rawptr<u8> buf, usize cap) : isize;
+
+unsafe extern fn clock_read(usize which) : i64;
+
+// D-0147: the seconds the machine's local time is ahead of UTC at the
+// moment `unix` (src/fileio.rs, the platform's zone rule).
+unsafe extern fn tz_offset(i64 unix) : i64;
+
+unsafe extern fn sleep_ns(u64 ns) : i64;              // D-0124: the thread sleeps at least `ns`
+
+unsafe extern fn file_at(usize op, usize h, u64 pos) : i64;
+
+// Paths and file metadata (`rule.stdlib.fs`, D-0141), child processes
+// (`rule.stdlib.process`, D-0143) and sockets (`rule.stdlib.net`, D-0144),
+// over three primitives of one shape, private to `std` (src/fileio.rs,
+// src/procio.rs, src/netio.rs): `op` names the operation and `h` the
+// handle it acts on; `a`/`an` and `b`/`bn` are its byte strings in; up to
+// `cap` bytes of its answer are copied to `out`. Each returns a number (a
+// handle, a count, the answer's whole length, asked again with room for
+// all of it when longer) or a failure code.
+unsafe extern fn path_op(
+    usize op,
+    usize h,
+    rawptr<u8> a,
+    usize an,
+    rawptr<u8> b,
+    usize bn,
+    rawptr<u8> out,
+    usize cap,
+) : i64;
+
+unsafe extern fn proc_op(
+    usize op,
+    usize h,
+    rawptr<u8> a,
+    usize an,
+    rawptr<u8> b,
+    usize bn,
+    rawptr<u8> out,
+    usize cap,
+) : i64;
+
+unsafe extern fn net_op(
+    usize op,
+    usize h,
+    rawptr<u8> a,
+    usize an,
+    rawptr<u8> b,
+    usize bn,
+    rawptr<u8> out,
+    usize cap,
+) : i64;
+
+// D-0142: `n` bytes from the operating system's secure source at `buf`;
+// 0, or -1 when it has none (src/osrand.rs).
+unsafe extern fn os_random(rawptr<u8> buf, usize n) : isize;
+
+// Channels (`rule.conc.channel`, spec/19 §3, D-0063) wait on event
+// counts, private to `std`: `event_op(0, …)` makes one and returns its
+// id; 1 reads its count; 2 waits until its count differs from `seen` (a
+// fault when no other thread could change it); 3 adds one to it, waking
+// whoever waits on it; 4 frees it. A channel's counts change only under
+// its lock, so a waiter that read one under the lock misses no change.
+unsafe extern fn event_op(usize op, usize id, usize seen) : usize;
+
+// D-0204: a contained failure's text, private to `std`: op 0 the report
+// as the program would have printed it, 1 the diagnostic's name; the
+// bytes at `out`, at most `cap`, and their whole length back.
+unsafe extern fn task_op(usize op, usize id, rawptr<u8> out, usize cap) : isize;
+
+// One of the three primitives above by number: 0 `path_op`, 1
+// `proc_op`, 2 `net_op`.
+// trusted: [Extern-Call] path_op, proc_op and net_op read the a and b ranges and write only [out, out + cap), ranges their callers keep live and own.
+fn byte_op(
+    usize which,
+    usize op,
+    usize h,
+    rawptr<u8> a,
+    usize an,
+    rawptr<u8> b,
+    usize bn,
+    rawptr<u8> out,
+    usize cap,
+) : i64
+{
+    unsafe
+    {
+        match (which)
+        {
+            0 : path_op(op, h, a, an, b, bn, out, cap),
+            1 : proc_op(op, h, a, an, b, bn, out, cap),
+            _ : net_op(op, h, a, an, b, bn, out, cap),
+        }
+    }
+}
+
+// The bytes of a `byte_op`'s answer, or its failure code: asked again
+// with room for all of it when it is longer than the room given. Only for
+// operations whose answer does not change when asked twice.
+fn byte_answer(usize which, usize op, usize h, slice<u8, shared> a, slice<u8, shared> b) : Result<Vec<u8>, i64>
+{
+    Vec<u8> out = Vec::new();
+    usize cap = 256;
+    while (true)
+    {
+        while (out.cap < cap)
+        {
+            Vec::grow(&mut out);
+        }
+        i64 n = byte_op(
+            which,
+            op,
+            h,
+            bytes_ptr(a),
+            slice_len(a),
+            bytes_ptr(b),
+            slice_len(b),
+            reinterpret_ptr<u8>(out.ptr),
+            cap,
+        );
+        if (n < 0)
+        {
+            return Err(n);
+        }
+        usize len = reinterpret<usize>(n);
+        if (len <= cap)
+        {
+            out.len = len;
+            return Ok(out);
+        }
+        cap = len;
+    }
+}
+
+// The address of a slice's first byte for the primitives; any address
+// when it is empty (they then read none).
+fn bytes_ptr(slice<u8, shared> s) : rawptr<u8>
+{
+    if (slice_len(s) == 0)
+    {
+        return dangling<u8>();
+    }
+    rawptr_of(&s[0])
+}
+
+// `file_error` of an `i64` code, as the newer primitives give them.
+fn code_error(i64 code) : FileError
+{
+    if (code == -1)
+    {
+        return FileError::NotFound;
+    }
+    if (code == -2)
+    {
+        return FileError::Denied;
+    }
+    FileError::Io
+}
+
+fn file_error(isize code) : FileError
+{
+    if (code == -1)
+    {
+        return FileError::NotFound;
+    }
+    if (code == -2)
+    {
+        return FileError::Denied;
+    }
+    FileError::Io
+}
+
+// Helpers over `fs_op` and `fs_query` shared by `std::fs` and `std::env`
+// (D-0176), private to `std`.
+
+// The bytes of `fs_query`'s answer, or its failure code.
+// trusted: [Extern-Call] fs_query reads [a, a + an) and writes [out.ptr, out.ptr + cap), out's reserved buffer.
+fn fs_answer(usize op, rawptr<u8> a, usize an) : Result<Vec<u8>, isize>
+{
+    Vec<u8> out = Vec::new();
+    usize cap = 256;
+    while (true)
+    {
+        while (out.cap < cap)
+        {
+            Vec::grow(&mut out);
+        }
+        isize n = unsafe
+        {
+            fs_query(op, a, an, reinterpret_ptr<u8>(out.ptr), cap)
+        };
+        if (n < 0)
+        {
+            return Err(n);
+        }
+        usize len = reinterpret<usize>(n);
+        if (len <= cap)
+        {
+            out.len = len;
+            return Ok(out);
+        }
+        cap = len;
+    }
+}
+
+// ---- paths and file metadata (`rule.stdlib.fs`, D-0141) ----
+//
+// A path's grammar is the operating system's (`C:\` and `\\server\share`
+// on Windows), so these are realized by `path_op` (src/fileio.rs) over
+// the platform's own path library. The part functions (`path_join` to
+// `path_extension`) and `path_normalize` never touch the file system.
+
+fn path_text(StringView a, StringView b, usize op) : Option<String>
+{
+    match (byte_answer(0, op, 0, a.bytes, b.bytes))
+    {
+        Ok(v) : match (String::from_utf8(v))
+        {
+            Ok(s)  : Some(s),
+            Err(_) : None,
+        },
+        Err(_) : None,
+    }
+}
+
+fn path_result(usize op, StringView a, StringView b) : Result<i64, FileError>
+{
+    i64 r = byte_op(
+        0,
+        op,
+        0,
+        StringView::ptr(a),
+        StringView::len(a),
+        StringView::ptr(b),
+        StringView::len(b),
+        dangling<u8>(),
+        0,
+    );
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    Ok(r)
+}
+
+export module core "core.cb";
+export module collections "collections.cb";
+export module text "text.cb";
+export module io "io.cb";
+export module fs "fs.cb";
+export module env "env.cb";
+export module memory "memory.cb";
+export module sync "sync.cb";
+export module random "random.cb";
+export module math "math.cb";
+export module time "time.cb";
+export module process "process.cb";
+export module net "net.cb";
+export module crypto "crypto.cb";
+export module x509 "x509.cb";
+export module tls "tls.cb";
+export module http "http.cb";
+export module database "database.cb";
+export module encoding "encoding.cb";
+export module compress "compress.cb";
+// D-0187: declared, never re-exported (its own comment says why).
+export module extensions "extensions.cb";
+
+export import std::core;
+export import std::collections;
+export import std::text;
+export import std::io;
+export import std::fs;
+export import std::env;
+export import std::memory;
+export import std::sync;
+export import std::random;
+export import std::math;
+export import std::time;
+export import std::process;
+export import std::net;
+export import std::crypto;
+export import std::x509;
+export import std::tls;
+export import std::http;
+export import std::database;
+export import std::encoding;
+export import std::compress;

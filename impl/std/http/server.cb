@@ -1,0 +1,235 @@
+// `std::http::server` (spec/21 §2p, D-0174, D-0186, D-0187): `HttpServer`
+// and `HttpConnection`: accepting connections, plain or TLS, parsing
+// their requests and writing responses, keeping a connection open for
+// the next request when the client asks.
+
+// ---- the server (D-0174) ----
+
+// A listening HTTP server: `accept` gives each client's connection. The
+// limits apply to every connection it accepts.
+export resource struct HttpServer
+{
+    TcpListener listener;
+    export usize max_body;
+    export u64 timeout_ms;
+    Option<PrivateKey> key;             // D-0186: set for an https server
+    Vec<Certificate> chain;
+}
+
+// Bound to `a` (port 0 for any free port), with a 16 MiB body limit and
+// a 30 s timeout per read and write.
+export fn HttpServer::bind(SocketAddr a) : Result<HttpServer, NetError>
+{
+    TcpListener l = TcpListener::bind(a)?;
+    Ok(HttpServer { .listener = l, .max_body = 16777216, .timeout_ms = 30000, .key = None, .chain = Vec::new() })
+}
+
+// D-0186: an https server: bound as `bind`, and every connection it
+// accepts first completes a TLS 1.3 handshake with `key` and `chain`
+// (the server's certificate, then its issuers) through
+// `TlsStream::server`.
+export fn HttpServer::bind_tls(SocketAddr a, PrivateKey key, Vec<Certificate> chain) : Result<HttpServer, NetError>
+{
+    TcpListener l = TcpListener::bind(a)?;
+    Ok(HttpServer { .listener = l, .max_body = 16777216, .timeout_ms = 30000, .key = Some(key), .chain = chain })
+}
+
+export fn HttpServer::local_addr(ref<HttpServer, shared> s) : SocketAddr
+{
+    TcpListener::local_addr(&s.listener)
+}
+
+// Waits for the next client; for an https server, through its
+// handshake (a client that fails it is `TlsFailure`, and the server goes
+// on to the next).
+export fn HttpServer::accept(ref<HttpServer, exclusive> s) : Result<HttpConnection, HttpError>
+{
+    TcpStream tcp = match (TcpListener::accept(&mut s.listener))
+    {
+        Ok(t)  : t,
+        Err(e) : return Err(NetFailure(e)),
+    };
+    TcpStream::set_read_timeout_ms(&mut tcp, s.timeout_ms);
+    TcpStream::set_write_timeout_ms(&mut tcp, s.timeout_ms);
+    TcpStream::set_nodelay(&mut tcp, true);
+    Conn conn = match (&s.key)
+    {
+        Some(k) : match (TlsStream::server(tcp, k, &s.chain[0..$]))
+        {
+            Ok(t)  : Secure(t),
+            Err(e) : return Err(TlsFailure(e)),
+        },
+        None : Plain(tcp),
+    };
+    Ok(HttpConnection { .reader = Reader { .conn = conn, .buf = Vec::new(), .at = 0 }, .max_body = s.max_body, .keep_alive = true, .head_request = false, .closed = false })
+}
+
+// One client's connection: `request` then `respond`, repeated while the
+// client keeps it open.
+export resource struct HttpConnection
+{
+    Reader reader;
+    usize max_body;
+    bool keep_alive;
+    bool head_request;
+    bool closed;
+}
+
+export fn HttpConnection::peer_addr(ref<HttpConnection, shared> c) : SocketAddr
+{
+    match (&c.reader.conn)
+    {
+        Plain(s)  : TcpStream::peer_addr(s),
+        Secure(s) : TlsStream::peer_addr(s),
+    }
+}
+
+// The next request, or None when the client has closed the connection
+// (or asked for it to close after the last response). A malformed
+// request is `BadMessage` and a too-large one `TooLarge`; the caller
+// answers 400 or 413 if it wishes, and the connection then closes.
+export fn HttpConnection::request(ref<HttpConnection, exclusive> c) : Result<Option<Request>, HttpError>
+{
+    if (c.closed || !c.keep_alive)
+    {
+        return Ok(None);
+    }
+    String line = match (http_line(&mut c.reader, MAX_HEAD)?)
+    {
+        Some(l) : l,
+        None    : return Ok(None),
+    };
+    // A request line: METHOD SP target SP HTTP/1.x.
+    Vec<StringView> parts = StringView::split(String::as_view(&line), " ");
+    if (Vec::len(&parts) != 3 || StringView::len(parts[0]) == 0 || StringView::len(parts[1]) == 0)
+    {
+        c.keep_alive = false;
+        return Err(BadMessage);
+    }
+    bool v11 = StringView::eq(parts[2], "HTTP/1.1");
+    if (!v11 && !StringView::eq(parts[2], "HTTP/1.0"))
+    {
+        c.keep_alive = false;
+        return Err(BadMessage);
+    }
+    Vec<Header> headers = match (read_headers(&mut c.reader, String::len(&line) + 2))
+    {
+        Ok(h)  : h,
+        Err(e) :
+        {
+            c.keep_alive = false;
+            return Err(e);
+        },
+    };
+    if (v11 && Option::is_none(&find_header(&headers[0..$], "host")))
+    {
+        c.keep_alive = false;
+        return Err(BadMessage);
+    }
+    // Keep-alive: HTTP/1.1 unless `Connection: close`, HTTP/1.0 only with
+    // `Connection: keep-alive`.
+    c.keep_alive = match (find_header(&headers[0..$], "connection"))
+    {
+        Some(v) : if (v11)
+        {
+            !name_eq(
+                StringView::trim(v),
+                "close",
+            )
+        }
+        else { name_eq(StringView::trim(v), "keep-alive") },
+        None : v11,
+    };
+    c.head_request = StringView::eq(parts[0], "HEAD");
+    BodyLength how = match (body_length(&headers[0..$], false))
+    {
+        Ok(h)  : h,
+        Err(e) :
+        {
+            c.keep_alive = false;
+            return Err(e);
+        },
+    };
+    if (Some(expect) = find_header(&headers[0..$], "expect"))
+    {
+        if (name_eq(StringView::trim(expect), "100-continue"))
+        {
+            conn_write(&mut c.reader.conn, &b"HTTP/1.1 100 Continue\r\n\r\n"[0..$])?;
+        }
+    }
+    Vec<u8> body = match (read_body(&mut c.reader, how, c.max_body))
+    {
+        Ok(b)  : b,
+        Err(e) :
+        {
+            c.keep_alive = false;
+            return Err(e);
+        },
+    };
+    Ok(Some(Request { .method = String::from_view(parts[0]), .url = String::from_view(parts[1]), .headers = headers, .body = body }))
+}
+
+// Writes a response: the status line (RFC 9110's reason phrase), the
+// headers given, Content-Length, and Connection as negotiated; the body
+// is omitted after a HEAD request. After a response that ends the
+// connection, `request` gives None.
+export fn HttpConnection::respond(
+    ref<HttpConnection, exclusive> c,
+    u16 status,
+    slice<Header, shared> headers,
+    slice<u8, shared> body,
+) : Result<void, HttpError>
+{
+    String head = String::from_str("HTTP/1.1 ");
+    String::append(&mut head, status);
+    String::append(&mut head, " ");
+    String::append(&mut head, reason_phrase(status));
+    String::append(&mut head, "\r\n");
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (name_eq(
+            String::as_view(&headers[i].name),
+            "content-length",
+        ) || name_eq(String::as_view(&headers[i].name), "connection"))
+        {
+            continue;
+        }
+        String::append(&mut head, String::as_view(&headers[i].name));
+        String::append(&mut head, ": ");
+        String::append(&mut head, String::as_view(&headers[i].value));
+        String::append(&mut head, "\r\n");
+    }
+    bool no_body = status == 204 || status == 304 || (status >= 100 && status < 200);
+    if (!no_body)
+    {
+        String::append(&mut head, "Content-Length: ");
+        String::append(&mut head, slice_len(body));
+        String::append(&mut head, "\r\n");
+    }
+    String::append(
+        &mut head,
+        if (c.keep_alive) { "Connection: keep-alive\r\n\r\n" } else { "Connection: close\r\n\r\n" },
+    );
+    Vec<u8> out = String::into_bytes(head);
+    if (!no_body && !c.head_request)
+    {
+        Vec::extend_from(&mut out, body);
+    }
+    conn_write(&mut c.reader.conn, &out[0..$])?;
+    if (!c.keep_alive)
+    {
+        conn_close(&mut c.reader.conn);
+        c.closed = true;
+    }
+    Ok(())
+}
+
+// Ends the connection.
+export fn HttpConnection::close(ref<HttpConnection, exclusive> c)
+{
+    if (!c.closed)
+    {
+        conn_close(&mut c.reader.conn);
+        c.closed = true;
+    }
+}

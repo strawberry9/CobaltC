@@ -1,0 +1,130 @@
+// `std::encoding::base64` (spec/21 §2g, D-0151, D-0198): bytes as base64
+// text (RFC 4648 §4) and back. Errors are `std::text`'s `ParseError`.
+
+// The bytes in base64 (RFC 4648 §4: `A`-`Z`, `a`-`z`, `0`-`9`, `+`, `/`,
+// padded with `=` to a multiple of four characters).
+export fn base64_encode(slice<u8, shared> bytes) : String
+{
+    str alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Vec<u8> out = Vec::new();
+    usize n = slice_len(bytes);
+    Vec::reserve(&mut out, (n + 2) / 3 * 4);
+    usize i = 0;
+    while (i + 3 <= n)
+    {
+        u32 v = (widen<u32>(bytes[i]) << 16) | (widen<u32>(bytes[i + 1]) << 8) | widen<u32>(bytes[i + 2]);
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 18) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 12) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 6) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>(v & 63)));
+        i += 3;
+    }
+    if (n - i == 1)
+    {
+        u32 v = widen<u32>(bytes[i]) << 16;
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 18) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 12) & 63)));
+        Vec::push(&mut out, b'=');
+        Vec::push(&mut out, b'=');
+    }
+    else if (n - i == 2)
+    {
+        u32 v = (widen<u32>(bytes[i]) << 16) | (widen<u32>(bytes[i + 1]) << 8);
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 18) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 12) & 63)));
+        Vec::push(&mut out, str_byte(alphabet, narrow<usize>((v >> 6) & 63)));
+        Vec::push(&mut out, b'=');
+    }
+    String { .bytes = out }
+}
+
+// The value of a base64 character; 255 for any other byte (`=` included).
+fn base64_value(u8 b) : u8
+{
+    if (b >= b'A' && b <= b'Z')
+    {
+        return b - b'A';
+    }
+    if (b >= b'a' && b <= b'z')
+    {
+        return b - b'a' + 26;
+    }
+    if (b >= b'0' && b <= b'9')
+    {
+        return b - b'0' + 52;
+    }
+    if (b == b'+')
+    {
+        return 62;
+    }
+    if (b == b'/')
+    {
+        return 63;
+    }
+    255
+}
+
+// Reads base64 as `base64_encode` writes it, padding required: `Ok` of the
+// empty vector for "", `Err(Invalid(i))` at the first byte that is not a
+// base64 character (a `=` before the final one or two is one), or at the
+// length when it is not a multiple of four.
+export fn base64_decode(StringView text) : Result<Vec<u8>, ParseError>
+{
+    base64_decode_bytes(text.bytes)
+}
+
+// `base64_decode` on the bytes (as `hex_decode`).
+fn base64_decode_bytes(slice<u8, shared> b) : Result<Vec<u8>, ParseError>
+{
+    usize n = slice_len(b);
+    Vec<u8> out = Vec::new();
+    if (n == 0)
+    {
+        return Ok(Vec::new());
+    }
+    if (n % 4 != 0)
+    {
+        return Err(Invalid(n));
+    }
+    usize pad = 0;
+    if (b[n - 1] == b'=')
+    {
+        pad = 1;
+        if (b[n - 2] == b'=')
+        {
+            pad = 2;
+        }
+    }
+    Vec::reserve(&mut out, n / 4 * 3);
+    for (usize i = 0; i < n; i += 4)
+    {
+        u32 v = 0;
+        for (usize j = 0; j < 4; j += 1)
+        {
+            u8 c = b[i + j];
+            if (c == b'=' && i + j >= n - pad)
+            {
+                v = v << 6;
+            }
+            else
+            {
+                u8 d = base64_value(c);
+                if (d == 255)
+                {
+                    return Err(Invalid(i + j));
+                }
+                v = (v << 6) | widen<u32>(d);
+            }
+        }
+        Vec::push(&mut out, narrow_wrapping<u8>(v >> 16));
+        if (i + 4 < n || pad < 2)
+        {
+            Vec::push(&mut out, narrow_wrapping<u8>(v >> 8));
+        }
+        if (i + 4 < n || pad < 1)
+        {
+            Vec::push(&mut out, narrow_wrapping<u8>(v));
+        }
+    }
+    Ok(out)
+}

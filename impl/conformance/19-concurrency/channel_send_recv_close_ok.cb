@@ -1,0 +1,86 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.channel [Channel-New] [Send] [Recv] [Close] [Channel-Destroy]; rule.stdlib.channel; D-0063; conf.channel-close; conf.channel-destroy
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3020310a31302031310a32302032310a72656675736564206c6174650a676f742066697273740a676f74207365636f6e640a7374696c6c20636c6f73656420616e6420656d7074790a746f6f6b20310a64726f7020310a656e64206f6620626c6f636b0a64726f7020320a64726f7020330a64726f7020340a646f6e650a
+//
+// One thread, never waiting: values come out oldest first, the ring
+// wraps, `send` on a closed channel gives its value back, `recv` drains
+// what was sent before `close` and then gives `None` (again and again),
+// closing twice changes nothing, and destroying a channel destroys the
+// values left in it oldest first.
+
+import std;
+
+resource struct Noisy
+{
+    i32 id;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("drop %v\n", self.id);
+}
+
+fn main() : u8
+{
+    Channel<i32> ch = Channel::new(2);
+    i32 round = 0;
+    while (round < 3)
+    {
+        _ = Channel::send(&ch, round * 10);
+        _ = Channel::send(&ch, round * 10 + 1);
+        match (Channel::recv(&ch))
+        {
+            Some(a) : printf("%v ", a),
+            None    : return 1,
+        }
+        match (Channel::recv(&ch))
+        {
+            Some(b) : printf("%v\n", b),
+            None    : return 2,
+        }
+        round = round + 1;
+    }
+
+    Channel<String> text = Channel::new(3);
+    _ = Channel::send(&text, String::from_str("first"));
+    _ = Channel::send(&text, String::from_str("second"));
+    Channel::close(&text);
+    Channel::close(&text);
+    match (Channel::send(&text, String::from_str("late")))
+    {
+        Ok(_)  : return 3,
+        Err(s) : printf("refused %v\n", &s),
+    }
+    while (true)
+    {
+        match (Channel::recv(&text))
+        {
+            Some(s) : printf("got %v\n", &s),
+            None    : break,
+        }
+    }
+    match (Channel::recv(&text))
+    {
+        Some(_) : return 4,
+        None    : printf("still closed and empty\n"),
+    }
+
+    {
+        Channel<Noisy> left = Channel::new(3);
+        _ = Channel::send(&left, Noisy { .id = 1 });
+        _ = Channel::send(&left, Noisy { .id = 2 });
+        _ = Channel::send(&left, Noisy { .id = 3 });
+        match (Channel::recv(&left))
+        {
+            Some(n) : printf("took %v\n", n.id),
+            None    : return 5,
+        }
+        _ = Channel::send(&left, Noisy { .id = 4 });
+        printf("end of block\n");
+    }
+    printf("done\n");
+    0
+}

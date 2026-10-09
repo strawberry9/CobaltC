@@ -1,0 +1,358 @@
+// A token gate
+//
+// Shows: an authenticated API, with every piece from `std`. Accounts are
+// Argon2id records; `POST /login` with `name:password` checks one with
+// `verify_password` and issues a token signed with the service's Ed25519
+// key: `header.claims.signature` in base64url, as a JWT. `GET /secret`
+// admits a request whose `Authorization: Bearer` token verifies under the
+// service's public key and has not expired, and answers 401 with a
+// `WWW-Authenticate` header for anything else, saying why. The client
+// walks through it: no token, a wrong password, a login, the secret, a
+// token with its claims edited (the signature no longer matches), one
+// issued already expired, and a second user. Keys, salts and the clock
+// are fixed so the output is; Ed25519 and Argon2id are deterministic, so
+// the tokens and records are too.
+
+import std;
+
+const i64 NOW = 1900000000;
+
+// base64url without padding.
+fn b64url(slice<u8, shared> bytes) : String
+{
+    String plain = base64_encode(bytes);
+    String out = String::new();
+    foreach (c in String::as_bytes(&plain))
+    {
+        if (*c == b'+') { String::push_ascii(&mut out, b'-'); }
+        else if (*c == b'/') { String::push_ascii(&mut out, b'_'); }
+        else if (*c != b'=') { String::push_ascii(&mut out, *c); }
+    }
+    out
+}
+
+fn b64url_decode(StringView text) : Option<Vec<u8>>
+{
+    String plain = String::new();
+    foreach (c in StringView::as_bytes(text))
+    {
+        String::push_ascii(&mut plain, if (*c == b'-') { b'+' } else if (*c == b'_') { b'/' } else { *c });
+    }
+    while (String::len(&plain) % 4 != 0)
+    {
+        String::push_ascii(&mut plain, b'=');
+    }
+    match (base64_decode(String::as_view(&plain)))
+    {
+        Ok(v)  : Some(v),
+        Err(_) : None,
+    }
+}
+
+struct Account
+{
+    String name;
+    String record;
+}
+
+// Standard base64 without padding, as PHC strings carry it.
+fn b64_unpadded(slice<u8, shared> bytes) : String
+{
+    String s = base64_encode(bytes);
+    while (String::ends_with(&s, "="))
+    {
+        String::truncate(&mut s, String::len(&s) - 1);
+    }
+    s
+}
+
+// An Argon2id record with small, fixed parameters for the demonstration;
+// `hash_password` is the real thing (a fresh salt, 19 MiB).
+fn record(str password, str salt) : String
+{
+    Vec<u8> digest = argon2id(
+        StringView::as_bytes(StringView::of(password)),
+        StringView::as_bytes(StringView::of(salt)),
+        1,
+        64,
+        1,
+        24,
+    );
+    String out = String::from_str("$argon2id$v=19$m=64,t=1,p=1$");
+    String::append(&mut out, &b64_unpadded(StringView::as_bytes(StringView::of(salt))));
+    String::append(&mut out, "$");
+    String::append(&mut out, &b64_unpadded(&digest[0..$]));
+    out
+}
+
+struct Service
+{
+    Vec<Account> accounts;
+    array<u8, 32> signing_key;
+}
+
+// A token for `name`, good until `exp`.
+fn issue(ref<Service, shared> svc, StringView name, i64 exp) : String
+{
+    String token = b64url(&b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}"[0..$]);
+    String::append(&mut token, ".");
+    String claims = sprintf("{\"sub\":\"%s\",\"exp\":%v}", name, exp);
+    String::append(&mut token, &b64url(StringView::as_bytes(String::as_view(&claims))));
+    array<u8, 64> sig = ed25519_sign(&svc.signing_key[0..$], StringView::as_bytes(String::as_view(&token)));
+    String::append(&mut token, ".");
+    String::append(&mut token, &b64url(&sig[0..$]));
+    token
+}
+
+enum Admission
+{
+    Admitted(String),
+    Refused(str),
+}
+
+// The `exp` and `sub` of a verified token, or the reason it is refused.
+fn admit(ref<Service, shared> svc, Option<StringView> authorization) : Admission
+{
+    StringView header = match (authorization)
+    {
+        Some(h) : h,
+        None    : return Refused("no token"),
+    };
+    if (!StringView::starts_with(header, "Bearer "))
+    {
+        return Refused("not a bearer token");
+    }
+    StringView token = StringView::sub(header, 7, StringView::len(header));
+    Vec<StringView> parts = StringView::split(token, ".");
+    if (Vec::len(&parts) != 3)
+    {
+        return Refused("malformed token");
+    }
+    Vec<u8> sig = match (b64url_decode(parts[2]))
+    {
+        Some(s) : s,
+        None    : return Refused("malformed token"),
+    };
+    array<u8, 32> public = ed25519_public_key(&svc.signing_key[0..$]);
+    StringView signed = StringView::sub(token, 0, StringView::len(parts[0]) + 1 + StringView::len(parts[1]));
+    if (!ed25519_verify(&public[0..$], StringView::as_bytes(signed), &sig[0..$]))
+    {
+        return Refused("bad signature");
+    }
+    String claims = match (b64url_decode(parts[1]))
+    {
+        Some(c) : Result::unwrap_or(String::from_utf8(c), String::new()),
+        None    : return Refused("malformed token"),
+    };
+    // `"exp":N` and `"sub":"name"` out of the claims we wrote.
+    StringView cv = String::as_view(&claims);
+    usize e = Option::unwrap_or(StringView::find(cv, "\"exp\":"), 0) + 6;
+    i64 exp = Result::unwrap_or(
+        StringView::parse<i64>(StringView::trim_end(StringView::sub(cv, e, StringView::len(cv) - 1))),
+        0,
+    );
+    if (exp <= NOW)
+    {
+        return Refused("token expired");
+    }
+    usize s0 = Option::unwrap_or(StringView::find(cv, "\"sub\":\""), 0) + 7;
+    StringView rest = StringView::sub(cv, s0, StringView::len(cv));
+    usize s1 = Option::unwrap_or(StringView::find(rest, "\""), 0);
+    Admitted(String::from_view(StringView::sub(rest, 0, s1)))
+}
+
+fn serve(HttpServer s, Service svc, usize count) : u8
+{
+    for (usize i = 0; i < count; i += 1)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(_) : return 1,
+        };
+        while (true)
+        {
+            Request req = match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) : r,
+                _           : break,
+            };
+            Vec<Header> h = Vec::new();
+            Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+            if (req.method == "POST" && req.url == "/login")
+            {
+                // name:password[:seconds] -- the seconds only for the demonstration.
+                String body = Result::unwrap_or(String::from_utf8(Vec::clone(&req.body)), String::new());
+                Vec<StringView> parts = StringView::split(String::as_view(&body), ":");
+                bool good = false;
+                if (Vec::len(&parts) >= 2)
+                {
+                    foreach (a in &svc.accounts)
+                    {
+                        if (a.name == parts[0] && verify_password(
+                            String::as_view(&a.record),
+                            StringView::as_bytes(parts[1]),
+                        ))
+                        {
+                            good = true;
+                        }
+                    }
+                }
+                if (good)
+                {
+                    i64 ttl = if (Vec::len(&parts) == 3)
+                    {
+                        Result::unwrap_or(
+                            StringView::parse<i64>(parts[2]),
+                            3600,
+                        )
+                    }
+                    else { 3600 };
+                    String token = issue(&svc, parts[0], NOW + ttl);
+                    _ = HttpConnection::respond(&mut c, 200, &h[0..$], StringView::as_bytes(String::as_view(&token)));
+                }
+                else
+                {
+                    _ = HttpConnection::respond(&mut c, 401, &h[0..$], &b"wrong name or password\n"[0..$]);
+                }
+            }
+            else if (req.method == "GET" && req.url == "/secret")
+            {
+                match (admit(&svc, Request::header(&req, "authorization")))
+                {
+                    Admitted(who) :
+                    {
+                        String text = sprintf("the secret, for %s: 42\n", &who);
+                        _ = HttpConnection::respond(
+                            &mut c,
+                            200,
+                            &h[0..$],
+                            StringView::as_bytes(String::as_view(&text)),
+                        );
+                    },
+                    Refused(why)  :
+                    {
+                        Vec::push(
+                            &mut h,
+                            Header::new(
+                                "WWW-Authenticate",
+                                String::as_view(&sprintf("Bearer realm=\"secret\", error=\"%s\"", why)),
+                            ),
+                        );
+                        _ = HttpConnection::respond(&mut c, 401, &h[0..$], &b"unauthorized\n"[0..$]);
+                    },
+                }
+            }
+            else
+            {
+                _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"no such route\n"[0..$]);
+            }
+        }
+    }
+    0
+}
+
+fn show(str label, Result<Response, HttpError> r) : String
+{
+    match (r)
+    {
+        Ok(resp) :
+        {
+            String body = Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::new());
+            String shown = if (String::len(&body) > 60)
+            {
+                sprintf(
+                    "token %s...%s",
+                    StringView::sub(String::as_view(&body), 0, 20),
+                    StringView::sub(String::as_view(&body), String::len(&body) - 8, String::len(&body)),
+                )
+            }
+            else { String::from_view(String::trim_end(&body)) };
+            printf("%-26s %u %s\n", label, resp.status, &shown);
+            if (Some(w) = Response::header(&resp, "www-authenticate"))
+            {
+                printf("%-26s   WWW-Authenticate: %s\n", "", w);
+            }
+            body
+        },
+        Err(e)   :
+        {
+            printf("%-26s error: %s\n", label, HttpError::text(&e));
+            String::new()
+        },
+    }
+}
+
+fn get_secret(
+    ref<HttpClient, exclusive> c,
+    ref<String, shared> base,
+    Option<String> token,
+) : Result<Response, HttpError>
+{
+    Request req = Request::new("GET", String::as_view(&sprintf("%s/secret", base)));
+    if (Some(t) = token)
+    {
+        Vec::push(&mut req.headers, Header::new("Authorization", String::as_view(&sprintf("Bearer %s", &t))));
+    }
+    HttpClient::send(c, &req)
+}
+
+fn main()
+{
+    Vec<Account> accounts = Vec::new();
+    Vec::push(
+        &mut accounts,
+        Account { .name = String::from_str("alice"), .record = record("correct horse battery", "salt-for-alice--") },
+    );
+    Vec::push(
+        &mut accounts,
+        Account { .name = String::from_str("bob"), .record = record("Tr0ub4dor&3", "salt-for-bob----") },
+    );
+    Vec<u8> key = Result::unwrap_or(
+        from_hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"),
+        Vec::new(),
+    );
+    array<u8, 32> signing_key = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        signing_key[i] = key[i];
+    }
+    Service svc = Service { .accounts = accounts, .signing_key = signing_key };
+    printf("service public key: %s\n\n", &b64url(&ed25519_public_key(&signing_key[0..$])[0..$]));
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto server = spawn(serve, s, svc, 9);
+    HttpClient c = HttpClient::new();
+    String login = sprintf("%s/login", &base);
+    _ = show("GET /secret, no token", get_secret(&mut c, &base, None));
+    _ = show(
+        "login alice, wrong",
+        http_post(String::as_view(&login), "text/plain", &b"alice:correct horse batteries"[0..$]),
+    );
+    String token = show(
+        "login alice",
+        http_post(String::as_view(&login), "text/plain", &b"alice:correct horse battery"[0..$]),
+    );
+    _ = show("GET /secret", get_secret(&mut c, &base, Some(String::clone(&token))));
+    // The claims edited to a later expiry: the signature no longer matches.
+    Vec<StringView> parts = StringView::split(String::as_view(&token), ".");
+    if (Vec::len(&parts) != 3)
+    {
+        printf("no token to edit\n");
+        return;
+    }
+    String edited = String::from_view(parts[0]);
+    String::append(&mut edited, ".");
+    String::append(&mut edited, &b64url(&b"{\"sub\":\"alice\",\"exp\":4000000000}"[0..$]));
+    String::append(&mut edited, ".");
+    String::append(&mut edited, parts[2]);
+    _ = show("GET /secret, edited claims", get_secret(&mut c, &base, Some(edited)));
+    String stale = show(
+        "login alice, 0 s",
+        http_post(String::as_view(&login), "text/plain", &b"alice:correct horse battery:0"[0..$]),
+    );
+    _ = show("GET /secret, expired", get_secret(&mut c, &base, Some(stale)));
+    String bob = show("login bob", http_post(String::as_view(&login), "text/plain", &b"bob:Tr0ub4dor&3"[0..$]));
+    _ = show("GET /secret as bob", get_secret(&mut c, &base, Some(bob)));
+    printf("server: %u\n", join(server));
+}

@@ -1,0 +1,1006 @@
+// `std::crypto::aead` (spec/21 §2m, D-0187): authenticated encryption.
+// ChaCha20 and Poly1305 (RFC 8439, D-0153) and AES-GCM (D-0165), with the
+// `_seal`/`_open` pairs over them. No branch and no index depends on a
+// key or a message byte, so the time taken depends on the lengths alone.
+
+// ChaCha20 and ChaCha20-Poly1305 (RFC 8439, D-0153): the stream cipher
+// and the authenticated encryption built on it. Every operation on secret
+// data is an addition, a rotation, an exclusive or, a multiplication or a
+// mask: no branch and no array index depends on a key, a nonce or a
+// message byte, so the time taken depends only on the lengths.
+
+// A key is 32 bytes and a nonce 12; any other length is
+// `diag.crypto-length`.
+fn crypto_check_lengths(slice<u8, shared> key, slice<u8, shared> nonce)
+{
+    if (slice_len(key) != 32 || slice_len(nonce) != 12)
+    {
+        fault(crypto_length);
+    }
+}
+
+fn chacha_quarter(ref<array<u32, 16>, exclusive> x, usize a, usize b, usize c, usize d)
+{
+    x[a] = wrapping_add(x[a], x[b]);
+    x[d] = rotate_left(x[d] ^ x[a], 16);
+    x[c] = wrapping_add(x[c], x[d]);
+    x[b] = rotate_left(x[b] ^ x[c], 12);
+    x[a] = wrapping_add(x[a], x[b]);
+    x[d] = rotate_left(x[d] ^ x[a], 8);
+    x[c] = wrapping_add(x[c], x[d]);
+    x[b] = rotate_left(x[b] ^ x[c], 7);
+}
+
+// The 64-byte keystream block for `counter` (RFC 8439 §2.3).
+fn chacha_block(slice<u8, shared> key, slice<u8, shared> nonce, u32 counter) : array<u8, 64>
+{
+    array<u32, 16> s = [0; 16];
+    s[0] = 0x61707865;
+    s[1] = 0x3320646e;
+    s[2] = 0x79622d32;
+    s[3] = 0x6b206574;
+    for (usize i = 0; i < 8; i += 1)
+    {
+        s[4 + i] = read_le<u32>(key, 4 * i);
+    }
+    s[12] = counter;
+    for (usize i = 0; i < 3; i += 1)
+    {
+        s[13 + i] = read_le<u32>(nonce, 4 * i);
+    }
+    array<u32, 16> x = s;
+    for (usize round = 0; round < 10; round += 1)
+    {
+        chacha_quarter(&mut x, 0, 4, 8, 12);
+        chacha_quarter(&mut x, 1, 5, 9, 13);
+        chacha_quarter(&mut x, 2, 6, 10, 14);
+        chacha_quarter(&mut x, 3, 7, 11, 15);
+        chacha_quarter(&mut x, 0, 5, 10, 15);
+        chacha_quarter(&mut x, 1, 6, 11, 12);
+        chacha_quarter(&mut x, 2, 7, 8, 13);
+        chacha_quarter(&mut x, 3, 4, 9, 14);
+    }
+    array<u8, 64> out = [0; 64];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        u32 w = wrapping_add(x[i], s[i]);
+        out[4 * i] = narrow_wrapping<u8>(w);
+        out[4 * i + 1] = narrow_wrapping<u8>(w >> 8);
+        out[4 * i + 2] = narrow_wrapping<u8>(w >> 16);
+        out[4 * i + 3] = narrow_wrapping<u8>(w >> 24);
+    }
+    out
+}
+
+// `data` exclusive-ored with ChaCha20's keystream for `key` and `nonce`,
+// starting at block `counter` (RFC 8439 §2.4): encryption and decryption
+// are the same operation. A stream cipher alone hides the data but does
+// not protect it from change; use `chacha20_poly1305_seal` for that. More
+// than 2^32 blocks from one counter is `diag.crypto-length`.
+export fn chacha20(slice<u8, shared> key, slice<u8, shared> nonce, u32 counter, slice<u8, shared> data) : Vec<u8>
+{
+    crypto_check_lengths(key, nonce);
+    usize n = slice_len(data);
+    if (widen<u64>(n) > (widen<u64>(max_value<u32>()) - widen<u64>(counter) + 1) * 64)
+    {
+        fault(crypto_length);
+    }
+    Vec<u8> out = Vec::new();
+    Vec::reserve(&mut out, n);
+    u32 block = counter;
+    usize at = 0;
+    while (at < n)
+    {
+        array<u8, 64> ks = chacha_block(key, nonce, block);
+        usize take = min(64, n - at);
+        for (usize i = 0; i < take; i += 1)
+        {
+            Vec::push(&mut out, data[at + i] ^ ks[i]);
+        }
+        at += take;
+        if (at < n)
+        {
+            block += 1;
+        }
+    }
+    out
+}
+
+// Poly1305 (RFC 8439 §2.5) over five 26-bit limbs, as poly1305-donna does:
+// the accumulator, the clamped key `r` and `5·r`, the final pad `s`.
+struct Poly1305
+{
+    array<u64, 5> h;
+    array<u64, 5> r;
+    array<u64, 4> pad;
+}
+
+fn Poly1305::new(slice<u8, shared> key) : Poly1305
+{
+    u64 m26 = 0x3ffffff;
+    array<u64, 5> r = [0; 5];
+    r[0] = widen<u64>(read_le<u32>(key, 0)) & m26;
+    r[1] = (widen<u64>(read_le<u32>(key, 3)) >> 2) & 0x3ffff03;
+    r[2] = (widen<u64>(read_le<u32>(key, 6)) >> 4) & 0x3ffc0ff;
+    r[3] = (widen<u64>(read_le<u32>(key, 9)) >> 6) & 0x3f03fff;
+    r[4] = (widen<u64>(read_le<u32>(key, 12)) >> 8) & 0x00fffff;
+    array<u64, 4> pad = [0; 4];
+    for (usize i = 0; i < 4; i += 1)
+    {
+        pad[i] = widen<u64>(read_le<u32>(key, 16 + 4 * i));
+    }
+    Poly1305 { .h = [0; 5], .r = r, .pad = pad }
+}
+
+// One 16-byte block; `hibit` is 2^24 for a whole block (the appended 1
+// bit) and 0 for the last, already padded, partial one.
+fn Poly1305::block(ref<Poly1305, exclusive> p, slice<u8, shared> m, u64 hibit)
+{
+    p.h = poly1305_blocks(p.h, p.r, m, hibit);
+}
+
+// The accumulator after every whole 16-byte block of `m`: the state as
+// values and `m` the only reference, read unchecked.
+fn poly1305_blocks(array<u64, 5> h, array<u64, 5> r, slice<u8, shared> m, u64 hibit) : array<u64, 5>
+{
+    u64 m26 = 0x3ffffff;
+    u64 r0 = r[0];
+    u64 r1 = r[1];
+    u64 r2 = r[2];
+    u64 r3 = r[3];
+    u64 r4 = r[4];
+    u64 s1 = r1 * 5;
+    u64 s2 = r2 * 5;
+    u64 s3 = r3 * 5;
+    u64 s4 = r4 * 5;
+    u64 h0 = h[0];
+    u64 h1 = h[1];
+    u64 h2 = h[2];
+    u64 h3 = h[3];
+    u64 h4 = h[4];
+    for (usize at = 0; at + 16 <= slice_len(m); at += 16)
+    {
+        // The little-endian words at 0, 3, 6, 9 and 12.
+        array<u64, 5> t = [0; 5];
+        for (usize k = 0; k < 5; k += 1)
+        {
+            usize o = at + 3 * k;
+            t[k] = widen<u64>(m[o]) | (widen<u64>(m[o + 1]) << 8) | (widen<u64>(m[o + 2]) << 16) | (widen<u64>(m[o + 3]) << 24);
+        }
+        h0 += t[0] & m26;
+        h1 += (t[1] >> 2) & m26;
+        h2 += (t[2] >> 4) & m26;
+        h3 += (t[3] >> 6) & m26;
+        h4 += (t[4] >> 8) | hibit;
+        u64 d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        u64 d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        u64 d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        u64 d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        u64 d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+        u64 c = d0 >> 26;
+        h0 = d0 & m26;
+        d1 += c;
+        c = d1 >> 26;
+        h1 = d1 & m26;
+        d2 += c;
+        c = d2 >> 26;
+        h2 = d2 & m26;
+        d3 += c;
+        c = d3 >> 26;
+        h3 = d3 & m26;
+        d4 += c;
+        c = d4 >> 26;
+        h4 = d4 & m26;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 = h0 & m26;
+        h1 += c;
+    }
+    [h0, h1, h2, h3, h4]
+}
+
+// Adds `data` to the message, in whole blocks and a final padded one.
+// Called once per message part; each part is padded to 16 bytes, as the
+// AEAD construction pads its parts.
+fn Poly1305::update_padded(ref<Poly1305, exclusive> p, slice<u8, shared> data)
+{
+    usize n = slice_len(data);
+    usize at = n - n % 16;
+    if (at > 0)
+    {
+        Poly1305::block(p, &data[0..at], 1 << 24);
+    }
+    if (at < n)
+    {
+        array<u8, 16> last = [0; 16];
+        for (usize i = 0; at + i < n; i += 1)
+        {
+            last[i] = data[at + i];
+        }
+        Poly1305::block(p, &last[0..$], 1 << 24);
+    }
+}
+
+// The final, unpadded partial block of a plain Poly1305 message: the 1
+// byte appended and zeros after it, with no extra bit.
+fn Poly1305::update_last(ref<Poly1305, exclusive> p, slice<u8, shared> data)
+{
+    usize n = slice_len(data);
+    usize at = 0;
+    while (at + 16 <= n)
+    {
+        Poly1305::block(p, &data[at..at + 16], 1 << 24);
+        at += 16;
+    }
+    if (at < n)
+    {
+        array<u8, 16> last = [0; 16];
+        for (usize i = 0; at + i < n; i += 1)
+        {
+            last[i] = data[at + i];
+        }
+        last[n - at] = 1;
+        Poly1305::block(p, &last[0..$], 0);
+    }
+}
+
+// The 16-byte tag: h reduced mod 2^130 - 5 without a branch on its value,
+// then plus `s` mod 2^128.
+fn Poly1305::finish(Poly1305 p) : array<u8, 16>
+{
+    u64 m26 = 0x3ffffff;
+    u64 h0 = p.h[0];
+    u64 h1 = p.h[1];
+    u64 h2 = p.h[2];
+    u64 h3 = p.h[3];
+    u64 h4 = p.h[4];
+    u64 c = h1 >> 26;
+    h1 = h1 & m26;
+    h2 += c;
+    c = h2 >> 26;
+    h2 = h2 & m26;
+    h3 += c;
+    c = h3 >> 26;
+    h3 = h3 & m26;
+    h4 += c;
+    c = h4 >> 26;
+    h4 = h4 & m26;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 = h0 & m26;
+    h1 += c;
+    // g = h + 5 - 2^130; it is chosen when it does not go below zero.
+    u64 g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 = g0 & m26;
+    u64 g1 = h1 + c;
+    c = g1 >> 26;
+    g1 = g1 & m26;
+    u64 g2 = h2 + c;
+    c = g2 >> 26;
+    g2 = g2 & m26;
+    u64 g3 = h3 + c;
+    c = g3 >> 26;
+    g3 = g3 & m26;
+    u64 g4 = wrapping_sub(h4 + c, 0x4000000);
+    u64 take_g = wrapping_sub(g4 >> 63, 1);
+    u64 take_h = ~take_g;
+    h0 = (h0 & take_h) | (g0 & take_g);
+    h1 = (h1 & take_h) | (g1 & take_g);
+    h2 = (h2 & take_h) | (g2 & take_g);
+    h3 = (h3 & take_h) | (g3 & take_g);
+    h4 = (h4 & take_h) | (g4 & take_g);
+    u64 m32 = 0xffffffff;
+    u64 w0 = (h0 | (h1 << 26)) & m32;
+    u64 w1 = ((h1 >> 6) | (h2 << 20)) & m32;
+    u64 w2 = ((h2 >> 12) | (h3 << 14)) & m32;
+    u64 w3 = ((h3 >> 18) | (h4 << 8)) & m32;
+    u64 f = w0 + p.pad[0];
+    w0 = f & m32;
+    f = w1 + p.pad[1] + (f >> 32);
+    w1 = f & m32;
+    f = w2 + p.pad[2] + (f >> 32);
+    w2 = f & m32;
+    f = w3 + p.pad[3] + (f >> 32);
+    w3 = f & m32;
+    array<u64, 4> w = [w0, w1, w2, w3];
+    array<u8, 16> tag = [0; 16];
+    for (usize i = 0; i < 4; i += 1)
+    {
+        tag[4 * i] = narrow_wrapping<u8>(w[i]);
+        tag[4 * i + 1] = narrow_wrapping<u8>(w[i] >> 8);
+        tag[4 * i + 2] = narrow_wrapping<u8>(w[i] >> 16);
+        tag[4 * i + 3] = narrow_wrapping<u8>(w[i] >> 24);
+    }
+    tag
+}
+
+// The Poly1305 tag of `message` under a one-time 32-byte key (RFC 8439
+// §2.5). A key must never authenticate two messages: the AEAD below derives
+// a fresh one per nonce. Another key length is `diag.crypto-length`.
+export fn poly1305(slice<u8, shared> key, slice<u8, shared> message) : array<u8, 16>
+{
+    if (slice_len(key) != 32)
+    {
+        fault(crypto_length);
+    }
+    Poly1305 p = Poly1305::new(key);
+    Poly1305::update_last(&mut p, message);
+    Poly1305::finish(p)
+}
+
+// The AEAD tag (RFC 8439 §2.8) of `aad` and `ciphertext` under the
+// one-time key from block 0.
+fn aead_tag(
+    slice<u8, shared> key,
+    slice<u8, shared> nonce,
+    slice<u8, shared> aad,
+    slice<u8, shared> ciphertext,
+) : array<u8, 16>
+{
+    array<u8, 64> block0 = chacha_block(key, nonce, 0);
+    Poly1305 p = Poly1305::new(&block0[0..32]);
+    Poly1305::update_padded(&mut p, aad);
+    Poly1305::update_padded(&mut p, ciphertext);
+    Vec<u8> lengths = Vec::new();
+    Vec::push_le(&mut lengths, widen<u64>(slice_len(aad)));
+    Vec::push_le(&mut lengths, widen<u64>(slice_len(ciphertext)));
+    Poly1305::block(&mut p, &lengths[0..$], 1 << 24);
+    Poly1305::finish(p)
+}
+
+// Encrypts and authenticates (RFC 8439 §2.8): the ciphertext of
+// `plaintext`, as long as it, followed by a 16-byte tag over it and over
+// `aad`, data sent in the clear but protected from change. `key` is 32
+// bytes and `nonce` 12; a nonce must never be used twice with one key.
+export fn chacha20_poly1305_seal(
+    slice<u8, shared> key,
+    slice<u8, shared> nonce,
+    slice<u8, shared> aad,
+    slice<u8, shared> plaintext,
+) : Vec<u8>
+{
+    Vec<u8> out = chacha20(key, nonce, 1, plaintext);
+    array<u8, 16> tag = aead_tag(key, nonce, aad, &out[0..$]);
+    for (usize i = 0; i < 16; i += 1)
+    {
+        Vec::push(&mut out, tag[i]);
+    }
+    out
+}
+
+// Checks and decrypts what `chacha20_poly1305_seal` gave: the plaintext
+// when the tag matches `sealed` and `aad` under `key` and `nonce`, and
+// `None` when anything was changed (or `sealed` is shorter than a tag).
+// Nothing of a message that fails is returned. Lengths as for `seal`.
+export fn chacha20_poly1305_open(
+    slice<u8, shared> key,
+    slice<u8, shared> nonce,
+    slice<u8, shared> aad,
+    slice<u8, shared> sealed,
+) : Option<Vec<u8>>
+{
+    crypto_check_lengths(key, nonce);
+    usize n = slice_len(sealed);
+    if (n < 16)
+    {
+        return None;
+    }
+    array<u8, 16> want = aead_tag(key, nonce, aad, &sealed[0..n - 16]);
+    if (!digest_eq(&want[0..$], &sealed[n - 16..n]))
+    {
+        return None;
+    }
+    Some(chacha20(key, nonce, 1, &sealed[0..n - 16]))
+}
+
+// AES (FIPS 197) and AES-GCM (NIST SP 800-38D; D-0165). AES is bitsliced:
+// four blocks at once, each step on every byte by masks and shifts, the
+// S-box a fixed circuit. GHASH multiplies by integer multiplications on
+// bits set four apart, whose carries cannot reach the bits kept. No branch
+// and no index depends on a key or a message byte, so the time taken
+// depends on the lengths alone.
+
+// Four blocks (64 bytes) as eight words: bit j of word b is bit b of byte
+// j, byte j being byte j % 16 of block j / 16, so each AES step works on
+// every byte of the four blocks at once, with masks and shifts and no
+// index or branch that depends on a key or a message (BearSSL's `aes_ct64`
+// approach, in a simpler layout).
+
+// The 8×8 bit matrix of x's bytes transposed: bit i of byte j becomes
+// bit j of byte i.
+fn aes_transpose8(u64 x) : u64
+{
+    u64 v = x;
+    u64 t = (v ^ (v >> 7)) & 0x00aa00aa00aa00aa;
+    v = v ^ t ^ (t << 7);
+    t = (v ^ (v >> 14)) & 0x0000cccc0000cccc;
+    v = v ^ t ^ (t << 14);
+    t = (v ^ (v >> 28)) & 0x00000000f0f0f0f0;
+    v ^ t ^ (t << 28)
+}
+
+// 64 bytes in the bitsliced layout.
+fn aes_pack(array<u8, 64> b) : array<u64, 8>
+{
+    array<u64, 8> q = [0; 8];
+    for (usize k = 0; k < 8; k += 1)
+    {
+        u64 x = 0;
+        for (usize i = 0; i < 8; i += 1)
+        {
+            x = x | (widen<u64>(b[8 * k + i]) << narrow<u32>(8 * i));
+        }
+        x = aes_transpose8(x);
+        for (usize p = 0; p < 8; p += 1)
+        {
+            q[p] = q[p] | (((x >> narrow<u32>(8 * p)) & 0xff) << narrow<u32>(8 * k));
+        }
+    }
+    q
+}
+
+// The 64 bytes of a bitsliced state.
+fn aes_unpack(array<u64, 8> q) : array<u8, 64>
+{
+    array<u8, 64> b = [0; 64];
+    for (usize k = 0; k < 8; k += 1)
+    {
+        u64 x = 0;
+        for (usize p = 0; p < 8; p += 1)
+        {
+            x = x | (((q[p] >> narrow<u32>(8 * k)) & 0xff) << narrow<u32>(8 * p));
+        }
+        x = aes_transpose8(x);
+        for (usize i = 0; i < 8; i += 1)
+        {
+            b[8 * k + i] = narrow_wrapping<u8>(x >> narrow<u32>(8 * i));
+        }
+    }
+    b
+}
+
+// The S-box of every byte: Boyar and Peralta's circuit of 113 gates
+// (a linear layer, a non-linear middle of 32 ANDs, a linear layer).
+fn aes_sbox_ct(array<u64, 8> q) : array<u64, 8>
+{
+    u64 x0 = q[7];
+    u64 x1 = q[6];
+    u64 x2 = q[5];
+    u64 x3 = q[4];
+    u64 x4 = q[3];
+    u64 x5 = q[2];
+    u64 x6 = q[1];
+    u64 x7 = q[0];
+    u64 y14 = x3 ^ x5;
+    u64 y13 = x0 ^ x6;
+    u64 y9 = x0 ^ x3;
+    u64 y8 = x0 ^ x5;
+    u64 t0 = x1 ^ x2;
+    u64 y1 = t0 ^ x7;
+    u64 y4 = y1 ^ x3;
+    u64 y12 = y13 ^ y14;
+    u64 y2 = y1 ^ x0;
+    u64 y5 = y1 ^ x6;
+    u64 y3 = y5 ^ y8;
+    u64 t1 = x4 ^ y12;
+    u64 y15 = t1 ^ x5;
+    u64 y20 = t1 ^ x1;
+    u64 y6 = y15 ^ x7;
+    u64 y10 = y15 ^ t0;
+    u64 y11 = y20 ^ y9;
+    u64 y7 = x7 ^ y11;
+    u64 y17 = y10 ^ y11;
+    u64 y19 = y10 ^ y8;
+    u64 y16 = t0 ^ y11;
+    u64 y21 = y13 ^ y16;
+    u64 y18 = x0 ^ y16;
+    u64 t2 = y12 & y15;
+    u64 t3 = y3 & y6;
+    u64 t4 = t3 ^ t2;
+    u64 t5 = y4 & x7;
+    u64 t6 = t5 ^ t2;
+    u64 t7 = y13 & y16;
+    u64 t8 = y5 & y1;
+    u64 t9 = t8 ^ t7;
+    u64 t10 = y2 & y7;
+    u64 t11 = t10 ^ t7;
+    u64 t12 = y9 & y11;
+    u64 t13 = y14 & y17;
+    u64 t14 = t13 ^ t12;
+    u64 t15 = y8 & y10;
+    u64 t16 = t15 ^ t12;
+    u64 t17 = t4 ^ t14;
+    u64 t18 = t6 ^ t16;
+    u64 t19 = t9 ^ t14;
+    u64 t20 = t11 ^ t16;
+    u64 t21 = t17 ^ y20;
+    u64 t22 = t18 ^ y19;
+    u64 t23 = t19 ^ y21;
+    u64 t24 = t20 ^ y18;
+    u64 t25 = t21 ^ t22;
+    u64 t26 = t21 & t23;
+    u64 t27 = t24 ^ t26;
+    u64 t28 = t25 & t27;
+    u64 t29 = t28 ^ t22;
+    u64 t30 = t23 ^ t24;
+    u64 t31 = t22 ^ t26;
+    u64 t32 = t31 & t30;
+    u64 t33 = t32 ^ t24;
+    u64 t34 = t23 ^ t33;
+    u64 t35 = t27 ^ t33;
+    u64 t36 = t24 & t35;
+    u64 t37 = t36 ^ t34;
+    u64 t38 = t27 ^ t36;
+    u64 t39 = t29 & t38;
+    u64 t40 = t25 ^ t39;
+    u64 t41 = t40 ^ t37;
+    u64 t42 = t29 ^ t33;
+    u64 t43 = t29 ^ t40;
+    u64 t44 = t33 ^ t37;
+    u64 t45 = t42 ^ t41;
+    u64 z0 = t44 & y15;
+    u64 z1 = t37 & y6;
+    u64 z2 = t33 & x7;
+    u64 z3 = t43 & y16;
+    u64 z4 = t40 & y1;
+    u64 z5 = t29 & y7;
+    u64 z6 = t42 & y11;
+    u64 z7 = t45 & y17;
+    u64 z8 = t41 & y10;
+    u64 z9 = t44 & y12;
+    u64 z10 = t37 & y3;
+    u64 z11 = t33 & y4;
+    u64 z12 = t43 & y13;
+    u64 z13 = t40 & y5;
+    u64 z14 = t29 & y2;
+    u64 z15 = t42 & y9;
+    u64 z16 = t45 & y14;
+    u64 z17 = t41 & y8;
+    u64 t46 = z15 ^ z16;
+    u64 t47 = z10 ^ z11;
+    u64 t48 = z5 ^ z13;
+    u64 t49 = z9 ^ z10;
+    u64 t50 = z2 ^ z12;
+    u64 t51 = z2 ^ z5;
+    u64 t52 = z7 ^ z8;
+    u64 t53 = z0 ^ z3;
+    u64 t54 = z6 ^ z7;
+    u64 t55 = z16 ^ z17;
+    u64 t56 = z12 ^ t48;
+    u64 t57 = t50 ^ t53;
+    u64 t58 = z4 ^ t46;
+    u64 t59 = z3 ^ t54;
+    u64 t60 = t46 ^ t57;
+    u64 t61 = z14 ^ t57;
+    u64 t62 = t52 ^ t58;
+    u64 t63 = t49 ^ t58;
+    u64 t64 = z4 ^ t59;
+    u64 t65 = t61 ^ t62;
+    u64 t66 = z1 ^ t63;
+    u64 s0 = t59 ^ t63;
+    u64 s6 = t56 ^ ~t62;
+    u64 s7 = t48 ^ ~t60;
+    u64 t67 = t64 ^ t65;
+    u64 s3 = t53 ^ t66;
+    u64 s4 = t51 ^ t66;
+    u64 s5 = t47 ^ t65;
+    u64 s1 = t64 ^ ~s3;
+    u64 s2 = t55 ^ ~t67;
+    [s7, s6, s5, s4, s3, s2, s1, s0]
+}
+
+// The S-box of each of the eight bytes of x (the key expansion's SubWord).
+fn aes_sbox_bytes(u64 x) : u64
+{
+    u64 t = aes_transpose8(x);
+    array<u64, 8> q = [0; 8];
+    for (usize p = 0; p < 8; p += 1)
+    {
+        q[p] = (t >> narrow<u32>(8 * p)) & 0xff;
+    }
+    q = aes_sbox_ct(q);
+    u64 r = 0;
+    for (usize p = 0; p < 8; p += 1)
+    {
+        r = r | ((q[p] & 0xff) << narrow<u32>(8 * p));
+    }
+    aes_transpose8(r)
+}
+
+// Masks of one row's bits in each 16-bit block, in the columns a row
+// moves right (`_LO`) and left (`_HI`) by in ShiftRows.
+const u64 AES_ROW0 = 0x1111111111111111;
+const u64 AES_ROW1_LO = 0x0222022202220222;
+const u64 AES_ROW1_HI = 0x2000200020002000;
+const u64 AES_ROW2_LO = 0x0044004400440044;
+const u64 AES_ROW2_HI = 0x4400440044004400;
+const u64 AES_ROW3_LO = 0x0008000800080008;
+const u64 AES_ROW3_HI = 0x8880888088808880;
+
+// ShiftRows: row r of each block moves r columns left, in every word.
+fn aes_shift_rows(array<u64, 8> q) : array<u64, 8>
+{
+    array<u64, 8> r = [0; 8];
+    for (usize b = 0; b < 8; b += 1)
+    {
+        u64 x = q[b];
+        r[b] = (x & AES_ROW0)
+            | ((x >> 4) & AES_ROW1_LO) | ((x << 12) & AES_ROW1_HI)
+            | ((x >> 8) & AES_ROW2_LO) | ((x << 8) & AES_ROW2_HI)
+            | ((x >> 12) & AES_ROW3_LO) | ((x << 4) & AES_ROW3_HI);
+    }
+    r
+}
+
+// Each column's rows rotated up by one, two and three: row r gets row
+// r + k's bit.
+fn aes_rot1(u64 x) : u64
+{
+    ((x >> 1) & 0x7777777777777777) | ((x << 3) & 0x8888888888888888)
+}
+
+fn aes_rot2(u64 x) : u64
+{
+    ((x >> 2) & 0x3333333333333333) | ((x << 2) & 0xcccccccccccccccc)
+}
+
+fn aes_rot3(u64 x) : u64
+{
+    ((x >> 3) & 0x1111111111111111) | ((x << 1) & 0xeeeeeeeeeeeeeeee)
+}
+
+// MixColumns: row r of a column becomes a[r+1] ^ a[r+2] ^ a[r+3] ^
+// 2·(a[r] ^ a[r+1]), the doubling a shift across the words with the
+// reduction by 0x1b.
+fn aes_mix_columns(array<u64, 8> q) : array<u64, 8>
+{
+    array<u64, 8> d = [0; 8];
+    array<u64, 8> s = [0; 8];
+    for (usize b = 0; b < 8; b += 1)
+    {
+        u64 r1 = aes_rot1(q[b]);
+        d[b] = q[b] ^ r1;
+        s[b] = r1 ^ aes_rot2(q[b]) ^ aes_rot3(q[b]);
+    }
+    [
+        s[0] ^ d[7],
+        s[1] ^ d[0] ^ d[7],
+        s[2] ^ d[1],
+        s[3] ^ d[2] ^ d[7],
+        s[4] ^ d[3] ^ d[7],
+        s[5] ^ d[4],
+        s[6] ^ d[5],
+        s[7] ^ d[6],
+    ]
+}
+
+fn aes_xtime(u8 a) : u8
+{
+    (a << 1) ^ (0x1b & wrapping_sub(0: u8, a >> 7))
+}
+
+// An expanded key: (rounds + 1) round keys, each bitsliced (`aes_pack`)
+// over four copies of itself, eight words a round.
+struct AesKey
+{
+    array<u64, 120> sk;
+    usize rounds;
+}
+
+// The key expansion (FIPS 197 §5.2) of a 16-, 24- or 32-byte key; another
+// length is `diag.crypto-length`. A word's byte k is its bits 8k to 8k+7.
+fn aes_expand(slice<u8, shared> key) : AesKey
+{
+    usize nk = slice_len(key) / 4;
+    if (slice_len(key) != 16 && slice_len(key) != 24 && slice_len(key) != 32)
+    {
+        fault(crypto_length);
+    }
+    usize rounds = nk + 6;
+    array<u32, 60> w = [0; 60];
+    for (usize i = 0; i < nk; i += 1)
+    {
+        w[i] = widen<u32>(key[4 * i]) | (widen<u32>(key[4 * i + 1]) << 8) | (widen<u32>(key[4 * i + 2]) << 16) | (widen<u32>(key[4 * i + 3]) << 24);
+    }
+    u8 rcon = 1;
+    for (usize word = nk; word < 4 * (rounds + 1); word += 1)
+    {
+        u32 t = w[word - 1];
+        if (word % nk == 0)
+        {
+            t = narrow_wrapping<u32>(aes_sbox_bytes(widen<u64>((t >> 8) | (t << 24)))) ^ widen<u32>(rcon);
+            rcon = aes_xtime(rcon);
+        }
+        else if (nk > 6 && word % nk == 4)
+        {
+            t = narrow_wrapping<u32>(aes_sbox_bytes(widen<u64>(t)));
+        }
+        w[word] = w[word - nk] ^ t;
+    }
+    array<u64, 120> sk = [0; 120];
+    for (usize r = 0; r <= rounds; r += 1)
+    {
+        array<u8, 64> b = [0; 64];
+        for (usize j = 0; j < 16; j += 1)
+        {
+            u8 v = narrow_wrapping<u8>(w[4 * r + j / 4] >> narrow<u32>(8 * (j % 4)));
+            for (usize k = 0; k < 4; k += 1)
+            {
+                b[16 * k + j] = v;
+            }
+        }
+        array<u64, 8> q = aes_pack(b);
+        for (usize p = 0; p < 8; p += 1)
+        {
+            sk[8 * r + p] = q[p];
+        }
+    }
+    AesKey { .sk = sk, .rounds = rounds }
+}
+
+// Four blocks, bitsliced, encrypted under an expanded key (FIPS 197 §5.1).
+// A block's byte r + 4c is row r of column c.
+fn aes_encrypt4(ref<AesKey, shared> key, array<u64, 8> input) : array<u64, 8>
+{
+    array<u64, 8> q = input;
+    for (usize p = 0; p < 8; p += 1)
+    {
+        q[p] = q[p] ^ key.sk[p];
+    }
+    for (usize round = 1; round <= key.rounds; round += 1)
+    {
+        q = aes_shift_rows(aes_sbox_ct(q));
+        if (round < key.rounds)
+        {
+            q = aes_mix_columns(q);
+        }
+        for (usize p = 0; p < 8; p += 1)
+        {
+            q[p] = q[p] ^ key.sk[8 * round + p];
+        }
+    }
+    q
+}
+
+// One block encrypted under an expanded key.
+fn aes_block(ref<AesKey, shared> key, array<u8, 16> input) : array<u8, 16>
+{
+    array<u8, 64> b = [0; 64];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        b[i] = input[i];
+    }
+    array<u8, 64> e = aes_unpack(aes_encrypt4(key, aes_pack(b)));
+    array<u8, 16> out = [0; 16];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        out[i] = e[i];
+    }
+    out
+}
+
+// One 16-byte block encrypted with AES under `key` (16, 24 or 32 bytes:
+// AES-128, AES-192 or AES-256). The bare block cipher, for building other
+// modes; `aes_gcm_seal` is what to encrypt data with.
+export fn aes_encrypt_block(slice<u8, shared> key, array<u8, 16> block) : array<u8, 16>
+{
+    AesKey k = aes_expand(key);
+    aes_block(&k, block)
+}
+
+// Sixteen bytes from `at` as a big-endian number, zeros past the end.
+fn gcm_block(slice<u8, shared> b, usize at) : u128
+{
+    u128 x = 0;
+    for (usize i = 0; i < 16; i += 1)
+    {
+        u8 v = if (at + i < slice_len(b)) { b[at + i] } else { 0 };
+        x = (x << 8) | widen<u128>(v);
+    }
+    x
+}
+
+// The low 64 bits of the carry-less product of x and y. Each operand is
+// split into four sets of bits four apart, so that a product of two sets
+// has at most fifteen terms in any column below bit 64 and its carries
+// never reach a column of the set kept (BearSSL's `bmul64`).
+fn ghash_bmul64(u64 x, u64 y) : u64
+{
+    u64 x0 = x & 0x1111111111111111;
+    u64 x1 = x & 0x2222222222222222;
+    u64 x2 = x & 0x4444444444444444;
+    u64 x3 = x & 0x8888888888888888;
+    u64 y0 = y & 0x1111111111111111;
+    u64 y1 = y & 0x2222222222222222;
+    u64 y2 = y & 0x4444444444444444;
+    u64 y3 = y & 0x8888888888888888;
+    u64 z0 = wrapping_mul(x0, y0) ^ wrapping_mul(x1, y3) ^ wrapping_mul(x2, y2) ^ wrapping_mul(x3, y1);
+    u64 z1 = wrapping_mul(x0, y1) ^ wrapping_mul(x1, y0) ^ wrapping_mul(x2, y3) ^ wrapping_mul(x3, y2);
+    u64 z2 = wrapping_mul(x0, y2) ^ wrapping_mul(x1, y1) ^ wrapping_mul(x2, y0) ^ wrapping_mul(x3, y3);
+    u64 z3 = wrapping_mul(x0, y3) ^ wrapping_mul(x1, y2) ^ wrapping_mul(x2, y1) ^ wrapping_mul(x3, y0);
+    (z0 & 0x1111111111111111) | (z1 & 0x2222222222222222) | (z2 & 0x4444444444444444) | (z3 & 0x8888888888888888)
+}
+
+// x with its 64 bits in reverse order.
+fn ghash_rev64(u64 x) : u64
+{
+    u64 v = ((x & 0x5555555555555555) << 1) | ((x >> 1) & 0x5555555555555555);
+    v = ((v & 0x3333333333333333) << 2) | ((v >> 2) & 0x3333333333333333);
+    v = ((v & 0x0f0f0f0f0f0f0f0f) << 4) | ((v >> 4) & 0x0f0f0f0f0f0f0f0f);
+    v = ((v & 0x00ff00ff00ff00ff) << 8) | ((v >> 8) & 0x00ff00ff00ff00ff);
+    v = ((v & 0x0000ffff0000ffff) << 16) | ((v >> 16) & 0x0000ffff0000ffff);
+    (v << 32) | (v >> 32)
+}
+
+// x·y in GF(2^128) with GCM's bit order (SP 800-38D §6.3): Karatsuba over
+// three 64-bit products, each half got by `ghash_bmul64` (the low half
+// directly, the high half from the bit-reversed operands), then the
+// reduction by x^128 + x^7 + x^2 + x + 1 (BearSSL's `ghash_ctmul64`).
+fn ghash_mul(u128 x, u128 y) : u128
+{
+    u64 x1 = narrow_wrapping<u64>(x >> 64);
+    u64 x0 = narrow_wrapping<u64>(x);
+    u64 y1 = narrow_wrapping<u64>(y >> 64);
+    u64 y0 = narrow_wrapping<u64>(y);
+    u64 x0r = ghash_rev64(x0);
+    u64 x1r = ghash_rev64(x1);
+    u64 y0r = ghash_rev64(y0);
+    u64 y1r = ghash_rev64(y1);
+    u64 z0 = ghash_bmul64(x0, y0);
+    u64 z1 = ghash_bmul64(x1, y1);
+    u64 z2 = ghash_bmul64(x0 ^ x1, y0 ^ y1);
+    u64 z0h = ghash_bmul64(x0r, y0r);
+    u64 z1h = ghash_bmul64(x1r, y1r);
+    u64 z2h = ghash_bmul64(x0r ^ x1r, y0r ^ y1r);
+    z2 = z2 ^ z0 ^ z1;
+    z2h = z2h ^ z0h ^ z1h;
+    z0h = ghash_rev64(z0h) >> 1;
+    z1h = ghash_rev64(z1h) >> 1;
+    z2h = ghash_rev64(z2h) >> 1;
+    u64 v0 = z0;
+    u64 v1 = z0h ^ z2;
+    u64 v2 = z1 ^ z2h;
+    u64 v3 = z1h;
+    v3 = (v3 << 1) | (v2 >> 63);
+    v2 = (v2 << 1) | (v1 >> 63);
+    v1 = (v1 << 1) | (v0 >> 63);
+    v0 = v0 << 1;
+    v2 = v2 ^ v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7);
+    v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57);
+    v3 = v3 ^ v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7);
+    v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57);
+    (widen<u128>(v3) << 64) | widen<u128>(v2)
+}
+
+fn ghash_update(u128 y, u128 h, slice<u8, shared> data) : u128
+{
+    u128 acc = y;
+    for (usize at = 0; at < slice_len(data); at += 16)
+    {
+        acc = ghash_mul(acc ^ gcm_block(data, at), h);
+    }
+    acc
+}
+
+fn gcm_bytes(u128 x) : array<u8, 16>
+{
+    array<u8, 16> b = [0; 16];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        b[i] = narrow_wrapping<u8>(x >> narrow<u32>(8 * (15 - i)));
+    }
+    b
+}
+
+// `data` exclusive-ored with the keystream of the counter blocks after
+// `j0` (the last 32 bits incremented, wrapping), as a new vector; four
+// blocks at a time.
+fn gcm_ctr(ref<AesKey, shared> key, array<u8, 16> j0, slice<u8, shared> data) : Vec<u8>
+{
+    Vec<u8> out = Vec::from_slice(data);
+    array<u8, 64> cb = [0; 64];
+    for (usize k = 0; k < 4; k += 1)
+    {
+        for (usize i = 0; i < 12; i += 1)
+        {
+            cb[16 * k + i] = j0[i];
+        }
+    }
+    // The counter, kept apart from the blocks (whose last four bytes it is).
+    u32 c = (widen<u32>(j0[12]) << 24) | (widen<u32>(j0[13]) << 16) | (widen<u32>(j0[14]) << 8) | widen<u32>(j0[15]);
+    for (usize at = 0; at < slice_len(data); at += 64)
+    {
+        for (usize k = 0; k < 4; k += 1)
+        {
+            c = wrapping_add(c, 1);
+            for (usize i = 0; i < 4; i += 1)
+            {
+                cb[16 * k + 12 + i] = narrow_wrapping<u8>(c >> narrow<u32>(24 - 8 * i));
+            }
+        }
+        array<u8, 64> ks = aes_unpack(aes_encrypt4(key, aes_pack(cb)));
+        for (usize i = 0; i < 64 && at + i < slice_len(data); i += 1)
+        {
+            out[at + i] = out[at + i] ^ ks[i];
+        }
+    }
+    out
+}
+
+// The tag: GHASH under H = E(0) of the aad, the ciphertext (each padded to
+// 16 bytes) and both bit lengths, exclusive-ored with E(j0).
+fn gcm_tag(
+    ref<AesKey, shared> key,
+    array<u8, 16> j0,
+    slice<u8, shared> aad,
+    slice<u8, shared> ciphertext,
+) : array<u8, 16>
+{
+    u128 h = gcm_block(&aes_block(key, [0; 16])[0..$], 0);
+    u128 y = ghash_update(ghash_update(0, h, aad), h, ciphertext);
+    u128 lengths = (widen<u128>(slice_len(aad)) * 8) << 64 | widen<u128>(slice_len(ciphertext)) * 8;
+    y = ghash_mul(y ^ lengths, h);
+    gcm_bytes(y ^ gcm_block(&aes_block(key, j0)[0..$], 0))
+}
+
+// The first counter block of a 12-byte nonce: nonce ‖ 0 0 0 1. Another
+// nonce length is `diag.crypto-length`.
+fn gcm_j0(slice<u8, shared> nonce) : array<u8, 16>
+{
+    if (slice_len(nonce) != 12)
+    {
+        fault(crypto_length);
+    }
+    array<u8, 16> j = [0; 16];
+    for (usize i = 0; i < 12; i += 1)
+    {
+        j[i] = nonce[i];
+    }
+    j[15] = 1;
+    j
+}
+
+// Encrypts and authenticates `plaintext` with AES-GCM under `key` (16, 24
+// or 32 bytes) and the 12-byte `nonce`: the ciphertext, as long as the
+// plaintext, followed by a 16-byte tag over it and `aad`. A nonce must
+// never be used twice with one key.
+export fn aes_gcm_seal(
+    slice<u8, shared> key,
+    slice<u8, shared> nonce,
+    slice<u8, shared> aad,
+    slice<u8, shared> plaintext,
+) : Vec<u8>
+{
+    array<u8, 16> j0 = gcm_j0(nonce);
+    AesKey k = aes_expand(key);
+    Vec<u8> out = gcm_ctr(&k, j0, plaintext);
+    array<u8, 16> tag = gcm_tag(&k, j0, aad, &out[0..$]);
+    Vec::extend_from(&mut out, &tag[0..$]);
+    out
+}
+
+// Checks and decrypts what `aes_gcm_seal` gave: Some(plaintext), or None
+// when the tag does not match (anything was changed, or the key, nonce or
+// aad differ); nothing of a refused message is returned.
+export fn aes_gcm_open(
+    slice<u8, shared> key,
+    slice<u8, shared> nonce,
+    slice<u8, shared> aad,
+    slice<u8, shared> sealed,
+) : Option<Vec<u8>>
+{
+    array<u8, 16> j0 = gcm_j0(nonce);
+    AesKey k = aes_expand(key);
+    usize n = slice_len(sealed);
+    if (n < 16)
+    {
+        return None;
+    }
+    array<u8, 16> want = gcm_tag(&k, j0, aad, &sealed[0..n - 16]);
+    if (!digest_eq(&want[0..$], &sealed[n - 16..n]))
+    {
+        return None;
+    }
+    Some(gcm_ctr(&k, j0, &sealed[0..n - 16]))
+}

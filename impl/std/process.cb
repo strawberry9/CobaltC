@@ -1,0 +1,517 @@
+// `std::process` (spec/21 §2k, D-0143): running other programs, and
+// interrupt requests. A failure is a `FileError`, as every input and
+// output failure is (D-0134): `NotFound` for a program that is not there
+// (nor on `PATH`, for a bare name). Written over `proc_op` (src/procio.rs), shared by
+// both implementations. No shell is ever involved: a program that wants
+// one runs `/bin/sh` with `-c` and says so.
+
+// A program to run: its name or path, its arguments, and how to run it.
+// Made by `Command::new` and changed by `arg`, `current_dir`, `env` and
+// `clear_env`; run by `output`, `output_with_input`, `status` or `spawn`,
+// any number of times.
+export struct Command
+{
+    Vec<String> program_and_args;
+    Option<String> dir;
+    Vec<String> env_names;
+    Vec<String> env_values;
+    bool clear_env;
+}
+
+// How a run of `output` ended: the exit status (minus the signal that
+// ended it, on Unix: `-9` for SIGKILL) and every byte it wrote to its
+// standard output and standard error.
+export struct Output
+{
+    export i32 status;
+    export Vec<u8> stdout;
+    export Vec<u8> stderr;
+}
+
+// The program `program`, with no arguments, run in this program's
+// working directory with its environment.
+export fn Command::new(StringView program) : Command
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, String::from_view(program));
+    Command { .program_and_args = v, .dir = None, .env_names = Vec::new(), .env_values = Vec::new(), .clear_env = false }
+}
+
+// Adds one argument, passed to the program exactly as given.
+export fn Command::arg(ref<Command, exclusive> c, StringView a)
+{
+    Vec::push(&mut c.program_and_args, String::from_view(a));
+}
+
+// The working directory the program starts in.
+export fn Command::current_dir(ref<Command, exclusive> c, StringView dir)
+{
+    c.dir = Some(String::from_view(dir));
+}
+
+// Sets an environment variable for the program (after `clear_env`, if
+// that is called too).
+export fn Command::env(ref<Command, exclusive> c, StringView name, StringView value)
+{
+    Vec::push(&mut c.env_names, String::from_view(name));
+    Vec::push(&mut c.env_values, String::from_view(value));
+}
+
+// The program starts with no environment variables but those `env` sets.
+export fn Command::clear_env(ref<Command, exclusive> c)
+{
+    c.clear_env = true;
+}
+
+fn Command::put(ref<Vec<u8>, exclusive> out, ref<String, shared> s)
+{
+    Vec::push_le(out, widen<u64>(String::len(s)));
+    foreach (b in &s.bytes)
+    {
+        Vec::push(out, *b);
+    }
+}
+
+// The command as `proc_op` reads it (src/procio.rs).
+fn Command::encode(ref<Command, shared> c) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push_le(&mut out, widen<u64>(Vec::len(&c.program_and_args)));
+    foreach (a in &c.program_and_args)
+    {
+        Command::put(&mut out, a);
+    }
+    Vec::push(&mut out, if (c.clear_env) { 1: u8 } else { 0: u8 });
+    match (&c.dir)
+    {
+        Some(d) :
+        {
+            Vec::push(&mut out, 1: u8);
+            Command::put(&mut out, d);
+        },
+        None    : Vec::push(&mut out, 0: u8),
+    }
+    Vec::push_le(&mut out, widen<u64>(Vec::len(&c.env_names)));
+    for (usize i = 0; i < Vec::len(&c.env_names); i += 1)
+    {
+        Command::put(&mut out, &c.env_names[i]);
+        Command::put(&mut out, &c.env_values[i]);
+    }
+    out
+}
+
+fn Command::run(ref<Command, shared> c, slice<u8, shared> input) : Result<Output, FileError>
+{
+    Vec<u8> spec = Command::encode(c);
+    i64 h = byte_op(
+        1,
+        0,
+        0,
+        bytes_ptr(&spec[0..$]),
+        Vec::len(&spec),
+        bytes_ptr(input),
+        slice_len(input),
+        dangling<u8>(),
+        0,
+    );
+    if (h < 0)
+    {
+        return Err(code_error(h));
+    }
+    Vec<u8> rec = match (byte_answer(1, 1, reinterpret<usize>(h), &spec[0..0], &spec[0..0]))
+    {
+        Ok(r)  : r,
+        Err(e) : return Err(code_error(e)),
+    };
+    usize n = narrow<usize>(read_le<u64>(&rec[0..$], 4));
+    Ok(Output { .status = read_le<i32>(
+        &rec[0..$],
+        0,
+    ), .stdout = Vec::from_slice(&rec[12..12 + n]), .stderr = Vec::from_slice(&rec[12 + n..$]) })
+}
+
+// Runs the program to its end with an empty standard input, and gives its
+// status and everything it wrote.
+export fn Command::output(ref<Command, shared> c) : Result<Output, FileError>
+{
+    Command::run(c, StringView::of("").bytes)
+}
+
+// The same, with `input` as the program's standard input.
+export fn Command::output_with_input(ref<Command, shared> c, slice<u8, shared> input) : Result<Output, FileError>
+{
+    Command::run(c, input)
+}
+
+// Runs the program to its end with this program's standard input, output
+// and error, and gives its status.
+export fn Command::status(ref<Command, shared> c) : Result<i32, FileError>
+{
+    Vec<u8> spec = Command::encode(c);
+    match (byte_answer(1, 2, 0, &spec[0..$], &spec[0..0]))
+    {
+        Ok(b)  : Ok(read_le<i32>(&b[0..$], 0)),
+        Err(e) : Err(code_error(e)),
+    }
+}
+
+// A running child, its standard input, output and error each a pipe to
+// this program. Dropping it closes the pipes but does not end it.
+export resource struct Child
+{
+    usize id;
+}
+
+// Starts the program and returns at once.
+export fn Command::spawn(ref<Command, shared> c) : Result<Child, FileError>
+{
+    Vec<u8> spec = Command::encode(c);
+    i64 h = byte_op(1, 3, 0, bytes_ptr(&spec[0..$]), Vec::len(&spec), dangling<u8>(), 0, dangling<u8>(), 0);
+    if (h < 0)
+    {
+        return Err(code_error(h));
+    }
+    Ok(Child { .id = reinterpret<usize>(h) })
+}
+
+fn Child::op(ref<Child, shared> ch, usize op, slice<u8, shared> data) : i64
+{
+    byte_op(1, op, ch.id, dangling<u8>(), 0, bytes_ptr(data), slice_len(data), dangling<u8>(), 0)
+}
+
+fn Child::done(i64 r) : Result<void, FileError>
+{
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    Ok(())
+}
+
+// The operating system's number for the child.
+export fn Child::id(ref<Child, shared> ch) : u64
+{
+    reinterpret<u64>(Child::op(ch, 4, StringView::of("").bytes))
+}
+
+// Writes all of `data` to the child's standard input.
+export fn Child::write_input(ref<Child, exclusive> ch, slice<u8, shared> data) : Result<void, FileError>
+{
+    Child::done(Child::op(ch, 5, data))
+}
+
+// Closes the child's standard input: it reads the end there.
+export fn Child::close_input(ref<Child, exclusive> ch)
+{
+    i64 r = Child::op(ch, 6, StringView::of("").bytes);
+}
+
+// Appends up to `want` bytes of a pipe (`op` 7 standard output, 9
+// standard error) to `buf`; how many, 0 at its end.
+// trusted: [Rawptr-Offset] to buf's spare capacity [len, len + want), reserved by the caller; the call below writes only there.
+fn Child::take(ref<Child, exclusive> ch, usize op, ref<Vec<u8>, exclusive> buf, usize want) : Result<usize, FileError>
+{
+    while (buf.cap - buf.len < want)
+    {
+        Vec::grow(buf);
+    }
+    rawptr<u8> at = unsafe
+    {
+        reinterpret_ptr<u8>(buf.ptr + reinterpret<isize>(buf.len))
+    };
+    i64 r = byte_op(1, op, ch.id, dangling<u8>(), 0, dangling<u8>(), 0, at, want);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    usize n = reinterpret<usize>(r);
+    buf.len = buf.len + n;
+    Ok(n)
+}
+
+fn Child::cap(usize max) : usize
+{
+    if (max > 1_048_576)
+    {
+        return 1_048_576;
+    }
+    max
+}
+
+// Appends up to `max` bytes of the child's standard output to `buf`, as
+// many as are ready (at most a MiB), and returns how many: 0 only at its
+// end, when `max` > 0.
+export fn Child::read_output(
+    ref<Child, exclusive> ch,
+    ref<Vec<u8>, exclusive> buf,
+    usize max,
+) : Result<usize, FileError>
+{
+    Child::take(ch, 7, buf, Child::cap(max))
+}
+
+// The next line of the child's standard output without its '\n' (nor a
+// '\r' before it); None at its end.
+export fn Child::read_output_line(ref<Child, exclusive> ch) : Result<Option<String>, FileError>
+{
+    i64 r = Child::op(ch, 8, StringView::of("").bytes);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = Child::take(ch, 7, &mut bytes, reinterpret<usize>(r))?;
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// As `read_output`, from the child's standard error.
+export fn Child::read_error(ref<Child, exclusive> ch, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, FileError>
+{
+    Child::take(ch, 9, buf, Child::cap(max))
+}
+
+// D-0181: as `read_output_line`, from the child's standard error.
+export fn Child::read_error_line(ref<Child, exclusive> ch) : Result<Option<String>, FileError>
+{
+    i64 r = Child::op(ch, 18, StringView::of("").bytes);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = Child::take(ch, 9, &mut bytes, reinterpret<usize>(r))?;
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// Closes the child's standard input and waits for it to end; its status,
+// as `Output`'s. Asked again, the same status.
+export fn Child::wait(ref<Child, exclusive> ch) : Result<i32, FileError>
+{
+    match (byte_answer(1, 10, ch.id, StringView::of("").bytes, StringView::of("").bytes))
+    {
+        Ok(b)  : Ok(read_le<i32>(&b[0..$], 0)),
+        Err(e) : Err(code_error(e)),
+    }
+}
+
+// The child's status if it has ended, without waiting; None while it runs.
+export fn Child::try_wait(ref<Child, exclusive> ch) : Result<Option<i32>, FileError>
+{
+    Vec<u8> b = Vec::new();
+    while (b.cap < 4)
+    {
+        Vec::grow(&mut b);
+    }
+    i64 r = byte_op(1, 11, ch.id, dangling<u8>(), 0, dangling<u8>(), 0, reinterpret_ptr<u8>(b.ptr), 4);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    b.len = 4;
+    Ok(Some(read_le<i32>(&b[0..$], 0)))
+}
+
+// Ends the child at once (SIGKILL on Unix); `wait` then gives its status.
+// Nothing happens to a child that has already ended.
+export fn Child::kill(ref<Child, exclusive> ch) : Result<void, FileError>
+{
+    Child::done(Child::op(ch, 12, StringView::of("").bytes))
+}
+
+// D-0205: ends the child and every process it started, and theirs in
+// turn (Linux: found from /proc; Windows: `taskkill /T`; elsewhere the child
+// alone, as `kill`). `wait` then gives its status.
+export fn Child::kill_tree(ref<Child, exclusive> ch) : Result<void, FileError>
+{
+    Child::done(Child::op(ch, 26, StringView::of("").bytes))
+}
+
+// D-0181: asks the child to end (SIGTERM on Unix, which a program may
+// catch to stop cleanly; on Windows, as `kill`); `wait` then gives its
+// status. Nothing happens to a child that has already ended.
+export fn Child::terminate(ref<Child, exclusive> ch) : Result<void, FileError>
+{
+    Child::done(Child::op(ch, 17, StringView::of("").bytes))
+}
+
+export fn Child::drop(ref<Child, exclusive> self)
+{
+    i64 r = byte_op(1, 13, self.id, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0);
+}
+
+// D-0195: a child's standard input or output as a value of its own, so
+// one thread can write a child's input while another reads its output (or
+// another child's): each end is independent of the `Child` and of the
+// other end, and outlives the `Child`. Dropping an end closes it; a child
+// reading its input then finds its end.
+export resource struct ChildInput
+{
+    usize id;
+}
+
+export resource struct ChildOutput
+{
+    usize id;
+}
+
+fn pipe_op(usize op, usize id, slice<u8, shared> data) : i64
+{
+    byte_op(1, op, id, dangling<u8>(), 0, bytes_ptr(data), slice_len(data), dangling<u8>(), 0)
+}
+
+// The child's standard input, taken out of it: `Child::write_input` and
+// `close_input` then do nothing (the end is the `ChildInput`'s). None if it
+// was taken or closed already.
+export fn Child::take_input(ref<Child, exclusive> ch) : Option<ChildInput>
+{
+    i64 h = Child::op(ch, 20, StringView::of("").bytes);
+    if (h < 0)
+    {
+        return None;
+    }
+    Some(ChildInput { .id = reinterpret<usize>(h) })
+}
+
+// The child's standard output, taken out of it with whatever was read
+// ahead: `Child::read_output` then finds its end. None if taken already.
+export fn Child::take_output(ref<Child, exclusive> ch) : Option<ChildOutput>
+{
+    i64 h = Child::op(ch, 21, StringView::of("").bytes);
+    if (h < 0)
+    {
+        return None;
+    }
+    Some(ChildOutput { .id = reinterpret<usize>(h) })
+}
+
+// Writes all of `data` to the child's standard input.
+export fn ChildInput::write(ref<ChildInput, exclusive> p, slice<u8, shared> data) : Result<void, FileError>
+{
+    Child::done(pipe_op(22, p.id, data))
+}
+
+export fn ChildInput::drop(ref<ChildInput, exclusive> self)
+{
+    i64 r = pipe_op(25, self.id, StringView::of("").bytes);
+}
+
+// As `Child::read_output`: up to `max` bytes (at most a MiB) appended to
+// `buf`; how many, 0 only at the end.
+// trusted: [Rawptr-Offset] to buf's spare capacity [len, len + want), reserved by the caller; the call below writes only there.
+export fn ChildOutput::read(
+    ref<ChildOutput, exclusive> p,
+    ref<Vec<u8>, exclusive> buf,
+    usize max,
+) : Result<usize, FileError>
+{
+    usize want = Child::cap(max);
+    while (buf.cap - buf.len < want)
+    {
+        Vec::grow(buf);
+    }
+    rawptr<u8> at = unsafe
+    {
+        reinterpret_ptr<u8>(buf.ptr + reinterpret<isize>(buf.len))
+    };
+    i64 r = byte_op(1, 23, p.id, dangling<u8>(), 0, dangling<u8>(), 0, at, want);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    usize n = reinterpret<usize>(r);
+    buf.len = buf.len + n;
+    Ok(n)
+}
+
+// As `Child::read_output_line`.
+export fn ChildOutput::read_line(ref<ChildOutput, exclusive> p) : Result<Option<String>, FileError>
+{
+    i64 r = pipe_op(24, p.id, StringView::of("").bytes);
+    if (r < 0)
+    {
+        return Err(code_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = ChildOutput::read(p, &mut bytes, reinterpret<usize>(r))?;
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+export fn ChildOutput::drop(ref<ChildOutput, exclusive> self)
+{
+    i64 r = pipe_op(25, self.id, StringView::of("").bytes);
+}
+
+// D-0181: the operating system's number for this program (its process
+// id), as a pid file records it.
+export fn process_id() : u64
+{
+    reinterpret<u64>(byte_op(1, 16, 0, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0))
+}
+
+// From now on, an interrupt (Ctrl-C, SIGINT; SIGTERM; on Windows Ctrl-C,
+// Ctrl-Break and closing the console) no longer ends the program: it
+// sets the flag `interrupt_requested` reads, and a blocking call it
+// arrives in may return early. A long-running loop checks the flag and
+// stops cleanly.
+export fn watch_interrupts()
+{
+    i64 r = byte_op(1, 14, 0, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0);
+}
+
+// Whether an interrupt has arrived since `watch_interrupts`.
+export fn interrupt_requested() : bool
+{
+    byte_op(1, 15, 0, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0) == 1
+}

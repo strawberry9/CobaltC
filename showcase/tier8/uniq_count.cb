@@ -1,0 +1,89 @@
+// Unique Lines, Counted
+//
+// Shows: a filter, the way `sort | uniq -c | sort -rn` is one. Standard
+// input is read a line at a time with `read_line`, and one `match` with
+// nested patterns tells a line (`Ok(Some(line))`) from the end of the
+// input (`Ok(None)`) — a value the loop handles, not a sentinel byte to
+// test for — and from a line that is not UTF-8 (`Err(Utf8(e))`), which
+// is reported with its line number and skipped. A line ending in
+// `\r\n` reads exactly as one ending in `\n` (D-0092), and a last line
+// with no newline still counts. Each line moves into a `HashMap`, which
+// keeps first-appearance order, so a stable sort by count gives the
+// same output on every run.
+//
+//   coby uniq_count.cb [-i] [-d] < FILE
+//
+// -i  ignore ASCII case (`Apple` counts as `apple`)
+// -d  print only lines that occur more than once
+
+import std;
+
+fn main() : u8
+{
+    bool fold = false;
+    bool dups_only = false;
+    foreach (i in 0..arg_count())
+    {
+        String a = Result::unwrap_or(arg(i), String::new());
+        if (&a[0..$] == "-i")
+        {
+            fold = true;
+        }
+        else if (&a[0..$] == "-d")
+        {
+            dups_only = true;
+        }
+        else
+        {
+            eprintf("uniq_count: unknown option \"%s\"\nusage: uniq_count [-i] [-d] < FILE\n", &a);
+            return 2;
+        }
+    }
+
+    HashMap<String, usize> counts = HashMap::new();
+    usize n = 0;
+    u8 status = 0;
+    while (true)
+    {
+        match (read_line())
+        {
+            Ok(Some(line)) :
+            {
+                n += 1;
+                String key = if (fold) { String::to_ascii_lower(&line) } else { line };
+                *HashMap::entry(&mut counts, key, 0) += 1;
+            },
+            Ok(None)       : break,
+            Err(Utf8(e))   :
+            {
+                n += 1;
+                eprintf("uniq_count: line %v: not UTF-8 at byte %v, skipped\n", n, e.offset);
+                status = 1;
+            },
+            Err(_)         :
+            {
+                eprintf("uniq_count: standard input could not be read after line %v\n", n);
+                return 1;
+            },
+        }
+    }
+
+    // Entry positions, most frequent first; the sort is stable, so equal
+    // counts keep the order in which the lines first appeared.
+    Vec<usize> order = Vec::from_fn(HashMap::len(&counts), [](usize i) : usize { i });
+    Vec::sort_by(&mut order, [counts](ref<usize, shared> a, ref<usize, shared> b) : bool
+    {
+        *HashMap::value_at(&counts, *a) > *HashMap::value_at(&counts, *b)
+    });
+    foreach (e in &order)
+    {
+        usize c = *HashMap::value_at(&counts, *e);
+        if (dups_only && c < 2)
+        {
+            continue;
+        }
+        printf("%7d %s\n", c, HashMap::key_at(&counts, *e));
+    }
+    printf("(%v lines, %v different)\n", n, HashMap::len(&counts));
+    status
+}

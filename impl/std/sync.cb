@@ -1,0 +1,311 @@
+// `std::sync` (spec/21 §3c): `Channel`.
+
+// A bounded queue between threads (`rule.conc.channel`, spec/19 §3,
+// D-0063), shared by reference as a `mutex` is: `send` waits while it is
+// full, `recv` while it is empty; after `close`, `send` gives its value
+// back and `recv` drains what is left, then gives `None`.
+struct ChannelState<T>
+{
+    Vec<Option<T>> slots;               // a ring of `cap` slots
+    usize head;                         // the oldest value's slot
+    usize count;
+    bool closed;
+}
+
+// The oldest value, taken from its slot; `st.count` is not 0.
+fn ChannelState::pop<T>(ref<ChannelState<T>, exclusive> st) : Option<T>
+{
+    usize at = st.head;
+    Option<T> none = None;
+    Option<T> x = replace(&mut st.slots[at], none);
+    st.head = (at + 1) % Vec::len(&st.slots);
+    st.count = st.count - 1;
+    x
+}
+
+export resource struct Channel<T>
+{
+    mutex<ChannelState<T>> state;
+    usize cap;
+    usize can_send;                     // counts a waiting `send` watches:
+    usize can_recv;                     // `recv` adds to it; and `send` to this
+}
+
+// A channel holding at most `cap` values; `cap` is at least 1.
+// trusted: [Extern-Call] event_op(new) touches no program storage.
+export fn Channel::new<T>(usize cap) : Channel<T>
+{
+    if (cap == 0)
+    {
+        fault(channel_zero_capacity);
+    }
+    Vec<Option<T>> slots = Vec::new();
+    usize i = 0;
+    while (i < cap)
+    {
+        Option<T> none = None;
+        Vec::push(&mut slots, none);
+        i = i + 1;
+    }
+    usize can_send = unsafe
+    {
+        event_op(0, 0, 0)
+    };
+    usize can_recv = unsafe
+    {
+        event_op(0, 0, 0)
+    };
+    ChannelState<T> st = ChannelState { .slots = slots, .head = 0, .count = 0, .closed = false };
+    Channel { .state = Mutex::new(st), .cap = cap, .can_send = can_send, .can_recv = can_recv }
+}
+
+// Puts v at the back, waiting while the channel is full; `Err(v)` once it
+// is closed.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+export fn Channel::send<T>(ref<Channel<T>, shared> ch, T v) : Result<void, T>
+{
+    while (true)
+    {
+        usize seen = 0;
+        {
+            auto g = lock(&ch.state);
+            if (g.closed)
+            {
+                return Err(v);
+            }
+            if (g.count < ch.cap)
+            {
+                usize at = (g.head + g.count) % ch.cap;
+                g.slots[at] = Some(v);
+                g.count = g.count + 1;
+                unsafe
+                {
+                    event_op(3, ch.can_recv, 0);
+                }
+                return Ok(());
+            }
+            seen = unsafe
+            {
+                event_op(1, ch.can_send, 0)
+            };
+        }
+        unsafe
+        {
+            event_op(2, ch.can_send, seen);
+        }
+    }
+}
+
+// Takes the value at the front, waiting while the channel is empty;
+// `None` once it is closed and empty.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+export fn Channel::recv<T>(ref<Channel<T>, shared> ch) : Option<T>
+{
+    while (true)
+    {
+        usize seen = 0;
+        {
+            auto g = lock(&ch.state);
+            if (g.count > 0)
+            {
+                Option<T> x = ChannelState::pop(&mut *g);
+                unsafe
+                {
+                    event_op(3, ch.can_send, 0);
+                }
+                return x;
+            }
+            if (g.closed)
+            {
+                return None;
+            }
+            seen = unsafe
+            {
+                event_op(1, ch.can_recv, 0)
+            };
+        }
+        unsafe
+        {
+            event_op(2, ch.can_recv, seen);
+        }
+    }
+}
+
+// D-0185: the value at the front if one is waiting, without waiting:
+// `Ok(Some(v))`; `Ok(None)` when the channel is empty; `Err(())` once it
+// is closed and empty, so a loop that also polls something else (a
+// socket, `interrupt_requested`) knows when the senders are done.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+export fn Channel::try_recv<T>(ref<Channel<T>, shared> ch) : Result<Option<T>, void>
+{
+    auto g = lock(&ch.state);
+    if (g.count > 0)
+    {
+        Option<T> x = ChannelState::pop(&mut *g);
+        unsafe
+        {
+            event_op(3, ch.can_send, 0);
+        }
+        return Ok(x);
+    }
+    if (g.closed)
+    {
+        return Err(());
+    }
+    Ok(None)
+}
+
+// D-0185: as `recv`, but waiting at most `ms` milliseconds: `Ok(Some(v))`
+// a value, `Ok(None)` none arrived in time, `Err(())` the channel is
+// closed and empty. The wait is a poll (every millisecond at first, then
+// every five), so it ends at most a few milliseconds late.
+// trusted: [Extern-Call] clock_read and sleep_ns touch no program storage.
+export fn Channel::recv_timeout_ms<T>(ref<Channel<T>, shared> ch, u64 ms) : Result<Option<T>, void>
+{
+    i64 deadline = unsafe
+    {
+        clock_read(0)
+    } + reinterpret<i64>(wrapping_mul(ms, 1000000));
+    u64 round = 0;
+    while (true)
+    {
+        match (Channel::try_recv(ch))
+        {
+            Ok(Some(v)) : return Ok(Some(v)),
+            Ok(None)    : {},
+            Err(_)      : return Err(()),
+        }
+        i64 now = unsafe
+        {
+            clock_read(0)
+        };
+        if (now >= deadline)
+        {
+            return Ok(None);
+        }
+        i64 ignored = unsafe
+        {
+            sleep_ns(if (round < 20) { 1000000 } else { 5000000 })
+        };
+        round += 1;
+    }
+}
+
+// D-0185: how many threads the machine runs at once (its processors, or
+// what this program may use of them): the size of a worker pool. At
+// least 1.
+export fn cpu_count() : usize
+{
+    i64 n = byte_op(1, 19, 0, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0);
+    if (n < 1)
+    {
+        return 1;
+    }
+    reinterpret<usize>(n)
+}
+
+// No more values: `send` fails from now on, and `recv` gives `None` once
+// the channel is empty. Closing a closed channel does nothing.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+export fn Channel::close<T>(ref<Channel<T>, shared> ch)
+{
+    auto g = lock(&ch.state);
+    g.closed = true;
+    unsafe
+    {
+        event_op(3, ch.can_send, 0);
+        event_op(3, ch.can_recv, 0);
+    }
+}
+
+// The values still in the channel are destroyed oldest first.
+// trusted: [Extern-Call] event_op(end) on the channel's own event ids: it touches no program storage.
+export fn Channel::drop<T>(ref<Channel<T>, exclusive> self)
+{
+    {
+        auto g = lock(&self.state);
+        while (g.count > 0)
+        {
+            Option<T> x = ChannelState::pop(&mut *g);
+            drop(x);
+        }
+    }
+    unsafe
+    {
+        event_op(4, self.can_send, 0);
+        event_op(4, self.can_recv, 0);
+    }
+}
+
+// D-0204: a spawned thread's fault, contained (spec/18 `[Fault-Contain]`)
+// and handed over by `try_join` instead of raised again.
+export struct ThreadFailure
+{
+    u64 id;
+}
+
+// `join`, with the thread's contained failure handed over as a value
+// instead of raised again (D-0204): how a thread supervises another.
+export fn try_join<R>(handle<R> h) : Result<R, ThreadFailure>
+{
+    u64 status = join_status(&h, 0);
+    if (status == 1)
+    {
+        return Ok(join(h));
+    }
+    Err(ThreadFailure { .id = status - 2 })
+}
+
+// Whether the thread has ended, its result (or its failure) waiting for
+// `join` or `try_join`, which then do not wait: how a supervisor finds
+// which of its threads to take, without waiting for any.
+export fn is_finished<R>(ref<handle<R>, shared> h) : bool
+{
+    join_status(h, 1) != 0
+}
+
+// The report, as the program would have printed it had nothing taken the
+// failure.
+export fn ThreadFailure::text(ref<ThreadFailure, shared> f) : String
+{
+    failure_text(0, f.id)
+}
+
+// The diagnostic's name: `diag.index-out-of-bounds`, `diag.thread-cancelled`, …
+export fn ThreadFailure::diagnostic(ref<ThreadFailure, shared> f) : String
+{
+    failure_text(1, f.id)
+}
+
+// Whether the thread ended because it was asked to (`cancel`), rather
+// than because of a fault of its own.
+export fn ThreadFailure::is_cancelled(ref<ThreadFailure, shared> f) : bool
+{
+    String d = failure_text(1, f.id);
+    StringView::eq(String::as_view(&d), "diag.thread-cancelled")
+}
+
+// trusted: [Extern-Call] task_op writes [out.ptr, out.ptr + cap), out's reserved buffer.
+fn failure_text(usize what, u64 id) : String
+{
+    Vec<u8> out = Vec::new();
+    usize cap = 256;
+    while (true)
+    {
+        while (out.cap < cap)
+        {
+            Vec::grow(&mut out);
+        }
+        isize n = unsafe
+        {
+            task_op(what, narrow<usize>(id), reinterpret_ptr<u8>(out.ptr), cap)
+        };
+        usize len = reinterpret<usize>(n);
+        if (n >= 0 && len <= cap)
+        {
+            out.len = len;
+            return Result::unwrap(String::from_utf8(out));
+        }
+        cap = len;
+    }
+}

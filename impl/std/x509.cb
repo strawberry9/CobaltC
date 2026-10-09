@@ -1,0 +1,1412 @@
+// `std::x509` (spec/21 §2n, D-0160): DER, X.509 certificates, and
+// verifying that a server's certificate chains to a trusted root and names
+// the server; then (D-0171) public and private keys in their standard
+// encodings (SubjectPublicKeyInfo, PKCS #8, PEM) and signing with them.
+// Written in CobaltC over `std::crypto`. Nothing here makes or signs a
+// certificate.
+
+// Why a certificate or a chain was refused.
+export enum CertError
+{
+    BadEncoding,
+    Expired,
+    NotYetValid,
+    UnknownAuthority,
+    HostMismatch,
+    BadSignature,
+    NotAuthority,
+    UnsupportedAlgorithm,
+    UnhandledCritical,
+    WrongUsage,
+    ChainTooLong,
+}
+
+export fn CertError::text(ref<CertError, shared> e) : str
+{
+    match (e)
+    {
+        BadEncoding          : "malformed certificate",
+        Expired              : "certificate expired",
+        NotYetValid          : "certificate not yet valid",
+        UnknownAuthority     : "certificate signed by an unknown authority",
+        HostMismatch         : "certificate is not for this host",
+        BadSignature         : "certificate signature does not verify",
+        NotAuthority         : "issuer is not a certificate authority",
+        UnsupportedAlgorithm : "unsupported key or signature algorithm",
+        UnhandledCritical    : "unhandled critical extension",
+        WrongUsage           : "certificate not usable for a TLS server",
+        ChainTooLong         : "certificate chain too long",
+    }
+}
+
+// One DER element (ITU-T X.690): its tag byte and where its contents lie
+// in the buffer it was read from, and where the next element begins.
+export struct Der
+{
+    export u8 tag;
+    export usize start;
+    export usize end;
+    export usize next;
+}
+
+// The element at `at` in `buf`, or None when it is not well-formed DER
+// (a length in the long form when the short would do, more than four
+// length bytes, the indefinite form, or contents past the buffer).
+export fn der_read(slice<u8, shared> buf, usize at) : Option<Der>
+{
+    usize n = slice_len(buf);
+    if (at + 2 > n)
+    {
+        return None;
+    }
+    u8 tag = buf[at];
+    if ((tag & 0x1f) == 0x1f)
+    {
+        return None;
+    }
+    u8 first = buf[at + 1];
+    usize len = 0;
+    usize start = at + 2;
+    if (first < 0x80)
+    {
+        len = widen<usize>(first);
+    }
+    else
+    {
+        usize count = widen<usize>(first & 0x7f);
+        if (count == 0 || count > 4 || start + count > n || buf[start] == 0)
+        {
+            return None;
+        }
+        for (usize i = 0; i < count; i += 1)
+        {
+            len = (len << 8) | widen<usize>(buf[start + i]);
+        }
+        if (len < 0x80)
+        {
+            return None;
+        }
+        start += count;
+    }
+    if (len > n - start)
+    {
+        return None;
+    }
+    Some(Der { .tag = tag, .start = start, .end = start + len, .next = start + len })
+}
+
+// The element at `at`, which must have tag `tag`.
+fn der_expect(slice<u8, shared> buf, usize at, u8 tag) : Result<Der, CertError>
+{
+    match (der_read(buf, at))
+    {
+        Some(d) : if (d.tag == tag) { Ok(d) } else { Err(BadEncoding) },
+        None    : Err(BadEncoding),
+    }
+}
+
+fn der_bytes(slice<u8, shared> buf, Der d) : Vec<u8>
+{
+    Vec::from_slice(&buf[d.start..d.end])
+}
+
+fn der_eq_hex(slice<u8, shared> buf, Der d, str hex) : bool
+{
+    Vec<u8> want = Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new());
+    d.end - d.start == Vec::len(&want) && digest_eq(&buf[d.start..d.end], &want[0..$])
+}
+
+// An elliptic-curve public key: the curve and the uncompressed point.
+export struct EcPublicKey
+{
+    export EcCurve curve;
+    export Vec<u8> point;
+}
+
+// The key in a certificate.
+export enum CertKey
+{
+    RsaKey(RsaPublicKey),
+    EcKey(EcPublicKey),
+    Ed25519Key(array<u8, 32>),
+    UnsupportedKey,
+}
+
+// How a certificate (or a TLS handshake) is signed.
+export enum SignatureScheme
+{
+    RsaPkcs1(HashKind),
+    RsaPss(HashKind),
+    Ecdsa(HashKind),
+    Ed25519,
+    UnsupportedSignature,
+}
+
+// A parsed X.509 v3 certificate (RFC 5280). `tbs` is the signed part;
+// `issuer` and `subject` are their names' DER, compared whole.
+export struct Certificate
+{
+    export Vec<u8> der;
+    export Vec<u8> tbs;
+    export Vec<u8> issuer;
+    export Vec<u8> subject;
+    export String common_name;
+    export DateTime not_before;
+    export DateTime not_after;
+    export Vec<String> dns_names;
+    export Vec<IpAddr> ip_addresses;
+    export bool is_ca;
+    export i64 max_path_len;
+    export bool can_sign_certificates;
+    export bool server_auth;
+    export bool unhandled_critical;
+    export CertKey key;
+    export SignatureScheme scheme;
+    export Vec<u8> signature;
+}
+
+fn hash_oid(slice<u8, shared> buf, Der d) : Option<HashKind>
+{
+    if (der_eq_hex(buf, d, "608648016503040201"))
+    {
+        return Some(Sha2_256);
+    }
+    if (der_eq_hex(buf, d, "608648016503040202"))
+    {
+        return Some(Sha2_384);
+    }
+    if (der_eq_hex(buf, d, "608648016503040203"))
+    {
+        return Some(Sha2_512);
+    }
+    None
+}
+
+// An AlgorithmIdentifier as a signature scheme.
+fn signature_algorithm(slice<u8, shared> buf, Der alg) : Result<SignatureScheme, CertError>
+{
+    Der oid = der_expect(buf, alg.start, 0x06)?;
+    if (der_eq_hex(buf, oid, "2a864886f70d01010b"))
+    {
+        return Ok(RsaPkcs1(Sha2_256));
+    }
+    if (der_eq_hex(buf, oid, "2a864886f70d01010c"))
+    {
+        return Ok(RsaPkcs1(Sha2_384));
+    }
+    if (der_eq_hex(buf, oid, "2a864886f70d01010d"))
+    {
+        return Ok(RsaPkcs1(Sha2_512));
+    }
+    if (der_eq_hex(buf, oid, "2a8648ce3d040302"))
+    {
+        return Ok(Ecdsa(Sha2_256));
+    }
+    if (der_eq_hex(buf, oid, "2a8648ce3d040303"))
+    {
+        return Ok(Ecdsa(Sha2_384));
+    }
+    if (der_eq_hex(buf, oid, "2a8648ce3d040304"))
+    {
+        return Ok(Ecdsa(Sha2_512));
+    }
+    if (der_eq_hex(buf, oid, "2b6570"))
+    {
+        return Ok(Ed25519);
+    }
+    if (der_eq_hex(buf, oid, "2a864886f70d01010a"))
+    {
+        // RSASSA-PSS-params: [0] hashAlgorithm, [1] maskGenAlgorithm,
+        // [2] saltLength; the hash must be SHA-2 and MGF1 over it, and the
+        // salt as long as the digest.
+        Der params = der_expect(buf, oid.next, 0x30)?;
+        Der h0 = der_expect(buf, params.start, 0xa0)?;
+        Der h_alg = der_expect(buf, h0.start, 0x30)?;
+        Der h_oid = der_expect(buf, h_alg.start, 0x06)?;
+        HashKind kind = match (hash_oid(buf, h_oid))
+        {
+            Some(k) : k,
+            None    : return Ok(UnsupportedSignature),
+        };
+        return Ok(RsaPss(kind));
+    }
+    Ok(UnsupportedSignature)
+}
+
+// The text of a DirectoryString-like value (UTF8String, PrintableString,
+// IA5String, or the T61String some old roots use for ASCII).
+fn der_text(slice<u8, shared> buf, Der d) : Option<String>
+{
+    if (d.tag != 0x0c && d.tag != 0x13 && d.tag != 0x16 && d.tag != 0x14)
+    {
+        return None;
+    }
+    match (String::from_utf8(der_bytes(buf, d)))
+    {
+        Ok(s)  : Some(s),
+        Err(_) : None,
+    }
+}
+
+// The last commonName (2.5.4.3) in a Name, or "".
+fn common_name_of(slice<u8, shared> buf, Der name) : String
+{
+    String cn = String::new();
+    usize at = name.start;
+    while (at < name.end)
+    {
+        Der set = match (der_read(buf, at))
+        {
+            Some(d) : d,
+            None    : return cn,
+        };
+        usize inner = set.start;
+        while (inner < set.end)
+        {
+            Der atv = match (der_read(buf, inner))
+            {
+                Some(d) : d,
+                None    : return cn,
+            };
+            if (Some(oid) = der_read(buf, atv.start))
+            {
+                if (oid.tag == 0x06 && der_eq_hex(buf, oid, "550403"))
+                {
+                    if (Some(v) = der_read(buf, oid.next))
+                    {
+                        if (Some(t) = der_text(buf, v))
+                        {
+                            overwrite(&mut cn, t);
+                        }
+                    }
+                }
+            }
+            inner = atv.next;
+        }
+        at = set.next;
+    }
+    cn
+}
+
+fn digits(slice<u8, shared> b, usize at, usize n) : Option<i64>
+{
+    i64 x = 0;
+    for (usize i = at; i < at + n; i += 1)
+    {
+        if (i >= slice_len(b) || !ascii_is_digit(b[i]))
+        {
+            return None;
+        }
+        x = x * 10 + widen<i64>(b[i] - b'0');
+    }
+    Some(x)
+}
+
+// UTCTime (YYMMDDHHMMSSZ; 50–99 are 19xx) or GeneralizedTime
+// (YYYYMMDDHHMMSSZ), as RFC 5280 §4.1.2.5 restricts them.
+fn der_time(slice<u8, shared> buf, Der d) : Result<DateTime, CertError>
+{
+    slice<u8, shared> t = &buf[d.start..d.end];
+    usize n = slice_len(t);
+    i64 year = 0;
+    usize at = 0;
+    if (d.tag == 0x17 && n == 13)
+    {
+        i64 yy = match (digits(t, 0, 2))
+        {
+            Some(y) : y,
+            None    : return Err(BadEncoding),
+        };
+        year = if (yy < 50) { 2000 + yy } else { 1900 + yy };
+        at = 2;
+    }
+    else if (d.tag == 0x18 && n == 15)
+    {
+        year = match (digits(t, 0, 4))
+        {
+            Some(y) : y,
+            None    : return Err(BadEncoding),
+        };
+        at = 4;
+    }
+    else
+    {
+        return Err(BadEncoding);
+    }
+    if (t[n - 1] != b'Z')
+    {
+        return Err(BadEncoding);
+    }
+    Option<i64> mo = digits(t, at, 2);
+    Option<i64> dd = digits(t, at + 2, 2);
+    Option<i64> hh = digits(t, at + 4, 2);
+    Option<i64> mi = digits(t, at + 6, 2);
+    Option<i64> ss = digits(t, at + 8, 2);
+    if (Some(m) = mo)
+    {
+        if (Some(day) = dd)
+        {
+            if (Some(h) = hh)
+            {
+                if (Some(min) = mi)
+                {
+                    if (Some(sec) = ss)
+                    {
+                        if (m <= 12 && day <= 31 && h <= 23 && min <= 59 && sec <= 59)
+                        {
+                            if (Some(dt) = DateTime::new(
+                                year,
+                                narrow<u8>(m),
+                                narrow<u8>(day),
+                                narrow<u8>(h),
+                                narrow<u8>(min),
+                                narrow<u8>(sec),
+                            ))
+                            {
+                                return Ok(dt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(BadEncoding)
+}
+
+fn public_key_of(slice<u8, shared> buf, Der spki) : Result<CertKey, CertError>
+{
+    Der alg = der_expect(buf, spki.start, 0x30)?;
+    Der bits = der_expect(buf, alg.next, 0x03)?;
+    if (bits.end == bits.start || buf[bits.start] != 0)
+    {
+        return Err(BadEncoding);
+    }
+    usize key_start = bits.start + 1;
+    Der oid = der_expect(buf, alg.start, 0x06)?;
+    if (der_eq_hex(buf, oid, "2a864886f70d010101"))
+    {
+        Der seq = der_expect(buf, key_start, 0x30)?;
+        Der n = der_expect(buf, seq.start, 0x02)?;
+        Der e = der_expect(buf, n.next, 0x02)?;
+        return Ok(RsaKey(RsaPublicKey { .n = BigUint::from_bytes_be(&buf[n.start..n.end]), .e = BigUint::from_bytes_be(&buf[e.start..e.end]) }));
+    }
+    if (der_eq_hex(buf, oid, "2a8648ce3d0201"))
+    {
+        Der curve = der_expect(buf, oid.next, 0x06)?;
+        Vec<u8> point = Vec::from_slice(&buf[key_start..bits.end]);
+        if (der_eq_hex(buf, curve, "2a8648ce3d030107"))
+        {
+            return Ok(EcKey(EcPublicKey { .curve = P256, .point = point }));
+        }
+        if (der_eq_hex(buf, curve, "2b81040022"))
+        {
+            return Ok(EcKey(EcPublicKey { .curve = P384, .point = point }));
+        }
+    }
+    if (der_eq_hex(buf, oid, "2b6570"))
+    {
+        if (bits.end - key_start != 32)
+        {
+            return Err(BadEncoding);
+        }
+        array<u8, 32> k = [0; 32];
+        for (usize i = 0; i < 32; i += 1)
+        {
+            k[i] = buf[key_start + i];
+        }
+        return Ok(Ed25519Key(k));
+    }
+    Ok(UnsupportedKey)
+}
+
+// Parses one certificate's DER (RFC 5280 §4.1).
+export fn Certificate::parse(slice<u8, shared> der) : Result<Certificate, CertError>
+{
+    Der cert = der_expect(der, 0, 0x30)?;
+    if (cert.next != slice_len(der))
+    {
+        return Err(BadEncoding);
+    }
+    Der tbs = der_expect(der, cert.start, 0x30)?;
+    Der outer_alg = der_expect(der, tbs.next, 0x30)?;
+    Der sig_bits = der_expect(der, outer_alg.next, 0x03)?;
+    if (sig_bits.next != cert.end || sig_bits.end == sig_bits.start || der[sig_bits.start] != 0)
+    {
+        return Err(BadEncoding);
+    }
+    SignatureScheme scheme = signature_algorithm(der, outer_alg)?;
+    usize at = tbs.start;
+    Der first = match (der_read(der, at))
+    {
+        Some(d) : d,
+        None    : return Err(BadEncoding),
+    };
+    if (first.tag == 0xa0)
+    {
+        at = first.next;
+    }
+    Der serial = der_expect(der, at, 0x02)?;
+    Der inner_alg = der_expect(der, serial.next, 0x30)?;
+    // The signature algorithm inside the signed part must be the outer one.
+    if (inner_alg.end - inner_alg.start != outer_alg.end - outer_alg.start || !digest_eq(
+        &der[inner_alg.start..inner_alg.end],
+        &der[outer_alg.start..outer_alg.end],
+    ))
+    {
+        return Err(BadEncoding);
+    }
+    Der issuer = der_expect(der, inner_alg.next, 0x30)?;
+    Der validity = der_expect(der, issuer.next, 0x30)?;
+    Der nb = match (der_read(der, validity.start))
+    {
+        Some(d) : d,
+        None    : return Err(BadEncoding),
+    };
+    Der na = match (der_read(der, nb.next))
+    {
+        Some(d) : d,
+        None    : return Err(BadEncoding),
+    };
+    DateTime not_before = der_time(der, nb)?;
+    DateTime not_after = der_time(der, na)?;
+    Der subject = der_expect(der, validity.next, 0x30)?;
+    Der spki = der_expect(der, subject.next, 0x30)?;
+    CertKey key = public_key_of(der, spki)?;
+    Certificate c = Certificate { .der = Vec::from_slice(der), .tbs = Vec::from_slice(&der[cert.start..tbs.next]), .issuer = Vec::from_slice(&der[inner_alg.next..issuer.next]), .subject = Vec::from_slice(&der[validity.next..subject.next]), .common_name = common_name_of(
+        der,
+        subject,
+    ), .not_before = not_before, .not_after = not_after, .dns_names = Vec::new(), .ip_addresses = Vec::new(), .is_ca = false, .max_path_len = -1, .can_sign_certificates = true, .server_auth = true, .unhandled_critical = false, .key = key, .scheme = scheme, .signature = Vec::from_slice(&der[sig_bits.start + 1..sig_bits.end]) };
+    at = spki.next;
+    while (at < tbs.end)
+    {
+        Der field = match (der_read(der, at))
+        {
+            Some(d) : d,
+            None    : return Err(BadEncoding),
+        };
+        if (field.tag == 0xa3)
+        {
+            Der exts = der_expect(der, field.start, 0x30)?;
+            usize e_at = exts.start;
+            while (e_at < exts.end)
+            {
+                Der ext = der_expect(der, e_at, 0x30)?;
+                Der oid = der_expect(der, ext.start, 0x06)?;
+                usize v_at = oid.next;
+                bool critical = false;
+                Der maybe = match (der_read(der, v_at))
+                {
+                    Some(d) : d,
+                    None    : return Err(BadEncoding),
+                };
+                if (maybe.tag == 0x01)
+                {
+                    critical = maybe.end > maybe.start && der[maybe.start] != 0;
+                    v_at = maybe.next;
+                }
+                Der value = der_expect(der, v_at, 0x04)?;
+                if (der_eq_hex(der, oid, "551d11"))
+                {
+                    Der names = der_expect(der, value.start, 0x30)?;
+                    usize n_at = names.start;
+                    while (n_at < names.end)
+                    {
+                        Der g = match (der_read(der, n_at))
+                        {
+                            Some(d) : d,
+                            None    : return Err(BadEncoding),
+                        };
+                        if (g.tag == 0x82)
+                        {
+                            if (Ok(s) = String::from_utf8(der_bytes(der, g)))
+                            {
+                                Vec::push(&mut c.dns_names, s);
+                            }
+                        }
+                        else if (g.tag == 0x87)
+                        {
+                            usize len = g.end - g.start;
+                            if (len == 4)
+                            {
+                                Vec::push(
+                                    &mut c.ip_addresses,
+                                    V4([der[g.start], der[g.start + 1], der[g.start + 2], der[g.start + 3]]),
+                                );
+                            }
+                            else if (len == 16)
+                            {
+                                array<u8, 16> a = [0; 16];
+                                for (usize i = 0; i < 16; i += 1)
+                                {
+                                    a[i] = der[g.start + i];
+                                }
+                                Vec::push(&mut c.ip_addresses, V6(a));
+                            }
+                        }
+                        n_at = g.next;
+                    }
+                }
+                else if (der_eq_hex(der, oid, "551d13"))
+                {
+                    Der bc = der_expect(der, value.start, 0x30)?;
+                    usize b_at = bc.start;
+                    if (b_at < bc.end)
+                    {
+                        Der x = match (der_read(der, b_at))
+                        {
+                            Some(d) : d,
+                            None    : return Err(BadEncoding),
+                        };
+                        if (x.tag == 0x01)
+                        {
+                            c.is_ca = x.end > x.start && der[x.start] != 0;
+                            b_at = x.next;
+                        }
+                    }
+                    if (b_at < bc.end)
+                    {
+                        Der pl = der_expect(der, b_at, 0x02)?;
+                        i64 v = 0;
+                        for (usize i = pl.start; i < pl.end && i < pl.start + 4; i += 1)
+                        {
+                            v = (v << 8) | widen<i64>(der[i]);
+                        }
+                        c.max_path_len = v;
+                    }
+                }
+                else if (der_eq_hex(der, oid, "551d0f"))
+                {
+                    Der ku = der_expect(der, value.start, 0x03)?;
+                    // Bit 5, keyCertSign, of the first byte after the
+                    // unused-bits count.
+                    c.can_sign_certificates = ku.end - ku.start >= 2 && (der[ku.start + 1] & 0x04) != 0;
+                }
+                else if (der_eq_hex(der, oid, "551d25"))
+                {
+                    Der eku = der_expect(der, value.start, 0x30)?;
+                    bool server = false;
+                    usize k_at = eku.start;
+                    while (k_at < eku.end)
+                    {
+                        Der p = der_expect(der, k_at, 0x06)?;
+                        if (der_eq_hex(der, p, "2b06010505070301") || der_eq_hex(der, p, "551d2500"))
+                        {
+                            server = true;
+                        }
+                        k_at = p.next;
+                    }
+                    c.server_auth = server;
+                }
+                else if (critical && !der_eq_hex(der, oid, "551d20") && !der_eq_hex(der, oid, "551d1e"))
+                {
+                    // An unknown critical extension; certificate policies
+                    // and name constraints are tolerated unread (D-0160).
+                    c.unhandled_critical = true;
+                }
+                e_at = ext.next;
+            }
+        }
+        at = field.next;
+    }
+    Ok(c)
+}
+
+// Every certificate in PEM text (RFC 7468's `-----BEGIN CERTIFICATE-----`
+// blocks); text between blocks is ignored. A block that is not base64,
+// or not a certificate, is skipped.
+export fn certificates_from_pem(StringView text) : Vec<Certificate>
+{
+    Vec<Certificate> out = Vec::new();
+    StringView begin = "-----BEGIN CERTIFICATE-----";
+    StringView end = "-----END CERTIFICATE-----";
+    usize at = 0;
+    usize n = StringView::len(text);
+    while (at < n)
+    {
+        StringView rest = StringView::sub(text, at, n);
+        usize b = match (StringView::find(rest, begin))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        StringView body = StringView::sub(rest, b + StringView::len(begin), StringView::len(rest));
+        usize e = match (StringView::find(body, end))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        String b64 = String::new();
+        StringView block = StringView::sub(body, 0, e);
+        for (usize i = 0; i < StringView::len(block); i += 1)
+        {
+            u8 c = block.bytes[i];
+            if (!ascii_is_space(c))
+            {
+                String::push_ascii(&mut b64, c);
+            }
+        }
+        if (Ok(der) = base64_decode(String::as_view(&b64)))
+        {
+            if (Ok(cert) = Certificate::parse(&der[0..$]))
+            {
+                Vec::push(&mut out, cert);
+            }
+        }
+        at = at + b + StringView::len(begin) + e + StringView::len(end);
+    }
+    out
+}
+
+// The roots a chain may end at.
+export struct TrustStore
+{
+    export Vec<Certificate> roots;
+}
+
+export fn TrustStore::new() : TrustStore
+{
+    TrustStore { .roots = Vec::new() }
+}
+
+export fn TrustStore::add(ref<TrustStore, exclusive> t, Certificate root)
+{
+    Vec::push(&mut t.roots, root);
+}
+
+// The roots in a PEM file (`/etc/ssl/certs/ca-certificates.crt` and the
+// like); `Err` when the file cannot be read.
+export fn TrustStore::from_pem_file(StringView path) : Result<TrustStore, FileError>
+{
+    String text = read_file(path)?;
+    Ok(TrustStore { .roots = certificates_from_pem(String::as_view(&text)) })
+}
+
+// The operating system's roots, from the first of the usual bundle files
+// that exists (Debian and Ubuntu, Fedora and RHEL, Alpine, macOS with a
+// package manager's OpenSSL). `Err(NotFound)` where there is none, as on
+// Windows: a program there passes a bundle to `from_pem_file`.
+export fn TrustStore::system() : Result<TrustStore, FileError>
+{
+    array<str, 5> paths = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+        "/usr/local/etc/openssl/cert.pem",
+    ];
+    foreach (p in &paths)
+    {
+        if (Ok(t) = TrustStore::from_pem_file(StringView::of(*p)))
+        {
+            if (Vec::len(&t.roots) > 0)
+            {
+                return Ok(t);
+            }
+        }
+    }
+    Err(NotFound)
+}
+
+// Whether `signature` over `message` verifies under `key` with `scheme`.
+export fn verify_signature(
+    ref<CertKey, shared> key,
+    ref<SignatureScheme, shared> scheme,
+    slice<u8, shared> message,
+    slice<u8, shared> signature,
+) : bool
+{
+    match (scheme)
+    {
+        RsaPkcs1(h) : match (key)
+        {
+            RsaKey(k) : rsa_verify_pkcs1v15(k, *h, &hash(*h, message)[0..$], signature),
+            _         : false,
+        },
+        RsaPss(h) : match (key)
+        {
+            RsaKey(k) : rsa_verify_pss(k, *h, &hash(*h, message)[0..$], signature),
+            _         : false,
+        },
+        Ecdsa(h) : match (key)
+        {
+            EcKey(k) : ecdsa_verify(k.curve, &k.point[0..$], &hash(*h, message)[0..$], signature),
+            _        : false,
+        },
+        Ed25519 : match (key)
+        {
+            Ed25519Key(k) : ed25519_verify(&k[0..$], message, signature),
+            _             : false,
+        },
+        UnsupportedSignature : false,
+    }
+}
+
+fn ascii_lower_eq(StringView a, StringView b) : bool
+{
+    if (StringView::len(a) != StringView::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < StringView::len(a); i += 1)
+    {
+        u8 x = a.bytes[i];
+        u8 y = b.bytes[i];
+        if (ascii_is_upper(x))
+        {
+            x += 32;
+        }
+        if (ascii_is_upper(y))
+        {
+            y += 32;
+        }
+        if (x != y)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// RFC 6125 §6.4: a name matches the host case-insensitively; `*` stands
+// for exactly one whole leftmost label, and never for an IP address.
+fn name_matches(StringView pattern, StringView host) : bool
+{
+    if (StringView::starts_with(pattern, "*."))
+    {
+        StringView suffix = StringView::sub(pattern, 1, StringView::len(pattern));
+        match (StringView::find(host, "."))
+        {
+            Some(dot) : dot > 0 && ascii_lower_eq(
+                suffix,
+                StringView::sub(host, dot, StringView::len(host)),
+            ) && Option::is_some(&StringView::find(StringView::sub(suffix, 1, StringView::len(suffix)), ".")),
+            None : false,
+        }
+    }
+    else
+    {
+        ascii_lower_eq(pattern, host)
+    }
+}
+
+// Whether the certificate is for `host`: an IP address literal against its
+// IP addresses, a name against its DNS names (the common name is not
+// consulted, as RFC 6125 and current browsers decide).
+export fn Certificate::matches_host(ref<Certificate, shared> c, StringView host) : bool
+{
+    if (Ok(ip) = IpAddr::parse(host))
+    {
+        foreach (a in &c.ip_addresses)
+        {
+            if (IpAddr::text(a) == IpAddr::text(&ip))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    StringView h = if (StringView::ends_with(
+        host,
+        ".",
+    )) { StringView::sub(host, 0, StringView::len(host) - 1) } else { host };
+    foreach (n in &c.dns_names)
+    {
+        if (name_matches(String::as_view(n), h))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn check_time(ref<Certificate, shared> c, ref<DateTime, shared> now) : Result<void, CertError>
+{
+    if (DateTime::less(now, &c.not_before))
+    {
+        return Err(NotYetValid);
+    }
+    if (DateTime::less(&c.not_after, now))
+    {
+        return Err(Expired);
+    }
+    if (c.unhandled_critical)
+    {
+        return Err(UnhandledCritical);
+    }
+    Ok(())
+}
+
+fn same_bytes(ref<Vec<u8>, shared> a, ref<Vec<u8>, shared> b) : bool
+{
+    Vec::len(a) == Vec::len(b) && digest_eq(&a[0..$], &b[0..$])
+}
+
+// Verifies a TLS server's chain (RFC 5280 §6, as a client needs it): the
+// leaf is for `host`, usable for a server, and in date at `now`; each
+// certificate is signed by the next, found among `intermediates` (in any
+// order) or `roots`, by issuer name and signature; every issuer is a CA
+// whose key may sign certificates, within its path length; the chain ends
+// at a root of `roots`, at most 10 certificates long.
+export fn verify_chain(
+    ref<Certificate, shared> leaf,
+    slice<Certificate, shared> intermediates,
+    ref<TrustStore, shared> roots,
+    StringView host,
+    ref<DateTime, shared> now,
+) : Result<void, CertError>
+{
+    if (!Certificate::matches_host(leaf, host))
+    {
+        return Err(HostMismatch);
+    }
+    if (!leaf.server_auth)
+    {
+        return Err(WrongUsage);
+    }
+    check_time(leaf, now)?;
+    Certificate current = Certificate::clone(leaf);
+    usize below = 0;
+    CertError last = UnknownAuthority;
+    for (usize depth = 0; depth < 10; depth += 1)
+    {
+        foreach (r in &roots.roots)
+        {
+            if (same_bytes(
+                &r.subject,
+                &current.issuer,
+            ) && verify_signature(&r.key, &current.scheme, &current.tbs[0..$], &current.signature[0..$]))
+            {
+                if (!r.is_ca || !r.can_sign_certificates)
+                {
+                    last = NotAuthority;
+                    continue;
+                }
+                if (Err(e) = check_time(r, now))
+                {
+                    last = e;
+                    continue;
+                }
+                return Ok(());
+            }
+        }
+        Option<Certificate> next = None;
+        for (usize i = 0; i < slice_len(intermediates); i += 1)
+        {
+            ref<Certificate, shared> m = &intermediates[i];
+            if (same_bytes(&m.subject, &current.issuer) && !same_bytes(&m.der, &current.der))
+            {
+                if (!verify_signature(&m.key, &current.scheme, &current.tbs[0..$], &current.signature[0..$]))
+                {
+                    last = BadSignature;
+                    continue;
+                }
+                if (!m.is_ca || !m.can_sign_certificates)
+                {
+                    return Err(NotAuthority);
+                }
+                if (m.max_path_len >= 0 && narrow<i64>(below) > m.max_path_len)
+                {
+                    return Err(NotAuthority);
+                }
+                check_time(m, now)?;
+                overwrite(&mut next, Some(Certificate::clone(m)));
+                break;
+            }
+        }
+        match (next)
+        {
+            Some(n) :
+            {
+                overwrite(&mut current, n);
+                below += 1;
+            },
+            None    : return Err(last),
+        }
+    }
+    Err(ChainTooLong)
+}
+
+// ---- keys in their standard encodings (D-0171) ----
+//
+// The formats `openssl` and every other tool write: a public key as a
+// SubjectPublicKeyInfo (RFC 5280 §4.1), a private key as PKCS #8
+// (RFC 5958), each in DER or in PEM (RFC 7468). The older PKCS #1
+// `RSA PRIVATE KEY` and SEC 1 `EC PRIVATE KEY` forms are read too;
+// what is written is always PKCS #8. An encrypted private key is not read.
+
+// DER length and element writers.
+fn der_push_len(ref<Vec<u8>, exclusive> out, usize len)
+{
+    if (len < 0x80)
+    {
+        Vec::push(out, narrow<u8>(len));
+        return;
+    }
+    usize count = 1;
+    while ((len >> narrow<u32>(8 * count)) != 0)
+    {
+        count += 1;
+    }
+    Vec::push(out, 0x80 | narrow<u8>(count));
+    for (usize i = 0; i < count; i += 1)
+    {
+        Vec::push(out, narrow_wrapping<u8>(len >> narrow<u32>(8 * (count - 1 - i))));
+    }
+}
+
+fn der_wrap(u8 tag, slice<u8, shared> content) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, tag);
+    der_push_len(&mut out, slice_len(content));
+    Vec::extend_from(&mut out, content);
+    out
+}
+
+// A DER INTEGER of the non-negative number with big-endian bytes `v`.
+fn der_uint(slice<u8, shared> v) : Vec<u8>
+{
+    usize from = 0;
+    while (from + 1 < slice_len(v) && v[from] == 0)
+    {
+        from += 1;
+    }
+    Vec<u8> content = Vec::new();
+    if (slice_len(v) == 0 || (v[from] & 0x80) != 0)
+    {
+        Vec::push(&mut content, 0);
+    }
+    Vec::extend_from(&mut content, &v[from..$]);
+    der_wrap(0x02, &content[0..$])
+}
+
+fn der_big(ref<BigUint, shared> a) : Vec<u8>
+{
+    der_uint(&BigUint::to_bytes_be(a)[0..$])
+}
+
+fn der_oid_hex(str hex) : Vec<u8>
+{
+    Vec<u8> b = Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new());
+    der_wrap(0x06, &b[0..$])
+}
+
+fn der_bit_string(slice<u8, shared> bytes) : Vec<u8>
+{
+    Vec<u8> content = Vec::new();
+    Vec::push(&mut content, 0);
+    Vec::extend_from(&mut content, bytes);
+    der_wrap(0x03, &content[0..$])
+}
+
+fn curve_oid_hex(EcCurve c) : str
+{
+    match (c)
+    {
+        P256 : "2a8648ce3d030107",
+        P384 : "2b81040022",
+    }
+}
+
+// The AlgorithmIdentifier of a key's algorithm.
+fn key_algorithm(ref<CertKey, shared> key) : Vec<u8>
+{
+    Vec<u8> content = match (key)
+    {
+        RsaKey(_)      :
+        {
+            Vec<u8> c = der_oid_hex("2a864886f70d010101");
+            Vec::push(&mut c, 0x05);
+            Vec::push(&mut c, 0x00);
+            c
+        },
+        EcKey(k)       :
+        {
+            Vec<u8> c = der_oid_hex("2a8648ce3d0201");
+            Vec::extend_from(&mut c, &der_oid_hex(curve_oid_hex(k.curve))[0..$]);
+            c
+        },
+        Ed25519Key(_)  : der_oid_hex("2b6570"),
+        UnsupportedKey : Vec::new(),
+    };
+    der_wrap(0x30, &content[0..$])
+}
+
+// The DER SubjectPublicKeyInfo of a key, or None for `UnsupportedKey`.
+export fn CertKey::to_der(ref<CertKey, shared> key) : Option<Vec<u8>>
+{
+    Vec<u8> bits = match (key)
+    {
+        RsaKey(k)      :
+        {
+            Vec<u8> seq = der_big(&k.n);
+            Vec::extend_from(&mut seq, &der_big(&k.e)[0..$]);
+            der_wrap(0x30, &seq[0..$])
+        },
+        EcKey(k)       : Vec::clone(&k.point),
+        Ed25519Key(k)  : Vec::from_slice(&k[0..$]),
+        UnsupportedKey : return None,
+    };
+    Vec<u8> content = key_algorithm(key);
+    Vec::extend_from(&mut content, &der_bit_string(&bits[0..$])[0..$]);
+    Some(der_wrap(0x30, &content[0..$]))
+}
+
+// The key of a DER SubjectPublicKeyInfo: `BadEncoding` when it is not one,
+// `UnsupportedAlgorithm` when its algorithm is not RSA, P-256, P-384 or
+// Ed25519.
+export fn CertKey::from_der(slice<u8, shared> der) : Result<CertKey, CertError>
+{
+    Der spki = der_expect(der, 0, 0x30)?;
+    if (spki.next != slice_len(der))
+    {
+        return Err(BadEncoding);
+    }
+    match (public_key_of(der, spki)?)
+    {
+        UnsupportedKey : Err(UnsupportedAlgorithm),
+        k              : Ok(k),
+    }
+}
+
+// The one PEM block of `text` with one of the `labels`: its DER, or
+// `BadEncoding` when there is none (or the base64 is not).
+fn pem_block(StringView text, slice<str, shared> labels) : Result<Vec<u8>, CertError>
+{
+    for (usize i = 0; i < slice_len(labels); i += 1)
+    {
+        String begin = String::from_str("-----BEGIN ");
+        String::append(&mut begin, labels[i]);
+        String::append(&mut begin, "-----");
+        String end = String::from_str("-----END ");
+        String::append(&mut end, labels[i]);
+        String::append(&mut end, "-----");
+        usize b = match (StringView::find(text, String::as_view(&begin)))
+        {
+            Some(v) : v,
+            None    : continue,
+        };
+        StringView body = StringView::sub(text, b + String::len(&begin), StringView::len(text));
+        usize e = match (StringView::find(body, String::as_view(&end)))
+        {
+            Some(v) : v,
+            None    : return Err(BadEncoding),
+        };
+        String b64 = String::new();
+        StringView block = StringView::sub(body, 0, e);
+        for (usize k = 0; k < StringView::len(block); k += 1)
+        {
+            u8 c = block.bytes[k];
+            if (!ascii_is_space(c))
+            {
+                String::push_ascii(&mut b64, c);
+            }
+        }
+        return match (base64_decode(String::as_view(&b64)))
+        {
+            Ok(der) : Ok(der),
+            Err(_)  : Err(BadEncoding),
+        };
+    }
+    if (Option::is_some(&StringView::find(text, "-----BEGIN ENCRYPTED PRIVATE KEY-----")))
+    {
+        return Err(UnsupportedAlgorithm);
+    }
+    Err(BadEncoding)
+}
+
+// `der` in a PEM block labelled `label`, in lines of 64 characters.
+fn pem_of(str label, slice<u8, shared> der) : String
+{
+    String out = String::from_str("-----BEGIN ");
+    String::append(&mut out, label);
+    String::append(&mut out, "-----\n");
+    String b64 = base64_encode(der);
+    usize n = String::len(&b64);
+    for (usize at = 0; at < n; at += 64)
+    {
+        String::append(&mut out, StringView::sub(String::as_view(&b64), at, min(at + 64, n)));
+        String::append(&mut out, "\n");
+    }
+    String::append(&mut out, "-----END ");
+    String::append(&mut out, label);
+    String::append(&mut out, "-----\n");
+    out
+}
+
+// The key of the `-----BEGIN PUBLIC KEY-----` block in `text`.
+export fn CertKey::from_pem(StringView text) : Result<CertKey, CertError>
+{
+    array<str, 1> labels = ["PUBLIC KEY"];
+    Vec<u8> der = pem_block(text, &labels[0..$])?;
+    CertKey::from_der(&der[0..$])
+}
+
+export fn CertKey::to_pem(ref<CertKey, shared> key) : Option<String>
+{
+    Some(pem_of("PUBLIC KEY", &CertKey::to_der(key)?[0..$]))
+}
+
+// An elliptic-curve private key: the curve and the scalar, 32 or 48
+// bytes.
+export struct EcPrivateKey
+{
+    export EcCurve curve;
+    export Vec<u8> scalar;
+}
+
+// A private key of one of the algorithms `std` signs with.
+export enum PrivateKey
+{
+    RsaPrivate(RsaPrivateKey),
+    EcPrivate(EcPrivateKey),
+    Ed25519Private(array<u8, 32>),
+}
+
+// The public key of a private key.
+export fn PrivateKey::public_key(ref<PrivateKey, shared> key) : CertKey
+{
+    match (key)
+    {
+        RsaPrivate(k)     : RsaKey(RsaPrivateKey::public_key(k)),
+        EcPrivate(k) : EcKey(EcPublicKey { .curve = k.curve, .point = Option::unwrap_or(
+            ec_public_key(k.curve, &k.scalar[0..$]),
+            Vec::new(),
+        ) }),
+        Ed25519Private(k) : Ed25519Key(ed25519_public_key(&k[0..$])),
+    }
+}
+
+// The RSAPrivateKey of PKCS #1 (RFC 8017 A.1.2) at `at` in `buf`.
+fn rsa_private_of(slice<u8, shared> buf, usize at) : Result<PrivateKey, CertError>
+{
+    Der seq = der_expect(buf, at, 0x30)?;
+    Der version = der_expect(buf, seq.start, 0x02)?;
+    Der n = der_expect(buf, version.next, 0x02)?;
+    Der e = der_expect(buf, n.next, 0x02)?;
+    Der d = der_expect(buf, e.next, 0x02)?;
+    Der p = der_expect(buf, d.next, 0x02)?;
+    Der q = der_expect(buf, p.next, 0x02)?;
+    match (RsaPrivateKey::new(
+        BigUint::from_bytes_be(&buf[n.start..n.end]),
+        BigUint::from_bytes_be(&buf[e.start..e.end]),
+        BigUint::from_bytes_be(&buf[d.start..d.end]),
+        BigUint::from_bytes_be(&buf[p.start..p.end]),
+        BigUint::from_bytes_be(&buf[q.start..q.end]),
+    ))
+    {
+        Some(k) : Ok(RsaPrivate(k)),
+        None    : Err(BadEncoding),
+    }
+}
+
+// The ECPrivateKey of SEC 1 (RFC 5915) at `at` in `buf`; the curve from
+// its own parameters when `curve` is None (the PKCS #8 wrapper names it).
+fn ec_private_of(slice<u8, shared> buf, usize at, Option<EcCurve> curve) : Result<PrivateKey, CertError>
+{
+    Der seq = der_expect(buf, at, 0x30)?;
+    Der version = der_expect(buf, seq.start, 0x02)?;
+    Der scalar = der_expect(buf, version.next, 0x04)?;
+    Option<EcCurve> found = curve;
+    usize p_at = scalar.next;
+    while (p_at < seq.end)
+    {
+        Der field = match (der_read(buf, p_at))
+        {
+            Some(v) : v,
+            None    : return Err(BadEncoding),
+        };
+        if (field.tag == 0xa0)
+        {
+            Der oid = der_expect(buf, field.start, 0x06)?;
+            if (der_eq_hex(buf, oid, "2a8648ce3d030107"))
+            {
+                found = Some(P256);
+            }
+            else if (der_eq_hex(buf, oid, "2b81040022"))
+            {
+                found = Some(P384);
+            }
+            else
+            {
+                return Err(UnsupportedAlgorithm);
+            }
+        }
+        p_at = field.next;
+    }
+    EcCurve c = match (found)
+    {
+        Some(v) : v,
+        None    : return Err(UnsupportedAlgorithm),
+    };
+    Vec<u8> k = Vec::from_slice(&buf[scalar.start..scalar.end]);
+    usize want = if (c == P256) { 32 } else { 48 };
+    if (Vec::len(&k) != want || Option::is_none(&ec_public_key(c, &k[0..$])))
+    {
+        return Err(BadEncoding);
+    }
+    Ok(EcPrivate(EcPrivateKey { .curve = c, .scalar = k }))
+}
+
+// The key of a DER private key: PKCS #8 PrivateKeyInfo, PKCS #1
+// RSAPrivateKey or SEC 1 ECPrivateKey, told apart by their first fields.
+// `BadEncoding` when it is none of them or its numbers do not fit
+// together; `UnsupportedAlgorithm` for an algorithm or curve `std` does
+// not sign with.
+export fn PrivateKey::from_der(slice<u8, shared> der) : Result<PrivateKey, CertError>
+{
+    Der seq = der_expect(der, 0, 0x30)?;
+    if (seq.next != slice_len(der))
+    {
+        return Err(BadEncoding);
+    }
+    Der version = der_expect(der, seq.start, 0x02)?;
+    Der second = match (der_read(der, version.next))
+    {
+        Some(v) : v,
+        None    : return Err(BadEncoding),
+    };
+    if (second.tag == 0x02)
+    {
+        return rsa_private_of(der, 0);
+    }
+    if (second.tag == 0x04)
+    {
+        return ec_private_of(der, 0, None);
+    }
+    if (second.tag != 0x30)
+    {
+        return Err(BadEncoding);
+    }
+    Der oid = der_expect(der, second.start, 0x06)?;
+    Der key = der_expect(der, second.next, 0x04)?;
+    if (der_eq_hex(der, oid, "2a864886f70d010101"))
+    {
+        return rsa_private_of(der, key.start);
+    }
+    if (der_eq_hex(der, oid, "2a8648ce3d0201"))
+    {
+        Der curve = der_expect(der, oid.next, 0x06)?;
+        if (der_eq_hex(der, curve, "2a8648ce3d030107"))
+        {
+            return ec_private_of(der, key.start, Some(P256));
+        }
+        if (der_eq_hex(der, curve, "2b81040022"))
+        {
+            return ec_private_of(der, key.start, Some(P384));
+        }
+        return Err(UnsupportedAlgorithm);
+    }
+    if (der_eq_hex(der, oid, "2b6570"))
+    {
+        Der inner = der_expect(der, key.start, 0x04)?;
+        if (inner.end - inner.start != 32 || inner.next != key.end)
+        {
+            return Err(BadEncoding);
+        }
+        array<u8, 32> seed = [0; 32];
+        for (usize i = 0; i < 32; i += 1)
+        {
+            seed[i] = der[inner.start + i];
+        }
+        return Ok(Ed25519Private(seed));
+    }
+    Err(UnsupportedAlgorithm)
+}
+
+// The key as DER PKCS #8 (version 0): an RSAPrivateKey with its CRT
+// values, an ECPrivateKey with its public key, or Ed25519's seed.
+export fn PrivateKey::to_der(ref<PrivateKey, shared> key) : Vec<u8>
+{
+    CertKey public = PrivateKey::public_key(key);
+    Vec<u8> inner = match (key)
+    {
+        RsaPrivate(k)     :
+        {
+            BigUint one = BigUint::from_u64(1);
+            BigUint p1 = BigUint::sub(&k.p, &one);
+            BigUint q1 = BigUint::sub(&k.q, &one);
+            Vec<u8> seq = der_uint(&[0: u8][0..$]);
+            Vec::extend_from(&mut seq, &der_big(&k.n)[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&k.e)[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&k.d)[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&k.p)[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&k.q)[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&BigUint::rem(&k.d, &p1))[0..$]);
+            Vec::extend_from(&mut seq, &der_big(&BigUint::rem(&k.d, &q1))[0..$]);
+            Vec::extend_from(
+                &mut seq,
+                &der_big(&Option::unwrap_or(BigUint::mod_inverse(&k.q, &k.p), BigUint::zero()))[0..$],
+            );
+            der_wrap(0x30, &seq[0..$])
+        },
+        EcPrivate(k)      :
+        {
+            Vec<u8> seq = der_uint(&[1: u8][0..$]);
+            Vec::extend_from(&mut seq, &der_wrap(0x04, &k.scalar[0..$])[0..$]);
+            Vec<u8> point = match (&public)
+            {
+                EcKey(pk) : Vec::clone(&pk.point),
+                _         : Vec::new(),
+            };
+            Vec::extend_from(&mut seq, &der_wrap(0xa1, &der_bit_string(&point[0..$])[0..$])[0..$]);
+            der_wrap(0x30, &seq[0..$])
+        },
+        Ed25519Private(k) : der_wrap(0x04, &k[0..$]),
+    };
+    Vec<u8> content = der_uint(&[0: u8][0..$]);
+    Vec::extend_from(&mut content, &key_algorithm(&public)[0..$]);
+    Vec::extend_from(&mut content, &der_wrap(0x04, &inner[0..$])[0..$]);
+    der_wrap(0x30, &content[0..$])
+}
+
+// The key of the first `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE
+// KEY` block in `text`; an `ENCRYPTED PRIVATE KEY` is `UnsupportedAlgorithm`.
+export fn PrivateKey::from_pem(StringView text) : Result<PrivateKey, CertError>
+{
+    array<str, 3> labels = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"];
+    Vec<u8> der = pem_block(text, &labels[0..$])?;
+    PrivateKey::from_der(&der[0..$])
+}
+
+export fn PrivateKey::to_pem(ref<PrivateKey, shared> key) : String
+{
+    pem_of("PRIVATE KEY", &PrivateKey::to_der(key)[0..$])
+}
+
+// `key`'s signature of `message` under `scheme`, as `verify_signature`
+// checks it: the message hashed with the scheme's hash and signed with
+// RSA or ECDSA, or signed whole with Ed25519. None when the key is not of
+// the scheme's kind (or the scheme is unsupported).
+export fn sign(
+    ref<PrivateKey, shared> key,
+    ref<SignatureScheme, shared> scheme,
+    slice<u8, shared> message,
+) : Option<Vec<u8>>
+{
+    match (scheme)
+    {
+        RsaPkcs1(h) : match (key)
+        {
+            RsaPrivate(k) : Some(rsa_sign_pkcs1v15(k, *h, &hash(*h, message)[0..$])),
+            _             : None,
+        },
+        RsaPss(h) : match (key)
+        {
+            RsaPrivate(k) : Some(rsa_sign_pss(k, *h, &hash(*h, message)[0..$])),
+            _             : None,
+        },
+        Ecdsa(h) : match (key)
+        {
+            EcPrivate(k) : ecdsa_sign(k.curve, &k.scalar[0..$], &hash(*h, message)[0..$]),
+            _            : None,
+        },
+        Ed25519 : match (key)
+        {
+            Ed25519Private(k) : Some(Vec::from_slice(&ed25519_sign(&k[0..$], message)[0..$])),
+            _                 : None,
+        },
+        UnsupportedSignature : None,
+    }
+}

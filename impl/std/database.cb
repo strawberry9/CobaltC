@@ -1,0 +1,152 @@
+// `std::database` (spec/21 §2q, D-0180, D-0187): database clients, one
+// submodule per server, each re-exported here: `postgres` (the `Pg*`
+// items). What they share is declared here: SCRAM-SHA-256 (RFC 5802, RFC
+// 7677), the SASL mechanism PostgreSQL and others authenticate with.
+
+// ---- SCRAM-SHA-256 (RFC 5802, RFC 7677), the client side ----
+
+// The salted password: PBKDF2 over HMAC-SHA-256, 32 bytes. The password
+// is used as given (no SASLprep).
+export fn scram_salted_password(StringView password, slice<u8, shared> salt, usize iterations) : Vec<u8>
+{
+    pbkdf2(Sha2_256, StringView::as_bytes(password), salt, iterations, 32)
+}
+
+// One SCRAM-SHA-256 exchange, without channel binding: `start` with the
+// user (its "," and "=" escaped; PostgreSQL ignores it and is sent "")
+// and the client's nonce, `client_first` to send, `respond` to the
+// server's first message gives the client's final message, `verify`
+// checks the server's.
+// Exported so the exchange can be checked against RFC 7677's vectors and
+// so a program can speak it to another server.
+export struct Scram
+{
+    String client_nonce;
+    String client_first_bare;
+    Vec<u8> server_signature;
+}
+
+export fn Scram::start(StringView user, StringView client_nonce) : Scram
+{
+    String bare = String::from_str("n=");
+    foreach (c in StringView::as_bytes(user))
+    {
+        if (*c == b',')
+        {
+            String::append(&mut bare, "=2C");
+        }
+        else if (*c == b'=')
+        {
+            String::append(&mut bare, "=3D");
+        }
+        else
+        {
+            String::push_ascii(&mut bare, *c);
+        }
+    }
+    String::append(&mut bare, ",r=");
+    String::append(&mut bare, client_nonce);
+    Scram { .client_nonce = String::from_view(client_nonce), .client_first_bare = bare, .server_signature = Vec::new() }
+}
+
+// `n,,n=<user>,r=<nonce>`: no channel binding.
+export fn Scram::client_first(ref<Scram, shared> s) : String
+{
+    String m = String::from_str("n,,");
+    String::append(&mut m, String::as_view(&s.client_first_bare));
+    m
+}
+
+fn attribute(slice<StringView, shared> parts, str name) : Option<StringView>
+{
+    foreach (p in parts)
+    {
+        if (StringView::starts_with(*p, StringView::of(name)))
+        {
+            return Some(StringView::sub(*p, 2, StringView::len(*p)));
+        }
+    }
+    None
+}
+
+// The client's final message for the server's first (`r=…,s=…,i=…`):
+// the proof of `password`. `AuthFailed` when the server's nonce does not
+// begin with the client's, `ProtocolViolation` when the message is malformed or
+// asks for an extension.
+export fn Scram::respond(
+    ref<Scram, exclusive> s,
+    StringView server_first,
+    StringView password,
+) : Result<String, PgError>
+{
+    Vec<StringView> parts = StringView::split(server_first, ",");
+    if (Option::is_some(&attribute(&parts[0..$], "m=")))
+    {
+        return Err(ProtocolViolation);
+    }
+    StringView nonce = Option::ok_or(attribute(&parts[0..$], "r="), ProtocolViolation)?;
+    StringView salt_text = Option::ok_or(attribute(&parts[0..$], "s="), ProtocolViolation)?;
+    StringView iter_text = Option::ok_or(attribute(&parts[0..$], "i="), ProtocolViolation)?;
+    if (!StringView::starts_with(
+        nonce,
+        String::as_view(&s.client_nonce),
+    ) || StringView::len(nonce) <= String::len(&s.client_nonce))
+    {
+        return Err(AuthFailed);
+    }
+    Vec<u8> salt = match (base64_decode(salt_text))
+    {
+        Ok(v)  : v,
+        Err(_) : return Err(ProtocolViolation),
+    };
+    usize iterations = match (StringView::parse<usize>(iter_text))
+    {
+        Ok(n)  : n,
+        Err(_) : return Err(ProtocolViolation),
+    };
+    if (iterations == 0)
+    {
+        return Err(ProtocolViolation);
+    }
+    Vec<u8> salted = scram_salted_password(password, &salt[0..$], iterations);
+    array<u8, 32> client_key = hmac_sha256(&salted[0..$], &b"Client Key"[0..$]);
+    array<u8, 32> stored_key = sha256(&client_key[0..$]);
+    String without_proof = String::from_str("c=biws,r=");
+    String::append(&mut without_proof, nonce);
+    String auth = String::clone(&s.client_first_bare);
+    String::append(&mut auth, ",");
+    String::append(&mut auth, server_first);
+    String::append(&mut auth, ",");
+    String::append(&mut auth, String::as_view(&without_proof));
+    array<u8, 32> client_signature = hmac_sha256(&stored_key[0..$], StringView::as_bytes(String::as_view(&auth)));
+    Vec<u8> proof = Vec::new();
+    for (usize i = 0; i < 32; i += 1)
+    {
+        Vec::push(&mut proof, client_key[i] ^ client_signature[i]);
+    }
+    array<u8, 32> server_key = hmac_sha256(&salted[0..$], &b"Server Key"[0..$]);
+    array<u8, 32> server_signature = hmac_sha256(&server_key[0..$], StringView::as_bytes(String::as_view(&auth)));
+    overwrite(&mut s.server_signature, Vec::from_slice(&server_signature[0..$]));
+    String::append(&mut without_proof, ",p=");
+    String::append(&mut without_proof, String::as_view(&base64_encode(&proof[0..$])));
+    Ok(without_proof)
+}
+
+// Whether the server's final message (`v=…`) carries the signature the
+// exchange expects; false for anything else (an `e=` error among them).
+export fn Scram::verify(ref<Scram, shared> s, StringView server_final) : bool
+{
+    if (!StringView::starts_with(server_final, "v="))
+    {
+        return false;
+    }
+    match (base64_decode(StringView::sub(server_final, 2, StringView::len(server_final))))
+    {
+        Ok(v)  : digest_eq(&v[0..$], &s.server_signature[0..$]),
+        Err(_) : false,
+    }
+}
+
+export module postgres "database/postgres.cb";
+
+export import std::database::postgres;

@@ -1,0 +1,120 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.channel [Send] [Recv] [Close]; rule.conc.spawn [Spawn]; rule.conc.join [Join]; D-0063; conf.channel-threads
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3430206a6f62732c20746f74616c20313033303930300a73756d203130393930300a
+//
+// A pool of three workers takes jobs from one channel and sends results
+// to another; the main thread closes the job channel once every job is
+// sent, and each worker stops when `recv` gives `None`. Then two
+// producers share a channel of capacity 1 with a consumer thread, which
+// stops once the main thread has joined the producers and closed it.
+// Every value is received exactly once, whatever the interleaving.
+
+import std;
+
+struct Job
+{
+    u32 id;
+    u64 n;
+}
+
+fn worker(ref<Channel<Job>, shared> jobs, ref<Channel<u64>, shared> results) : u32
+{
+    u32 done = 0;
+    while (true)
+    {
+        match (Channel::recv(jobs))
+        {
+            Some(j) :
+            {
+                u64 s = 0;
+                u64 i = 1;
+                while (i <= j.n)
+                {
+                    s = s + i;
+                    i = i + 1;
+                }
+                match (Channel::send(results, s))
+                {
+                    Ok(_)  : done = done + 1,
+                    Err(_) : return done,
+                }
+            },
+            None    : break,
+        }
+    }
+    done
+}
+
+fn produce(ref<Channel<i64>, shared> ch, i64 from, i64 n) : i64
+{
+    i64 i = 0;
+    while (i < n)
+    {
+        _ = Channel::send(ch, from + i);
+        i = i + 1;
+    }
+    n
+}
+
+fn consume(ref<Channel<i64>, shared> ch) : i64
+{
+    i64 s = 0;
+    while (true)
+    {
+        match (Channel::recv(ch))
+        {
+            Some(x) : s = s + x,
+            None    : break,
+        }
+    }
+    s
+}
+
+fn main()
+{
+    Channel<Job> jobs = Channel::new(4);
+    Channel<u64> results = Channel::new(64);
+    u32 by_workers = 0;
+    {
+        auto a = spawn(worker, &jobs, &results);
+        auto b = spawn(worker, &jobs, &results);
+        auto c = spawn(worker, &jobs, &results);
+        u32 k = 0;
+        while (k < 40)
+        {
+            _ = Channel::send(&jobs, Job { .id = k, .n = widen<u64>(k) * 10 });
+            k = k + 1;
+        }
+        Channel::close(&jobs);
+        by_workers = join(a) + join(b) + join(c);
+    }
+    Channel::close(&results);
+    u64 total = 0;
+    while (true)
+    {
+        match (Channel::recv(&results))
+        {
+            Some(x) : total = total + x,
+            None    : break,
+        }
+    }
+    printf("%v jobs, total %v\n", by_workers, total);
+
+    Channel<i64> ch = Channel::new(1);
+    i64 sum = 0;
+    {
+        auto c = spawn(consume, &ch);
+        {
+            auto p = spawn(produce, &ch, 0, 100);
+            auto q = spawn(produce, &ch, 1000, 100);
+            join(p);
+            join(q);
+        }
+        Channel::close(&ch);
+        sum = join(c);
+    }
+    printf("sum %v\n", sum);
+}

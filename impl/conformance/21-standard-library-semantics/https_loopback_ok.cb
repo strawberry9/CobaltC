@@ -1,0 +1,168 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Https-Bind] [Http-Accept] [Form] [Content-Encoding] (D-0186, D-0181, D-0183); conf.https-server, conf.http-forms, conf.http-content-encoding
+// kind: positive
+// expect: ok
+// slow: TLS handshakes and HTTP bodies under the interpreter take minutes
+// expect-stdout-hex: 666f726d3a206e616d653d4164612b4c6f76656c6163652b2532362b636f266e6f74653d3130302532350a323030207b2270617468223a222f7375626d6974222c2271223a22612062222c226e616d65223a22416461204c6f76656c616365202620636f222c22706172616d73223a347d0a7365727665723a20300a2f677a69703a203634302062797465732c20656e636f64696e6720686561646572206b6570742066616c73652c207465787420747275650a2f6465666c6174653a203634302062797465732c20656e636f64696e6720686561646572206b6570742066616c73652c207465787420747275650a2f6f746865723a203634302062797465732c20656e636f64696e6720686561646572206b65707420747275652c207465787420747275650a656e636f646564207365727665723a20300a
+//
+// Hermetic: an https server (a self-signed P-256 certificate for
+// `localhost`, valid to 2100) in one thread answering JSON, fetched by
+// `HttpClient` with that certificate as its only root, over one
+// connection kept alive; the query string read with `query_pairs` and
+// a form body with `form_decode`; a plain server that answers with a
+// gzip and a deflate body, which the client decodes, and one that
+// answers an unknown encoding, which it leaves alone. About a minute in
+// the interpreter.
+
+import std;
+
+const str KEY = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu3C8POhsRghdJeFO\nRfBtamW9adcNKXPEOePIxqMaB/+hRANCAAT4Mzg1tMjxf2EPxlGI9PGCwuBkk8XV\nuhklx3HuJsY9cOdRoNBN3IdaGEic6JIDQEBRZ2BXNexHomD6IkAnfwOP\n-----END PRIVATE KEY-----\n";
+const str CRT = "-----BEGIN CERTIFICATE-----\nMIIBvzCCAWWgAwIBAgIUD8tK+TI2BRRR53EOiFOc8Ss7vI4wCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAwNzA1MTUwMloYDzIxMDAwOTA5\nMDUxNTAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAAT4Mzg1tMjxf2EPxlGI9PGCwuBkk8XVuhklx3HuJsY9cOdRoNBN3Ida\nGEic6JIDQEBRZ2BXNexHomD6IkAnfwOPo4GSMIGPMB0GA1UdDgQWBBQXdpiHOJlB\nADoFgcpiHolQSzN2jDAfBgNVHSMEGDAWgBQXdpiHOJlBADoFgcpiHolQSzN2jDAP\nBgNVHRMBAf8EBTADAQH/MAsGA1UdDwQEAwIChDATBgNVHSUEDDAKBggrBgEFBQcD\nATAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDSAAwRQIg\nLYpNpn0u1+HFmnfynzI5wSIvJA+VtqcwDQbX4Xz73ScCIQCDGUrlVlPPtNJyaQlZ\nIA91v4g2IdNYLYR8aAq0CSKD3w==\n-----END CERTIFICATE-----\n";
+
+fn serve(HttpServer s) : u8
+{
+    HttpConnection c = match (HttpServer::accept(&mut s))
+    {
+        Ok(c)  : c,
+        Err(_) : return 1,
+    };
+    while (true)
+    {
+        match (HttpConnection::request(&mut c))
+        {
+            Ok(Some(req)) :
+            {
+                Vec<Header> h = Vec::new();
+                Vec::push(&mut h, Header::new("Content-Type", "application/json"));
+                Url u = Result::unwrap(Url::parse(String::as_view(&sprintf("https://localhost%s", &req.url))));
+                Vec<Param> q = Url::query_pairs(&u);
+                Vec<Param> form = form_decode(String::as_view(&Result::unwrap(String::from_utf8(Vec::clone(&req.body)))));
+                Json j = JsonObject(Vec::new());
+                Json::set(&mut j, "path", JsonText(String::clone(&u.path)));
+                Json::set(
+                    &mut j,
+                    "q",
+                    JsonText(String::from_view(Option::unwrap_or(find_param(&q[0..$], "q"), StringView::of("-")))),
+                );
+                Json::set(
+                    &mut j,
+                    "name",
+                    JsonText(String::from_view(Option::unwrap_or(
+                        find_param(&form[0..$], "name"),
+                        StringView::of("-"),
+                    ))),
+                );
+                Json::set(&mut j, "params", JsonNumber(to_float<f64>(Vec::len(&q) + Vec::len(&form))));
+                _ = HttpConnection::respond(&mut c, 200, &h[0..$], &String::into_bytes(Json::text(&j))[0..$]);
+            },
+            Ok(None)      : return 0,
+            Err(_)        : return 2,
+        }
+    }
+    0
+}
+
+// A plain HTTP server that answers each request with the body and
+// Content-Encoding its path asks for.
+fn serve_encoded(TcpListener l) : u8
+{
+    Vec<u8> body = Vec::new();
+    foreach (i in 0..40)
+    {
+        Vec::extend_from(&mut body, &b"compressed text "[0..$]);
+    }
+    foreach (i in 0..3)
+    {
+        TcpStream s = Result::unwrap(TcpListener::accept(&mut l));
+        String line = Option::unwrap_or(Result::unwrap(TcpStream::read_line(&mut s)), String::new());
+        while (true)
+        {
+            match (TcpStream::read_line(&mut s))
+            {
+                Ok(Some(h)) : if (String::len(&h) == 0) { break; },
+                _           : break,
+            }
+        }
+        Vec<u8> data = Vec::new();
+        str enc = "";
+        if (String::contains(&line, "/gzip"))
+        {
+            overwrite(&mut data, gzip(&body[0..$]));
+            enc = "gzip";
+        }
+        else if (String::contains(&line, "/deflate"))
+        {
+            overwrite(&mut data, zlib_deflate(&body[0..$]));
+            enc = "deflate";
+        }
+        else
+        {
+            overwrite(&mut data, Vec::from_slice(&body[0..$]));
+            enc = "br";
+        }
+        _ = TcpStream::printf(
+            &mut s,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: %s\r\nContent-Length: %v\r\nConnection: close\r\n\r\n",
+            enc,
+            Vec::len(&data),
+        );
+        _ = TcpStream::write(&mut s, &data[0..$]);
+        _ = TcpStream::shutdown_write(&mut s);
+    }
+    0
+}
+
+fn main()
+{
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(KEY));
+    Vec<Certificate> chain = certificates_from_pem(CRT);
+    TrustStore roots = TrustStore::new();
+    TrustStore::add(&mut roots, Certificate::clone(&chain[0]));
+    HttpServer s = Result::unwrap(HttpServer::bind_tls(SocketAddr::new(IpAddr::localhost_v4(), 0), key, chain));
+    u16 port = HttpServer::local_addr(&s).port;
+    auto server = spawn(serve, s);
+    HttpClient c = HttpClient::new();
+    overwrite(&mut c.roots, Some(roots));
+    Vec<Param> form = Vec::new();
+    Vec::push(&mut form, Param::new("name", "Ada Lovelace & co"));
+    Vec::push(&mut form, Param::new("note", "100%"));
+    String body = form_encode(&form[0..$]);
+    printf("form: %v\n", &body);
+    Request req = Request::new("POST", String::as_view(&sprintf("https://localhost:%u/submit?q=a%%20b&x=1", port)));
+    Vec::push(&mut req.headers, Header::new("Content-Type", "application/x-www-form-urlencoded"));
+    Vec::push(&mut req.headers, Header::new("Connection", "keep-alive"));
+    overwrite(&mut req.body, String::into_bytes(body));
+    match (HttpClient::send(&mut c, &req))
+    {
+        Ok(r)  :
+        {
+            String text = Result::unwrap(String::from_utf8(Vec::clone(&r.body)));
+            printf("%u %v\n", r.status, &text);
+        },
+        Err(e) : printf("error: %s\n", HttpError::text(&e)),
+    }
+    printf("server: %v\n", join(server));
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    u16 port2 = TcpListener::local_addr(&l).port;
+    auto encoded = spawn(serve_encoded, l);
+    foreach (path in ["/gzip", "/deflate", "/other"])
+    {
+        match (http_get(String::as_view(&sprintf("http://127.0.0.1:%u%s", port2, path))))
+        {
+            Ok(r)  :
+            {
+                bool kept = Option::is_some(&Response::header(&r, "content-encoding"));
+                printf(
+                    "%s: %v bytes, encoding header kept %v, text %v\n",
+                    path,
+                    Vec::len(&r.body),
+                    kept,
+                    r.body[0] == b'c' && r.body[15] == b' ',
+                );
+            },
+            Err(e) : printf("%s: error %s\n", path, HttpError::text(&e)),
+        }
+    }
+    printf("encoded server: %v\n", join(encoded));
+}

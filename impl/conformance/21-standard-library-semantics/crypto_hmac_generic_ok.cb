@@ -1,0 +1,62 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.crypto [Hasher] [Hmac] [Hkdf-With] (D-0166); conf.hmac-generic, conf.hkdf-generic
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 686d61632d333834206166343564326533373634383430333136313766373864326235386136623162396337656634363466356130316234376534326563333733363332323434356538653232343063613565363965326337386233323339656366616232313634390a686d61632d3531322031363462376137626663663831396532653339356662653733623536653061333837626436343232326538333166643631303237306364376561323530353534393735386266373563303561393934613664303334663635663866306536666463616561623161333464346136623462363336653037306133386263653733370a686d61632d3235362061677265657320747275650a73747265616d696e672061677265657320747275650a6861736865722061677265657320747275650a686b64662d333834203962353039376138363033386238303533303930373661343462336139663338303633653235623531366463626633363966333934636661623433363835663734386236343537373633653466303230346663356439356431646133653632350a686b64662d353132206635666130326231383239386137326138633233383938613837303334373263366562313739646332303463303334323563393730653362313634626639306666663232643034383336643065323334336261630a686b64662d323536203363623235663235666161636435376139303433346636346430333632663261326432643061393063663161356134633564623032643536656363346335626633343030373230386435623838373138353836352061677265657320747275650a657874726163742b657870616e642061677265657320747275650a6c6162656c2061677265657320747275650a
+//
+// RFC 4231's test case 2 ("Jefe") under SHA-384 and SHA-512, the SHA-256
+// form agreeing with `hmac_sha256`; a `Hasher` fed in pieces gives `hash`;
+// HKDF over SHA-384 and SHA-512 (values confirmed with Python's hmac
+// module), and over SHA-256 RFC 5869's A.1 as `hkdf_sha256` gives it.
+
+import std;
+
+fn bytes(str hex) : Vec<u8>
+{
+    Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new())
+}
+
+fn main() : u8
+{
+    Vec<u8> key = Vec::from_slice(&b"Jefe"[0..$]);
+    Vec<u8> msg = Vec::from_slice(&b"what do ya want for nothing?"[0..$]);
+    printf("hmac-384 %s\n", &to_hex(&hmac(Sha2_384, &key[0..$], &msg[0..$])[0..$]));
+    printf("hmac-512 %s\n", &to_hex(&hmac(Sha2_512, &key[0..$], &msg[0..$])[0..$]));
+    array<u8, 32> plain = hmac_sha256(&key[0..$], &msg[0..$]);
+    printf("hmac-256 agrees %v\n", digest_eq(&hmac(Sha2_256, &key[0..$], &msg[0..$])[0..$], &plain[0..$]));
+    Hmac m = Hmac::new(Sha2_512, &key[0..$]);
+    Hmac::update(&mut m, &msg[0..10]);
+    Hmac::update(&mut m, &msg[10..$]);
+    printf("streaming agrees %v\n", digest_eq(&Hmac::finish(m)[0..$], &hmac(Sha2_512, &key[0..$], &msg[0..$])[0..$]));
+    Hasher h = Hasher::new(Sha2_384);
+    Hasher::update(&mut h, &msg[0..3]);
+    Hasher::update(&mut h, &msg[3..$]);
+    printf("hasher agrees %v\n", digest_eq(&Hasher::finish(h)[0..$], &hash(Sha2_384, &msg[0..$])[0..$]));
+    Vec<u8> ikm = Vec::filled(22, 0x0b: u8);
+    Vec<u8> salt = bytes("000102030405060708090a0b0c");
+    Vec<u8> info = bytes("f0f1f2f3f4f5f6f7f8f9");
+    Vec<u8> none = Vec::new();
+    printf("hkdf-384 %s\n", &to_hex(&hkdf_with(Sha2_384, &salt[0..$], &ikm[0..$], &info[0..$], 48)[0..$]));
+    printf("hkdf-512 %s\n", &to_hex(&hkdf_with(Sha2_512, &none[0..$], &ikm[0..$], &none[0..$], 42)[0..$]));
+    Vec<u8> a1 = hkdf_with(Sha2_256, &salt[0..$], &ikm[0..$], &info[0..$], 42);
+    printf(
+        "hkdf-256 %s agrees %v\n",
+        &to_hex(&a1[0..$]),
+        digest_eq(&a1[0..$], &hkdf_sha256(&salt[0..$], &ikm[0..$], &info[0..$], 42)[0..$]),
+    );
+    Vec<u8> prk = hkdf_extract_with(Sha2_384, &salt[0..$], &ikm[0..$]);
+    printf(
+        "extract+expand agrees %v\n",
+        digest_eq(
+            &hkdf_expand_with(Sha2_384, &prk[0..$], &info[0..$], 48)[0..$],
+            &hkdf_with(Sha2_384, &salt[0..$], &ikm[0..$], &info[0..$], 48)[0..$],
+        ),
+    );
+    Vec<u8> label = hkdf_expand_label_with(Sha2_256, &prk[0..32], "derived", &none[0..$], 32);
+    printf(
+        "label agrees %v\n",
+        digest_eq(&label[0..$], &hkdf_expand_label(&prk[0..32], "derived", &none[0..$], 32)[0..$]),
+    );
+    0
+}

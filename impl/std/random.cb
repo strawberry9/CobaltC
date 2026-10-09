@@ -1,0 +1,159 @@
+// `std::random` (spec/21 §0): `Rng`, and the operating system's secure
+// random bytes (D-0142).
+
+// D-0120: a reproducible pseudo-random sequence: xoshiro256** seeded
+// through splitmix64, exactly as spec/21 `[Rng]` writes it. Not for
+// cryptography.
+export struct Rng
+{
+    u64 s0;
+    u64 s1;
+    u64 s2;
+    u64 s3;
+}
+
+fn Rng::rotl(u64 x, u32 k) : u64
+{
+    (x << k) | (x >> (64 - k))
+}
+
+fn Rng::splitmix(ref<u64, exclusive> state) : u64
+{
+    *state = wrapping_add(*state, 0x9E3779B97F4A7C15);
+    u64 z = *state;
+    z = wrapping_mul(z ^ (z >> 30), 0xBF58476D1CE4E5B9);
+    z = wrapping_mul(z ^ (z >> 27), 0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+export fn Rng::new(u64 seed) : Rng
+{
+    u64 state = seed;
+    u64 a = Rng::splitmix(&mut state);
+    u64 b = Rng::splitmix(&mut state);
+    u64 c = Rng::splitmix(&mut state);
+    u64 d = Rng::splitmix(&mut state);
+    Rng { .s0 = a, .s1 = b, .s2 = c, .s3 = d }
+}
+
+export fn Rng::next_u64(ref<Rng, exclusive> r) : u64
+{
+    u64 result = wrapping_mul(Rng::rotl(wrapping_mul(r.s1, 5), 7), 9);
+    u64 t = r.s1 << 17;
+    r.s2 = r.s2 ^ r.s0;
+    r.s3 = r.s3 ^ r.s1;
+    r.s1 = r.s1 ^ r.s2;
+    r.s0 = r.s0 ^ r.s3;
+    r.s2 = r.s2 ^ t;
+    r.s3 = Rng::rotl(r.s3, 45);
+    result
+}
+
+// 0 .. n, each value equally likely: a draw in the top partial block of
+// 2^64 is rejected and drawn again. `n` = 0 is `diag.div-by-zero`.
+export fn Rng::below(ref<Rng, exclusive> r, u64 n) : u64
+{
+    u64 reject_under = wrapping_sub(0, n) % n;
+    u64 x = Rng::next_u64(r);
+    while (x < reject_under)
+    {
+        x = Rng::next_u64(r);
+    }
+    x % n
+}
+
+// 0.0 <= x < 1.0 from the top 53 bits of one draw.
+export fn Rng::unit_f64(ref<Rng, exclusive> r) : f64
+{
+    to_float<f64>(Rng::next_u64(r) >> 11) / 9007199254740992.0
+}
+
+// D-0142: bytes from the operating system's cryptographically secure
+// source, for keys, tokens and nonces, and for seeding `Rng`; the bytes
+// are unpredictable. `diag.entropy-unavailable` when the system has no
+// such source (none of the systems either tool runs on lacks one).
+// trusted: [Extern-Call] os_random writes n bytes of b's buffer, reserved just above, where no element object lies.
+fn os_random_vec(usize n) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    while (b.cap < n)
+    {
+        Vec::grow(&mut b);
+    }
+    if (n > 0)
+    {
+        isize r = unsafe
+        {
+            os_random(reinterpret_ptr<u8>(b.ptr), n)
+        };
+        if (r != 0)
+        {
+            fault(entropy_unavailable);
+        }
+    }
+    b.len = n;
+    b
+}
+
+// Fills `out` with secure random bytes.
+export fn os_random_bytes(slice<u8, exclusive> out)
+{
+    Vec<u8> b = os_random_vec(slice_len(out));
+    for (usize i = 0; i < slice_len(out); i += 1)
+    {
+        out[i] = b[i];
+    }
+}
+
+// A secure random `u64`.
+export fn os_random_u64() : u64
+{
+    Vec<u8> b = os_random_vec(8);
+    read_le<u64>(&b[0..$], 0)
+}
+
+// An `Rng` seeded from the operating system's secure source, so each run
+// draws a different sequence. The sequence itself is still `Rng`'s: not
+// for cryptography.
+export fn Rng::from_os() : Rng
+{
+    Rng::new(os_random_u64())
+}
+
+// D-0181: the elements of `s` in a uniformly random order (Fisher-Yates:
+// each position swapped with one drawn by `below` from itself and those
+// before it), moved by `slice_swap`, so none is copied. The same seed
+// gives the same order in every implementation.
+export fn Rng::shuffle<T>(ref<Rng, exclusive> r, slice<T, exclusive> s)
+{
+    usize n = slice_len(s);
+    for (usize i = n; i > 1; i -= 1)
+    {
+        usize j = narrow<usize>(Rng::below(r, widen<u64>(i)));
+        slice_swap(s, i - 1, j);
+    }
+}
+
+// D-0181: a version 4 UUID (RFC 9562 §5.4) from the operating system's
+// secure source, as text: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`,
+// lowercase, `y` one of 8, 9, a, b. An identifier that no one else will
+// draw.
+export fn uuid_v4() : String
+{
+    Vec<u8> b = os_random_vec(16);
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    String hex = to_hex(&b[0..$]);
+    String out = String::new();
+    String::reserve(&mut out, 36);
+    String::append(&mut out, String::view(&hex, 0, 8));
+    String::append(&mut out, "-");
+    String::append(&mut out, String::view(&hex, 8, 12));
+    String::append(&mut out, "-");
+    String::append(&mut out, String::view(&hex, 12, 16));
+    String::append(&mut out, "-");
+    String::append(&mut out, String::view(&hex, 16, 20));
+    String::append(&mut out, "-");
+    String::append(&mut out, String::view(&hex, 20, 32));
+    out
+}

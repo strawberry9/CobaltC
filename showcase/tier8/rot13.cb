@@ -1,0 +1,144 @@
+// ROT13, a Byte at a Time
+//
+// Shows: standard input as a stream of bytes, not lines. `read_line`
+// is the safe way to read text; a filter that must pass every byte
+// through unchanged — a `\r`, a byte that is not UTF-8, a last line
+// with no newline — reads with `stdin_read`, the extern underneath it,
+// into a buffer of raw memory. Its result is a claim like any extern's:
+// how many bytes it stored, 0 at the end of the input, -1 when the
+// input cannot be read. The claim is checked before a single byte is
+// trusted, and the bytes go out through `stdout_write`, whose claim is
+// checked the same way. The buffer is a `resource struct` whose
+// destructor frees it, so every way out of `main` frees it once.
+// The `unsafe` is confined to the three small functions that touch the
+// buffer; letters are rotated by safe code.
+//
+//   coby rot13.cb [CHUNK] < FILE
+//
+// CHUNK is how many bytes each read asks for (default 4096); the output
+// is the same whatever it is.
+
+import std;
+
+resource struct Buffer
+{
+    rawptr<u8> base;
+    usize size;
+}
+
+fn Buffer::drop(ref<Buffer, exclusive> self)
+{
+    unsafe
+    {
+        deallocate(self.base, self.size, 1);
+    }
+}
+
+// Reads the next chunk into the buffer: the number of bytes stored, 0 at
+// the end of the input, or Err with the claim that cannot be believed.
+fn fill(ref<Buffer, exclusive> b) : Result<usize, isize>
+{
+    isize claimed = unsafe { stdin_read(b.base, b.size) };
+    if (claimed < 0 || claimed > reinterpret<isize>(b.size))
+    {
+        return Err(claimed);               // -1, or more than the buffer holds
+    }
+    Ok(reinterpret<usize>(claimed))
+}
+
+fn get(ref<Buffer, shared> b, usize i) : u8
+{
+    unsafe { *(b.base + reinterpret<isize>(i)) }
+}
+
+fn put(ref<Buffer, exclusive> b, usize i, u8 c)
+{
+    unsafe { *(b.base + reinterpret<isize>(i)) = c; }
+}
+
+// Writes the first `n` bytes; false when the claim is not `n`.
+fn emit(ref<Buffer, shared> b, usize n) : bool
+{
+    isize claimed = unsafe { stdout_write(b.base, n) };
+    claimed == reinterpret<isize>(n)
+}
+
+// A letter turned 13 places, wrapping around; any other byte unchanged.
+fn rot13(u8 c) : u8
+{
+    if (ascii_is_lower(c))
+    {
+        b'a' + (c - b'a' + 13) % 26
+    }
+    else if (ascii_is_upper(c))
+    {
+        b'A' + (c - b'A' + 13) % 26
+    }
+    else
+    {
+        c
+    }
+}
+
+fn main() : u8
+{
+    usize chunk = 4096;
+    if (arg_count() > 1)
+    {
+        eprintf("usage: rot13 [CHUNK] < FILE\n");
+        return 2;
+    }
+    if (arg_count() == 1)
+    {
+        String a = Result::unwrap_or(arg(0), String::new());
+        chunk = Result::unwrap_or(String::parse<usize>(&a), 0);   // not a number: 0, refused too
+        if (chunk == 0)
+        {
+            eprintf("rot13: CHUNK must be a positive number, not \"%s\"\n", &a);
+            return 2;
+        }
+    }
+    Buffer buf = match (allocate(chunk, 1))
+    {
+        Ok(p)  : Buffer { .base = p, .size = chunk },
+        Err(_) :
+        {
+            eprintf("rot13: no memory for a %v-byte buffer\n", chunk);
+            return 1;
+        },
+    };
+
+    usize total = 0;
+    usize letters = 0;
+    while (true)
+    {
+        usize n = match (fill(&mut buf))
+        {
+            Ok(0)  : break,
+            Ok(n)  : n,
+            Err(c) :
+            {
+                eprintf("rot13: standard input could not be read (claim %v)\n", c);
+                return 1;                  // `buf` is freed on the way out
+            },
+        };
+        foreach (i in 0..n)
+        {
+            u8 c = get(&buf, i);
+            u8 r = rot13(c);
+            if (r != c)
+            {
+                letters += 1;
+            }
+            put(&mut buf, i, r);
+        }
+        if (!emit(&buf, n))
+        {
+            eprintf("rot13: short write\n");
+            return 1;
+        }
+        total += n;
+    }
+    eprintf("rot13: %v bytes, %v letters turned\n", total, letters);
+    0
+}

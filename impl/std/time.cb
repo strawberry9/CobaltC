@@ -1,0 +1,742 @@
+// `std::time` (spec/21 §2j, D-0140): dates and times of day in UTC, the
+// wall clock in milliseconds, and the machine's local time (D-0147).
+// Calendar arithmetic written in CobaltC: the proleptic Gregorian
+// calendar, no leap seconds; the local offset is the platform's. Elapsed
+// time is measured with `monotonic_ns`, never with the wall clock, which
+// may be changed while a program runs.
+
+// A moment in UTC: a date of the proleptic Gregorian calendar (`year` 0
+// is 1 BC) and a time of day to the second. Any field values can be
+// written in a struct literal; `DateTime::new` checks them, and
+// `DateTime::to_unix` faults on a value that names no moment.
+export struct DateTime
+{
+    export i64 year;
+    export u8 month;
+    export u8 day;
+    export u8 hour;
+    export u8 minute;
+    export u8 second;
+}
+
+export enum Weekday
+{
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+// The quotient rounded down and the remainder with the divisor's sign
+// (`/` and `%` round towards zero); `d` > 0.
+fn floor_div(i64 n, i64 d) : i64
+{
+    i64 q = n / d;
+    if (n % d < 0)
+    {
+        q -= 1;
+    }
+    q
+}
+
+fn floor_mod(i64 n, i64 d) : i64
+{
+    i64 r = n % d;
+    if (r < 0)
+    {
+        r += d;
+    }
+    r
+}
+
+fn leap_year(i64 y) : bool
+{
+    floor_mod(y, 4) == 0 && (floor_mod(y, 100) != 0 || floor_mod(y, 400) == 0)
+}
+
+fn days_in_month(i64 y, u8 m) : u8
+{
+    if (m == 2)
+    {
+        if (leap_year(y))
+        {
+            return 29;
+        }
+        return 28;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11)
+    {
+        return 30;
+    }
+    31
+}
+
+fn DateTime::valid(ref<DateTime, shared> t) : bool
+{
+    t.month >= 1 && t.month <= 12 && t.day >= 1 && t.day <= days_in_month(
+        t.year,
+        t.month,
+    ) && t.hour < 24 && t.minute < 60 && t.second < 60
+}
+
+// D-0140: the moment `s` seconds after 1970-01-01T00:00:00Z (before it
+// when negative). Every `i64` names one, so this never fails. The days
+// are converted by H. Hinnant's `civil_from_days`.
+export fn DateTime::from_unix(i64 s) : DateTime
+{
+    i64 z = floor_div(s, 86400) + 719468;
+    i64 secs = floor_mod(s, 86400);
+    i64 era = floor_div(z, 146097);
+    i64 doe = z - era * 146097;
+    i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    i64 mp = (5 * doy + 2) / 153;
+    i64 d = doy - (153 * mp + 2) / 5 + 1;
+    i64 m = mp + 3;
+    if (mp >= 10)
+    {
+        m = mp - 9;
+    }
+    i64 y = yoe + era * 400;
+    if (m <= 2)
+    {
+        y += 1;
+    }
+    DateTime { .year = y, .month = narrow<u8>(m), .day = narrow<u8>(d), .hour = narrow<u8>(secs / 3600), .minute = narrow<u8>(secs % 3600 / 60), .second = narrow<u8>(secs % 60) }
+}
+
+// The moment now, by the wall clock, to the second.
+export fn DateTime::now() : DateTime
+{
+    DateTime::from_unix(unix_seconds())
+}
+
+// The `DateTime` with these fields, or `None` when they name no moment
+// (a month 13, a 30 February, an hour 24, a second 60).
+export fn DateTime::new(i64 year, u8 month, u8 day, u8 hour, u8 minute, u8 second) : Option<DateTime>
+{
+    DateTime t = DateTime { .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
+    if (!DateTime::valid(&t))
+    {
+        return None;
+    }
+    Some(t)
+}
+
+// The seconds since 1970-01-01T00:00:00Z, `from_unix`'s inverse (H.
+// Hinnant's `days_from_civil`). A `DateTime` whose fields name no moment,
+// or one too far from 1970 for an `i64`, is `diag.invalid-datetime`.
+export fn DateTime::to_unix(ref<DateTime, shared> t) : i64
+{
+    if (!DateTime::valid(t))
+    {
+        fault(invalid_datetime);
+    }
+    i64 m = widen<i64>(t.month);
+    i64 y = t.year;
+    if (m <= 2)
+    {
+        y = match (checked_sub(y, 1))
+        {
+            Some(v) : v,
+            None    : fault(invalid_datetime),
+        };
+    }
+    i64 era = floor_div(y, 400);
+    i64 yoe = y - era * 400;
+    i64 mp = m + 9;
+    if (m > 2)
+    {
+        mp = m - 3;
+    }
+    i64 doy = (153 * mp + 2) / 5 + widen<i64>(t.day) - 1;
+    i64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64 secs = widen<i64>(t.hour) * 3600 + widen<i64>(t.minute) * 60 + widen<i64>(t.second);
+    Option<i64> days = match (checked_mul(era, 146097))
+    {
+        Some(e) : checked_add(e, doe - 719468),
+        None    : None,
+    };
+    // Before 1970 the day after is multiplied, and the seconds counted back
+    // from it, so the earliest `i64` second is reached without overflow.
+    Option<i64> s = match (days)
+    {
+        Some(d) : if (d < 0)
+        {
+            match (checked_mul(d + 1, 86400))
+            {
+                Some(x) : checked_add(x, secs - 86400),
+                None    : None,
+            }
+        }
+        else
+        {
+            match (checked_mul(d, 86400))
+            {
+                Some(x) : checked_add(x, secs),
+                None    : None,
+            }
+        },
+        None : None,
+    };
+    match (s)
+    {
+        Some(v) : v,
+        None    : fault(invalid_datetime),
+    }
+}
+
+// The day of the week (1970-01-01 was a Thursday). The calendar repeats
+// every 400 years, a whole number of weeks, so any year is reduced to one
+// near 2000 first and no `DateTime` is too far from 1970 for this.
+export fn DateTime::weekday(ref<DateTime, shared> t) : Weekday
+{
+    DateTime near = DateTime { .year = 2000 + floor_mod(
+        t.year,
+        400,
+    ), .month = t.month, .day = t.day, .hour = 0, .minute = 0, .second = 0 };
+    i64 days = DateTime::to_unix(&near) / 86400;
+    match (floor_mod(days + 3, 7))
+    {
+        0 : Monday,
+        1 : Tuesday,
+        2 : Wednesday,
+        3 : Thursday,
+        4 : Friday,
+        5 : Saturday,
+        _ : Sunday,
+    }
+}
+
+export fn Weekday::text(ref<Weekday, shared> w) : str
+{
+    match (w)
+    {
+        Monday    : "Monday",
+        Tuesday   : "Tuesday",
+        Wednesday : "Wednesday",
+        Thursday  : "Thursday",
+        Friday    : "Friday",
+        Saturday  : "Saturday",
+        Sunday    : "Sunday",
+    }
+}
+
+// ISO 8601 in UTC: `2026-10-03T10:17:00Z`. A year outside 0 ..= 9999 is
+// written with its sign and at least four digits (`-0001`, `+10000`).
+export fn DateTime::to_iso(ref<DateTime, shared> t) : String
+{
+    String out = String::new();
+    if (t.year >= 0 && t.year <= 9999)
+    {
+        String::appendf(&mut out, "%04d", t.year);
+    }
+    else if (t.year > 9999)
+    {
+        String::appendf(&mut out, "+%d", t.year);
+    }
+    else
+    {
+        String::appendf(&mut out, "-%04u", wrapping_sub(0: u64, reinterpret<u64>(t.year)));
+    }
+    String::appendf(&mut out, "-%02d-%02dT%02d:%02d:%02dZ", t.month, t.day, t.hour, t.minute, t.second);
+    out
+}
+
+// The number in the `n` digits at `at`, or the position of the first
+// byte that is not a digit.
+fn iso_digits(StringView v, usize at, usize n) : Result<i64, usize>
+{
+    i64 x = 0;
+    for (usize i = at; i < at + n; i += 1)
+    {
+        if (i >= slice_len(v.bytes) || !ascii_is_digit(v.bytes[i]))
+        {
+            return Err(i);
+        }
+        x = x * 10 + widen<i64>(v.bytes[i] - 48);
+    }
+    Ok(x)
+}
+
+// Whether byte `at` is `c`; a missing byte is not.
+fn iso_byte(StringView v, usize at, u8 c) : bool
+{
+    at < slice_len(v.bytes) && v.bytes[at] == c
+}
+
+// Reads `YYYY-MM-DDTHH:MM:SSZ`, or a date alone, `YYYY-MM-DD`, as its
+// midnight; `to_iso`'s form, nothing else, except that the seconds may
+// carry a fraction (`:37.25Z`, D-0181), which `from_iso` drops and
+// `unix_ms_from_iso` keeps to the millisecond. A year is four digits, or
+// a sign and four or more. `Invalid(i)` gives the first byte that does
+// not fit (the length when the text stops short); `OutOfRange` a field
+// that names no moment (a month 13, a 29 February in a common year, a
+// second 60) or a year beyond `i64`.
+export fn DateTime::from_iso(StringView text) : Result<DateTime, ParseError>
+{
+    u16 ms = 0;
+    DateTime::read_iso(text, &mut ms)
+}
+
+// `from_iso`, with the milliseconds of the fraction (rounded down) in
+// `ms`.
+fn DateTime::read_iso(StringView text, ref<u16, exclusive> ms) : Result<DateTime, ParseError>
+{
+    usize n = slice_len(text.bytes);
+    if (n == 0)
+    {
+        return Err(Empty);
+    }
+    usize i = 0;
+    bool negative = false;
+    bool signed = false;
+    if (text.bytes[0] == b'+' || text.bytes[0] == b'-')
+    {
+        negative = text.bytes[0] == b'-';
+        signed = true;
+        i = 1;
+    }
+    usize start = i;
+    i64 year = 0;
+    bool too_big = false;
+    while (i < n && ascii_is_digit(text.bytes[i]))
+    {
+        i64 d = widen<i64>(text.bytes[i] - 48);
+        year = match (checked_mul(year, 10))
+        {
+            Some(y) : match (checked_add(y, d))
+            {
+                Some(z) : z,
+                None    :
+                {
+                    too_big = true;
+                    0
+                },
+            },
+            None :
+            {
+                too_big = true;
+                0
+            },
+        };
+        i += 1;
+    }
+    if (i - start < 4)
+    {
+        return Err(Invalid(i));
+    }
+    if (!signed && i - start > 4)
+    {
+        return Err(Invalid(start + 4));
+    }
+    if (negative)
+    {
+        year = 0 - year;
+    }
+    if (!iso_byte(text, i, b'-'))
+    {
+        return Err(Invalid(i));
+    }
+    i64 month = match (iso_digits(text, i + 1, 2))
+    {
+        Ok(x)   : x,
+        Err(at) : return Err(Invalid(at)),
+    };
+    if (!iso_byte(text, i + 3, b'-'))
+    {
+        return Err(Invalid(i + 3));
+    }
+    i64 day = match (iso_digits(text, i + 4, 2))
+    {
+        Ok(x)   : x,
+        Err(at) : return Err(Invalid(at)),
+    };
+    i += 6;
+    i64 hour = 0;
+    i64 minute = 0;
+    i64 second = 0;
+    if (i < n)
+    {
+        if (!iso_byte(text, i, b'T'))
+        {
+            return Err(Invalid(i));
+        }
+        hour = match (iso_digits(text, i + 1, 2))
+        {
+            Ok(x)   : x,
+            Err(at) : return Err(Invalid(at)),
+        };
+        if (!iso_byte(text, i + 3, b':'))
+        {
+            return Err(Invalid(i + 3));
+        }
+        minute = match (iso_digits(text, i + 4, 2))
+        {
+            Ok(x)   : x,
+            Err(at) : return Err(Invalid(at)),
+        };
+        if (!iso_byte(text, i + 6, b':'))
+        {
+            return Err(Invalid(i + 6));
+        }
+        second = match (iso_digits(text, i + 7, 2))
+        {
+            Ok(x)   : x,
+            Err(at) : return Err(Invalid(at)),
+        };
+        i += 9;
+        if (iso_byte(text, i, b'.'))
+        {
+            usize start_frac = i + 1;
+            i = start_frac;
+            u16 scale = 100;
+            u16 frac = 0;
+            while (i < n && ascii_is_digit(text.bytes[i]))
+            {
+                frac = frac + widen<u16>(text.bytes[i] - 48) * scale;
+                scale = scale / 10;
+                i += 1;
+            }
+            if (i == start_frac)
+            {
+                return Err(Invalid(i));
+            }
+            *ms = frac;
+        }
+        if (!iso_byte(text, i, b'Z'))
+        {
+            return Err(Invalid(i));
+        }
+        i += 1;
+        if (i < n)
+        {
+            return Err(Invalid(i));
+        }
+    }
+    if (too_big)
+    {
+        return Err(OutOfRange);
+    }
+    match (DateTime::new(
+        year,
+        narrow<u8>(month),
+        narrow<u8>(day),
+        narrow<u8>(hour),
+        narrow<u8>(minute),
+        narrow<u8>(second),
+    ))
+    {
+        Some(t) : Ok(t),
+        None    : Err(OutOfRange),
+    }
+}
+
+// Whether `a` and `b` are the same moment.
+export fn DateTime::eq(ref<DateTime, shared> a, ref<DateTime, shared> b) : bool
+{
+    a.year == b.year && a.month == b.month && a.day == b.day && a.hour == b.hour && a.minute == b.minute && a.second == b.second
+}
+
+// Whether `a` is earlier than `b`; fits `Vec::sort_by`.
+export fn DateTime::less(ref<DateTime, shared> a, ref<DateTime, shared> b) : bool
+{
+    if (a.year != b.year)
+    {
+        return a.year < b.year;
+    }
+    if (a.month != b.month)
+    {
+        return a.month < b.month;
+    }
+    if (a.day != b.day)
+    {
+        return a.day < b.day;
+    }
+    if (a.hour != b.hour)
+    {
+        return a.hour < b.hour;
+    }
+    if (a.minute != b.minute)
+    {
+        return a.minute < b.minute;
+    }
+    a.second < b.second
+}
+
+// The wall clock in milliseconds since 1970-01-01T00:00:00Z.
+// trusted: [Extern-Call] clock_read touches no program storage.
+export fn unix_ms() : i64
+{
+    unsafe
+    {
+        clock_read(2)
+    }
+}
+
+// D-0147: how many seconds the machine's local time is ahead of UTC
+// (behind, when negative) at the moment `unix` seconds after
+// 1970-01-01T00:00:00Z, daylight saving included, by the operating
+// system's rule for the zone the program runs in. For a moment the system
+// has no rule for, the offset now.
+// trusted: [Extern-Call] tz_offset touches no program storage.
+export fn local_offset_seconds(i64 unix) : i64
+{
+    unsafe
+    {
+        tz_offset(unix)
+    }
+}
+
+// The moment `t` (in UTC) written in the machine's local time. The result
+// is a `DateTime` like any other and knows nothing of its zone: print its
+// fields, not `to_iso` (which writes `Z`), and keep the UTC value for
+// arithmetic. A moment within a day of an `i64` limit is
+// `diag.invalid-datetime`.
+export fn DateTime::to_local(ref<DateTime, shared> t) : DateTime
+{
+    i64 s = DateTime::to_unix(t);
+    match (checked_add(s, local_offset_seconds(s)))
+    {
+        Some(v) : DateTime::from_unix(v),
+        None    : fault(invalid_datetime),
+    }
+}
+
+// The clocks (D-0061, moved here from `std::sys` by D-0176): a monotonic
+// count for measuring durations, the wall clock in seconds, and sleeping.
+
+// A monotonic clock, in nanoseconds from an arbitrary start: for measuring
+// how long something takes; it never goes backwards.
+// trusted: [Extern-Call] clock_read touches no program storage.
+export fn monotonic_ns() : u64
+{
+    reinterpret<u64>(unsafe
+    {
+        clock_read(0)
+    })
+}
+
+// The wall clock: whole seconds since 1970-01-01 00:00 UTC.
+// trusted: [Extern-Call] clock_read touches no program storage.
+export fn unix_seconds() : i64
+{
+    unsafe
+    {
+        clock_read(1)
+    }
+}
+
+// D-0124: the calling thread does nothing for at least `ms` milliseconds;
+// other threads run meanwhile.
+// trusted: [Extern-Call] sleep_ns touches no program storage.
+export fn sleep_ms(u64 ms)
+{
+    i64 ignored = unsafe
+    {
+        sleep_ns(wrapping_mul(ms, 1000000))
+    };
+}
+
+// ---- D-0181: milliseconds in ISO text, and HTTP dates ----
+
+// `to_iso` of the moment `ms` milliseconds after 1970-01-01T00:00:00Z,
+// with the milliseconds: `2026-10-07T12:34:56.789Z`. A log line's or a
+// JSON document's timestamp.
+export fn iso_from_unix_ms(i64 ms) : String
+{
+    i64 s = floor_div(ms, 1000);
+    i64 frac = floor_mod(ms, 1000);
+    DateTime t = DateTime::from_unix(s);
+    String out = DateTime::to_iso(&t);
+    String::truncate(&mut out, String::len(&out) - 1);
+    String::appendf(&mut out, ".%03dZ", frac);
+    out
+}
+
+// `from_iso`'s text as milliseconds since 1970-01-01T00:00:00Z, a
+// fraction of the seconds kept to the millisecond (`.5` is 500, `.1234`
+// is 123). The errors are `from_iso`'s; a moment beyond `i64`
+// milliseconds is `OutOfRange`.
+export fn unix_ms_from_iso(StringView text) : Result<i64, ParseError>
+{
+    u16 ms = 0;
+    DateTime t = DateTime::read_iso(text, &mut ms)?;
+    match (checked_mul(DateTime::to_unix(&t), 1000))
+    {
+        Some(x) : match (checked_add(x, widen<i64>(ms)))
+        {
+            Some(y) : Ok(y),
+            None    : Err(OutOfRange),
+        },
+        None : Err(OutOfRange),
+    }
+}
+
+fn month_name(u8 m) : str
+{
+    match (m)
+    {
+        1  : "Jan",
+        2  : "Feb",
+        3  : "Mar",
+        4  : "Apr",
+        5  : "May",
+        6  : "Jun",
+        7  : "Jul",
+        8  : "Aug",
+        9  : "Sep",
+        10 : "Oct",
+        11 : "Nov",
+        _  : "Dec",
+    }
+}
+
+fn month_number(StringView name) : Option<u8>
+{
+    for (u8 m = 1; m <= 12; m += 1)
+    {
+        if (StringView::eq_str(name, month_name(m)))
+        {
+            return Some(m);
+        }
+    }
+    None
+}
+
+// The moment in HTTP's date form (RFC 9110 §5.6.7, the IMF-fixdate):
+// `Sun, 06 Nov 1994 08:49:37 GMT`, as the `Date`, `Last-Modified` and
+// `Expires` headers carry it. The year is written in four digits
+// (`diag.invalid-datetime` outside 0 ..= 9999).
+export fn DateTime::to_http_date(ref<DateTime, shared> t) : String
+{
+    if (t.year < 0 || t.year > 9999)
+    {
+        fault(invalid_datetime);
+    }
+    Weekday w = DateTime::weekday(t);
+    str day = Weekday::text(&w);
+    String out = String::new();
+    String::append(&mut out, StringView::sub(StringView::of(day), 0, 3));
+    String::appendf(
+        &mut out,
+        ", %02d %s %04d %02d:%02d:%02d GMT",
+        t.day,
+        month_name(t.month),
+        t.year,
+        t.hour,
+        t.minute,
+        t.second,
+    );
+    out
+}
+
+// The words of `text` and where each starts.
+fn http_date_words(StringView text, ref<Vec<usize>, exclusive> starts) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = slice_len(text.bytes);
+    usize i = 0;
+    while (i < n)
+    {
+        while (i < n && ascii_is_space(text.bytes[i]))
+        {
+            i += 1;
+        }
+        usize start = i;
+        while (i < n && !ascii_is_space(text.bytes[i]))
+        {
+            i += 1;
+        }
+        if (i > start)
+        {
+            Vec::push(&mut out, StringView::sub(text, start, i));
+            Vec::push(starts, start);
+        }
+    }
+    out
+}
+
+// `hh:mm:ss` into its parts.
+fn http_time(StringView w, ref<u8, exclusive> h, ref<u8, exclusive> m, ref<u8, exclusive> s) : bool
+{
+    if (StringView::len(w) != 8 || !iso_byte(w, 2, b':') || !iso_byte(w, 5, b':'))
+    {
+        return false;
+    }
+    i64 a = match (iso_digits(w, 0, 2)) { Ok(x) : x, Err(_) : return false };
+    i64 b = match (iso_digits(w, 3, 2)) { Ok(x) : x, Err(_) : return false };
+    i64 c = match (iso_digits(w, 6, 2)) { Ok(x) : x, Err(_) : return false };
+    *h = narrow<u8>(a);
+    *m = narrow<u8>(b);
+    *s = narrow<u8>(c);
+    true
+}
+
+// Reads an HTTP date in any of the three forms a recipient must accept
+// (RFC 9110 §5.6.7): `Sun, 06 Nov 1994 08:49:37 GMT` (the one to send),
+// the obsolete `Sunday, 06-Nov-94 08:49:37 GMT` (a two-digit year: 70 to
+// 99 are the 1900s, 00 to 69 the 2000s) and `Sun Nov  6 08:49:37 1994`.
+// The weekday is not checked against the date. `Invalid(i)` names the
+// first word that does not fit; `OutOfRange` fields that name no moment.
+export fn DateTime::from_http_date(StringView text) : Result<DateTime, ParseError>
+{
+    Vec<usize> at = Vec::new();
+    Vec<StringView> w = http_date_words(text, &mut at);
+    if (Vec::len(&w) == 0)
+    {
+        return Err(Empty);
+    }
+    i64 year = 0;
+    u8 month = 0;
+    u8 day = 0;
+    u8 hour = 0;
+    u8 minute = 0;
+    u8 second = 0;
+    if (Vec::len(&w) == 6 && StringView::eq_str(w[5], "GMT"))
+    {
+        // IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
+        if (!StringView::ends_with(w[0], ",")) { return Err(Invalid(at[0])); }
+        day = match (iso_digits(w[1], 0, 2)) { Ok(x) : narrow<u8>(x), Err(_) : return Err(Invalid(at[1])) };
+        if (StringView::len(w[1]) != 2) { return Err(Invalid(at[1])); }
+        month = match (month_number(w[2])) { Some(m) : m, None : return Err(Invalid(at[2])) };
+        year = match (iso_digits(w[3], 0, 4)) { Ok(x) : x, Err(_) : return Err(Invalid(at[3])) };
+        if (StringView::len(w[3]) != 4) { return Err(Invalid(at[3])); }
+        if (!http_time(w[4], &mut hour, &mut minute, &mut second)) { return Err(Invalid(at[4])); }
+    }
+    else if (Vec::len(&w) == 4 && StringView::eq_str(w[3], "GMT"))
+    {
+        // RFC 850: `Sunday, 06-Nov-94 08:49:37 GMT`.
+        if (!StringView::ends_with(w[0], ",")) { return Err(Invalid(at[0])); }
+        StringView d = w[1];
+        if (StringView::len(d) != 9 || !iso_byte(d, 2, b'-') || !iso_byte(d, 6, b'-')) { return Err(Invalid(at[1])); }
+        day = match (iso_digits(d, 0, 2)) { Ok(x) : narrow<u8>(x), Err(_) : return Err(Invalid(at[1])) };
+        month = match (month_number(StringView::sub(d, 3, 6))) { Some(m) : m, None : return Err(Invalid(at[1])) };
+        i64 yy = match (iso_digits(d, 7, 2)) { Ok(x) : x, Err(_) : return Err(Invalid(at[1])) };
+        year = if (yy >= 70) { 1900 + yy } else { 2000 + yy };
+        if (!http_time(w[2], &mut hour, &mut minute, &mut second)) { return Err(Invalid(at[2])); }
+    }
+    else if (Vec::len(&w) == 5)
+    {
+        // asctime: `Sun Nov  6 08:49:37 1994`.
+        month = match (month_number(w[1])) { Some(m) : m, None : return Err(Invalid(at[1])) };
+        usize dl = StringView::len(w[2]);
+        if (dl == 0 || dl > 2) { return Err(Invalid(at[2])); }
+        day = match (iso_digits(w[2], 0, dl)) { Ok(x) : narrow<u8>(x), Err(_) : return Err(Invalid(at[2])) };
+        if (!http_time(w[3], &mut hour, &mut minute, &mut second)) { return Err(Invalid(at[3])); }
+        year = match (iso_digits(w[4], 0, 4)) { Ok(x) : x, Err(_) : return Err(Invalid(at[4])) };
+        if (StringView::len(w[4]) != 4) { return Err(Invalid(at[4])); }
+    }
+    else
+    {
+        return Err(Invalid(at[0]));
+    }
+    match (DateTime::new(year, month, day, hour, minute, second))
+    {
+        Some(t) : Ok(t),
+        None    : Err(OutOfRange),
+    }
+}

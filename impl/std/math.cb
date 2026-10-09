@@ -1,0 +1,561 @@
+// `std::math` (spec/21 §0, §3d): numbers. The four generic helpers below
+// are written in CobaltC over D-0090's bounds (D-0091; moved here from
+// `std::core` by D-0148). The floating-point functions `sqrt`, `floor`,
+// `ceil`, `round`, `trunc`, `ln`, `exp`, `log2`, `log10`, `sin`, `cos`,
+// `tan`, `atan2` and `powf` (`rule.arith.float-fns`) each take an `f32`
+// or `f64` (`atan2` and `powf` two of one type) and give that type, which
+// no bound can say, so both implementations realize them natively, and
+// none is written here.
+
+// The smaller of two values (`a` when they are equal).
+export fn min<T: ordered>(T a, T b) : T
+{
+    if (b < a) { b } else { a }
+}
+
+// The larger of two values (`a` when they are equal).
+export fn max<T: ordered>(T a, T b) : T
+{
+    if (b > a) { b } else { a }
+}
+
+// The magnitude: checked (`abs` of a signed type's minimum overflows);
+// `abs(-0.0)` is `0.0`, and a NaN stays a NaN.
+export fn abs<T: number>(T x) : T
+{
+    if (x < 0 || x == 0) { 0 - x } else { x }
+}
+
+// `base` to the power `exp` (`pow(x, 0)` is 1), by squaring: checked,
+// and overflowing only when the result does.
+export fn pow<T: number>(T base, u32 exp) : T
+{
+    T r = 1;
+    T b = base;
+    u32 e = exp;
+    while (e > 0)
+    {
+        if ((e & 1) == 1) { r = r * b; }
+        e = e >> 1;
+        if (e > 0) { b = b * b; }
+    }
+    r
+}
+
+// D-0181: `x` held within `lo ..= hi`: `lo` when it is below, `hi` when
+// it is above, else `x`. `lo` above `hi` is `diag.assert-failed`.
+export fn clamp<T: ordered>(T x, T lo, T hi) : T
+{
+    assert(!(hi < lo), "clamp: `lo` is above `hi`");
+    if (x < lo) { lo } else if (hi < x) { hi } else { x }
+}
+
+// D-0181: whether `x` is a NaN (the one value that is not equal to
+// itself); `false` for every integer.
+export fn is_nan<T: number>(T x) : bool
+{
+    x != x
+}
+
+// D-0181: whether `x` is neither a NaN nor an infinity (`x - x` is then
+// 0, and otherwise a NaN); `true` for every integer.
+export fn is_finite<T: number>(T x) : bool
+{
+    (x - x) == (x - x)
+}
+
+// D-0181: the greatest common divisor of `a` and `b` (Euclid), never
+// negative; `gcd(0, 0)` is 0. The magnitude of a signed type's minimum
+// overflows, as `abs` does.
+export fn gcd<T: integer>(T a, T b) : T
+{
+    T x = abs(a);
+    T y = abs(b);
+    while (y != 0)
+    {
+        T r = x % y;
+        x = y;
+        y = r;
+    }
+    x
+}
+
+// D-0157: `BigUint`, an unsigned integer of any size, for public-key
+// verification (RSA, elliptic curves) and for numbers too large for `u128`.
+// Its operations take time that depends on the values, so a `BigUint` is
+// for public values only: never for a private key or anything secret.
+
+// The value Σ limbs[i]·2^(32·i): 32-bit limbs, least significant first,
+// with no zero limb at the top (zero has none).
+export struct BigUint
+{
+    Vec<u32> limbs;
+}
+
+fn BigUint::trim(ref<BigUint, exclusive> a)
+{
+    while (Vec::len(&a.limbs) > 0 && a.limbs[Vec::len(&a.limbs) - 1] == 0)
+    {
+        Vec::pop(&mut a.limbs);
+    }
+}
+
+export fn BigUint::zero() : BigUint
+{
+    BigUint { .limbs = Vec::new() }
+}
+
+export fn BigUint::from_u64(u64 x) : BigUint
+{
+    BigUint r = BigUint { .limbs = Vec::new() };
+    Vec::push(&mut r.limbs, narrow_wrapping<u32>(x));
+    Vec::push(&mut r.limbs, narrow_wrapping<u32>(x >> 32));
+    BigUint::trim(&mut r);
+    r
+}
+
+// The number whose big-endian bytes these are (leading zero bytes allowed).
+export fn BigUint::from_bytes_be(slice<u8, shared> bytes) : BigUint
+{
+    BigUint r = BigUint { .limbs = Vec::new() };
+    usize n = slice_len(bytes);
+    usize i = n;
+    while (i > 0)
+    {
+        u32 limb = 0;
+        usize lo = if (i >= 4) { i - 4 } else { 0 };
+        for (usize k = lo; k < i; k += 1)
+        {
+            limb = (limb << 8) | widen<u32>(bytes[k]);
+        }
+        Vec::push(&mut r.limbs, limb);
+        i = lo;
+    }
+    BigUint::trim(&mut r);
+    r
+}
+
+// The big-endian bytes of `a`, with no leading zero byte (none for zero).
+export fn BigUint::to_bytes_be(ref<BigUint, shared> a) : Vec<u8>
+{
+    BigUint::to_bytes_be_padded(a, (BigUint::bit_len(a) + 7) / 8)
+}
+
+// The big-endian bytes of `a` in exactly `width` bytes, zeros in front; a
+// value that does not fit is `diag.arith-overflow`.
+export fn BigUint::to_bytes_be_padded(ref<BigUint, shared> a, usize width) : Vec<u8>
+{
+    if (BigUint::bit_len(a) > width * 8)
+    {
+        fault(arith_overflow);
+    }
+    Vec<u8> out = Vec::filled(width, 0: u8);
+    for (usize i = 0; i < width; i += 1)
+    {
+        usize limb = i / 4;
+        if (limb < Vec::len(&a.limbs))
+        {
+            out[width - 1 - i] = narrow_wrapping<u8>(a.limbs[limb] >> narrow<u32>(8 * (i % 4)));
+        }
+    }
+    out
+}
+
+export fn BigUint::is_zero(ref<BigUint, shared> a) : bool
+{
+    Vec::len(&a.limbs) == 0
+}
+
+// The number of bits needed to write `a` (0 for zero).
+export fn BigUint::bit_len(ref<BigUint, shared> a) : usize
+{
+    usize n = Vec::len(&a.limbs);
+    if (n == 0)
+    {
+        return 0;
+    }
+    32 * n - widen<usize>(leading_zeros(a.limbs[n - 1]))
+}
+
+// Bit `i` of `a` (bit 0 the least significant).
+export fn BigUint::bit(ref<BigUint, shared> a, usize i) : bool
+{
+    usize limb = i / 32;
+    limb < Vec::len(&a.limbs) && ((a.limbs[limb] >> narrow<u32>(i % 32)) & 1) == 1
+}
+
+// -1, 0 or 1 as `a` is less than, equal to or greater than `b`.
+fn BigUint::compare(ref<BigUint, shared> a, ref<BigUint, shared> b) : i32
+{
+    usize n = Vec::len(&a.limbs);
+    if (n != Vec::len(&b.limbs))
+    {
+        return if (n < Vec::len(&b.limbs)) { -1 } else { 1 };
+    }
+    usize i = n;
+    while (i > 0)
+    {
+        i -= 1;
+        if (a.limbs[i] != b.limbs[i])
+        {
+            return if (a.limbs[i] < b.limbs[i]) { -1 } else { 1 };
+        }
+    }
+    0
+}
+
+export fn BigUint::eq(ref<BigUint, shared> a, ref<BigUint, shared> b) : bool
+{
+    BigUint::compare(a, b) == 0
+}
+
+// Whether `a` is less than `b`; fits `Vec::sort_by`.
+export fn BigUint::less(ref<BigUint, shared> a, ref<BigUint, shared> b) : bool
+{
+    BigUint::compare(a, b) < 0
+}
+
+export fn BigUint::add(ref<BigUint, shared> a, ref<BigUint, shared> b) : BigUint
+{
+    usize n = max(Vec::len(&a.limbs), Vec::len(&b.limbs));
+    BigUint r = BigUint { .limbs = Vec::new() };
+    u64 carry = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        u64 x = if (i < Vec::len(&a.limbs)) { widen<u64>(a.limbs[i]) } else { 0 };
+        u64 y = if (i < Vec::len(&b.limbs)) { widen<u64>(b.limbs[i]) } else { 0 };
+        u64 t = x + y + carry;
+        Vec::push(&mut r.limbs, narrow_wrapping<u32>(t));
+        carry = t >> 32;
+    }
+    if (carry > 0)
+    {
+        Vec::push(&mut r.limbs, narrow_wrapping<u32>(carry));
+    }
+    r
+}
+
+// a - b; `b` greater than `a` is `diag.arith-overflow`, as for any
+// unsigned subtraction.
+export fn BigUint::sub(ref<BigUint, shared> a, ref<BigUint, shared> b) : BigUint
+{
+    if (BigUint::compare(a, b) < 0)
+    {
+        fault(arith_overflow);
+    }
+    BigUint r = BigUint { .limbs = Vec::new() };
+    i64 borrow = 0;
+    for (usize i = 0; i < Vec::len(&a.limbs); i += 1)
+    {
+        i64 y = if (i < Vec::len(&b.limbs)) { widen<i64>(b.limbs[i]) } else { 0 };
+        i64 t = widen<i64>(a.limbs[i]) - y - borrow;
+        if (t < 0)
+        {
+            t += 0x100000000;
+            borrow = 1;
+        }
+        else
+        {
+            borrow = 0;
+        }
+        Vec::push(&mut r.limbs, narrow<u32>(t));
+    }
+    BigUint::trim(&mut r);
+    r
+}
+
+export fn BigUint::mul(ref<BigUint, shared> a, ref<BigUint, shared> b) : BigUint
+{
+    usize n = Vec::len(&a.limbs);
+    usize m = Vec::len(&b.limbs);
+    BigUint r = BigUint { .limbs = Vec::filled(n + m, 0: u32) };
+    for (usize i = 0; i < n; i += 1)
+    {
+        u64 carry = 0;
+        u64 x = widen<u64>(a.limbs[i]);
+        for (usize j = 0; j < m; j += 1)
+        {
+            u64 t = x * widen<u64>(b.limbs[j]) + widen<u64>(r.limbs[i + j]) + carry;
+            r.limbs[i + j] = narrow_wrapping<u32>(t);
+            carry = t >> 32;
+        }
+        r.limbs[i + m] = narrow_wrapping<u32>(carry);
+    }
+    BigUint::trim(&mut r);
+    r
+}
+
+// `a` divided by 2^k, rounded down.
+export fn BigUint::shift_right(ref<BigUint, shared> a, usize k) : BigUint
+{
+    usize whole = k / 32;
+    u32 part = narrow<u32>(k % 32);
+    BigUint r = BigUint { .limbs = Vec::new() };
+    for (usize i = whole; i < Vec::len(&a.limbs); i += 1)
+    {
+        u32 lo = a.limbs[i] >> part;
+        u32 hi = if (part == 0 || i + 1 >= Vec::len(&a.limbs)) { 0 } else { a.limbs[i + 1] << (32 - part) };
+        Vec::push(&mut r.limbs, lo | hi);
+    }
+    BigUint::trim(&mut r);
+    r
+}
+
+// `a` times 2^k.
+export fn BigUint::shift_left(ref<BigUint, shared> a, usize k) : BigUint
+{
+    BigUint r = BigUint { .limbs = Vec::filled(k / 32, 0: u32) };
+    Vec<u32> moved = BigUint::shifted_limbs(a, narrow<u32>(k % 32), 0);
+    Vec::extend_from(&mut r.limbs, &moved[0..$]);
+    BigUint::trim(&mut r);
+    r
+}
+
+// `a` shifted left by `k` bits, with `extra` more zero limbs on top.
+fn BigUint::shifted_limbs(ref<BigUint, shared> a, u32 k, usize extra) : Vec<u32>
+{
+    Vec<u32> out = Vec::new();
+    u32 carry = 0;
+    for (usize i = 0; i < Vec::len(&a.limbs); i += 1)
+    {
+        u32 x = a.limbs[i];
+        if (k == 0)
+        {
+            Vec::push(&mut out, x);
+        }
+        else
+        {
+            Vec::push(&mut out, (x << k) | carry);
+            carry = x >> (32 - k);
+        }
+    }
+    Vec::push(&mut out, carry);
+    for (usize i = 0; i < extra; i += 1)
+    {
+        Vec::push(&mut out, 0);
+    }
+    out
+}
+
+// The quotient and remainder of `a` by `b` (D. Knuth's algorithm D).
+// `b` zero is `diag.div-by-zero`.
+export struct BigDivision
+{
+    export BigUint quotient;
+    export BigUint remainder;
+}
+
+export fn BigUint::div_rem(ref<BigUint, shared> a, ref<BigUint, shared> b) : BigDivision
+{
+    if (BigUint::is_zero(b))
+    {
+        fault(div_by_zero);
+    }
+    if (BigUint::compare(a, b) < 0)
+    {
+        return BigDivision { .quotient = BigUint::zero(), .remainder = BigUint::clone(a) };
+    }
+    usize n = Vec::len(&b.limbs);
+    if (n == 1)
+    {
+        u64 d = widen<u64>(b.limbs[0]);
+        BigUint q = BigUint { .limbs = Vec::filled(Vec::len(&a.limbs), 0: u32) };
+        u64 rem = 0;
+        usize i = Vec::len(&a.limbs);
+        while (i > 0)
+        {
+            i -= 1;
+            u64 cur = (rem << 32) | widen<u64>(a.limbs[i]);
+            q.limbs[i] = narrow<u32>(cur / d);
+            rem = cur % d;
+        }
+        BigUint::trim(&mut q);
+        return BigDivision { .quotient = q, .remainder = BigUint::from_u64(rem) };
+    }
+    u32 s = leading_zeros(b.limbs[n - 1]);
+    Vec<u32> bn = BigUint::shifted_limbs(b, s, 0);
+    Vec::pop(&mut bn);
+    Vec<u32> an = BigUint::shifted_limbs(a, s, 0);
+    usize m = Vec::len(&a.limbs) - n;
+    BigUint q = BigUint { .limbs = Vec::filled(m + 1, 0: u32) };
+    u64 base = 0x100000000;
+    u64 btop = widen<u64>(bn[n - 1]);
+    u64 bnext = widen<u64>(bn[n - 2]);
+    usize jj = m + 1;
+    while (jj > 0)
+    {
+        jj -= 1;
+        usize j = jj;
+        u64 num = (widen<u64>(an[j + n]) << 32) | widen<u64>(an[j + n - 1]);
+        u64 qhat = num / btop;
+        u64 rhat = num % btop;
+        while (qhat >= base || qhat * bnext > ((rhat << 32) | widen<u64>(an[j + n - 2])))
+        {
+            qhat -= 1;
+            rhat += btop;
+            if (rhat >= base)
+            {
+                break;
+            }
+        }
+        i64 k = 0;
+        i64 t = 0;
+        for (usize i = 0; i < n; i += 1)
+        {
+            u64 p = qhat * widen<u64>(bn[i]);
+            t = widen<i64>(an[i + j]) - k - reinterpret<i64>(p & 0xffffffff);
+            an[i + j] = narrow_wrapping<u32>(reinterpret<u64>(t));
+            k = reinterpret<i64>(p >> 32) - (t >> 32);
+        }
+        t = widen<i64>(an[j + n]) - k;
+        an[j + n] = narrow_wrapping<u32>(reinterpret<u64>(t));
+        if (t < 0)
+        {
+            qhat -= 1;
+            u64 c = 0;
+            for (usize i = 0; i < n; i += 1)
+            {
+                u64 sum = widen<u64>(an[i + j]) + widen<u64>(bn[i]) + c;
+                an[i + j] = narrow_wrapping<u32>(sum);
+                c = sum >> 32;
+            }
+            an[j + n] = wrapping_add(an[j + n], narrow_wrapping<u32>(c));
+        }
+        q.limbs[j] = narrow<u32>(qhat);
+    }
+    BigUint::trim(&mut q);
+    BigUint r = BigUint { .limbs = Vec::new() };
+    for (usize i = 0; i < n; i += 1)
+    {
+        u32 hi = if (s == 0 || i + 1 >= n) { 0 } else { an[i + 1] << (32 - s) };
+        Vec::push(&mut r.limbs, (an[i] >> s) | hi);
+    }
+    BigUint::trim(&mut r);
+    BigDivision { .quotient = q, .remainder = r }
+}
+
+// a mod m; `m` zero is `diag.div-by-zero`.
+export fn BigUint::rem(ref<BigUint, shared> a, ref<BigUint, shared> m) : BigUint
+{
+    BigDivision { quotient, remainder } = BigUint::div_rem(a, m);
+    remainder
+}
+
+// base^exp mod m, by squaring and multiplying, left to right over `exp`'s
+// bits. `m` zero is `diag.div-by-zero`; anything mod 1 is 0.
+export fn BigUint::mod_pow(ref<BigUint, shared> base, ref<BigUint, shared> exp, ref<BigUint, shared> m) : BigUint
+{
+    BigUint one = BigUint::from_u64(1);
+    BigUint result = BigUint::rem(&one, m);
+    BigUint b = BigUint::rem(base, m);
+    usize bits = BigUint::bit_len(exp);
+    usize i = bits;
+    while (i > 0)
+    {
+        i -= 1;
+        overwrite(&mut result, BigUint::rem(&BigUint::mul(&result, &result), m));
+        if (BigUint::bit(exp, i))
+        {
+            overwrite(&mut result, BigUint::rem(&BigUint::mul(&result, &b), m));
+        }
+    }
+    result
+}
+
+export fn BigUint::clone(ref<BigUint, shared> a) : BigUint
+{
+    BigUint { .limbs = Vec::clone(&a.limbs) }
+}
+
+// a⁻¹ mod m: the number below m whose product with a is 1 mod m, or None
+// when a and m share a factor (or m is below 2). Extended Euclid, the
+// coefficient kept below m (D-0169). Like every BigUint operation, in a
+// time that depends on the values: for public numbers and for one-time
+// blinding factors, not for a private key.
+export fn BigUint::mod_inverse(ref<BigUint, shared> a, ref<BigUint, shared> m) : Option<BigUint>
+{
+    BigUint one = BigUint::from_u64(1);
+    if (!BigUint::less(&one, m))
+    {
+        return None;
+    }
+    BigUint r0 = BigUint::clone(m);
+    BigUint r1 = BigUint::rem(a, m);
+    BigUint t0 = BigUint::zero();
+    BigUint t1 = BigUint::from_u64(1);
+    while (!BigUint::is_zero(&r1))
+    {
+        BigDivision { quotient, remainder } = BigUint::div_rem(&r0, &r1);
+        // t2 = t0 - q·t1 mod m, computed without going below zero.
+        BigUint qt = BigUint::rem(&BigUint::mul(&quotient, &t1), m);
+        BigUint t2 = if (BigUint::less(&t0, &qt))
+        {
+            BigUint::sub(&BigUint::add(&t0, m), &qt)
+        }
+        else
+        {
+            BigUint::sub(&t0, &qt)
+        };
+        overwrite(&mut r0, r1);
+        r1 = remainder;
+        overwrite(&mut t0, t1);
+        t1 = t2;
+    }
+    if (!BigUint::eq(&r0, &one))
+    {
+        return None;
+    }
+    Some(t0)
+}
+
+// The number in decimal digits.
+export fn BigUint::text(ref<BigUint, shared> a) : String
+{
+    if (BigUint::is_zero(a))
+    {
+        return "0";
+    }
+    Vec<u32> chunks = Vec::new();
+    BigUint billion = BigUint::from_u64(1000000000);
+    BigUint cur = BigUint::clone(a);
+    while (!BigUint::is_zero(&cur))
+    {
+        BigDivision { quotient, remainder } = BigUint::div_rem(&cur, &billion);
+        u32 low = if (Vec::len(&remainder.limbs) == 0) { 0 } else { remainder.limbs[0] };
+        Vec::push(&mut chunks, low);
+        overwrite(&mut cur, quotient);
+    }
+    String out = String::new();
+    usize i = Vec::len(&chunks);
+    i -= 1;
+    String::appendf(&mut out, "%u", chunks[i]);
+    while (i > 0)
+    {
+        i -= 1;
+        String::appendf(&mut out, "%09u", chunks[i]);
+    }
+    out
+}
+
+// Reads decimal digits: `Err(Empty)` for "", `Err(Invalid(i))` at the
+// first byte that is not a digit.
+export fn BigUint::parse(StringView text) : Result<BigUint, ParseError>
+{
+    usize n = StringView::len(text);
+    if (n == 0)
+    {
+        return Err(Empty);
+    }
+    BigUint r = BigUint::zero();
+    BigUint ten = BigUint::from_u64(10);
+    for (usize i = 0; i < n; i += 1)
+    {
+        u8 c = text.bytes[i];
+        if (!ascii_is_digit(c))
+        {
+            return Err(Invalid(i));
+        }
+        overwrite(&mut r, BigUint::add(&BigUint::mul(&r, &ten), &BigUint::from_u64(widen<u64>(c - b'0'))));
+    }
+    Ok(r)
+}

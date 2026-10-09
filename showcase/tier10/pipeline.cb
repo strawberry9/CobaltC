@@ -1,0 +1,85 @@
+// Pipelines
+//
+// Shows: running other programs with `std::process`, and why there is
+// no shell in `Command`. A pipeline is a shell's feature, so the program
+// asks for one by name — `/bin/sh -c` — and passes the user's text as a
+// separate argument (`$1`), where no `;` or `$(…)` in it can run
+// anything. `Command::output` captures standard output, standard error
+// and the status; `output_with_input` feeds a program's standard input.
+// A status is the exit code, or minus the signal that ended the
+// program: a `sleep` that is `spawn`ed, found still running by
+// `try_wait`, and `kill`ed reports -9. A program that is not there is
+// `Err(NotFound)`, not a status.
+
+import std;
+
+fn text(Vec<u8> b) : String
+{
+    match (String::from_utf8(b))
+    {
+        Ok(s)  : s,
+        Err(_) : String::from_str("(not UTF-8)"),
+    }
+}
+
+// Runs `script` under /bin/sh with `arg` as $1, feeding `input`.
+fn shell(str script, str arg, str input)
+{
+    Command c = Command::new("/bin/sh");
+    Command::arg(&mut c, "-c");
+    Command::arg(&mut c, StringView::of(script));
+    Command::arg(&mut c, "sh");
+    Command::arg(&mut c, StringView::of(arg));
+    String fed = String::from_str(input);
+    match (Command::output_with_input(&c, &String::as_bytes(&fed)[0..$]))
+    {
+        Ok(o)  :
+        {
+            String out = text(Vec::clone(&o.stdout));
+            String err = text(Vec::clone(&o.stderr));
+            printf("$ %s   [$1 = %s]\n%s", script, arg, &out);
+            if (String::len(&err) > 0)
+            {
+                printf("(stderr) %s", &err);
+            }
+            printf("status %d\n\n", o.status);
+        },
+        Err(e) : printf("$ %s: %s\n\n", script, FileError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    shell("printf '%s\\n' pear fig apple fig | sort | uniq -c", "", "");
+    shell("tr a-z A-Z | rev", "", "ferry times\nharbour notes\n");
+    shell("echo \"hello, $1\"", "world; echo injected", "");
+    shell("grep -c \"$1\" || exit 7", "ferry", "no match here\n");
+    shell("echo half >&2; exit 3", "", "");
+    Command sleeper = Command::new("sleep");
+    Command::arg(&mut sleeper, "60");
+    match (Command::spawn(&sleeper))
+    {
+        Ok(child) :
+        {
+            bool running = match (Child::try_wait(&mut child))
+            {
+                Ok(None) : true,
+                _        : false,
+            };
+            _ = Child::kill(&mut child);
+            printf(
+                "sleep 60: running %v, after kill status %d\n",
+                running,
+                Result::unwrap_or(Child::wait(&mut child), 0),
+            );
+        },
+        Err(e)    : printf("sleep: %s\n", FileError::text(&e)),
+    }
+    Command missing = Command::new("no-such-tool");
+    match (Command::status(&missing))
+    {
+        Ok(s)  : printf("no-such-tool: status %d?\n", s),
+        Err(e) : printf("no-such-tool: %s\n", FileError::text(&e)),
+    }
+    0
+}

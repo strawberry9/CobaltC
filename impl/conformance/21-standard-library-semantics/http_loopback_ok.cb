@@ -1,0 +1,191 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Send] [Http-Body] [Http-Redirect] [Http-Error] [Http-Accept] [Http-Request] [Http-Respond] (D-0173, D-0174); conf.http-get-post, conf.http-redirects, conf.http-server-keep-alive, conf.http-server-no-body, conf.http-server-refusals
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 676574202020202020202020202020323030204f4b207c206f6e2d636f6e6e656374696f6e2031207c20474554202f68656c6c6f3f783d3120626f64793d5b5d206167656e743d436f62616c74432d7374642d687474702f3120747970653d2d0a706f73742020202020202020202020323030204f4b207c206f6e2d636f6e6e656374696f6e2031207c20504f5354202f7375626d697420626f64793d5b7b2261223a317d5d206167656e743d436f62616c74432d7374642d687474702f3120747970653d6170706c69636174696f6e2f6a736f6e0a333032202020202020202020202020323030204f4b207c206f6e2d636f6e6e656374696f6e2031207c20474554202f66696e616c20626f64793d5b5d206167656e743d436f62616c74432d7374642d687474702f3120747970653d2d0a333033206f66206120706f73742020323030204f4b207c206f6e2d636f6e6e656374696f6e2031207c20474554202f66696e616c20626f64793d5b5d206167656e743d436f62616c74432d7374642d687474702f3120747970653d2d0a333037206f66206120706f73742020323030204f4b207c206f6e2d636f6e6e656374696f6e2031207c20504f5354202f66696e616c20626f64793d5b6b6570745d206167656e743d436f62616c74432d7374642d687474702f3120747970653d746578742f706c61696e0a343034202020202020202020202020343034204e6f7420466f756e64207c206f6e2d636f6e6e656374696f6e2031207c206e6f207375636820706167650a323034202020202020202020202020323034204e6f20436f6e74656e74207c206f6e2d636f6e6e656374696f6e2031207c200a6865616420202020202020202020203230302c20626f647920302062797465732c20636f6e74656e742d6c656e6774682035350a6b6565702d616c6976653a2020202074776f20726573706f6e73657320747275652c207365636f6e64207361797320636f6e6e656374696f6e203220747275652c206669727374206b6565702d616c69766520747275652c206c61737420636c6f736520747275650a746f6f206c6172676520202020202034313320436f6e74656e7420546f6f204c61726765207c206f6e2d636f6e6e656374696f6e202d207c20726566757365640a676172626167653a20202020202020485454502f312e31203430302042616420526571756573740a7365727665723a20300a
+//
+// Hermetic: an `HttpServer` on a loopback port in one thread, clients in
+// the main thread. GET and POST with headers and bodies both ways; 302
+// and 303 followed by GET without the body, 307 with it; 404 and 204;
+// `HEAD` without a body but with the length; two requests on one
+// connection (the server counts them); a `Connection: close` request;
+// a request too large for the server's limit answered 413 and a
+// malformed request line 400, each closing the connection.
+
+import std;
+
+fn serve(HttpServer s) : u8
+{
+    usize served = 0;
+    while (served < 15)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(_) : return 1,
+        };
+        usize on_connection = 0;
+        while (true)
+        {
+            Vec<u8> none = Vec::new();
+            Vec<Header> h = Vec::new();
+            Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+            match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(req)) :
+                {
+                    served += 1;
+                    on_connection += 1;
+                    Vec::push(
+                        &mut h,
+                        Header::new("X-Request-On-Connection", String::as_view(&sprintf("%v", on_connection))),
+                    );
+                    if (req.url == "/redirect302")
+                    {
+                        Vec::push(&mut h, Header::new("Location", "/final"));
+                        _ = HttpConnection::respond(&mut c, 302, &h[0..$], &none[0..$]);
+                    }
+                    else if (req.url == "/redirect303")
+                    {
+                        Vec::push(&mut h, Header::new("Location", "final"));
+                        _ = HttpConnection::respond(&mut c, 303, &h[0..$], &none[0..$]);
+                    }
+                    else if (req.url == "/redirect307")
+                    {
+                        Vec::push(&mut h, Header::new("Location", "/final"));
+                        _ = HttpConnection::respond(&mut c, 307, &h[0..$], &none[0..$]);
+                    }
+                    else if (req.url == "/missing")
+                    {
+                        _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"no such page\n"[0..$]);
+                    }
+                    else if (req.url == "/empty")
+                    {
+                        _ = HttpConnection::respond(&mut c, 204, &h[0..$], &none[0..$]);
+                    }
+                    else
+                    {
+                        String body = sprintf(
+                            "%s %s body=[%s] agent=%s type=%s\n",
+                            &req.method,
+                            &req.url,
+                            &Result::unwrap_or(String::from_utf8(Vec::clone(&req.body)), String::new()),
+                            Option::unwrap_or(Request::header(&req, "user-agent"), StringView::of("-")),
+                            Option::unwrap_or(Request::header(&req, "content-type"), StringView::of("-")),
+                        );
+                        _ = HttpConnection::respond(
+                            &mut c,
+                            200,
+                            &h[0..$],
+                            StringView::as_bytes(String::as_view(&body)),
+                        );
+                    }
+                },
+                Ok(None)      : break,
+                Err(e)        :
+                {
+                    served += 1;
+                    u16 code = match (e)
+                    {
+                        TooLarge : 413,
+                        _        : 400,
+                    };
+                    _ = HttpConnection::respond(&mut c, code, &h[0..$], &b"refused\n"[0..$]);
+                    break;
+                },
+            }
+        }
+    }
+    0
+}
+
+fn show(str label, Result<Response, HttpError> r)
+{
+    match (r)
+    {
+        Ok(resp) : printf(
+            "%-14s %u %s | on-connection %s | %s",
+            label,
+            resp.status,
+            &resp.reason,
+            Option::unwrap_or(Response::header(&resp, "x-request-on-connection"), StringView::of("-")),
+            &Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::new()),
+        ),
+        Err(e) : printf("%-14s error: %s\n", label, HttpError::text(&e)),
+    }
+}
+
+fn url(ref<String, shared> base, str path) : String
+{
+    String u = String::clone(base);
+    String::append(&mut u, path);
+    u
+}
+
+fn main() : u8
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    s.max_body = 100;
+    SocketAddr at = HttpServer::local_addr(&s);
+    auto server = spawn(serve, s);
+    String base = sprintf("http://127.0.0.1:%u", at.port);
+    show("get", http_get(String::as_view(&url(&base, "/hello?x=1"))));
+    show("post", http_post(String::as_view(&url(&base, "/submit")), "application/json", &b"{\"a\":1}"[0..$]));
+    show("302", http_get(String::as_view(&url(&base, "/redirect302"))));
+    show("303 of a post", http_post(String::as_view(&url(&base, "/redirect303")), "text/plain", &b"dropped"[0..$]));
+    show("307 of a post", http_post(String::as_view(&url(&base, "/redirect307")), "text/plain", &b"kept"[0..$]));
+    show("404", http_get(String::as_view(&url(&base, "/missing"))));
+    show("204", http_get(String::as_view(&url(&base, "/empty"))));
+    printf("\n");
+    HttpClient c = HttpClient::new();
+    Request head = Request::new("HEAD", String::as_view(&url(&base, "/anything")));
+    match (HttpClient::send(&mut c, &head))
+    {
+        Ok(resp) : printf(
+            "head           %u, body %v bytes, content-length %s\n",
+            resp.status,
+            Vec::len(&resp.body),
+            Option::unwrap_or(Response::header(&resp, "content-length"), StringView::of("-")),
+        ),
+        Err(e) : printf("head error: %s\n", HttpError::text(&e)),
+    }
+    // Two requests on one connection, by hand over TCP.
+    TcpStream t = Result::unwrap(TcpStream::connect(at));
+    TcpStream::set_read_timeout_ms(&mut t, 10000);
+    _ = TcpStream::write_text(
+        &mut t,
+        "GET /one HTTP/1.1\r\nHost: h\r\n\r\nGET /two HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+    );
+    Vec<u8> got = Vec::new();
+    while (true)
+    {
+        match (TcpStream::read(&mut t, &mut got, 4096))
+        {
+            Ok(0)  : break,
+            Ok(_)  : {},
+            Err(_) : break,
+        }
+    }
+    String text = Result::unwrap_or(String::from_utf8(got), String::new());
+    printf(
+        "keep-alive:    two responses %v, second says connection 2 %v, first keep-alive %v, last close %v\n",
+        Vec::len(&String::split(&text, "HTTP/1.1 200 OK")) == 3,
+        String::contains(&text, "X-Request-On-Connection: 2"),
+        String::contains(&text, "Connection: keep-alive"),
+        String::ends_with(&text, "GET /two body=[] agent=- type=-\n"),
+    );
+    // Refused by the server: a body over its 100-byte limit, then garbage.
+    Vec<u8> big = Vec::filled(200, b'x');
+    show("too large", http_post(String::as_view(&url(&base, "/big")), "text/plain", &big[0..$]));
+    TcpStream g = Result::unwrap(TcpStream::connect(at));
+    TcpStream::set_read_timeout_ms(&mut g, 10000);
+    _ = TcpStream::write_text(&mut g, "NOT HTTP\r\n\r\n");
+    match (TcpStream::read_line(&mut g))
+    {
+        Ok(Some(line)) : printf("garbage:       %s\n", &line),
+        _              : printf("garbage: no answer\n"),
+    }
+    printf("server: %u\n", join(server));
+    0
+}

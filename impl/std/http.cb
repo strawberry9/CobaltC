@@ -1,0 +1,823 @@
+// `std::http` (spec/21 §2p, D-0173, D-0174): HTTP/1.1 (RFC 9110, RFC 9112)
+// over `std::net` and `std::tls`. A client that fetches a URL or posts to
+// one, following redirects and decoding chunked bodies, with limits on
+// what it will read; and a server that accepts connections, parses their
+// requests and writes responses, keeping a connection open for the next
+// request when the client asks. Written in CobaltC. HTTP/1.1 only: no
+// HTTP/2, no compression, no cookies, no proxies. The client and the
+// server are the submodules `client` and `server` (D-0187), re-exported
+// here; what both use -- errors, URLs, forms, headers, messages and the
+// buffered reader -- is declared here.
+
+// Why a request or a connection failed.
+export enum HttpError
+{
+    NetFailure(NetError),
+    TlsFailure(TlsError),
+    BadUrl,
+    UnsupportedScheme,
+    NoRoots,
+    BadMessage,
+    TooLarge,
+    TooManyRedirects,
+    ConnectionClosed,
+}
+
+export fn HttpError::text(ref<HttpError, shared> e) : str
+{
+    match (e)
+    {
+        NetFailure(n)     : NetError::text(n),
+        TlsFailure(t)     : TlsError::text(t),
+        BadUrl            : "the URL is malformed",
+        UnsupportedScheme : "the URL's scheme is neither http nor https",
+        NoRoots           : "no trusted roots for https (TrustStore::system failed)",
+        BadMessage        : "the HTTP message is malformed",
+        TooLarge          : "the HTTP message is larger than the limit",
+        TooManyRedirects  : "too many redirects",
+        ConnectionClosed  : "the connection was closed",
+    }
+}
+
+// ---- URLs ----
+
+// A parsed `scheme://host[:port]/path?query`; the fragment, which never
+// reaches a server, is dropped. `port` is the scheme's default when the
+// text names none; `path` is "/" when it names none.
+export struct Url
+{
+    export String scheme;
+    export String host;
+    export u16 port;
+    export String path;
+    export String query;
+}
+
+fn default_port(StringView scheme) : u16
+{
+    if (StringView::eq(scheme, "https")) { 443 } else { 80 }
+}
+
+// `Err(BadUrl)` for text without `://`, with no host, with user
+// information (`user@`), or with a port that is not a number.
+export fn Url::parse(StringView text) : Result<Url, HttpError>
+{
+    usize sep = match (StringView::find(text, "://"))
+    {
+        Some(i) : i,
+        None    : return Err(BadUrl),
+    };
+    String scheme = String::to_ascii_lower(&String::from_view(StringView::sub(text, 0, sep)));
+    StringView rest = StringView::sub(text, sep + 3, StringView::len(text));
+    usize n = StringView::len(rest);
+    slice<u8, shared> b = StringView::as_bytes(rest);
+    usize auth_end = 0;
+    while (auth_end < n && b[auth_end] != b'/' && b[auth_end] != b'?' && b[auth_end] != b'#')
+    {
+        auth_end += 1;
+    }
+    StringView authority = StringView::sub(rest, 0, auth_end);
+    if (auth_end == 0 || Option::is_some(&StringView::find(authority, "@")))
+    {
+        return Err(BadUrl);
+    }
+    slice<u8, shared> ab = StringView::as_bytes(authority);
+    usize host_end = auth_end;
+    if (ab[0] == b'[')
+    {
+        host_end = match (StringView::find(authority, "]"))
+        {
+            Some(i) : i + 1,
+            None    : return Err(BadUrl),
+        };
+    }
+    else
+    {
+        host_end = 0;
+        while (host_end < auth_end && ab[host_end] != b':')
+        {
+            host_end += 1;
+        }
+    }
+    String host = String::to_ascii_lower(&String::from_view(StringView::sub(authority, 0, host_end)));
+    u16 port = default_port(String::as_view(&scheme));
+    if (host_end < auth_end)
+    {
+        if (ab[host_end] != b':')
+        {
+            return Err(BadUrl);
+        }
+        port = match (StringView::parse<u16>(StringView::sub(authority, host_end + 1, auth_end)))
+        {
+            Ok(p)  : p,
+            Err(_) : return Err(BadUrl),
+        };
+    }
+    usize path_end = auth_end;
+    while (path_end < n && b[path_end] != b'?' && b[path_end] != b'#')
+    {
+        path_end += 1;
+    }
+    String path = if (path_end == auth_end) { String::from_str("/") } else
+    {
+        String::from_view(StringView::sub(
+            rest,
+            auth_end,
+            path_end,
+        ))
+    };
+    String query = String::new();
+    if (path_end < n && b[path_end] == b'?')
+    {
+        usize q_end = path_end + 1;
+        while (q_end < n && b[q_end] != b'#')
+        {
+            q_end += 1;
+        }
+        String::append(&mut query, StringView::sub(rest, path_end + 1, q_end));
+    }
+    Ok(Url { .scheme = scheme, .host = host, .port = port, .path = path, .query = query })
+}
+
+// The request target: the path, and `?query` when there is one.
+export fn Url::target(ref<Url, shared> u) : String
+{
+    String t = String::clone(&u.path);
+    if (String::len(&u.query) > 0)
+    {
+        String::append(&mut t, "?");
+        String::append(&mut t, String::as_view(&u.query));
+    }
+    t
+}
+
+// The host as a `Host` header or a URL writes it: with the port when it
+// is not the scheme's default.
+fn host_text(ref<Url, shared> u) : String
+{
+    String h = String::clone(&u.host);
+    if (u.port != default_port(String::as_view(&u.scheme)))
+    {
+        String::append(&mut h, ":");
+        String::append(&mut h, u.port);
+    }
+    h
+}
+
+// The URL as text again.
+export fn Url::text(ref<Url, shared> u) : String
+{
+    String t = String::clone(&u.scheme);
+    String::append(&mut t, "://");
+    String::append(&mut t, String::as_view(&host_text(u)));
+    String::append(&mut t, String::as_view(&Url::target(u)));
+    t
+}
+
+fn is_unreserved(u8 b) : bool
+{
+    ascii_is_alnum(b) || b == b'-' || b == b'.' || b == b'_' || b == b'~'
+}
+
+// RFC 3986 percent-encoding: unreserved bytes as they are, every other
+// as `%XX` (upper-case hex).
+export fn percent_encode(slice<u8, shared> bytes) : String
+{
+    String out = String::new();
+    str digits = "0123456789ABCDEF";
+    foreach (c in bytes)
+    {
+        if (is_unreserved(*c))
+        {
+            String::push_ascii(&mut out, *c);
+        }
+        else
+        {
+            String::push_ascii(&mut out, b'%');
+            String::push_ascii(&mut out, str_byte(digits, widen<usize>(*c >> 4)));
+            String::push_ascii(&mut out, str_byte(digits, widen<usize>(*c & 15)));
+        }
+    }
+    out
+}
+
+fn hex_digit(u8 c) : Option<u8>
+{
+    if (c >= b'0' && c <= b'9') { Some(c - b'0') }
+    else if (c >= b'a' && c <= b'f') { Some(c - b'a' + 10) }
+    else if (c >= b'A' && c <= b'F') { Some(c - b'A' + 10) }
+    else { None }
+}
+
+// The bytes `text` percent-encodes; None for a `%` not followed by two
+// hex digits.
+export fn percent_decode(StringView text) : Option<Vec<u8>>
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    Vec<u8> out = Vec::new();
+    usize i = 0;
+    while (i < slice_len(b))
+    {
+        if (b[i] == b'%')
+        {
+            if (i + 3 > slice_len(b))
+            {
+                return None;
+            }
+            u8 hi = hex_digit(b[i + 1])?;
+            u8 lo = hex_digit(b[i + 2])?;
+            Vec::push(&mut out, hi * 16 + lo);
+            i += 3;
+        }
+        else
+        {
+            Vec::push(&mut out, b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+// ---- D-0181: query strings and form bodies ----
+
+// One name and value of a query string or an
+// `application/x-www-form-urlencoded` body. Names compare exactly (unlike
+// a header's).
+export struct Param
+{
+    export String name;
+    export String value;
+}
+
+export fn Param::new(StringView name, StringView value) : Param
+{
+    Param { .name = String::from_view(name), .value = String::from_view(value) }
+}
+
+// The value of the first parameter named `name`, exactly.
+export fn find_param(slice<Param, shared> params, str name) : Option<StringView>
+{
+    for (usize i = 0; i < slice_len(params); i += 1)
+    {
+        if (String::eq_str(&params[i].name, name))
+        {
+            return Some(String::as_view(&params[i].value));
+        }
+    }
+    None
+}
+
+// The parameters of `text`, a query string (without its `?`) or a form
+// body: `name=value` pairs separated by `&` (or `;`), each name and value
+// percent-decoded with `+` read as a space; a pair without `=` has an
+// empty value; empty pairs are skipped. A name or value that is not
+// UTF-8 after decoding, or a bad percent-escape, is kept as the text
+// given, so nothing is lost.
+export fn form_decode(StringView text) : Vec<Param>
+{
+    Vec<Param> out = Vec::new();
+    foreach (pair in StringView::split(text, "&"))
+    {
+        foreach (p in StringView::split(pair, ";"))
+        {
+            if (StringView::len(p) == 0)
+            {
+                continue;
+            }
+            StringView name = p;
+            StringView value = StringView::of("");
+            if (Some(eq) = StringView::find(p, "="))
+            {
+                name = StringView::sub(p, 0, eq);
+                value = StringView::sub(p, eq + 1, StringView::len(p));
+            }
+            Vec::push(&mut out, Param { .name = form_part(name), .value = form_part(value) });
+        }
+    }
+    out
+}
+
+// One part of a form, decoded: `+` a space, then percent-decoding.
+fn form_part(StringView v) : String
+{
+    String plus = StringView::replace(v, "+", " ");
+    match (percent_decode(String::as_view(&plus)))
+    {
+        Some(b) : match (String::from_utf8(b))
+        {
+            Ok(s)  : s,
+            Err(_) : plus,
+        },
+        None : plus,
+    }
+}
+
+// `params` as a query string or form body: `name=value` pairs joined by
+// `&`, each name and value percent-encoded (a space as `+`), so
+// `form_decode` reads it back. Without a leading `?`.
+export fn form_encode(slice<Param, shared> params) : String
+{
+    String out = String::new();
+    for (usize i = 0; i < slice_len(params); i += 1)
+    {
+        if (i > 0)
+        {
+            String::push_ascii(&mut out, b'&');
+        }
+        String::append(&mut out, String::as_view(&form_encode_part(&params[i].name)));
+        String::push_ascii(&mut out, b'=');
+        String::append(&mut out, String::as_view(&form_encode_part(&params[i].value)));
+    }
+    out
+}
+
+fn form_encode_part(ref<String, shared> s) : String
+{
+    String enc = percent_encode(StringView::as_bytes(String::as_view(s)));
+    String::replace(&enc, "%20", "+")
+}
+
+// The parameters of the URL's query, by `form_decode`.
+export fn Url::query_pairs(ref<Url, shared> u) : Vec<Param>
+{
+    form_decode(String::as_view(&u.query))
+}
+
+// ---- headers and messages ----
+
+// One header field. Names compare without regard to case.
+export struct Header
+{
+    export String name;
+    export String value;
+}
+
+export fn Header::new(str name, StringView value) : Header
+{
+    Header { .name = String::from_str(name), .value = String::from_view(value) }
+}
+
+fn name_eq(StringView a, str b) : bool
+{
+    ascii_ieq_str(a.bytes, b)
+}
+
+fn names_eq(StringView a, StringView b) : bool
+{
+    ascii_ieq(a.bytes, b.bytes)
+}
+
+// Whether two names are equal ignoring ASCII case, on the bytes: shared
+// slices of plain bytes, read unchecked.
+fn ascii_ieq(slice<u8, shared> a, slice<u8, shared> b) : bool
+{
+    if (slice_len(a) != slice_len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        if (ascii_to_lower(a[i]) != ascii_to_lower(b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn ascii_ieq_str(slice<u8, shared> a, str b) : bool
+{
+    if (slice_len(a) != str_len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        if (ascii_to_lower(a[i]) != ascii_to_lower(str_byte(b, i)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_header(slice<Header, shared> headers, StringView name) : bool
+{
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (names_eq(String::as_view(&headers[i].name), name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// The value of the first header named `name`, whatever its case.
+export fn find_header(slice<Header, shared> headers, str name) : Option<StringView>
+{
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (name_eq(String::as_view(&headers[i].name), name))
+        {
+            return Some(String::as_view(&headers[i].value));
+        }
+    }
+    None
+}
+
+// A request: for the client, `url` is absolute (`https://…`); for a
+// request a server received, it is the target as sent (`/path?query`).
+export struct Request
+{
+    export String method;
+    export String url;
+    export Vec<Header> headers;
+    export Vec<u8> body;
+}
+
+export fn Request::new(str method, StringView url) : Request
+{
+    Request { .method = String::from_str(method), .url = String::from_view(url), .headers = Vec::new(), .body = Vec::new() }
+}
+
+export fn Request::header(ref<Request, shared> r, str name) : Option<StringView>
+{
+    find_header(&r.headers[0..$], name)
+}
+
+// A response: the status, its reason phrase, the headers and the whole
+// body (decoded if it was chunked).
+export struct Response
+{
+    export u16 status;
+    export String reason;
+    export Vec<Header> headers;
+    export Vec<u8> body;
+}
+
+export fn Response::header(ref<Response, shared> r, str name) : Option<StringView>
+{
+    find_header(&r.headers[0..$], name)
+}
+
+// D-0193: the body as text: a copy of its bytes, which must be UTF-8.
+export fn Response::text(ref<Response, shared> r) : Result<String, Utf8Error>
+{
+    String::from_utf8(Vec::clone(&r.body))
+}
+
+// The reason phrase of a status code, as RFC 9110 lists them.
+export fn reason_phrase(u16 status) : str
+{
+    match (status)
+    {
+        100 : "Continue",
+        101 : "Switching Protocols",
+        200 : "OK",
+        201 : "Created",
+        202 : "Accepted",
+        204 : "No Content",
+        206 : "Partial Content",
+        301 : "Moved Permanently",
+        302 : "Found",
+        303 : "See Other",
+        304 : "Not Modified",
+        307 : "Temporary Redirect",
+        308 : "Permanent Redirect",
+        400 : "Bad Request",
+        401 : "Unauthorized",
+        403 : "Forbidden",
+        404 : "Not Found",
+        405 : "Method Not Allowed",
+        408 : "Request Timeout",
+        409 : "Conflict",
+        411 : "Length Required",
+        413 : "Content Too Large",
+        415 : "Unsupported Media Type",
+        429 : "Too Many Requests",
+        500 : "Internal Server Error",
+        501 : "Not Implemented",
+        502 : "Bad Gateway",
+        503 : "Service Unavailable",
+        504 : "Gateway Timeout",
+        _   : "",
+    }
+}
+
+// The most a message's head (request or status line and headers) may
+// take, and a chunk-size line.
+const usize MAX_HEAD = 65536;
+
+// ---- a buffered reader over a plain or a TLS connection ----
+
+enum Conn
+{
+    Plain(TcpStream),
+    Secure(TlsStream),
+}
+
+fn conn_read(ref<Conn, exclusive> c, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, HttpError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(NetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(TlsFailure(e)),
+        },
+    }
+}
+
+fn conn_write(ref<Conn, exclusive> c, slice<u8, shared> data) : Result<void, HttpError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(NetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(TlsFailure(e)),
+        },
+    }
+}
+
+fn conn_close(ref<Conn, exclusive> c)
+{
+    match (c)
+    {
+        Plain(s)  : { _ = TcpStream::shutdown_write(s); },
+        Secure(s) : { _ = TlsStream::close(s); },
+    }
+}
+
+// Bytes read ahead of what the parser has consumed.
+struct Reader
+{
+    Conn conn;
+    Vec<u8> buf;
+    usize at;
+}
+
+// More bytes into the buffer; false at the end of the stream.
+fn fill_buffer(ref<Reader, exclusive> r) : Result<bool, HttpError>
+{
+    if (r.at > 0 && r.at == Vec::len(&r.buf))
+    {
+        Vec::clear(&mut r.buf);
+        r.at = 0;
+    }
+    usize n = conn_read(&mut r.conn, &mut r.buf, 16384)?;
+    Ok(n > 0)
+}
+
+fn available(ref<Reader, shared> r) : usize
+{
+    Vec::len(&r.buf) - r.at
+}
+
+// A line without its CRLF (a bare LF is accepted too); None at the end
+// of the stream before any byte; TooLarge past `limit` bytes.
+// The first newline in `b` from `at`, or its length: the bytes are the
+// function's only reference, read unchecked.
+fn http_newline_from(slice<u8, shared> b, usize at) : usize
+{
+    usize i = at;
+    while (i < slice_len(b) && b[i] != b'\n')
+    {
+        i += 1;
+    }
+    i
+}
+
+fn http_line(ref<Reader, exclusive> r, usize limit) : Result<Option<String>, HttpError>
+{
+    usize scanned = 0;
+    while (true)
+    {
+        usize i = http_newline_from(&r.buf[0..$], r.at + scanned);
+        if (i < Vec::len(&r.buf))
+        {
+            usize end = if (i > r.at && r.buf[i - 1] == b'\r') { i - 1 } else { i };
+            Vec<u8> bytes = Vec::from_slice(&r.buf[r.at..end]);
+            r.at = i + 1;
+            return match (String::from_utf8(bytes))
+            {
+                Ok(s)  : Ok(Some(s)),
+                Err(_) : Err(BadMessage),
+            };
+        }
+        scanned = Vec::len(&r.buf) - r.at;
+        if (scanned > limit)
+        {
+            return Err(TooLarge);
+        }
+        if (!fill_buffer(r)?)
+        {
+            return if (scanned == 0) { Ok(None) } else { Err(BadMessage) };
+        }
+    }
+}
+
+// Exactly `n` bytes appended to `out`; ConnectionClosed when the stream ends first.
+fn read_n(ref<Reader, exclusive> r, ref<Vec<u8>, exclusive> out, usize n) : Result<void, HttpError>
+{
+    usize need = n;
+    while (need > 0)
+    {
+        if (available(r) == 0)
+        {
+            if (!fill_buffer(r)?)
+            {
+                return Err(ConnectionClosed);
+            }
+        }
+        usize take = min(need, available(r));
+        Vec::extend_from(out, &r.buf[r.at..r.at + take]);
+        r.at += take;
+        need -= take;
+    }
+    Ok(())
+}
+
+// Everything to the end of the stream, at most `max` bytes.
+fn read_to_end(ref<Reader, exclusive> r, ref<Vec<u8>, exclusive> out, usize max) : Result<void, HttpError>
+{
+    while (true)
+    {
+        usize have = available(r);
+        if (have > 0)
+        {
+            if (Vec::len(out) + have > max)
+            {
+                return Err(TooLarge);
+            }
+            Vec::extend_from(out, &r.buf[r.at..$]);
+            r.at = Vec::len(&r.buf);
+        }
+        if (!fill_buffer(r)?)
+        {
+            return Ok(());
+        }
+    }
+}
+
+// Header lines up to the empty line; the head may not exceed MAX_HEAD.
+fn read_headers(ref<Reader, exclusive> r, usize used) : Result<Vec<Header>, HttpError>
+{
+    Vec<Header> headers = Vec::new();
+    usize total = used;
+    while (true)
+    {
+        String line = match (http_line(r, MAX_HEAD)?)
+        {
+            Some(l) : l,
+            None    : return Err(BadMessage),
+        };
+        total += String::len(&line) + 2;
+        if (total > MAX_HEAD)
+        {
+            return Err(TooLarge);
+        }
+        if (String::len(&line) == 0)
+        {
+            return Ok(headers);
+        }
+        StringView v = String::as_view(&line);
+        usize colon = match (StringView::find(v, ":"))
+        {
+            Some(i) : i,
+            None    : return Err(BadMessage),
+        };
+        StringView name = StringView::sub(v, 0, colon);
+        if (colon == 0 || StringView::len(StringView::trim(name)) != colon)
+        {
+            return Err(BadMessage);
+        }
+        Vec::push(
+            &mut headers,
+            Header { .name = String::from_view(name), .value = String::from_view(StringView::trim(StringView::sub(
+                v,
+                colon + 1,
+                StringView::len(v),
+            ))) },
+        );
+    }
+}
+
+// How a message's body is delimited (RFC 9112 §6).
+enum BodyLength
+{
+    Length(usize),
+    Chunked,
+    UntilClose,
+    NoBody,
+}
+
+fn body_length(slice<Header, shared> headers, bool response) : Result<BodyLength, HttpError>
+{
+    Option<StringView> te = find_header(headers, "transfer-encoding");
+    Option<StringView> cl = find_header(headers, "content-length");
+    if (Some(t) = te)
+    {
+        if (Option::is_some(&cl) || !name_eq(StringView::trim(t), "chunked"))
+        {
+            return Err(BadMessage);
+        }
+        return Ok(Chunked);
+    }
+    if (Some(c) = cl)
+    {
+        return match (StringView::parse<usize>(StringView::trim(c)))
+        {
+            Ok(n)  : Ok(Length(n)),
+            Err(_) : Err(BadMessage),
+        };
+    }
+    Ok(if (response) { UntilClose } else { NoBody })
+}
+
+// The body, decoded, at most `max` bytes; the chunked trailers are read
+// and dropped.
+fn read_body(ref<Reader, exclusive> r, BodyLength how, usize max) : Result<Vec<u8>, HttpError>
+{
+    Vec<u8> body = Vec::new();
+    match (how)
+    {
+        NoBody     : {},
+        Length(n)  :
+        {
+            if (n > max)
+            {
+                return Err(TooLarge);
+            }
+            read_n(r, &mut body, n)?;
+        },
+        UntilClose : read_to_end(r, &mut body, max)?,
+        Chunked    :
+        {
+            while (true)
+            {
+                String line = match (http_line(r, MAX_HEAD)?)
+                {
+                    Some(l) : l,
+                    None    : return Err(ConnectionClosed),
+                };
+                StringView size_text = String::as_view(&line);
+                if (Some(semi) = StringView::find(size_text, ";"))
+                {
+                    size_text = StringView::sub(size_text, 0, semi);
+                }
+                usize size = 0;
+                slice<u8, shared> sb = StringView::as_bytes(StringView::trim(size_text));
+                if (slice_len(sb) == 0 || slice_len(sb) > 8)
+                {
+                    return Err(BadMessage);
+                }
+                foreach (c in sb)
+                {
+                    size = size * 16 + widen<usize>(Option::ok_or(hex_digit(*c), BadMessage)?);
+                }
+                if (size == 0)
+                {
+                    break;
+                }
+                if (Vec::len(&body) + size > max)
+                {
+                    return Err(TooLarge);
+                }
+                read_n(r, &mut body, size)?;
+                match (http_line(r, 2)?)
+                {
+                    Some(end) : if (String::len(&end) != 0) { return Err(BadMessage); },
+                    None      : return Err(ConnectionClosed),
+                }
+            }
+            // Trailers, up to the empty line.
+            while (true)
+            {
+                match (http_line(r, MAX_HEAD)?)
+                {
+                    Some(t) : if (String::len(&t) == 0) { break; },
+                    None    : return Err(ConnectionClosed),
+                }
+            }
+        },
+    }
+    Ok(body)
+}
+
+export module client "http/client.cb";
+export module server "http/server.cb";
+
+export import std::http::client;
+export import std::http::server;

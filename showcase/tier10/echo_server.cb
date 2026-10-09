@@ -1,0 +1,125 @@
+// Echo server
+//
+// Shows: a TCP server and its clients in one program, the way `std::net`
+// is meant to be used — blocking sockets, a thread per connection. The
+// server listens on loopback port 0 (the system picks a free port, so
+// the program never collides with another), accepts three connections
+// and `spawn`s a thread for each, moving the `TcpStream` into it. Three
+// client threads connect at once, send lines and read the echoes with
+// `read_line`; they finish in any order, so each sends its report into
+// a `Channel` with its number, and the main thread prints the reports
+// in client order. Every blocking call (`accept`, `read_line`,
+// `connect`) lets the other threads run, under the interpreter too.
+
+import std;
+
+struct Report
+{
+    usize client;
+    String text;
+}
+
+// One connection: every line back, reversed, until the client is done.
+fn serve(TcpStream s) : u32
+{
+    u32 lines = 0;
+    while (Ok(Some(line)) = TcpStream::read_line(&mut s))
+    {
+        String back = String::new();
+        usize i = String::len(&line);
+        while (i > 0)
+        {
+            i -= 1;
+            String::push_ascii(&mut back, String::as_bytes(&line)[i]);
+        }
+        if (Err(_) = TcpStream::printf(&mut s, "%s\n", &back))
+        {
+            break;
+        }
+        lines += 1;
+    }
+    lines
+}
+
+fn listen(TcpListener l, usize clients) : u32
+{
+    Vec<handle<u32>> served = Vec::new();
+    for (usize i = 0; i < clients; i += 1)
+    {
+        match (TcpListener::accept(&mut l))
+        {
+            Ok(s)  : Vec::push(&mut served, spawn(serve, s)),
+            Err(e) : eprintf("accept: %s\n", NetError::text(&e)),
+        }
+    }
+    u32 total = 0;
+    while (Some(h) = Vec::pop(&mut served))
+    {
+        total += join(h);
+    }
+    total
+}
+
+fn client(SocketAddr at, usize k, ref<Channel<Report>, shared> out)
+{
+    String text = String::new();
+    match (TcpStream::connect(at))
+    {
+        Ok(c)  :
+        {
+            foreach (word in ["level", "stressed", "drawer"])
+            {
+                _ = TcpStream::printf(&mut c, "%s%u\n", word, k);
+                match (TcpStream::read_line(&mut c))
+                {
+                    Ok(Some(echo)) : String::appendf(&mut text, " %s", &echo),
+                    _              : String::appendf(&mut text, " (lost)"),
+                }
+            }
+        },
+        Err(e) : String::appendf(&mut text, " connect: %s", NetError::text(&e)),
+    }
+    _ = Channel::send(out, Report { .client = k, .text = text });
+}
+
+fn by_client(ref<Report, shared> a, ref<Report, shared> b) : bool
+{
+    a.client < b.client
+}
+
+fn main() : u8
+{
+    TcpListener l = match (TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(l)  : l,
+        Err(e) :
+        {
+            eprintf("bind: %s\n", NetError::text(&e));
+            return 1;
+        },
+    };
+    SocketAddr at = TcpListener::local_addr(&l);
+    auto server = spawn(listen, l, 3);
+    Channel<Report> reports = Channel::new(3);
+    Vec<Report> got = Vec::new();
+    {
+        auto a = spawn(client, at, 1, &reports);
+        auto b = spawn(client, at, 2, &reports);
+        auto c = spawn(client, at, 3, &reports);
+        join(a);
+        join(b);
+        join(c);
+    }
+    Channel::close(&reports);
+    while (Some(r) = Channel::recv(&reports))
+    {
+        Vec::push(&mut got, r);
+    }
+    Vec::sort_by(&mut got, by_client);
+    foreach (r in &got)
+    {
+        printf("client %u got back:%s\n", r.client, &r.text);
+    }
+    printf("the server echoed %u lines\n", join(server));
+    0
+}

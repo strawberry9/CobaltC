@@ -1,0 +1,1001 @@
+// `std::crypto::digest` (spec/21 §2m, D-0187): the digests. SHA-256 (FIPS
+// 180-4, D-0151), SHA-384 and SHA-512 (D-0157), SHA-1 (D-0181, legacy),
+// BLAKE2b (D-0170), `HashKind` and `Hasher` for a hash chosen at run time
+// (D-0166), `digest_eq`, which compares digests in the same time whatever
+// they hold, and `crc32` (D-0119, D-0177), a checksum that is not
+// cryptographic. Written in CobaltC, so both implementations compute
+// exactly this.
+
+const array<u32, 64> SHA256_K = [
+    0x428a2f98,
+    0x71374491,
+    0xb5c0fbcf,
+    0xe9b5dba5,
+    0x3956c25b,
+    0x59f111f1,
+    0x923f82a4,
+    0xab1c5ed5,
+    0xd807aa98,
+    0x12835b01,
+    0x243185be,
+    0x550c7dc3,
+    0x72be5d74,
+    0x80deb1fe,
+    0x9bdc06a7,
+    0xc19bf174,
+    0xe49b69c1,
+    0xefbe4786,
+    0x0fc19dc6,
+    0x240ca1cc,
+    0x2de92c6f,
+    0x4a7484aa,
+    0x5cb0a9dc,
+    0x76f988da,
+    0x983e5152,
+    0xa831c66d,
+    0xb00327c8,
+    0xbf597fc7,
+    0xc6e00bf3,
+    0xd5a79147,
+    0x06ca6351,
+    0x14292967,
+    0x27b70a85,
+    0x2e1b2138,
+    0x4d2c6dfc,
+    0x53380d13,
+    0x650a7354,
+    0x766a0abb,
+    0x81c2c92e,
+    0x92722c85,
+    0xa2bfe8a1,
+    0xa81a664b,
+    0xc24b8b70,
+    0xc76c51a3,
+    0xd192e819,
+    0xd6990624,
+    0xf40e3585,
+    0x106aa070,
+    0x19a4c116,
+    0x1e376c08,
+    0x2748774c,
+    0x34b0bcb5,
+    0x391c0cb3,
+    0x4ed8aa4a,
+    0x5b9cca4f,
+    0x682e6ff3,
+    0x748f82ee,
+    0x78a5636f,
+    0x84c87814,
+    0x8cc70208,
+    0x90befffa,
+    0xa4506ceb,
+    0xbef9a3f7,
+    0xc67178f2,
+];
+
+// A SHA-256 computation in progress: the eight state words, the bytes of
+// the block not yet compressed, and how many bytes have been given in all.
+// A plain value: it can be copied to hash two continuations of one prefix.
+export struct Sha256
+{
+    array<u32, 8> h;
+    array<u8, 64> block;
+    usize fill;
+    u64 length;
+}
+
+export fn Sha256::new() : Sha256
+{
+    Sha256 { .h = [
+        0x6a09e667,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ], .block = [0; 64], .fill = 0, .length = 0 }
+}
+
+// One 64-byte block folded into the state `h`. Both are values: nothing
+// here goes through a reference, so nothing is checked at run time.
+fn sha256_block(array<u32, 8> h, array<u8, 64> blk) : array<u32, 8>
+{
+    array<u32, 64> k = SHA256_K;
+    array<u32, 64> w = [0; 64];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        w[i] = (widen<u32>(blk[4 * i]) << 24) | (widen<u32>(blk[4 * i + 1]) << 16) | (widen<u32>(blk[4 * i + 2]) << 8) | widen<u32>(blk[4 * i + 3]);
+    }
+    for (usize i = 16; i < 64; i += 1)
+    {
+        u32 s0 = rotate_right(w[i - 15], 7) ^ rotate_right(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        u32 s1 = rotate_right(w[i - 2], 17) ^ rotate_right(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = wrapping_add(wrapping_add(w[i - 16], s0), wrapping_add(w[i - 7], s1));
+    }
+    u32 a = h[0];
+    u32 b = h[1];
+    u32 c = h[2];
+    u32 d = h[3];
+    u32 e = h[4];
+    u32 f = h[5];
+    u32 g = h[6];
+    u32 hh = h[7];
+    for (usize i = 0; i < 64; i += 1)
+    {
+        u32 big_s1 = rotate_right(e, 6) ^ rotate_right(e, 11) ^ rotate_right(e, 25);
+        u32 ch = (e & f) ^ (~e & g);
+        u32 t1 = wrapping_add(wrapping_add(wrapping_add(hh, big_s1), wrapping_add(ch, k[i])), w[i]);
+        u32 big_s0 = rotate_right(a, 2) ^ rotate_right(a, 13) ^ rotate_right(a, 22);
+        u32 maj = (a & b) ^ (a & c) ^ (b & c);
+        u32 t2 = wrapping_add(big_s0, maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = wrapping_add(d, t1);
+        d = c;
+        c = b;
+        b = a;
+        a = wrapping_add(t1, t2);
+    }
+    array<u32, 8> out = h;
+    out[0] = wrapping_add(h[0], a);
+    out[1] = wrapping_add(h[1], b);
+    out[2] = wrapping_add(h[2], c);
+    out[3] = wrapping_add(h[3], d);
+    out[4] = wrapping_add(h[4], e);
+    out[5] = wrapping_add(h[5], f);
+    out[6] = wrapping_add(h[6], g);
+    out[7] = wrapping_add(h[7], hh);
+    out
+}
+
+// `data` added to a state given and returned by value: `data` is then the
+// function's only reference, read element by element, which the compiler
+// can leave unchecked (`Sha256::update` itself holds two references).
+fn sha256_absorb(Sha256 s, slice<u8, shared> data) : Sha256
+{
+    usize n = slice_len(data);
+    usize i = 0;
+    while (i < n)
+    {
+        if (s.fill == 0 && n - i >= 64)
+        {
+            array<u8, 64> blk = [0; 64];
+            for (usize k = 0; k < 64; k += 1)
+            {
+                blk[k] = data[i + k];
+            }
+            s.h = sha256_block(s.h, blk);
+            i += 64;
+        }
+        else
+        {
+            s.block[s.fill] = data[i];
+            s.fill += 1;
+            i += 1;
+            if (s.fill == 64)
+            {
+                s.h = sha256_block(s.h, s.block);
+                s.fill = 0;
+            }
+        }
+    }
+    s.length = wrapping_add(s.length, widen<u64>(n));
+    s
+}
+
+// Adds `data` to the message; call as often as the message arrives.
+export fn Sha256::update(ref<Sha256, exclusive> s, slice<u8, shared> data)
+{
+    *s = sha256_absorb(*s, data);
+}
+
+// The digest of everything given: 32 bytes. The computation is consumed;
+// copy it first to continue hashing.
+export fn Sha256::finish(Sha256 s) : array<u8, 32>
+{
+    u64 bits = wrapping_mul(s.length, 8);
+    array<u32, 8> h = s.h;
+    array<u8, 64> last = s.block;
+    usize f = s.fill;
+    last[f] = 0x80;
+    for (usize i = f + 1; i < 64; i += 1)
+    {
+        last[i] = 0;
+    }
+    if (f >= 56)
+    {
+        h = sha256_block(h, last);
+        last = [0; 64];
+    }
+    for (usize i = 0; i < 8; i += 1)
+    {
+        last[56 + i] = narrow_wrapping<u8>(bits >> narrow<u32>(56 - 8 * i));
+    }
+    h = sha256_block(h, last);
+    array<u8, 32> out = [0; 32];
+    for (usize i = 0; i < 8; i += 1)
+    {
+        out[4 * i] = narrow_wrapping<u8>(h[i] >> 24);
+        out[4 * i + 1] = narrow_wrapping<u8>(h[i] >> 16);
+        out[4 * i + 2] = narrow_wrapping<u8>(h[i] >> 8);
+        out[4 * i + 3] = narrow_wrapping<u8>(h[i]);
+    }
+    out
+}
+
+// The SHA-256 digest of `data` in one call.
+export fn sha256(slice<u8, shared> data) : array<u8, 32>
+{
+    Sha256 s = Sha256::new();
+    Sha256::update(&mut s, data);
+    Sha256::finish(s)
+}
+
+// SHA-512 and SHA-384 (FIPS 180-4, D-0156): the 64-bit-word hashes, SHA-384
+// being SHA-512 from other initial values, cut to 48 bytes. Certificates
+// signed with ECDSA P-384 or RSA-SHA-384, and TLS's SHA-384 cipher suites,
+// hash with them.
+
+const array<u64, 80> SHA512_K = [
+    0x428a2f98d728ae22,
+    0x7137449123ef65cd,
+    0xb5c0fbcfec4d3b2f,
+    0xe9b5dba58189dbbc,
+    0x3956c25bf348b538,
+    0x59f111f1b605d019,
+    0x923f82a4af194f9b,
+    0xab1c5ed5da6d8118,
+    0xd807aa98a3030242,
+    0x12835b0145706fbe,
+    0x243185be4ee4b28c,
+    0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f,
+    0x80deb1fe3b1696b1,
+    0x9bdc06a725c71235,
+    0xc19bf174cf692694,
+    0xe49b69c19ef14ad2,
+    0xefbe4786384f25e3,
+    0x0fc19dc68b8cd5b5,
+    0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275,
+    0x4a7484aa6ea6e483,
+    0x5cb0a9dcbd41fbd4,
+    0x76f988da831153b5,
+    0x983e5152ee66dfab,
+    0xa831c66d2db43210,
+    0xb00327c898fb213f,
+    0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2,
+    0xd5a79147930aa725,
+    0x06ca6351e003826f,
+    0x142929670a0e6e70,
+    0x27b70a8546d22ffc,
+    0x2e1b21385c26c926,
+    0x4d2c6dfc5ac42aed,
+    0x53380d139d95b3df,
+    0x650a73548baf63de,
+    0x766a0abb3c77b2a8,
+    0x81c2c92e47edaee6,
+    0x92722c851482353b,
+    0xa2bfe8a14cf10364,
+    0xa81a664bbc423001,
+    0xc24b8b70d0f89791,
+    0xc76c51a30654be30,
+    0xd192e819d6ef5218,
+    0xd69906245565a910,
+    0xf40e35855771202a,
+    0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8,
+    0x1e376c085141ab53,
+    0x2748774cdf8eeb99,
+    0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63,
+    0x4ed8aa4ae3418acb,
+    0x5b9cca4f7763e373,
+    0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc,
+    0x78a5636f43172f60,
+    0x84c87814a1f0ab72,
+    0x8cc702081a6439ec,
+    0x90befffa23631e28,
+    0xa4506cebde82bde9,
+    0xbef9a3f7b2c67915,
+    0xc67178f2e372532b,
+    0xca273eceea26619c,
+    0xd186b8c721c0c207,
+    0xeada7dd6cde0eb1e,
+    0xf57d4f7fee6ed178,
+    0x06f067aa72176fba,
+    0x0a637dc5a2c898a6,
+    0x113f9804bef90dae,
+    0x1b710b35131c471b,
+    0x28db77f523047d84,
+    0x32caab7b40c72493,
+    0x3c9ebe0a15c9bebc,
+    0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6,
+    0x597f299cfc657e2a,
+    0x5fcb6fab3ad6faec,
+    0x6c44198c4a475817,
+];
+
+// A SHA-512 computation in progress, as `Sha256` is one: a plain value.
+export struct Sha512
+{
+    array<u64, 8> h;
+    array<u8, 128> block;
+    usize fill;
+    u64 length;
+}
+
+export fn Sha512::new() : Sha512
+{
+    Sha512 { .h = [
+        0x6a09e667f3bcc908,
+        0xbb67ae8584caa73b,
+        0x3c6ef372fe94f82b,
+        0xa54ff53a5f1d36f1,
+        0x510e527fade682d1,
+        0x9b05688c2b3e6c1f,
+        0x1f83d9abfb41bd6b,
+        0x5be0cd19137e2179,
+    ], .block = [0; 128], .fill = 0, .length = 0 }
+}
+
+// One 128-byte block folded into the state `h`, both values (as
+// `sha256_block`: nothing here is checked at run time).
+fn sha512_block(array<u64, 8> h, array<u8, 128> blk) : array<u64, 8>
+{
+    array<u64, 80> w = [0; 80];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        u64 x = 0;
+        for (usize j = 0; j < 8; j += 1)
+        {
+            x = (x << 8) | widen<u64>(blk[8 * i + j]);
+        }
+        w[i] = x;
+    }
+    for (usize i = 16; i < 80; i += 1)
+    {
+        u64 s0 = rotate_right(w[i - 15], 1) ^ rotate_right(w[i - 15], 8) ^ (w[i - 15] >> 7);
+        u64 s1 = rotate_right(w[i - 2], 19) ^ rotate_right(w[i - 2], 61) ^ (w[i - 2] >> 6);
+        w[i] = wrapping_add(wrapping_add(w[i - 16], s0), wrapping_add(w[i - 7], s1));
+    }
+    u64 a = h[0];
+    u64 b = h[1];
+    u64 c = h[2];
+    u64 d = h[3];
+    u64 e = h[4];
+    u64 f = h[5];
+    u64 g = h[6];
+    u64 hh = h[7];
+    for (usize i = 0; i < 80; i += 1)
+    {
+        u64 big_s1 = rotate_right(e, 14) ^ rotate_right(e, 18) ^ rotate_right(e, 41);
+        u64 ch = (e & f) ^ (~e & g);
+        u64 t1 = wrapping_add(wrapping_add(wrapping_add(hh, big_s1), wrapping_add(ch, SHA512_K[i])), w[i]);
+        u64 big_s0 = rotate_right(a, 28) ^ rotate_right(a, 34) ^ rotate_right(a, 39);
+        u64 maj = (a & b) ^ (a & c) ^ (b & c);
+        u64 t2 = wrapping_add(big_s0, maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = wrapping_add(d, t1);
+        d = c;
+        c = b;
+        b = a;
+        a = wrapping_add(t1, t2);
+    }
+    array<u64, 8> out = h;
+    out[0] = wrapping_add(h[0], a);
+    out[1] = wrapping_add(h[1], b);
+    out[2] = wrapping_add(h[2], c);
+    out[3] = wrapping_add(h[3], d);
+    out[4] = wrapping_add(h[4], e);
+    out[5] = wrapping_add(h[5], f);
+    out[6] = wrapping_add(h[6], g);
+    out[7] = wrapping_add(h[7], hh);
+    out
+}
+
+// `data` added to a state given and returned by value (as `sha256_absorb`).
+fn sha512_absorb(Sha512 s, slice<u8, shared> data) : Sha512
+{
+    usize n = slice_len(data);
+    usize i = 0;
+    while (i < n)
+    {
+        if (s.fill == 0 && n - i >= 128)
+        {
+            array<u8, 128> blk = [0; 128];
+            for (usize k = 0; k < 128; k += 1)
+            {
+                blk[k] = data[i + k];
+            }
+            s.h = sha512_block(s.h, blk);
+            i += 128;
+        }
+        else
+        {
+            s.block[s.fill] = data[i];
+            s.fill += 1;
+            i += 1;
+            if (s.fill == 128)
+            {
+                s.h = sha512_block(s.h, s.block);
+                s.fill = 0;
+            }
+        }
+    }
+    s.length = wrapping_add(s.length, widen<u64>(n));
+    s
+}
+
+export fn Sha512::update(ref<Sha512, exclusive> s, slice<u8, shared> data)
+{
+    *s = sha512_absorb(*s, data);
+}
+
+// The final state words, after the padding and the 128-bit length.
+fn Sha512::final_words(Sha512 s) : array<u64, 8>
+{
+    u64 bits = wrapping_mul(s.length, 8);
+    array<u64, 8> h = s.h;
+    array<u8, 128> last = s.block;
+    usize f = s.fill;
+    last[f] = 0x80;
+    for (usize i = f + 1; i < 128; i += 1)
+    {
+        last[i] = 0;
+    }
+    if (f >= 112)
+    {
+        h = sha512_block(h, last);
+        last = [0; 128];
+    }
+    for (usize i = 0; i < 8; i += 1)
+    {
+        last[112 + i] = narrow_wrapping<u8>(s.length >> 61 >> narrow<u32>(56 - 8 * i));
+        last[120 + i] = narrow_wrapping<u8>(bits >> narrow<u32>(56 - 8 * i));
+    }
+    sha512_block(h, last)
+}
+
+fn sha512_bytes(array<u64, 8> h, usize words) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    for (usize i = 0; i < words; i += 1)
+    {
+        Vec::push_be(&mut out, h[i]);
+    }
+    out
+}
+
+// The 64-byte digest of everything given.
+export fn Sha512::finish(Sha512 s) : array<u8, 64>
+{
+    Vec<u8> b = sha512_bytes(Sha512::final_words(s), 8);
+    array<u8, 64> out = [0; 64];
+    for (usize i = 0; i < 64; i += 1)
+    {
+        out[i] = b[i];
+    }
+    out
+}
+
+export fn sha512(slice<u8, shared> data) : array<u8, 64>
+{
+    Sha512 s = Sha512::new();
+    Sha512::update(&mut s, data);
+    Sha512::finish(s)
+}
+
+// A SHA-384 computation in progress.
+export struct Sha384
+{
+    Sha512 inner;
+}
+
+export fn Sha384::new() : Sha384
+{
+    Sha384 { .inner = Sha512 { .h = [
+        0xcbbb9d5dc1059ed8,
+        0x629a292a367cd507,
+        0x9159015a3070dd17,
+        0x152fecd8f70e5939,
+        0x67332667ffc00b31,
+        0x8eb44a8768581511,
+        0xdb0c2e0d64f98fa7,
+        0x47b5481dbefa4fa4,
+    ], .block = [0; 128], .fill = 0, .length = 0 } }
+}
+
+export fn Sha384::update(ref<Sha384, exclusive> s, slice<u8, shared> data)
+{
+    Sha512::update(&mut s.inner, data);
+}
+
+// The 48-byte digest of everything given.
+export fn Sha384::finish(Sha384 s) : array<u8, 48>
+{
+    Vec<u8> b = sha512_bytes(Sha512::final_words(s.inner), 6);
+    array<u8, 48> out = [0; 48];
+    for (usize i = 0; i < 48; i += 1)
+    {
+        out[i] = b[i];
+    }
+    out
+}
+
+export fn sha384(slice<u8, shared> data) : array<u8, 48>
+{
+    Sha384 s = Sha384::new();
+    Sha384::update(&mut s, data);
+    Sha384::finish(s)
+}
+
+// ---- SHA-1 (D-0181) ----
+//
+// FIPS 180-4's SHA-1, as `Sha256` is written: a plain value. Legacy: it
+// is here for the protocols that still require it (RFC 6238's default
+// HMAC, git), not for new signatures (collisions have been made).
+export struct Sha1
+{
+    array<u32, 5> h;
+    array<u8, 64> block;
+    usize fill;
+    u64 length;
+}
+
+export fn Sha1::new() : Sha1
+{
+    Sha1 { .h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0], .block = [0; 64], .fill = 0, .length = 0 }
+}
+
+// One 64-byte block folded into the state `h`, both values (as
+// `sha256_block`).
+fn sha1_block(array<u32, 5> h, array<u8, 64> blk) : array<u32, 5>
+{
+    array<u32, 80> w = [0; 80];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        w[i] = (widen<u32>(blk[4 * i]) << 24) | (widen<u32>(blk[4 * i + 1]) << 16) | (widen<u32>(blk[4 * i + 2]) << 8) | widen<u32>(blk[4 * i + 3]);
+    }
+    for (usize i = 16; i < 80; i += 1)
+    {
+        w[i] = rotate_left(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+    u32 a = h[0];
+    u32 b = h[1];
+    u32 c = h[2];
+    u32 d = h[3];
+    u32 e = h[4];
+    for (usize i = 0; i < 80; i += 1)
+    {
+        u32 f = 0;
+        u32 k = 0;
+        if (i < 20)
+        {
+            f = (b & c) | (~b & d);
+            k = 0x5A827999;
+        }
+        else if (i < 40)
+        {
+            f = b ^ c ^ d;
+            k = 0x6ED9EBA1;
+        }
+        else if (i < 60)
+        {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8F1BBCDC;
+        }
+        else
+        {
+            f = b ^ c ^ d;
+            k = 0xCA62C1D6;
+        }
+        u32 t = wrapping_add(wrapping_add(rotate_left(a, 5), f), wrapping_add(wrapping_add(e, k), w[i]));
+        e = d;
+        d = c;
+        c = rotate_left(b, 30);
+        b = a;
+        a = t;
+    }
+    array<u32, 5> out = h;
+    out[0] = wrapping_add(h[0], a);
+    out[1] = wrapping_add(h[1], b);
+    out[2] = wrapping_add(h[2], c);
+    out[3] = wrapping_add(h[3], d);
+    out[4] = wrapping_add(h[4], e);
+    out
+}
+
+// `data` added to a state given and returned by value (as `sha256_absorb`).
+fn sha1_absorb(Sha1 s, slice<u8, shared> data) : Sha1
+{
+    usize n = slice_len(data);
+    usize i = 0;
+    while (i < n)
+    {
+        if (s.fill == 0 && n - i >= 64)
+        {
+            array<u8, 64> blk = [0; 64];
+            for (usize k = 0; k < 64; k += 1)
+            {
+                blk[k] = data[i + k];
+            }
+            s.h = sha1_block(s.h, blk);
+            i += 64;
+        }
+        else
+        {
+            s.block[s.fill] = data[i];
+            s.fill += 1;
+            i += 1;
+            if (s.fill == 64)
+            {
+                s.h = sha1_block(s.h, s.block);
+                s.fill = 0;
+            }
+        }
+    }
+    s.length = wrapping_add(s.length, widen<u64>(n));
+    s
+}
+
+export fn Sha1::update(ref<Sha1, exclusive> s, slice<u8, shared> data)
+{
+    *s = sha1_absorb(*s, data);
+}
+
+// The 20-byte digest of everything given.
+export fn Sha1::finish(Sha1 s) : array<u8, 20>
+{
+    u64 bits = wrapping_mul(s.length, 8);
+    array<u32, 5> h = s.h;
+    array<u8, 64> last = s.block;
+    usize f = s.fill;
+    last[f] = 0x80;
+    for (usize i = f + 1; i < 64; i += 1)
+    {
+        last[i] = 0;
+    }
+    if (f >= 56)
+    {
+        h = sha1_block(h, last);
+        last = [0; 64];
+    }
+    for (usize i = 0; i < 8; i += 1)
+    {
+        last[56 + i] = narrow_wrapping<u8>(bits >> narrow<u32>(56 - 8 * i));
+    }
+    h = sha1_block(h, last);
+    array<u8, 20> out = [0; 20];
+    for (usize i = 0; i < 5; i += 1)
+    {
+        out[4 * i] = narrow_wrapping<u8>(h[i] >> 24);
+        out[4 * i + 1] = narrow_wrapping<u8>(h[i] >> 16);
+        out[4 * i + 2] = narrow_wrapping<u8>(h[i] >> 8);
+        out[4 * i + 3] = narrow_wrapping<u8>(h[i]);
+    }
+    out
+}
+
+// The SHA-1 digest of `data` in one call; `sha1("abc")` is
+// a9993e364706816aba3e25717850c26c9cd0d89d.
+export fn sha1(slice<u8, shared> data) : array<u8, 20>
+{
+    Sha1 s = Sha1::new();
+    Sha1::update(&mut s, data);
+    Sha1::finish(s)
+}
+
+// ---- public-key signature verification (D-0158, D-0159) ----
+//
+// Checking a signature uses only public values (the key, the message, the
+// signature), so these use `BigUint` (std::math) and need not take the
+// same time for every input. Nothing here signs: a client verifies.
+
+// The hash a signature was made over. `Sha1` (D-0181) is legacy: for
+// what older protocols still require (HMAC-SHA-1 in RFC 6238 TOTP, git's
+// object names, old signatures to check), never for a new signature or
+// anything whose collision resistance matters.
+export enum HashKind
+{
+    Sha1,
+    Sha2_256,
+    Sha2_384,
+    Sha2_512,
+}
+
+// The digest of `data` by `kind`: 20, 32, 48 or 64 bytes.
+export fn hash(HashKind kind, slice<u8, shared> data) : Vec<u8>
+{
+    match (kind)
+    {
+        Sha1     : Vec::from_slice(&sha1(data)[0..$]),
+        Sha2_256 : Vec::from_slice(&sha256(data)[0..$]),
+        Sha2_384 : Vec::from_slice(&sha384(data)[0..$]),
+        Sha2_512 : Vec::from_slice(&sha512(data)[0..$]),
+    }
+}
+
+// ---- hashing, HMAC and HKDF over any `HashKind` (D-0166) ----
+//
+// `Hasher`, `Hmac` and the `_with` functions choose the hash at run time,
+// for protocols that negotiate it (TLS's SHA-384 suites, RFC 6979, PBKDF2)
+// and for programs that read it from a file format. The SHA-256 forms above
+// stay the simple spelling.
+
+// A hash computation of a `HashKind` chosen at run time: a plain value.
+export struct Hasher
+{
+    HashKind kind;
+    Sha1 s1;
+    Sha256 s256;
+    Sha512 s512;
+}
+
+export fn Hasher::new(HashKind kind) : Hasher
+{
+    Hasher { .kind = kind, .s1 = Sha1::new(), .s256 = Sha256::new(), .s512 = match (kind)
+    {
+        Sha2_384 : Sha384::new().inner,
+        _        : Sha512::new(),
+    } }
+}
+
+export fn Hasher::update(ref<Hasher, exclusive> h, slice<u8, shared> data)
+{
+    match (h.kind)
+    {
+        Sha1     : Sha1::update(&mut h.s1, data),
+        Sha2_256 : Sha256::update(&mut h.s256, data),
+        _        : Sha512::update(&mut h.s512, data),
+    }
+}
+
+// The digest of everything given: 20, 32, 48 or 64 bytes.
+export fn Hasher::finish(Hasher h) : Vec<u8>
+{
+    match (h.kind)
+    {
+        Sha1     : Vec::from_slice(&Sha1::finish(h.s1)[0..$]),
+        Sha2_256 : Vec::from_slice(&Sha256::finish(h.s256)[0..$]),
+        Sha2_384 : Vec::from_slice(&Sha384::finish(Sha384 { .inner = h.s512 })[0..$]),
+        Sha2_512 : Vec::from_slice(&Sha512::finish(h.s512)[0..$]),
+    }
+}
+
+// ---- BLAKE2b, PBKDF2, Argon2id and password hashing (D-0170) ----
+//
+// A stored password is never kept as a fast hash: `hash_password` runs
+// Argon2id (RFC 9106), which costs memory as well as time, so guessing
+// stays expensive on any hardware, and writes the parameters and salt next
+// to the result in the PHC string format every password library reads.
+// PBKDF2 (RFC 8018) is here for the formats that still use it. BLAKE2b
+// (RFC 7693) is Argon2's hash and a fast general one.
+
+const array<u64, 8> BLAKE2B_IV = [
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
+];
+
+// The ten message schedules, sixteen indices each.
+const array<u8, 160> BLAKE2B_SIGMA = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+    11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+    7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+    9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+    2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+    12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+    13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+    6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+    10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0,
+];
+
+// A BLAKE2b computation in progress: the state, the block not yet
+// compressed (the last block is always compressed by `finish`, with the
+// final flag), the bytes compressed so far, and the digest length.
+export struct Blake2b
+{
+    array<u64, 8> h;
+    array<u8, 128> block;
+    usize fill;
+    u64 length;
+    usize out_len;
+}
+
+// One block folded into the state `h`, all values (as `sha256_block`):
+// `length` is the byte count so far, `last` marks the final block.
+fn blake2b_block(array<u64, 8> h, array<u8, 128> blk, u64 length, bool last) : array<u64, 8>
+{
+    array<u64, 16> m = [0; 16];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        u64 x = 0;
+        for (usize j = 0; j < 8; j += 1)
+        {
+            x = x | (widen<u64>(blk[8 * i + j]) << narrow<u32>(8 * j));
+        }
+        m[i] = x;
+    }
+    array<u64, 16> v = [0; 16];
+    for (usize i = 0; i < 8; i += 1)
+    {
+        v[i] = h[i];
+        v[8 + i] = BLAKE2B_IV[i];
+    }
+    v[12] = v[12] ^ length;
+    if (last)
+    {
+        v[14] = ~v[14];
+    }
+    for (usize r = 0; r < 12; r += 1)
+    {
+        usize o = 16 * (r % 10);
+        for (usize g = 0; g < 8; g += 1)
+        {
+            usize a = widen<usize>(BLAKE2B_G[4 * g]);
+            usize b = widen<usize>(BLAKE2B_G[4 * g + 1]);
+            usize c = widen<usize>(BLAKE2B_G[4 * g + 2]);
+            usize d = widen<usize>(BLAKE2B_G[4 * g + 3]);
+            u64 x = m[widen<usize>(BLAKE2B_SIGMA[o + 2 * g])];
+            u64 y = m[widen<usize>(BLAKE2B_SIGMA[o + 2 * g + 1])];
+            v[a] = wrapping_add(wrapping_add(v[a], v[b]), x);
+            v[d] = rotate_right(v[d] ^ v[a], 32);
+            v[c] = wrapping_add(v[c], v[d]);
+            v[b] = rotate_right(v[b] ^ v[c], 24);
+            v[a] = wrapping_add(wrapping_add(v[a], v[b]), y);
+            v[d] = rotate_right(v[d] ^ v[a], 16);
+            v[c] = wrapping_add(v[c], v[d]);
+            v[b] = rotate_right(v[b] ^ v[c], 63);
+        }
+    }
+    array<u64, 8> out = h;
+    for (usize i = 0; i < 8; i += 1)
+    {
+        out[i] = h[i] ^ v[i] ^ v[8 + i];
+    }
+    out
+}
+
+// `data` added to a state given and returned by value (as `sha256_absorb`).
+// The last block is kept back: `finish` compresses it with the final flag.
+fn blake2b_absorb(Blake2b s, slice<u8, shared> data) : Blake2b
+{
+    usize at = 0;
+    usize n = slice_len(data);
+    while (at < n)
+    {
+        if (s.fill == 128)
+        {
+            s.length += 128;
+            s.h = blake2b_block(s.h, s.block, s.length, false);
+            s.fill = 0;
+        }
+        usize take = min(128 - s.fill, n - at);
+        for (usize i = 0; i < take; i += 1)
+        {
+            s.block[s.fill + i] = data[at + i];
+        }
+        s.fill += take;
+        at += take;
+    }
+    s
+}
+
+// A keyed BLAKE2b of `out_len` bytes (1 to 64) under `key` (up to 64
+// bytes, none for the plain hash); other lengths are `diag.crypto-length`.
+export fn Blake2b::new_keyed(slice<u8, shared> key, usize out_len) : Blake2b
+{
+    usize klen = slice_len(key);
+    if (out_len == 0 || out_len > 64 || klen > 64)
+    {
+        fault(crypto_length);
+    }
+    array<u64, 8> h = BLAKE2B_IV;
+    h[0] = h[0] ^ 0x01010000 ^ (widen<u64>(klen) << 8) ^ widen<u64>(out_len);
+    Blake2b s = Blake2b { .h = h, .block = [0; 128], .fill = 0, .length = 0, .out_len = out_len };
+    if (klen > 0)
+    {
+        for (usize i = 0; i < klen; i += 1)
+        {
+            s.block[i] = key[i];
+        }
+        s.fill = 128;
+    }
+    s
+}
+
+export fn Blake2b::new(usize out_len) : Blake2b
+{
+    Vec<u8> none = Vec::new();
+    Blake2b::new_keyed(&none[0..$], out_len)
+}
+
+export fn Blake2b::update(ref<Blake2b, exclusive> s, slice<u8, shared> data)
+{
+    *s = blake2b_absorb(*s, data);
+}
+
+// The digest of everything given: `out_len` bytes.
+export fn Blake2b::finish(Blake2b s) : Vec<u8>
+{
+    s.length += widen<u64>(s.fill);
+    for (usize i = s.fill; i < 128; i += 1)
+    {
+        s.block[i] = 0;
+    }
+    s.h = blake2b_block(s.h, s.block, s.length, true);
+    Vec<u8> out = Vec::new();
+    for (usize i = 0; i < s.out_len; i += 1)
+    {
+        Vec::push(&mut out, narrow_wrapping<u8>(s.h[i / 8] >> narrow<u32>(8 * (i % 8))));
+    }
+    out
+}
+
+// The BLAKE2b digest of `data`, `out_len` bytes (64 for BLAKE2b-512).
+export fn blake2b(slice<u8, shared> data, usize out_len) : Vec<u8>
+{
+    Blake2b s = Blake2b::new(out_len);
+    Blake2b::update(&mut s, data);
+    Blake2b::finish(s)
+}
+
+// D-0119: CRC-32/IEEE (polynomial 0x04C11DB7, reflected 0xEDB88320,
+// initial value and final xor 0xFFFFFFFF, input and output reflected):
+// the checksum of zlib, PNG, gzip and Ethernet; crc32("123456789") is
+// 0xCBF43926. Bit by bit, as spec/21 `[CRC32]` writes it. Here beside the
+// hashes (D-0177), but not cryptographic: it detects accidental corruption,
+// and anyone can make data with a chosen CRC.
+export fn crc32(slice<u8, shared> data) : u32
+{
+    u32 crc = 0xFFFFFFFF;
+    for (usize i = 0; i < slice_len(data); i += 1)
+    {
+        crc = crc ^ widen<u32>(data[i]);
+        for (u32 k = 0; k < 8; k += 1)
+        {
+            if ((crc & 1) == 1)
+            {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            }
+            else
+            {
+                crc = crc >> 1;
+            }
+        }
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+// Whether two digests (or MACs) are the same bytes, in a time that depends
+// only on their lengths: every byte is compared, however early they
+// differ, so a sender guessing a MAC learns nothing from how long the
+// check took. Use this, never `==`, to check a MAC that arrived.
+export fn digest_eq(slice<u8, shared> a, slice<u8, shared> b) : bool
+{
+    if (slice_len(a) != slice_len(b))
+    {
+        return false;
+    }
+    u8 acc = 0;
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        acc = acc | (a[i] ^ b[i]);
+    }
+    acc == 0
+}

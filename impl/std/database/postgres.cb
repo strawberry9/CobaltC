@@ -1,0 +1,1286 @@
+// `std::database::postgres` (spec/21 §2q, D-0180, D-0187): a PostgreSQL
+// client speaking the server's wire protocol (version 3.0) over `std::net`
+// and `std::tls`, authenticating with `std::database`'s SCRAM-SHA-256. A
+// connection is opened from a URL, runs one statement at a time with its
+// parameters bound (never spliced into the SQL text) and gives the rows
+// back in the server's text form. Written in CobaltC; nothing is linked.
+// No binary rows, cursors, COPY, LISTEN/NOTIFY, cancellation or channel
+// binding. The items carry the `Pg` prefix, so a later client's can
+// share `std`'s flat namespace beside them.
+
+// Why a connection or a statement failed.
+export enum PgError
+{
+    NetFailure(NetError),
+    TlsFailure(TlsError),
+    TlsRefused,
+    NoTrustedRoots,
+    BadConnectionUrl,
+    UnsupportedAuth,
+    AuthRefused,
+    AuthFailed,
+    Server(PgServerError),
+    ProtocolViolation,
+    ResultTooLarge,
+    Disconnected,
+}
+
+// What the server reported: an ErrorResponse or a NoticeResponse, its
+// severity ("ERROR", "FATAL", "NOTICE", ...), its five-character SQLSTATE
+// code, its message, and the detail, hint and character position (from
+// 1 into the statement) when it gave them.
+export struct PgServerError
+{
+    export String severity;
+    export String code;
+    export String message;
+    export Option<String> detail;
+    export Option<String> hint;
+    export Option<u32> position;
+}
+
+// The error as text; a server error as `severity: message (code)`.
+export fn PgError::text(ref<PgError, shared> e) : String
+{
+    match (e)
+    {
+        NetFailure(n)     : String::from_str(NetError::text(n)),
+        TlsFailure(t)     : String::from_str(TlsError::text(t)),
+        TlsRefused        : String::from_str("the server does not accept TLS"),
+        NoTrustedRoots    : String::from_str("no trusted roots for TLS (TrustStore::system failed)"),
+        BadConnectionUrl  : String::from_str("the connection URL is malformed"),
+        UnsupportedAuth   : String::from_str("the server asks for an authentication method that is not supported"),
+        AuthRefused       : String::from_str("the server asks for the password in clear over an unencrypted connection"),
+        AuthFailed        : String::from_str("authentication failed"),
+        Server(s)         :
+        {
+            String t = String::clone(&s.severity);
+            String::append(&mut t, ": ");
+            String::append(&mut t, String::as_view(&s.message));
+            String::append(&mut t, " (");
+            String::append(&mut t, String::as_view(&s.code));
+            String::append(&mut t, ")");
+            t
+        },
+        ProtocolViolation : String::from_str("the server's message is malformed"),
+        ResultTooLarge    : String::from_str("the result is larger than the limit"),
+        Disconnected      : String::from_str("the connection is closed"),
+    }
+}
+
+// ---- the connection URL ----
+
+// Whether the connection is encrypted: not at all, or by TLS with the
+// server's certificate verified against the roots given (the system's
+// by default). An unverified TLS connection is not offered.
+export enum PgSslMode
+{
+    Disable,
+    VerifyFull,
+}
+
+// A parsed `postgres://user[:password]@host[:port]/database[?sslmode=MODE]`.
+export struct PgUrl
+{
+    export String user;
+    export Option<String> password;
+    export String host;
+    export u16 port;
+    export String database;
+    export PgSslMode sslmode;
+}
+
+// Percent-decoded, as UTF-8.
+fn decoded(StringView v) : Result<String, PgError>
+{
+    Vec<u8> bytes = match (percent_decode(v))
+    {
+        Some(b) : b,
+        None    : return Err(BadConnectionUrl),
+    };
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(s),
+        Err(_) : Err(BadConnectionUrl),
+    }
+}
+
+// `Err(BadConnectionUrl)` for a scheme other than postgres or postgresql,
+// no user, no host, a port that is not a number, an sslmode other than
+// disable or verify-full, any other query key, or a bad percent-encoding.
+// The port defaults to 5432, the database to the user, sslmode to
+// verify-full.
+export fn PgUrl::parse(StringView text) : Result<PgUrl, PgError>
+{
+    usize sep = match (StringView::find(text, "://"))
+    {
+        Some(i) : i,
+        None    : return Err(BadConnectionUrl),
+    };
+    StringView scheme = StringView::sub(text, 0, sep);
+    if (!StringView::eq(scheme, "postgres") && !StringView::eq(scheme, "postgresql"))
+    {
+        return Err(BadConnectionUrl);
+    }
+    StringView rest = StringView::sub(text, sep + 3, StringView::len(text));
+    usize n = StringView::len(rest);
+    slice<u8, shared> b = StringView::as_bytes(rest);
+    usize auth_end = 0;
+    while (auth_end < n && b[auth_end] != b'/' && b[auth_end] != b'?')
+    {
+        auth_end += 1;
+    }
+    // The user information ends at the last '@' of the authority.
+    usize at_sign = auth_end;
+    for (usize i = 0; i < auth_end; i += 1)
+    {
+        if (b[i] == b'@')
+        {
+            at_sign = i;
+        }
+    }
+    if (at_sign == auth_end || at_sign == 0)
+    {
+        return Err(BadConnectionUrl);
+    }
+    StringView userinfo = StringView::sub(rest, 0, at_sign);
+    String user = String::new();
+    Option<String> password = None;
+    match (StringView::find(userinfo, ":"))
+    {
+        Some(colon) :
+        {
+            overwrite(&mut user, decoded(StringView::sub(userinfo, 0, colon))?);
+            overwrite(&mut password, Some(decoded(StringView::sub(userinfo, colon + 1, StringView::len(userinfo)))?));
+        },
+        None        : overwrite(&mut user, decoded(userinfo)?),
+    }
+    if (String::len(&user) == 0)
+    {
+        return Err(BadConnectionUrl);
+    }
+    StringView hostport = StringView::sub(rest, at_sign + 1, auth_end);
+    usize hp = StringView::len(hostport);
+    slice<u8, shared> hb = StringView::as_bytes(hostport);
+    if (hp == 0)
+    {
+        return Err(BadConnectionUrl);
+    }
+    String host = String::new();
+    usize host_end = 0;
+    if (hb[0] == b'[')
+    {
+        usize close = match (StringView::find(hostport, "]"))
+        {
+            Some(i) : i,
+            None    : return Err(BadConnectionUrl),
+        };
+        String::append(&mut host, StringView::sub(hostport, 1, close));
+        host_end = close + 1;
+    }
+    else
+    {
+        while (host_end < hp && hb[host_end] != b':')
+        {
+            host_end += 1;
+        }
+        String::append(&mut host, StringView::sub(hostport, 0, host_end));
+    }
+    if (String::len(&host) == 0)
+    {
+        return Err(BadConnectionUrl);
+    }
+    u16 port = 5432;
+    if (host_end < hp)
+    {
+        if (hb[host_end] != b':')
+        {
+            return Err(BadConnectionUrl);
+        }
+        port = match (StringView::parse<u16>(StringView::sub(hostport, host_end + 1, hp)))
+        {
+            Ok(p)  : p,
+            Err(_) : return Err(BadConnectionUrl),
+        };
+    }
+    // The database: the path without its '/', the user when none.
+    usize path_end = auth_end;
+    while (path_end < n && b[path_end] != b'?')
+    {
+        path_end += 1;
+    }
+    String database = String::new();
+    if (path_end > auth_end + 1)
+    {
+        overwrite(&mut database, decoded(StringView::sub(rest, auth_end + 1, path_end))?);
+    }
+    if (String::len(&database) == 0)
+    {
+        overwrite(&mut database, String::clone(&user));
+    }
+    PgSslMode sslmode = VerifyFull;
+    if (path_end < n)
+    {
+        StringView query = StringView::sub(rest, path_end + 1, n);
+        if (StringView::len(query) > 0)
+        {
+            Vec<StringView> pairs = StringView::split(query, "&");
+            foreach (pair in &pairs)
+            {
+                if (StringView::starts_with(*pair, "sslmode="))
+                {
+                    StringView mode = StringView::sub(*pair, 8, StringView::len(*pair));
+                    if (StringView::eq(mode, "disable"))
+                    {
+                        sslmode = Disable;
+                    }
+                    else if (StringView::eq(mode, "verify-full"))
+                    {
+                        sslmode = VerifyFull;
+                    }
+                    else
+                    {
+                        return Err(BadConnectionUrl);
+                    }
+                }
+                else
+                {
+                    return Err(BadConnectionUrl);
+                }
+            }
+        }
+    }
+    Ok(PgUrl { .user = user, .password = password, .host = host, .port = port, .database = database, .sslmode = sslmode })
+}
+
+// ---- values, columns, rows, results ----
+
+// A statement parameter. Each is sent in the text form the server reads
+// for it: an integer and a float as their decimal text (a float that is
+// not finite as Infinity, -Infinity or NaN), a bool as t or f, bytes as
+// bytea's hex form. The server infers each parameter's type from the
+// statement.
+export enum PgValue
+{
+    Null,
+    Text(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Bytes(Vec<u8>),
+}
+
+fn float_text(f64 x) : String
+{
+    if (x != x)
+    {
+        return String::from_str("NaN");
+    }
+    if (x > 1.7976931348623157e308)
+    {
+        return String::from_str("Infinity");
+    }
+    if (x < -1.7976931348623157e308)
+    {
+        return String::from_str("-Infinity");
+    }
+    String t = String::new();
+    String::append(&mut t, x);
+    t
+}
+
+// The text the value is sent as; None for Null.
+export fn PgValue::text(ref<PgValue, shared> value) : Option<String>
+{
+    match (value)
+    {
+        Null     : None,
+        Text(s)  : Some(String::clone(s)),
+        Int(i)   :
+        {
+            String t = String::new();
+            String::append(&mut t, *i);
+            Some(t)
+        },
+        Float(f) : Some(float_text(*f)),
+        Bool(b)  : Some(String::from_str(if (*b) { "t" } else { "f" })),
+        Bytes(v) :
+        {
+            String t = String::from_str("\\x");
+            String::append(&mut t, String::as_view(&to_hex(&v[0..$])));
+            Some(t)
+        },
+    }
+}
+
+// One column of a result: its name and the OID of its type (23 for
+// int4, 25 for text, 16 for bool, ...).
+export struct PgColumn
+{
+    export String name;
+    export u32 type_oid;
+}
+
+// One row: a cell per column, NULL as None, every other value as the
+// server's text form.
+export struct PgRow
+{
+    export Vec<Option<String>> cells;
+}
+
+// The cell at `i`: None for NULL or past the last column.
+export fn PgRow::get(ref<PgRow, shared> r, usize i) : Option<StringView>
+{
+    if (i >= Vec::len(&r.cells))
+    {
+        return None;
+    }
+    match (&r.cells[i])
+    {
+        Some(s) : Some(String::as_view(s)),
+        None    : None,
+    }
+}
+
+// D-0181: a cell read as a value: `None` for NULL, for a column past the
+// last, and for text that is not of the form asked for (an integer, a
+// float as the server writes one, `t`/`f`, `bytea`'s hex form); the
+// text itself is still there through `get`.
+export fn PgRow::get_i64(ref<PgRow, shared> r, usize i) : Option<i64>
+{
+    match (PgRow::get(r, i))
+    {
+        Some(t) : match (StringView::parse<i64>(t))
+        {
+            Ok(v)  : Some(v),
+            Err(_) : None,
+        },
+        None : None,
+    }
+}
+
+export fn PgRow::get_f64(ref<PgRow, shared> r, usize i) : Option<f64>
+{
+    match (PgRow::get(r, i))
+    {
+        Some(t) :
+        {
+            if (StringView::eq(t, "NaN"))
+            {
+                return Some(0.0 / 0.0);
+            }
+            if (StringView::eq(t, "Infinity"))
+            {
+                return Some(1.0 / 0.0);
+            }
+            if (StringView::eq(t, "-Infinity"))
+            {
+                return Some(-1.0 / 0.0);
+            }
+            match (StringView::parse<f64>(t))
+            {
+                Ok(v)  : Some(v),
+                Err(_) : None,
+            }
+        },
+        None    : None,
+    }
+}
+
+export fn PgRow::get_bool(ref<PgRow, shared> r, usize i) : Option<bool>
+{
+    match (PgRow::get(r, i))
+    {
+        Some(t) :
+        {
+            if (StringView::eq(t, "t"))
+            {
+                return Some(true);
+            }
+            if (StringView::eq(t, "f"))
+            {
+                return Some(false);
+            }
+            None
+        },
+        None    : None,
+    }
+}
+
+export fn PgRow::get_bytes(ref<PgRow, shared> r, usize i) : Option<Vec<u8>>
+{
+    match (PgRow::get(r, i))
+    {
+        Some(t) : match (StringView::strip_prefix(t, "\\x"))
+        {
+            // `\x` alone is the empty bytea, which from_hex refuses.
+            Some(hex) : if (StringView::len(hex) == 0)
+            {
+                Some(Vec::new())
+            }
+            else
+            {
+                match (from_hex(hex))
+                {
+                    Ok(v)  : Some(v),
+                    Err(_) : None,
+                }
+            },
+            None : None,
+        },
+        None : None,
+    }
+}
+
+// What a statement gave: the columns and rows (none for a statement
+// without a result set), the rows affected as the command tag counts
+// them (0 when it carries no count), and the tag itself ("SELECT 3",
+// "INSERT 0 1", "CREATE TABLE", ...).
+export struct PgResult
+{
+    export Vec<PgColumn> columns;
+    export Vec<PgRow> rows;
+    export u64 affected;
+    export String tag;
+}
+
+// The index of the column named `name` (exactly, as the server names it).
+export fn PgResult::column(ref<PgResult, shared> res, str name) : Option<usize>
+{
+    for (usize i = 0; i < Vec::len(&res.columns); i += 1)
+    {
+        if (String::eq_str(&res.columns[i].name, name))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// The count a command tag ends with, 0 when it ends with none.
+fn tag_count(StringView tag) : u64
+{
+    Vec<StringView> words = StringView::split(tag, " ");
+    if (Vec::len(&words) < 2)
+    {
+        return 0;
+    }
+    match (StringView::parse<u64>(words[Vec::len(&words) - 1]))
+    {
+        Ok(n)  : n,
+        Err(_) : 0,
+    }
+}
+
+// ---- messages over a plain or a TLS connection ----
+
+enum PgConn
+{
+    Plain(TcpStream),
+    Secure(TlsStream),
+}
+
+fn pg_read(ref<PgConn, exclusive> c, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, PgError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(NetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(TlsFailure(e)),
+        },
+    }
+}
+
+fn pg_write(ref<PgConn, exclusive> c, slice<u8, shared> data) : Result<void, PgError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(NetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(TlsFailure(e)),
+        },
+    }
+}
+
+fn pg_close(ref<PgConn, exclusive> c)
+{
+    match (c)
+    {
+        Plain(s)  : { _ = TcpStream::shutdown_write(s); },
+        Secure(s) : { _ = TlsStream::close(s); },
+    }
+}
+
+// Bytes read ahead of what the decoder has consumed.
+struct PgReader
+{
+    PgConn conn;
+    Vec<u8> buf;
+    usize at;
+}
+
+fn pg_fill(ref<PgReader, exclusive> r) : Result<bool, PgError>
+{
+    if (r.at > 0 && r.at == Vec::len(&r.buf))
+    {
+        Vec::clear(&mut r.buf);
+        r.at = 0;
+    }
+    usize n = pg_read(&mut r.conn, &mut r.buf, 16384)?;
+    Ok(n > 0)
+}
+
+fn pg_available(ref<PgReader, shared> r) : usize
+{
+    Vec::len(&r.buf) - r.at
+}
+
+// Exactly `n` bytes appended to `out`; Disconnected when the stream ends first.
+fn pg_read_n(ref<PgReader, exclusive> r, ref<Vec<u8>, exclusive> out, usize n) : Result<void, PgError>
+{
+    usize need = n;
+    while (need > 0)
+    {
+        if (pg_available(r) == 0)
+        {
+            if (!pg_fill(r)?)
+            {
+                return Err(Disconnected);
+            }
+        }
+        usize take = min(need, pg_available(r));
+        Vec::extend_from(out, &r.buf[r.at..r.at + take]);
+        r.at += take;
+        need -= take;
+    }
+    Ok(())
+}
+
+// The most one message from the server may be.
+const usize MAX_MESSAGE = 1073741824;
+
+// A message from the server: its type byte and its body (the length
+// word dropped).
+struct Message
+{
+    u8 kind;
+    Vec<u8> body;
+}
+
+fn read_message(ref<PgReader, exclusive> r) : Result<Message, PgError>
+{
+    // Most messages are already whole in the buffer: taken from it at once.
+    usize avail = pg_available(r);
+    if (avail >= 5)
+    {
+        u8 kind = r.buf[r.at];
+        u32 len = read_be<u32>(&r.buf[0..$], r.at + 1);
+        if (len < 4 || widen<usize>(len) - 4 > MAX_MESSAGE)
+        {
+            return Err(ProtocolViolation);
+        }
+        usize n = widen<usize>(len) - 4;
+        if (avail - 5 >= n)
+        {
+            Vec<u8> body = Vec::from_slice(&r.buf[r.at + 5..r.at + 5 + n]);
+            r.at += 5 + n;
+            return Ok(Message { .kind = kind, .body = body });
+        }
+    }
+    Vec<u8> head = Vec::new();
+    pg_read_n(r, &mut head, 5)?;
+    u8 kind = head[0];
+    u32 len = read_be<u32>(&head[0..$], 1);
+    if (len < 4 || widen<usize>(len) - 4 > MAX_MESSAGE)
+    {
+        return Err(ProtocolViolation);
+    }
+    Vec<u8> body = Vec::new();
+    pg_read_n(r, &mut body, widen<usize>(len) - 4)?;
+    Ok(Message { .kind = kind, .body = body })
+}
+
+// A message to the server: its type byte, its length (counting itself),
+// its body.
+fn frame(u8 kind, slice<u8, shared> body) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, kind);
+    Vec::push_be(&mut out, narrow<u32>(slice_len(body) + 4));
+    Vec::extend_from(&mut out, body);
+    out
+}
+
+fn push_cstr(ref<Vec<u8>, exclusive> out, StringView s)
+{
+    Vec::extend_from(out, StringView::as_bytes(s));
+    Vec::push(out, 0);
+}
+
+// The NUL-terminated string at `*at`, which moves past it; ProtocolViolation
+// without a NUL or when it is not UTF-8.
+fn cstr_at(slice<u8, shared> b, ref<usize, exclusive> at) : Result<String, PgError>
+{
+    usize end = *at;
+    while (end < slice_len(b) && b[end] != 0)
+    {
+        end += 1;
+    }
+    if (end == slice_len(b))
+    {
+        return Err(ProtocolViolation);
+    }
+    Vec<u8> bytes = Vec::from_slice(&b[*at..end]);
+    *at = end + 1;
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(s),
+        Err(_) : Err(ProtocolViolation),
+    }
+}
+
+// An ErrorResponse or NoticeResponse body: fields of a type byte and a
+// string, to a NUL.
+fn decode_server_error(slice<u8, shared> b) : Result<PgServerError, PgError>
+{
+    PgServerError e = PgServerError { .severity = String::new(), .code = String::new(), .message = String::new(), .detail = None, .hint = None, .position = None };
+    usize at = 0;
+    while (at < slice_len(b) && b[at] != 0)
+    {
+        u8 field = b[at];
+        at += 1;
+        String t = cstr_at(b, &mut at)?;
+        if (field == b'S' || field == b'V')
+        {
+            overwrite(&mut e.severity, t);
+        }
+        else if (field == b'C')
+        {
+            overwrite(&mut e.code, t);
+        }
+        else if (field == b'M')
+        {
+            overwrite(&mut e.message, t);
+        }
+        else if (field == b'D')
+        {
+            overwrite(&mut e.detail, Some(t));
+        }
+        else if (field == b'H')
+        {
+            overwrite(&mut e.hint, Some(t));
+        }
+        else if (field == b'P')
+        {
+            match (String::parse<u32>(&t))
+            {
+                Ok(p)  : overwrite(&mut e.position, Some(p)),
+                Err(_) : {},
+            }
+        }
+    }
+    Ok(e)
+}
+
+// A RowDescription body.
+fn decode_columns(slice<u8, shared> b) : Result<Vec<PgColumn>, PgError>
+{
+    if (slice_len(b) < 2)
+    {
+        return Err(ProtocolViolation);
+    }
+    usize n = widen<usize>(read_be<u16>(b, 0));
+    usize at = 2;
+    Vec<PgColumn> columns = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        String name = cstr_at(b, &mut at)?;
+        if (at + 18 > slice_len(b))
+        {
+            return Err(ProtocolViolation);
+        }
+        u32 type_oid = read_be<u32>(b, at + 6);
+        at += 18;
+        Vec::push(&mut columns, PgColumn { .name = name, .type_oid = type_oid });
+    }
+    Ok(columns)
+}
+
+// A DataRow body.
+fn decode_row(slice<u8, shared> b) : Result<PgRow, PgError>
+{
+    if (slice_len(b) < 2)
+    {
+        return Err(ProtocolViolation);
+    }
+    usize n = widen<usize>(read_be<u16>(b, 0));
+    usize at = 2;
+    Vec<Option<String>> cells = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (at + 4 > slice_len(b))
+        {
+            return Err(ProtocolViolation);
+        }
+        i32 len = read_be<i32>(b, at);
+        at += 4;
+        if (len < 0)
+        {
+            Vec::push(&mut cells, None);
+            continue;
+        }
+        usize size = narrow<usize>(len);
+        if (at + size > slice_len(b))
+        {
+            return Err(ProtocolViolation);
+        }
+        Vec<u8> bytes = Vec::from_slice(&b[at..at + size]);
+        at += size;
+        match (String::from_utf8(bytes))
+        {
+            Ok(s)  : Vec::push(&mut cells, Some(s)),
+            Err(_) : return Err(ProtocolViolation),
+        }
+    }
+    Ok(PgRow { .cells = cells })
+}
+
+// ---- the connection ----
+
+struct PgParameter
+{
+    String name;
+    String value;
+}
+
+// An open connection to a server. `notices` holds the NoticeResponse
+// messages received so far, for the program to read and clear;
+// `max_result` is the most a statement's rows may take (16 MiB).
+// Dropping a connection without `close` just closes the socket.
+export resource struct PgConnection
+{
+    PgReader reader;
+    bool secure;
+    bool closed;
+    Vec<PgParameter> parameters;
+    u32 backend_pid;
+    u32 backend_key;
+    export Vec<PgServerError> notices;
+    export usize max_result;
+}
+
+// TCP to `host`'s addresses in turn, each within `timeout_ms`, which then
+// bounds every read and write.
+fn open_tcp(StringView host, u16 port, u64 timeout_ms) : Result<TcpStream, PgError>
+{
+    Vec<SocketAddr> addrs = match (IpAddr::parse(host))
+    {
+        Ok(ip) :
+        {
+            Vec<SocketAddr> one = Vec::new();
+            Vec::push(&mut one, SocketAddr::new(ip, port));
+            one
+        },
+        Err(_) : match (resolve(host, port))
+        {
+            Ok(a)  : a,
+            Err(e) : return Err(NetFailure(e)),
+        },
+    };
+    if (Vec::len(&addrs) == 0)
+    {
+        return Err(NetFailure(UnknownHost));
+    }
+    NetError last = Failed;
+    for (usize i = 0; i < Vec::len(&addrs); i += 1)
+    {
+        TcpStream tcp = match (TcpStream::connect_timeout(addrs[i], timeout_ms))
+        {
+            Ok(t)  : t,
+            Err(e) :
+            {
+                last = e;
+                continue;
+            },
+        };
+        TcpStream::set_read_timeout_ms(&mut tcp, timeout_ms);
+        TcpStream::set_write_timeout_ms(&mut tcp, timeout_ms);
+        TcpStream::set_nodelay(&mut tcp, true);
+        return Ok(tcp);
+    }
+    Err(NetFailure(last))
+}
+
+// Connects by `url` with a 30 s timeout; for verify-full, the system
+// roots (NoTrustedRoots when they cannot be loaded).
+export fn PgConnection::connect(StringView url) : Result<PgConnection, PgError>
+{
+    PgUrl u = PgUrl::parse(url)?;
+    TrustStore roots = match (u.sslmode)
+    {
+        Disable : TrustStore::new(),
+        VerifyFull : match (TrustStore::system())
+        {
+            Ok(t)  : t,
+            Err(_) : return Err(NoTrustedRoots),
+        },
+    };
+    connect_url(&u, &roots, 30000)
+}
+
+// Connects by `url`, verifying the server's certificate against `roots`
+// (unused for sslmode=disable), with `timeout_ms` for connecting and for
+// each read and write.
+export fn PgConnection::connect_with(
+    StringView url,
+    ref<TrustStore, shared> roots,
+    u64 timeout_ms,
+) : Result<PgConnection, PgError>
+{
+    PgUrl u = PgUrl::parse(url)?;
+    connect_url(&u, roots, timeout_ms)
+}
+
+fn connect_url(ref<PgUrl, shared> u, ref<TrustStore, shared> roots, u64 timeout_ms) : Result<PgConnection, PgError>
+{
+    TcpStream tcp = open_tcp(String::as_view(&u.host), u.port, timeout_ms)?;
+    bool secure = false;
+    PgConn conn = match (u.sslmode)
+    {
+        Disable    : Plain(tcp),
+        VerifyFull :
+        {
+            // SSLRequest: the server answers S (go ahead) or N (no TLS).
+            Vec<u8> req = Vec::new();
+            Vec::push_be<u32>(&mut req, 8);
+            Vec::push_be<u32>(&mut req, 80877103);
+            match (TcpStream::write(&mut tcp, &req[0..$]))
+            {
+                Ok(_)  : {},
+                Err(e) : return Err(NetFailure(e)),
+            }
+            Vec<u8> answer = Vec::new();
+            match (TcpStream::read_exact(&mut tcp, &mut answer, 1))
+            {
+                Ok(_)  : {},
+                Err(e) : return Err(NetFailure(e)),
+            }
+            if (answer[0] == b'N')
+            {
+                return Err(TlsRefused);
+            }
+            if (answer[0] != b'S')
+            {
+                return Err(ProtocolViolation);
+            }
+            secure = true;
+            match (TlsStream::client(tcp, String::as_view(&u.host), roots))
+            {
+                Ok(s)  : Secure(s),
+                Err(e) : return Err(TlsFailure(e)),
+            }
+        },
+    };
+    PgConnection c = PgConnection { .reader = PgReader { .conn = conn, .buf = Vec::new(), .at = 0 }, .secure = secure, .closed = false, .parameters = Vec::new(), .backend_pid = 0, .backend_key = 0, .notices = Vec::new(), .max_result = 16777216 };
+    // StartupMessage: protocol 3.0, the user, the database, UTF-8.
+    Vec<u8> body = Vec::new();
+    Vec::push_be<u32>(&mut body, 196608);
+    push_cstr(&mut body, "user");
+    push_cstr(&mut body, String::as_view(&u.user));
+    push_cstr(&mut body, "database");
+    push_cstr(&mut body, String::as_view(&u.database));
+    push_cstr(&mut body, "client_encoding");
+    push_cstr(&mut body, "UTF8");
+    Vec::push(&mut body, 0);
+    Vec<u8> startup = Vec::new();
+    Vec::push_be(&mut startup, narrow<u32>(Vec::len(&body) + 4));
+    Vec::extend_from(&mut startup, &body[0..$]);
+    match (pg_write(&mut c.reader.conn, &startup[0..$]))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(e),
+    }
+    match (authenticate(&mut c, u))
+    {
+        Ok(_)  : Ok(c),
+        Err(e) :
+        {
+            pg_close(&mut c.reader.conn);
+            Err(e)
+        },
+    }
+}
+
+// The authentication exchange and the rest of the startup, to the first
+// ReadyForQuery.
+fn authenticate(ref<PgConnection, exclusive> c, ref<PgUrl, shared> u) : Result<void, PgError>
+{
+    Option<Scram> scram = None;
+    String password = match (&u.password)
+    {
+        Some(p) : String::clone(p),
+        None    : String::new(),
+    };
+    while (true)
+    {
+        Message m = read_message(&mut c.reader)?;
+        slice<u8, shared> b = &m.body[0..$];
+        if (m.kind == b'R')
+        {
+            if (slice_len(b) < 4)
+            {
+                return Err(ProtocolViolation);
+            }
+            u32 code = read_be<u32>(b, 0);
+            if (code == 0)
+            {
+                continue;
+            }
+            else if (code == 3)
+            {
+                if (!c.secure)
+                {
+                    return Err(AuthRefused);
+                }
+                Vec<u8> pw = Vec::new();
+                push_cstr(&mut pw, String::as_view(&password));
+                pg_write(&mut c.reader.conn, &frame(b'p', &pw[0..$])[0..$])?;
+            }
+            else if (code == 10)
+            {
+                bool offered = false;
+                usize at = 4;
+                while (at < slice_len(b) && b[at] != 0)
+                {
+                    String mech = cstr_at(b, &mut at)?;
+                    if (String::eq_str(&mech, "SCRAM-SHA-256"))
+                    {
+                        offered = true;
+                    }
+                }
+                if (!offered)
+                {
+                    return Err(UnsupportedAuth);
+                }
+                array<u8, 18> raw = [0; 18];
+                os_random_bytes(&mut raw[0..$]);
+                String nonce = base64_encode(&raw[0..$]);
+                Scram s = Scram::start("", String::as_view(&nonce));
+                String first = Scram::client_first(&s);
+                Vec<u8> body = Vec::new();
+                push_cstr(&mut body, "SCRAM-SHA-256");
+                Vec::push_be(&mut body, narrow<u32>(String::len(&first)));
+                Vec::extend_from(&mut body, StringView::as_bytes(String::as_view(&first)));
+                pg_write(&mut c.reader.conn, &frame(b'p', &body[0..$])[0..$])?;
+                overwrite(&mut scram, Some(s));
+            }
+            else if (code == 11)
+            {
+                String server_first = match (String::from_utf8(Vec::from_slice(&b[4..$])))
+                {
+                    Ok(s)  : s,
+                    Err(_) : return Err(ProtocolViolation),
+                };
+                String client_final = match (&mut scram)
+                {
+                    Some(s) : Scram::respond(s, String::as_view(&server_first), String::as_view(&password))?,
+                    None    : return Err(ProtocolViolation),
+                };
+                pg_write(&mut c.reader.conn, &frame(b'p', StringView::as_bytes(String::as_view(&client_final)))[0..$])?;
+            }
+            else if (code == 12)
+            {
+                String server_final = match (String::from_utf8(Vec::from_slice(&b[4..$])))
+                {
+                    Ok(s)  : s,
+                    Err(_) : return Err(ProtocolViolation),
+                };
+                bool ok = match (&scram)
+                {
+                    Some(s) : Scram::verify(s, String::as_view(&server_final)),
+                    None    : false,
+                };
+                if (!ok)
+                {
+                    return Err(AuthFailed);
+                }
+            }
+            else
+            {
+                return Err(UnsupportedAuth);
+            }
+        }
+        else if (m.kind == b'S')
+        {
+            usize at = 0;
+            String name = cstr_at(b, &mut at)?;
+            String value = cstr_at(b, &mut at)?;
+            Vec::push(&mut c.parameters, PgParameter { .name = name, .value = value });
+        }
+        else if (m.kind == b'K')
+        {
+            if (slice_len(b) < 8)
+            {
+                return Err(ProtocolViolation);
+            }
+            c.backend_pid = read_be<u32>(b, 0);
+            c.backend_key = read_be<u32>(b, 4);
+        }
+        else if (m.kind == b'Z')
+        {
+            return Ok(());
+        }
+        else if (m.kind == b'E')
+        {
+            PgServerError e = decode_server_error(b)?;
+            return Err(if (String::starts_with(&e.code, "28")) { AuthFailed } else { Server(e) });
+        }
+        else if (m.kind == b'N')
+        {
+            Vec::push(&mut c.notices, decode_server_error(b)?);
+        }
+        else
+        {
+            return Err(ProtocolViolation);
+        }
+    }
+}
+
+// The value the server reported for a run-time parameter at startup
+// ("server_version", "server_encoding", "TimeZone", ...).
+export fn PgConnection::parameter(ref<PgConnection, shared> c, str name) : Option<StringView>
+{
+    foreach (p in &c.parameters)
+    {
+        if (String::eq_str(&p.name, name))
+        {
+            return Some(String::as_view(&p.value));
+        }
+    }
+    None
+}
+
+// Marks the connection unusable and gives the error back.
+fn broken(ref<PgConnection, exclusive> c, PgError e) : PgError
+{
+    c.closed = true;
+    e
+}
+
+// Reads the server's answer to a statement or a script, to ReadyForQuery.
+// A server error is kept and given after the server is ready again; rows
+// are kept only when `keep` and while they fit in `max_result`.
+fn collect(ref<PgConnection, exclusive> c, bool keep) : Result<PgResult, PgError>
+{
+    PgResult res = PgResult { .columns = Vec::new(), .rows = Vec::new(), .affected = 0, .tag = String::new() };
+    Option<PgServerError> failure = None;
+    bool too_large = false;
+    usize bytes = 0;
+    while (true)
+    {
+        Message m = match (read_message(&mut c.reader))
+        {
+            Ok(msg) : msg,
+            Err(e)  : return Err(broken(c, e)),
+        };
+        slice<u8, shared> b = &m.body[0..$];
+        if (m.kind == b'T')
+        {
+            match (decode_columns(b))
+            {
+                Ok(cols) : overwrite(&mut res.columns, cols),
+                Err(e)   : return Err(broken(c, e)),
+            }
+        }
+        else if (m.kind == b'D')
+        {
+            if (keep && !too_large)
+            {
+                bytes += slice_len(b);
+                if (bytes > c.max_result)
+                {
+                    too_large = true;
+                    Vec::clear(&mut res.rows);
+                }
+                else
+                {
+                    match (decode_row(b))
+                    {
+                        Ok(row) : Vec::push(&mut res.rows, row),
+                        Err(e)  : return Err(broken(c, e)),
+                    }
+                }
+            }
+        }
+        else if (m.kind == b'C')
+        {
+            usize at = 0;
+            String tag = match (cstr_at(b, &mut at))
+            {
+                Ok(t)  : t,
+                Err(e) : return Err(broken(c, e)),
+            };
+            res.affected = tag_count(String::as_view(&tag));
+            overwrite(&mut res.tag, tag);
+        }
+        else if (m.kind == b'E')
+        {
+            PgServerError reported = match (decode_server_error(b))
+            {
+                Ok(se) : se,
+                Err(e) : return Err(broken(c, e)),
+            };
+            if (Option::is_none(&failure))
+            {
+                overwrite(&mut failure, Some(reported));
+            }
+        }
+        else if (m.kind == b'N')
+        {
+            match (decode_server_error(b))
+            {
+                Ok(se) : Vec::push(&mut c.notices, se),
+                Err(e) : return Err(broken(c, e)),
+            }
+        }
+        else if (m.kind == b'Z')
+        {
+            break;
+        }
+        else if (m.kind == b'1' || m.kind == b'2' || m.kind == b'n' || m.kind == b'I' || m.kind == b's' || m.kind == b'A' || m.kind == b'S')
+        {
+            // ParseComplete, BindComplete, NoData, EmptyQueryResponse,
+            // PortalSuspended, a notification, a parameter changed.
+            continue;
+        }
+        else
+        {
+            return Err(broken(c, ProtocolViolation));
+        }
+    }
+    if (Some(e) = failure)
+    {
+        return Err(Server(e));
+    }
+    if (too_large)
+    {
+        return Err(ResultTooLarge);
+    }
+    Ok(res)
+}
+
+// Runs one statement with `$1`, `$2`, ... bound to `params` (the extended
+// query protocol: Parse, Bind, Describe, Execute, Sync) and gives its
+// result. A server error leaves the connection usable; a network or
+// protocol failure does not, and every later call gives Disconnected.
+export fn PgConnection::query(
+    ref<PgConnection, exclusive> c,
+    StringView sql,
+    slice<PgValue, shared> params,
+) : Result<PgResult, PgError>
+{
+    if (c.closed)
+    {
+        return Err(Disconnected);
+    }
+    if (slice_len(params) > 65535)
+    {
+        return Err(ResultTooLarge);
+    }
+    Vec<u8> out = Vec::new();
+    Vec<u8> parse = Vec::new();
+    push_cstr(&mut parse, "");
+    push_cstr(&mut parse, sql);
+    Vec::push_be<u16>(&mut parse, 0);
+    Vec::extend_from(&mut out, &frame(b'P', &parse[0..$])[0..$]);
+    Vec<u8> bind = Vec::new();
+    push_cstr(&mut bind, "");
+    push_cstr(&mut bind, "");
+    Vec::push_be<u16>(&mut bind, 0);
+    Vec::push_be(&mut bind, narrow<u16>(slice_len(params)));
+    foreach (p in params)
+    {
+        match (PgValue::text(p))
+        {
+            Some(t) :
+            {
+                Vec::push_be(&mut bind, narrow<u32>(String::len(&t)));
+                Vec::extend_from(&mut bind, StringView::as_bytes(String::as_view(&t)));
+            },
+            None    : Vec::push_be<i32>(&mut bind, -1),
+        }
+    }
+    Vec::push_be<u16>(&mut bind, 0);
+    Vec::extend_from(&mut out, &frame(b'B', &bind[0..$])[0..$]);
+    Vec<u8> describe = Vec::new();
+    Vec::push(&mut describe, b'P');
+    Vec::push(&mut describe, 0);
+    Vec::extend_from(&mut out, &frame(b'D', &describe[0..$])[0..$]);
+    Vec<u8> execute = Vec::new();
+    push_cstr(&mut execute, "");
+    Vec::push_be<u32>(&mut execute, 0);
+    Vec::extend_from(&mut out, &frame(b'E', &execute[0..$])[0..$]);
+    Vec<u8> none = Vec::new();
+    Vec::extend_from(&mut out, &frame(b'S', &none[0..$])[0..$]);
+    match (pg_write(&mut c.reader.conn, &out[0..$]))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(broken(c, e)),
+    }
+    collect(c, true)
+}
+
+// `query` for a statement without rows: the count of rows it affected.
+export fn PgConnection::execute(
+    ref<PgConnection, exclusive> c,
+    StringView sql,
+    slice<PgValue, shared> params,
+) : Result<u64, PgError>
+{
+    PgResult r = PgConnection::query(c, sql, params)?;
+    Ok(r.affected)
+}
+
+// Runs `sql` as a script: statements separated by `;`, without
+// parameters (the simple query protocol), every result discarded, the
+// first server error given. Not for COPY.
+export fn PgConnection::run_script(ref<PgConnection, exclusive> c, StringView sql) : Result<void, PgError>
+{
+    if (c.closed)
+    {
+        return Err(Disconnected);
+    }
+    Vec<u8> q = Vec::new();
+    push_cstr(&mut q, sql);
+    match (pg_write(&mut c.reader.conn, &frame(b'Q', &q[0..$])[0..$]))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(broken(c, e)),
+    }
+    _ = collect(c, false)?;
+    Ok(())
+}
+
+// Sends Terminate and closes the connection.
+export fn PgConnection::close(ref<PgConnection, exclusive> c)
+{
+    if (!c.closed)
+    {
+        Vec<u8> none = Vec::new();
+        _ = pg_write(&mut c.reader.conn, &frame(b'X', &none[0..$])[0..$]);
+        pg_close(&mut c.reader.conn);
+        c.closed = true;
+    }
+}

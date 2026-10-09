@@ -1,0 +1,1410 @@
+// `std::compress` (spec/21 §2s, D-0183): DEFLATE (RFC 1951) and its two
+// wrappers, zlib (RFC 1950) and gzip (RFC 1952), compressed and
+// decompressed; Adler-32. Written in CobaltC. Compression is LZ77 over a
+// 32 KiB window with hash chains, each block written in whichever of the
+// three block kinds is smallest (stored, fixed or dynamic Huffman);
+// decompression reads every well-formed stream. `crc32` is `std::crypto`'s.
+
+// Why a stream could not be decompressed. `Corrupt(i)`: the stream is
+// not DEFLATE (or not the wrapper asked for), or its checksum does not
+// match, first seen at byte `i`; `Truncated`: it ends before its last
+// block; `Oversize`: the output would exceed the `max` given.
+export enum CompressError
+{
+    Corrupt(usize),
+    Truncated,
+    Oversize,
+}
+
+export fn CompressError::text(ref<CompressError, shared> e) : str
+{
+    match (e)
+    {
+        Corrupt(_) : "corrupt compressed data",
+        Truncated  : "compressed data ends early",
+        Oversize   : "decompressed data too large",
+    }
+}
+
+// ---- the DEFLATE tables (RFC 1951 §3.2.5) ----
+
+// The length codes 257 to 285: the base length of each and its extra bits.
+const array<u16, 29> LENGTH_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+];
+const array<u8, 29> LENGTH_EXTRA = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    5,
+    5,
+    5,
+    5,
+    0,
+];
+// The distance codes 0 to 29.
+const array<u16, 30> DIST_BASE = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const array<u8, 30> DIST_EXTRA = [
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13,
+];
+// The order the code-length code lengths are sent in.
+const array<u8, 19> CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// ---- decompression ----
+
+struct BitReader
+{
+    slice<u8, shared> data;
+    usize at;                           // the next byte
+    u32 bits;                           // bits not yet taken, least significant first
+    u32 count;
+}
+
+// The next `n` bits (at most 16), least significant first.
+fn BitReader::take(ref<BitReader, exclusive> r, u32 n) : Result<u32, CompressError>
+{
+    while (r.count < n)
+    {
+        if (r.at >= slice_len(r.data))
+        {
+            return Err(Truncated);
+        }
+        r.bits = r.bits | (widen<u32>(r.data[r.at]) << r.count);
+        r.at += 1;
+        r.count += 8;
+    }
+    u32 v = r.bits & ((1: u32 << n) - 1);
+    r.bits = r.bits >> n;
+    r.count -= n;
+    Ok(v)
+}
+
+fn BitReader::align(ref<BitReader, exclusive> r)
+{
+    r.bits = 0;
+    r.count = 0;
+}
+
+// A canonical Huffman code, as puff.c decodes it: how many codes have
+// each length, and the symbols in code order. Plain data (at most 288
+// symbols, the literal/length alphabet), so the decoder below can reach
+// it through a reference with no check at run time.
+struct Huffman
+{
+    array<u16, 16> counts;
+    array<u16, 320> symbols;
+}
+
+// The code for symbols with the given lengths (0: unused); `false` for
+// an over-subscribed set of lengths.
+fn Huffman::build(slice<u8, shared> lengths) : Option<Huffman>
+{
+    array<u16, 16> counts = [0; 16];
+    for (usize i = 0; i < slice_len(lengths); i += 1)
+    {
+        counts[widen<usize>(lengths[i])] += 1;
+    }
+    counts[0] = 0;
+    i32 left = 1;
+    for (usize len = 1; len < 16; len += 1)
+    {
+        left = left * 2 - widen<i32>(counts[len]);
+        if (left < 0)
+        {
+            return None;
+        }
+    }
+    array<u16, 16> offs = [0; 16];
+    for (usize len = 1; len < 15; len += 1)
+    {
+        offs[len + 1] = offs[len] + counts[len];
+    }
+    array<u16, 320> symbols = [0; 320];
+    for (usize i = 0; i < slice_len(lengths); i += 1)
+    {
+        if (lengths[i] != 0)
+        {
+            symbols[widen<usize>(offs[widen<usize>(lengths[i])])] = narrow<u16>(i);
+            offs[widen<usize>(lengths[i])] += 1;
+        }
+    }
+    Some(Huffman { .counts = counts, .symbols = symbols })
+}
+
+// The next symbol, bit by bit.
+fn Huffman::decode(ref<Huffman, shared> h, ref<BitReader, exclusive> r) : Result<u16, CompressError>
+{
+    HuffStep s = huff_step(r.data, h, r.at, r.bits, r.count);
+    r.at = s.at;
+    r.bits = s.bits;
+    r.count = s.count;
+    if (s.sym == -1)
+    {
+        return Err(Truncated);
+    }
+    if (s.sym < 0)
+    {
+        return Err(Corrupt(r.at));
+    }
+    Ok(narrow<u16>(s.sym))
+}
+
+// The bit reader's state passed by value (as the hashes' blocks are, so
+// that nothing is checked per bit): a symbol decoded from `data` (-1: the
+// data ran out, -2: no code matched), or `need` bits taken.
+struct HuffStep
+{
+    i32 sym;
+    usize at;
+    u32 bits;
+    u32 count;
+}
+
+fn huff_step(slice<u8, shared> data, ref<Huffman, shared> h, usize at, u32 bits, u32 count) : HuffStep
+{
+    usize n = slice_len(data);
+    usize p = at;
+    u32 bb = bits;
+    u32 bc = count;
+    i32 code = 0;
+    i32 first = 0;
+    i32 index = 0;
+    for (usize len = 1; len < 16; len += 1)
+    {
+        if (bc == 0)
+        {
+            if (p >= n)
+            {
+                return HuffStep { .sym = -1, .at = p, .bits = bb, .count = bc };
+            }
+            bb = widen<u32>(data[p]);
+            p += 1;
+            bc = 8;
+        }
+        code = code | narrow<i32>(bb & 1);
+        bb = bb >> 1;
+        bc -= 1;
+        i32 c = widen<i32>(h.counts[len]);
+        if (code - c < first)
+        {
+            return HuffStep { .sym = widen<i32>(h.symbols[narrow<usize>(index + (code - first))]), .at = p, .bits = bb, .count = bc };
+        }
+        index += c;
+        first += c;
+        first = first << 1;
+        code = code << 1;
+    }
+    HuffStep { .sym = -2, .at = p, .bits = bb, .count = bc }
+}
+
+struct BitsStep
+{
+    bool ok;
+    u32 v;
+    usize at;
+    u32 bits;
+    u32 count;
+}
+
+fn bits_step(slice<u8, shared> data, usize at, u32 bits, u32 count, u32 need) : BitsStep
+{
+    usize p = at;
+    u32 bb = bits;
+    u32 bc = count;
+    while (bc < need)
+    {
+        if (p >= slice_len(data))
+        {
+            return BitsStep { .ok = false, .v = 0, .at = p, .bits = bb, .count = bc };
+        }
+        bb = bb | (widen<u32>(data[p]) << bc);
+        p += 1;
+        bc += 8;
+    }
+    u32 v = bb & ((1: u32 << need) - 1);
+    BitsStep { .ok = true, .v = v, .at = p, .bits = bb >> need, .count = bc - need }
+}
+
+// The fixed codes of RFC 1951 §3.2.6.
+fn fixed_codes() : Huffman
+{
+    Vec<u8> lit = Vec::filled(288, 8: u8);
+    for (usize i = 144; i < 256; i += 1)
+    {
+        lit[i] = 9;
+    }
+    for (usize i = 256; i < 280; i += 1)
+    {
+        lit[i] = 7;
+    }
+    Option::unwrap(Huffman::build(&lit[0..$]))
+}
+
+fn fixed_distances() : Huffman
+{
+    Vec<u8> d = Vec::filled(30, 5: u8);
+    Option::unwrap(Huffman::build(&d[0..$]))
+}
+
+// One compressed block's symbols copied out, under the codes given. The
+// work is `inflate_run`'s, on the output vector and the bit reader's
+// state passed by value: its references are then all shared ones to
+// plain data, and the vector a confined local, none of them checked per
+// symbol.
+fn inflate_codes(
+    ref<BitReader, exclusive> r,
+    ref<Vec<u8>, exclusive> out,
+    ref<Huffman, shared> lit,
+    ref<Huffman, shared> dist,
+    usize max,
+) : Result<void, CompressError>
+{
+    Vec<u8> o = replace(out, Vec::new());
+    InflateRun { bytes, pos, bitbuf, nbits, status } = inflate_run(r.data, lit, dist, o, r.at, r.bits, r.count, max);
+    r.at = pos;
+    r.bits = bitbuf;
+    r.count = nbits;
+    overwrite(out, bytes);
+    if (status == 1)
+    {
+        return Err(Truncated);
+    }
+    if (status == 2)
+    {
+        return Err(Corrupt(r.at));
+    }
+    if (status == 3)
+    {
+        return Err(Oversize);
+    }
+    Ok(())
+}
+
+// `inflate_codes`'s result: the output and the reader's state, and how the
+// block ended: 0 at its end code, 1 the data ran out (`Truncated`), 2 a
+// bad code or distance (`Corrupt` at `at`), 3 beyond `max` (`Oversize`).
+struct InflateRun
+{
+    Vec<u8> bytes;
+    usize pos;
+    u32 bitbuf;
+    u32 nbits;
+    u32 status;
+}
+
+fn inflate_run(
+    slice<u8, shared> data,
+    ref<Huffman, shared> lit,
+    ref<Huffman, shared> dist,
+    Vec<u8> out,
+    usize at0,
+    u32 bits0,
+    u32 count0,
+    usize max,
+) : InflateRun
+{
+    usize at = at0;
+    u32 bits = bits0;
+    u32 count = count0;
+    u32 status = 0;
+    while (true)
+    {
+        HuffStep s = huff_step(data, lit, at, bits, count);
+        at = s.at;
+        bits = s.bits;
+        count = s.count;
+        if (s.sym < 0)
+        {
+            status = if (s.sym == -1) { 1 } else { 2 };
+            break;
+        }
+        if (s.sym < 256)
+        {
+            if (Vec::len(&out) >= max)
+            {
+                status = 3;
+                break;
+            }
+            Vec::push(&mut out, narrow<u8>(s.sym));
+            continue;
+        }
+        if (s.sym == 256)
+        {
+            break;
+        }
+        usize li = narrow<usize>(s.sym) - 257;
+        if (li >= 29)
+        {
+            status = 2;
+            break;
+        }
+        BitsStep e = bits_step(data, at, bits, count, widen<u32>(LENGTH_EXTRA[li]));
+        at = e.at;
+        bits = e.bits;
+        count = e.count;
+        if (!e.ok)
+        {
+            status = 1;
+            break;
+        }
+        usize len = widen<usize>(LENGTH_BASE[li]) + narrow<usize>(e.v);
+        HuffStep d = huff_step(data, dist, at, bits, count);
+        at = d.at;
+        bits = d.bits;
+        count = d.count;
+        if (d.sym < 0)
+        {
+            status = if (d.sym == -1) { 1 } else { 2 };
+            break;
+        }
+        usize di = narrow<usize>(d.sym);
+        if (di >= 30)
+        {
+            status = 2;
+            break;
+        }
+        BitsStep f = bits_step(data, at, bits, count, widen<u32>(DIST_EXTRA[di]));
+        at = f.at;
+        bits = f.bits;
+        count = f.count;
+        if (!f.ok)
+        {
+            status = 1;
+            break;
+        }
+        usize distance = widen<usize>(DIST_BASE[di]) + narrow<usize>(f.v);
+        if (distance > Vec::len(&out))
+        {
+            status = 2;
+            break;
+        }
+        if (Vec::len(&out) + len > max)
+        {
+            status = 3;
+            break;
+        }
+        usize from = Vec::len(&out) - distance;
+        for (usize k = 0; k < len; k += 1)
+        {
+            u8 b = out[from + k];
+            Vec::push(&mut out, b);
+        }
+    }
+    InflateRun { .bytes = out, .pos = at, .bitbuf = bits, .nbits = count, .status = status }
+}
+
+// A dynamic block's two codes, read from its header (RFC 1951 §3.2.7).
+fn read_dynamic(
+    ref<BitReader, exclusive> r,
+    ref<Option<Huffman>, exclusive> lit,
+    ref<Option<Huffman>, exclusive> dist,
+) : Result<void, CompressError>
+{
+    usize nlen = narrow<usize>(BitReader::take(r, 5)?) + 257;
+    usize ndist = narrow<usize>(BitReader::take(r, 5)?) + 1;
+    usize ncode = narrow<usize>(BitReader::take(r, 4)?) + 4;
+    if (nlen > 286 || ndist > 30)
+    {
+        return Err(Corrupt(r.at));
+    }
+    Vec<u8> clens = Vec::filled(19, 0: u8);
+    for (usize i = 0; i < ncode; i += 1)
+    {
+        clens[widen<usize>(CLEN_ORDER[i])] = narrow<u8>(BitReader::take(r, 3)?);
+    }
+    Huffman ccode = match (Huffman::build(&clens[0..$]))
+    {
+        Some(h) : h,
+        None    : return Err(Corrupt(r.at)),
+    };
+    Vec<u8> lengths = Vec::new();
+    while (Vec::len(&lengths) < nlen + ndist)
+    {
+        u16 sym = Huffman::decode(&ccode, r)?;
+        if (sym < 16)
+        {
+            Vec::push(&mut lengths, narrow<u8>(sym));
+            continue;
+        }
+        u8 value = 0;
+        usize repeat = 0;
+        if (sym == 16)
+        {
+            if (Vec::len(&lengths) == 0)
+            {
+                return Err(Corrupt(r.at));
+            }
+            value = lengths[Vec::len(&lengths) - 1];
+            repeat = 3 + narrow<usize>(BitReader::take(r, 2)?);
+        }
+        else if (sym == 17)
+        {
+            repeat = 3 + narrow<usize>(BitReader::take(r, 3)?);
+        }
+        else
+        {
+            repeat = 11 + narrow<usize>(BitReader::take(r, 7)?);
+        }
+        if (Vec::len(&lengths) + repeat > nlen + ndist)
+        {
+            return Err(Corrupt(r.at));
+        }
+        for (usize k = 0; k < repeat; k += 1)
+        {
+            Vec::push(&mut lengths, value);
+        }
+    }
+    if (lengths[256] == 0)
+    {
+        return Err(Corrupt(r.at));
+    }
+    match (Huffman::build(&lengths[0..nlen]))
+    {
+        Some(h) : overwrite(lit, Some(h)),
+        None    : return Err(Corrupt(r.at)),
+    }
+    match (Huffman::build(&lengths[nlen..nlen + ndist]))
+    {
+        Some(h) : overwrite(dist, Some(h)),
+        None    : return Err(Corrupt(r.at)),
+    }
+    Ok(())
+}
+
+// The DEFLATE stream in `data`, from `start`, inflated onto `out`; the
+// position after its last block.
+fn inflate_from(
+    slice<u8, shared> data,
+    usize start,
+    ref<Vec<u8>, exclusive> out,
+    usize max,
+) : Result<usize, CompressError>
+{
+    BitReader r = BitReader { .data = data, .at = start, .bits = 0, .count = 0 };
+    Huffman fixed_lit = fixed_codes();
+    Huffman fixed_dist = fixed_distances();
+    while (true)
+    {
+        u32 last = BitReader::take(&mut r, 1)?;
+        u32 kind = BitReader::take(&mut r, 2)?;
+        if (kind == 0)
+        {
+            BitReader::align(&mut r);
+            if (r.at + 4 > slice_len(data))
+            {
+                return Err(Truncated);
+            }
+            usize len = widen<usize>(read_le<u16>(data, r.at));
+            usize nlen = widen<usize>(read_le<u16>(data, r.at + 2));
+            if (len != (nlen ^ 0xFFFF))
+            {
+                return Err(Corrupt(r.at));
+            }
+            r.at += 4;
+            if (r.at + len > slice_len(data))
+            {
+                return Err(Truncated);
+            }
+            if (Vec::len(out) + len > max)
+            {
+                return Err(Oversize);
+            }
+            Vec::extend_from(out, &data[r.at..r.at + len]);
+            r.at += len;
+        }
+        else if (kind == 1)
+        {
+            inflate_codes(&mut r, out, &fixed_lit, &fixed_dist, max)?;
+        }
+        else if (kind == 2)
+        {
+            Option<Huffman> lit = None;
+            Option<Huffman> dist = None;
+            read_dynamic(&mut r, &mut lit, &mut dist)?;
+            inflate_codes(&mut r, out, &Option::unwrap(lit), &Option::unwrap(dist), max)?;
+        }
+        else
+        {
+            return Err(Corrupt(r.at));
+        }
+        if (last == 1)
+        {
+            // The bits left in the reader's buffer belong to no block; the
+            // position after the block is the next whole byte.
+            return Ok(r.at);
+        }
+    }
+}
+
+// The bytes a raw DEFLATE stream (RFC 1951, no header) compresses, at
+// most `max` of them (`Oversize` beyond that: a limit against a small
+// stream that expands without bound). Data after the last block is
+// ignored.
+export fn inflate(slice<u8, shared> data, usize max) : Result<Vec<u8>, CompressError>
+{
+    Vec<u8> out = Vec::new();
+    inflate_from(data, 0, &mut out, max)?;
+    Ok(out)
+}
+
+// ---- compression ----
+
+struct BitWriter
+{
+    Vec<u8> out;
+    u64 bits;
+    u32 count;
+}
+
+fn BitWriter::put(ref<BitWriter, exclusive> w, u32 value, u32 n)
+{
+    w.bits = w.bits | (widen<u64>(value) << w.count);
+    w.count += n;
+    while (w.count >= 8)
+    {
+        Vec::push(&mut w.out, narrow_wrapping<u8>(w.bits));
+        w.bits = w.bits >> 8;
+        w.count -= 8;
+    }
+}
+
+// A Huffman code's bits are sent most significant first: reversed.
+fn BitWriter::put_code(ref<BitWriter, exclusive> w, u32 code, u32 len)
+{
+    u32 rev = 0;
+    for (u32 i = 0; i < len; i += 1)
+    {
+        rev = (rev << 1) | ((code >> i) & 1);
+    }
+    BitWriter::put(w, rev, len);
+}
+
+fn BitWriter::flush(ref<BitWriter, exclusive> w)
+{
+    if (w.count > 0)
+    {
+        Vec::push(&mut w.out, narrow_wrapping<u8>(w.bits));
+        w.bits = 0;
+        w.count = 0;
+    }
+}
+
+// Code lengths for `freq` (0 for an unused symbol), none longer than
+// `limit`: a Huffman tree built by merging the two lightest nodes, and,
+// when it is too deep, rebuilt over flattened frequencies until it fits
+// (a little longer, never invalid). A lone used symbol gets length 1.
+fn code_lengths(slice<u32, shared> freq, usize limit) : Vec<u8>
+{
+    usize n = slice_len(freq);
+    Vec<u8> lengths = Vec::filled(n, 0: u8);
+    Vec<u32> f = Vec::from_slice(freq);
+    usize used = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (f[i] > 0)
+        {
+            used += 1;
+        }
+    }
+    if (used == 0)
+    {
+        return lengths;
+    }
+    if (used == 1)
+    {
+        for (usize i = 0; i < n; i += 1)
+        {
+            if (f[i] > 0)
+            {
+                lengths[i] = 1;
+            }
+        }
+        return lengths;
+    }
+    while (true)
+    {
+        // Nodes 0..n are the symbols, n.. the merges; each node's weight,
+        // parent and depth.
+        Vec<u64> weight = Vec::new();
+        Vec<usize> parent = Vec::new();
+        Vec<bool> alive = Vec::new();
+        for (usize i = 0; i < n; i += 1)
+        {
+            Vec::push(&mut weight, widen<u64>(f[i]));
+            Vec::push(&mut parent, 0);
+            Vec::push(&mut alive, f[i] > 0);
+        }
+        usize live = used;
+        while (live > 1)
+        {
+            usize a = n * 2;
+            usize b = n * 2;
+            for (usize i = 0; i < Vec::len(&weight); i += 1)
+            {
+                if (!alive[i])
+                {
+                    continue;
+                }
+                if (a == n * 2 || weight[i] < weight[a])
+                {
+                    b = a;
+                    a = i;
+                }
+                else if (b == n * 2 || weight[i] < weight[b])
+                {
+                    b = i;
+                }
+            }
+            usize m = Vec::len(&weight);
+            Vec::push(&mut weight, weight[a] + weight[b]);
+            Vec::push(&mut parent, 0);
+            Vec::push(&mut alive, true);
+            alive[a] = false;
+            alive[b] = false;
+            parent[a] = m;
+            parent[b] = m;
+            live -= 1;
+        }
+        usize root = Vec::len(&weight) - 1;
+        usize deepest = 0;
+        for (usize i = 0; i < n; i += 1)
+        {
+            if (f[i] == 0)
+            {
+                continue;
+            }
+            usize d = 0;
+            usize at = i;
+            while (at != root)
+            {
+                at = parent[at];
+                d += 1;
+            }
+            lengths[i] = narrow<u8>(d);
+            if (d > deepest)
+            {
+                deepest = d;
+            }
+        }
+        if (deepest <= limit)
+        {
+            return lengths;
+        }
+        for (usize i = 0; i < n; i += 1)
+        {
+            if (f[i] > 0)
+            {
+                f[i] = (f[i] >> 1) | 1;
+            }
+        }
+    }
+}
+
+// The canonical codes for `lengths` (RFC 1951 §3.2.2).
+fn canonical_codes(slice<u8, shared> lengths) : Vec<u32>
+{
+    array<u32, 16> count = [0; 16];
+    for (usize i = 0; i < slice_len(lengths); i += 1)
+    {
+        count[widen<usize>(lengths[i])] += 1;
+    }
+    count[0] = 0;
+    array<u32, 16> next = [0; 16];
+    u32 code = 0;
+    for (usize len = 1; len < 16; len += 1)
+    {
+        code = (code + count[len - 1]) << 1;
+        next[len] = code;
+    }
+    Vec<u32> codes = Vec::filled(slice_len(lengths), 0: u32);
+    for (usize i = 0; i < slice_len(lengths); i += 1)
+    {
+        usize l = widen<usize>(lengths[i]);
+        if (l != 0)
+        {
+            codes[i] = next[l];
+            next[l] += 1;
+        }
+    }
+    codes
+}
+
+// The LZ77 symbols of one block: a literal (< 256), or a match as its
+// length code with extra bits and its distance code with extra bits.
+struct Token
+{
+    u16 lit;                            // a literal, or 256 + length code - 257 for a match
+    u16 len_extra;
+    u8 len_extra_bits;
+    u8 dist_code;
+    u16 dist_extra;
+    u8 dist_extra_bits;
+}
+
+fn length_code(usize len) : usize
+{
+    usize c = 28;
+    for (usize i = 0; i < 28; i += 1)
+    {
+        if (len < widen<usize>(LENGTH_BASE[i + 1]))
+        {
+            c = i;
+            break;
+        }
+    }
+    c
+}
+
+fn distance_code(usize d) : usize
+{
+    usize c = 29;
+    for (usize i = 0; i < 29; i += 1)
+    {
+        if (d < widen<usize>(DIST_BASE[i + 1]))
+        {
+            c = i;
+            break;
+        }
+    }
+    c
+}
+
+const usize WINDOW = 32768;
+const usize HASH_SIZE = 32768;
+const usize CHAIN_LIMIT = 64;
+const usize MAX_TOKENS = 32768;
+
+fn hash3(slice<u8, shared> d, usize i) : usize
+{
+    ((widen<usize>(d[i]) << 10) ^ (widen<usize>(d[i + 1]) << 5) ^ widen<usize>(d[i + 2])) & (HASH_SIZE - 1)
+}
+
+// How often each literal/length and distance code occurs among a block's
+// tokens, and their extra bits in all: counted with the tokens the only
+// reference, read unchecked.
+struct TokenCounts
+{
+    array<u32, 286> lit;
+    array<u32, 30> dist;
+    u64 extra;
+}
+
+fn token_counts(slice<Token, shared> tokens) : TokenCounts
+{
+    array<u32, 286> lit = [0; 286];
+    array<u32, 30> dist = [0; 30];
+    u64 extra = 0;
+    for (usize k = 0; k < slice_len(tokens); k += 1)
+    {
+        u16 l = tokens[k].lit;
+        lit[widen<usize>(l)] += 1;
+        if (l >= 256)
+        {
+            dist[widen<usize>(tokens[k].dist_code)] += 1;
+            extra += widen<u64>(tokens[k].len_extra_bits) + widen<u64>(tokens[k].dist_extra_bits);
+        }
+    }
+    TokenCounts { .lit = lit, .dist = dist, .extra = extra }
+}
+
+// One block's tokens written: as stored, fixed or dynamic, whichever is
+// shortest.
+fn write_block(ref<BitWriter, exclusive> w, slice<Token, shared> tokens, slice<u8, shared> raw, bool last)
+{
+    // Frequencies, with the end-of-block symbol.
+    TokenCounts counts = token_counts(tokens);
+    Vec<u32> lf = Vec::from_slice(&counts.lit[0..$]);
+    Vec<u32> df = Vec::from_slice(&counts.dist[0..$]);
+    lf[256] += 1;
+    Vec<u8> ll = code_lengths(&lf[0..$], 15);
+    Vec<u8> dl = code_lengths(&df[0..$], 15);
+    // The fixed code's lengths, for its cost.
+    Vec<u8> fl = Vec::filled(288, 8: u8);
+    for (usize i = 144; i < 256; i += 1)
+    {
+        fl[i] = 9;
+    }
+    for (usize i = 256; i < 280; i += 1)
+    {
+        fl[i] = 7;
+    }
+    u64 extra = counts.extra;
+    u64 cost_fixed = extra;
+    u64 cost_dyn = extra;
+    for (usize i = 0; i < 286; i += 1)
+    {
+        cost_fixed += widen<u64>(lf[i]) * widen<u64>(fl[i]);
+        cost_dyn += widen<u64>(lf[i]) * widen<u64>(ll[i]);
+    }
+    for (usize i = 0; i < 30; i += 1)
+    {
+        cost_fixed += widen<u64>(df[i]) * 5;
+        cost_dyn += widen<u64>(df[i]) * widen<u64>(dl[i]);
+    }
+    // The dynamic header: the code lengths run-length coded.
+    usize nlen = 286;
+    while (nlen > 257 && ll[nlen - 1] == 0)
+    {
+        nlen -= 1;
+    }
+    usize ndist = 30;
+    while (ndist > 1 && dl[ndist - 1] == 0)
+    {
+        ndist -= 1;
+    }
+    Vec<u8> all = Vec::new();
+    Vec::extend_from(&mut all, &ll[0..nlen]);
+    Vec::extend_from(&mut all, &dl[0..ndist]);
+    // Run-length symbols: (symbol, extra value, extra bits).
+    Vec<u8> rl_sym = Vec::new();
+    Vec<u8> rl_val = Vec::new();
+    Vec<u8> rl_bits = Vec::new();
+    usize i = 0;
+    while (i < Vec::len(&all))
+    {
+        u8 v = all[i];
+        usize run = 1;
+        while (i + run < Vec::len(&all) && all[i + run] == v)
+        {
+            run += 1;
+        }
+        if (v == 0 && run >= 3)
+        {
+            usize r = if (run > 138) { 138 } else { run };
+            if (r <= 10)
+            {
+                Vec::push(&mut rl_sym, 17);
+                Vec::push(&mut rl_val, narrow<u8>(r - 3));
+                Vec::push(&mut rl_bits, 3);
+            }
+            else
+            {
+                Vec::push(&mut rl_sym, 18);
+                Vec::push(&mut rl_val, narrow<u8>(r - 11));
+                Vec::push(&mut rl_bits, 7);
+            }
+            i += r;
+        }
+        else if (v != 0 && run >= 4)
+        {
+            Vec::push(&mut rl_sym, v);
+            Vec::push(&mut rl_val, 0);
+            Vec::push(&mut rl_bits, 0);
+            usize r = if (run - 1 > 6) { 6 } else { run - 1 };
+            Vec::push(&mut rl_sym, 16);
+            Vec::push(&mut rl_val, narrow<u8>(r - 3));
+            Vec::push(&mut rl_bits, 2);
+            i += 1 + r;
+        }
+        else
+        {
+            Vec::push(&mut rl_sym, v);
+            Vec::push(&mut rl_val, 0);
+            Vec::push(&mut rl_bits, 0);
+            i += 1;
+        }
+    }
+    Vec<u32> cf = Vec::filled(19, 0: u32);
+    foreach (s in &rl_sym)
+    {
+        cf[widen<usize>(*s)] += 1;
+    }
+    Vec<u8> cl = code_lengths(&cf[0..$], 7);
+    usize ncode = 19;
+    while (ncode > 4 && cl[widen<usize>(CLEN_ORDER[ncode - 1])] == 0)
+    {
+        ncode -= 1;
+    }
+    cost_dyn += 14 + widen<u64>(ncode) * 3;
+    for (usize k = 0; k < Vec::len(&rl_sym); k += 1)
+    {
+        cost_dyn += widen<u64>(cl[widen<usize>(rl_sym[k])]) + widen<u64>(rl_bits[k]);
+    }
+    u64 cost_stored = widen<u64>(slice_len(raw)) * 8 + 40 * (widen<u64>(slice_len(raw)) / 65535 + 1);
+    if (cost_stored <= cost_fixed && cost_stored <= cost_dyn)
+    {
+        // Stored blocks of at most 65535 bytes, the last marked.
+        usize at = 0;
+        while (true)
+        {
+            usize take = if (slice_len(raw) - at > 65535) { 65535 } else { slice_len(raw) - at };
+            bool final = last && at + take == slice_len(raw);
+            BitWriter::put(w, if (final) { 1 } else { 0 }, 1);
+            BitWriter::put(w, 0, 2);
+            BitWriter::flush(w);
+            Vec::push_le(&mut w.out, narrow<u16>(take));
+            Vec::push_le(&mut w.out, narrow<u16>(take ^ 0xFFFF));
+            Vec::extend_from(&mut w.out, &raw[at..at + take]);
+            at += take;
+            if (at >= slice_len(raw))
+            {
+                return;
+            }
+        }
+    }
+    BitWriter::put(w, if (last) { 1 } else { 0 }, 1);
+    Vec<u32> lcodes = Vec::new();
+    Vec<u8> llens = Vec::new();
+    Vec<u32> dcodes = Vec::new();
+    Vec<u8> dlens = Vec::new();
+    if (cost_fixed <= cost_dyn)
+    {
+        BitWriter::put(w, 1, 2);
+        overwrite(&mut lcodes, canonical_codes(&fl[0..$]));
+        overwrite(&mut llens, fl);
+        Vec<u8> fd = Vec::filled(30, 5: u8);
+        overwrite(&mut dcodes, canonical_codes(&fd[0..$]));
+        overwrite(&mut dlens, fd);
+    }
+    else
+    {
+        BitWriter::put(w, 2, 2);
+        BitWriter::put(w, narrow<u32>(nlen - 257), 5);
+        BitWriter::put(w, narrow<u32>(ndist - 1), 5);
+        BitWriter::put(w, narrow<u32>(ncode - 4), 4);
+        for (usize k = 0; k < ncode; k += 1)
+        {
+            BitWriter::put(w, widen<u32>(cl[widen<usize>(CLEN_ORDER[k])]), 3);
+        }
+        Vec<u32> ccodes = canonical_codes(&cl[0..$]);
+        for (usize k = 0; k < Vec::len(&rl_sym); k += 1)
+        {
+            usize s = widen<usize>(rl_sym[k]);
+            BitWriter::put_code(w, ccodes[s], widen<u32>(cl[s]));
+            if (rl_bits[k] > 0)
+            {
+                BitWriter::put(w, widen<u32>(rl_val[k]), widen<u32>(rl_bits[k]));
+            }
+        }
+        overwrite(&mut lcodes, canonical_codes(&ll[0..$]));
+        overwrite(&mut llens, ll);
+        overwrite(&mut dcodes, canonical_codes(&dl[0..$]));
+        overwrite(&mut dlens, dl);
+    }
+    Vec<u8> o = replace(&mut w.out, Vec::new());
+    BitOut { buf, acc, nacc } = put_tokens(
+        o,
+        w.bits,
+        w.count,
+        tokens,
+        &lcodes[0..$],
+        &llens[0..$],
+        &dcodes[0..$],
+        &dlens[0..$],
+    );
+    overwrite(&mut w.out, buf);
+    w.bits = acc;
+    w.count = nacc;
+}
+
+// A block's tokens and its end code written under the codes given: the
+// output and the bit buffer passed by value, the rest shared slices of
+// plain data, so nothing here is checked per code.
+struct BitOut
+{
+    Vec<u8> buf;
+    u64 acc;
+    u32 nacc;
+}
+
+fn put_tokens(
+    Vec<u8> out,
+    u64 bits0,
+    u32 count0,
+    slice<Token, shared> tokens,
+    slice<u32, shared> lcodes,
+    slice<u8, shared> llens,
+    slice<u32, shared> dcodes,
+    slice<u8, shared> dlens,
+) : BitOut
+{
+    u64 bits = bits0;
+    u32 count = count0;
+    usize nt = slice_len(tokens);
+    for (usize k = 0; k <= nt; k += 1)
+    {
+        // Up to four fields per token: its code (or, after the last, the
+        // end code), then for a match the length's extra bits, the
+        // distance's code and its extra bits. A code goes most
+        // significant bit first: reversed.
+        usize s = if (k < nt) { widen<usize>(tokens[k].lit) } else { 256 };
+        for (usize f = 0; f < 4; f += 1)
+        {
+            u32 v = 0;
+            u32 n = 0;
+            if (f == 0)
+            {
+                u32 code = lcodes[s];
+                n = widen<u32>(llens[s]);
+                for (u32 i = 0; i < n; i += 1)
+                {
+                    v = (v << 1) | ((code >> i) & 1);
+                }
+            }
+            else if (s >= 257)
+            {
+                if (f == 1)
+                {
+                    v = widen<u32>(tokens[k].len_extra);
+                    n = widen<u32>(tokens[k].len_extra_bits);
+                }
+                else if (f == 2)
+                {
+                    usize d = widen<usize>(tokens[k].dist_code);
+                    u32 code = dcodes[d];
+                    n = widen<u32>(dlens[d]);
+                    for (u32 i = 0; i < n; i += 1)
+                    {
+                        v = (v << 1) | ((code >> i) & 1);
+                    }
+                }
+                else
+                {
+                    v = widen<u32>(tokens[k].dist_extra);
+                    n = widen<u32>(tokens[k].dist_extra_bits);
+                }
+            }
+            if (n == 0)
+            {
+                continue;
+            }
+            bits = bits | (widen<u64>(v) << count);
+            count += n;
+            while (count >= 8)
+            {
+                Vec::push(&mut out, narrow_wrapping<u8>(bits));
+                bits = bits >> 8;
+                count -= 8;
+            }
+        }
+    }
+    BitOut { .buf = out, .acc = bits, .nacc = count }
+}
+
+// `deflate`'s matching for one block: tokens for `data` from `start` until
+// there are `MAX_TOKENS` or the data ends. `data` is the function's only
+// reference, read element by element and handed to nothing, so the
+// compiler reads it unchecked; the hash chains and the tokens are vectors
+// passed in and given back by value.
+struct DeflateScan
+{
+    Vec<usize> head;
+    Vec<usize> prev;
+    Vec<Token> tokens;
+    usize end;
+}
+
+fn deflate_scan(slice<u8, shared> data, Vec<usize> head, Vec<usize> prev, Vec<Token> tokens, usize start) : DeflateScan
+{
+    usize n = slice_len(data);
+    usize i = start;
+    while (i < n && Vec::len(&tokens) < MAX_TOKENS)
+    {
+        usize best_len = 0;
+        usize best_dist = 0;
+        if (i + 3 <= n)
+        {
+            usize h = ((widen<usize>(data[i]) << 10) ^ (widen<usize>(data[i + 1]) << 5) ^ widen<usize>(data[i + 2])) & (HASH_SIZE - 1);
+            usize cand = head[h];
+            usize chain = 0;
+            usize limit = if (n - i > 258) { 258 } else { n - i };
+            while (cand != max_value<usize>() && i - cand <= WINDOW && chain < CHAIN_LIMIT)
+            {
+                if (data[cand + best_len] == data[i + best_len])
+                {
+                    usize l = 0;
+                    while (l < limit && data[cand + l] == data[i + l])
+                    {
+                        l += 1;
+                    }
+                    if (l > best_len)
+                    {
+                        best_len = l;
+                        best_dist = i - cand;
+                        if (l == limit)
+                        {
+                            break;
+                        }
+                    }
+                }
+                usize next = prev[cand & (WINDOW - 1)];
+                if (next == max_value<usize>() || next >= cand)
+                {
+                    break;
+                }
+                cand = next;
+                chain += 1;
+            }
+            prev[i & (WINDOW - 1)] = head[h];
+            head[h] = i;
+        }
+        if (best_len >= 3)
+        {
+            usize lc = length_code(best_len);
+            usize dc = distance_code(best_dist);
+            Vec::push(&mut tokens, Token {
+                .lit = narrow<u16>(257 + lc),
+                .len_extra = narrow<u16>(best_len - widen<usize>(LENGTH_BASE[lc])),
+                .len_extra_bits = LENGTH_EXTRA[lc],
+                .dist_code = narrow<u8>(dc),
+                .dist_extra = narrow<u16>(best_dist - widen<usize>(DIST_BASE[dc])),
+                .dist_extra_bits = DIST_EXTRA[dc],
+            });
+            // The bytes inside the match enter the hash chains too.
+            for (usize k = 1; k < best_len; k += 1)
+            {
+                if (i + k + 3 <= n)
+                {
+                    usize h = ((widen<usize>(data[i + k]) << 10) ^ (widen<usize>(data[i + k + 1]) << 5) ^ widen<usize>(data[i + k + 2])) & (HASH_SIZE - 1);
+                    prev[(i + k) & (WINDOW - 1)] = head[h];
+                    head[h] = i + k;
+                }
+            }
+            i += best_len;
+        }
+        else
+        {
+            Vec::push(
+                &mut tokens,
+                Token { .lit = widen<u16>(data[i]), .len_extra = 0, .len_extra_bits = 0, .dist_code = 0, .dist_extra = 0, .dist_extra_bits = 0 },
+            );
+            i += 1;
+        }
+    }
+    DeflateScan { .head = head, .prev = prev, .tokens = tokens, .end = i }
+}
+
+// `data` as a raw DEFLATE stream (RFC 1951, no header or checksum).
+export fn deflate(slice<u8, shared> data) : Vec<u8>
+{
+    BitWriter w = BitWriter { .out = Vec::new(), .bits = 0, .count = 0 };
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        // One empty fixed block.
+        BitWriter::put(&mut w, 1, 1);
+        BitWriter::put(&mut w, 1, 2);
+        BitWriter::put(&mut w, 0, 7);
+        BitWriter::flush(&mut w);
+        BitWriter { out, bits, count } = w;
+        return out;
+    }
+    Vec<usize> heads = Vec::filled(HASH_SIZE, max_value<usize>());
+    Vec<usize> chains = Vec::filled(WINDOW, max_value<usize>());
+    DeflateScan s = DeflateScan { .head = heads, .prev = chains, .tokens = Vec::new(), .end = 0 };
+    while (s.end < n)
+    {
+        usize block_start = s.end;
+        DeflateScan { head, prev, tokens, end } = s;
+        s = deflate_scan(data, head, prev, tokens, end);
+        write_block(&mut w, &s.tokens[0..$], &data[block_start..s.end], s.end >= n);
+        Vec::clear(&mut s.tokens);
+    }
+    BitWriter::flush(&mut w);
+    BitWriter { out, bits, count } = w;
+    out
+}
+
+// ---- the wrappers ----
+
+// Adler-32 (RFC 1950 §8.2), zlib's checksum; `adler32` of the empty
+// slice is 1.
+export fn adler32(slice<u8, shared> data) : u32
+{
+    u32 a = 1;
+    u32 b = 0;
+    usize i = 0;
+    usize n = slice_len(data);
+    while (i < n)
+    {
+        // 5552 bytes at a time fit the sums in a `u32` before reducing.
+        usize end = if (n - i > 5552) { i + 5552 } else { n };
+        while (i < end)
+        {
+            a += widen<u32>(data[i]);
+            b += a;
+            i += 1;
+        }
+        a = a % 65521;
+        b = b % 65521;
+    }
+    (b << 16) | a
+}
+
+// `data` as a zlib stream (RFC 1950): the two-byte header, the DEFLATE
+// stream, the Adler-32 of `data`.
+export fn zlib_deflate(slice<u8, shared> data) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, 0x78);
+    Vec::push(&mut out, 0x9C);
+    Vec::append(&mut out, deflate(data));
+    Vec::push_be(&mut out, adler32(data));
+    out
+}
+
+// The bytes of a zlib stream, at most `max` (`Oversize` beyond): its
+// header checked (DEFLATE, no preset dictionary) and its Adler-32
+// verified (`Corrupt` at the checksum when it does not match).
+export fn zlib_inflate(slice<u8, shared> data, usize max) : Result<Vec<u8>, CompressError>
+{
+    if (slice_len(data) < 6)
+    {
+        return Err(Truncated);
+    }
+    u8 cmf = data[0];
+    u8 flg = data[1];
+    if ((cmf & 0x0F) != 8 || (widen<u32>(cmf) * 256 + widen<u32>(flg)) % 31 != 0 || (flg & 0x20) != 0)
+    {
+        return Err(Corrupt(0));
+    }
+    Vec<u8> out = Vec::new();
+    usize end = inflate_from(data, 2, &mut out, max)?;
+    if (end + 4 > slice_len(data))
+    {
+        return Err(Truncated);
+    }
+    if (read_be<u32>(data, end) != adler32(&out[0..$]))
+    {
+        return Err(Corrupt(end));
+    }
+    Ok(out)
+}
+
+// `data` as a gzip file (RFC 1952): a header with no name, time or
+// extra fields, the DEFLATE stream, the CRC-32 and the length of `data`.
+export fn gzip(slice<u8, shared> data) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    array<u8, 10> header = [0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255];
+    Vec::extend_from(&mut out, &header[0..$]);
+    Vec::append(&mut out, deflate(data));
+    Vec::push_le(&mut out, crc32(data));
+    Vec::push_le(&mut out, narrow_wrapping<u32>(slice_len(data)));
+    out
+}
+
+// The bytes of a gzip file, at most `max` (`Oversize` beyond): every
+// member in turn, each header read (its optional fields skipped) and
+// each CRC-32 and length verified (`Corrupt` at the trailer otherwise).
+export fn gunzip(slice<u8, shared> data, usize max) : Result<Vec<u8>, CompressError>
+{
+    Vec<u8> out = Vec::new();
+    usize at = 0;
+    usize n = slice_len(data);
+    while (true)
+    {
+        if (at + 10 > n)
+        {
+            return Err(Truncated);
+        }
+        if (data[at] != 0x1F || data[at + 1] != 0x8B || data[at + 2] != 8)
+        {
+            return Err(Corrupt(at));
+        }
+        u8 flags = data[at + 3];
+        usize p = at + 10;
+        if ((flags & 4) != 0)
+        {
+            if (p + 2 > n)
+            {
+                return Err(Truncated);
+            }
+            p += 2 + widen<usize>(read_le<u16>(data, p));
+        }
+        if ((flags & 8) != 0)
+        {
+            while (p < n && data[p] != 0)
+            {
+                p += 1;
+            }
+            p += 1;
+        }
+        if ((flags & 16) != 0)
+        {
+            while (p < n && data[p] != 0)
+            {
+                p += 1;
+            }
+            p += 1;
+        }
+        if ((flags & 2) != 0)
+        {
+            p += 2;
+        }
+        if (p > n)
+        {
+            return Err(Truncated);
+        }
+        usize before = Vec::len(&out);
+        usize end = inflate_from(data, p, &mut out, max)?;
+        if (end + 8 > n)
+        {
+            return Err(Truncated);
+        }
+        if (read_le<u32>(
+            data,
+            end,
+        ) != crc32(&out[before..$]) || read_le<u32>(data, end + 4) != narrow_wrapping<u32>(Vec::len(&out) - before))
+        {
+            return Err(Corrupt(end));
+        }
+        at = end + 8;
+        if (at >= n)
+        {
+            return Ok(out);
+        }
+    }
+}

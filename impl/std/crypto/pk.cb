@@ -1,0 +1,2263 @@
+// `std::crypto::pk` (spec/21 §2m, D-0187): public-key cryptography. X25519
+// (RFC 7748, D-0154) and P-256/P-384 key agreement (D-0165, D-0168), ECDSA
+// verification and signing (D-0159, D-0168), Ed25519 (RFC 8032, D-0167),
+// RSA verification (D-0158), RSA private keys, signing and key generation
+// (D-0169). The field and curve arithmetic that signs takes the same time
+// for every input; verification, over public values only, need not.
+
+// X25519 (RFC 7748, D-0154): Diffie-Hellman over Curve25519. A field
+// element is five 51-bit limbs of a number below 2^255 - 19, multiplied
+// through `u128`; the Montgomery ladder swaps by mask, so no branch and
+// no array index depends on a scalar bit, and every call takes the same
+// steps.
+
+const u64 FE_MASK = 0x7ffffffffffff;
+
+// Carries each limb into the next, the top one round to the bottom times
+// 19 (2^255 = 19 mod p): every limb ends below 2^52.
+fn fe_carry(array<u64, 5> f) : array<u64, 5>
+{
+    array<u64, 5> r = f;
+    for (usize i = 0; i < 4; i += 1)
+    {
+        r[i + 1] += r[i] >> 51;
+        r[i] = r[i] & FE_MASK;
+    }
+    u64 c = r[4] >> 51;
+    r[4] = r[4] & FE_MASK;
+    r[0] += c * 19;
+    r[1] += r[0] >> 51;
+    r[0] = r[0] & FE_MASK;
+    r
+}
+
+fn fe_add(array<u64, 5> a, array<u64, 5> b) : array<u64, 5>
+{
+    fe_carry([a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]])
+}
+
+// a - b, as a + 4p - b so no limb goes below zero (limbs below 2^52).
+fn fe_sub(array<u64, 5> a, array<u64, 5> b) : array<u64, 5>
+{
+    fe_carry([
+        a[0] + 0x1fffffffffffb4 - b[0],
+        a[1] + 0x1ffffffffffffc - b[1],
+        a[2] + 0x1ffffffffffffc - b[2],
+        a[3] + 0x1ffffffffffffc - b[3],
+        a[4] + 0x1ffffffffffffc - b[4],
+    ])
+}
+
+fn fe_mul(array<u64, 5> a, array<u64, 5> b) : array<u64, 5>
+{
+    u128 a0 = widen<u128>(a[0]);
+    u128 a1 = widen<u128>(a[1]);
+    u128 a2 = widen<u128>(a[2]);
+    u128 a3 = widen<u128>(a[3]);
+    u128 a4 = widen<u128>(a[4]);
+    u128 b0 = widen<u128>(b[0]);
+    u128 b1 = widen<u128>(b[1]);
+    u128 b2 = widen<u128>(b[2]);
+    u128 b3 = widen<u128>(b[3]);
+    u128 b4 = widen<u128>(b[4]);
+    u128 b1_19 = b1 * 19;
+    u128 b2_19 = b2 * 19;
+    u128 b3_19 = b3 * 19;
+    u128 b4_19 = b4 * 19;
+    u128 t0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19;
+    u128 t1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19;
+    u128 t2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19;
+    u128 t3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19;
+    u128 t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
+    u128 m = 0x7ffffffffffff;
+    t1 += t0 >> 51;
+    t2 += t1 >> 51;
+    t3 += t2 >> 51;
+    t4 += t3 >> 51;
+    u128 r0 = (t0 & m) + (t4 >> 51) * 19;
+    u128 r1 = (t1 & m) + (r0 >> 51);
+    array<u64, 5> r = [
+        narrow<u64>(r0 & m),
+        narrow<u64>(r1),
+        narrow<u64>(t2 & m),
+        narrow<u64>(t3 & m),
+        narrow<u64>(t4 & m),
+    ];
+    fe_carry(r)
+}
+
+// Exchanges a and b when `swap` is 1, leaves them when it is 0, by mask.
+fn fe_cswap(ref<array<u64, 5>, exclusive> a, ref<array<u64, 5>, exclusive> b, u64 swap)
+{
+    u64 mask = wrapping_sub(0, swap);
+    for (usize i = 0; i < 5; i += 1)
+    {
+        u64 x = mask & (a[i] ^ b[i]);
+        a[i] = a[i] ^ x;
+        b[i] = b[i] ^ x;
+    }
+}
+
+// z^(p - 2) = 1/z mod p (Fermat); the exponent 2^255 - 21 is public.
+fn fe_invert(array<u64, 5> z) : array<u64, 5>
+{
+    array<u64, 5> r = [1, 0, 0, 0, 0];
+    for (usize k = 0; k < 255; k += 1)
+    {
+        usize i = 254 - k;
+        r = fe_mul(r, r);
+        if (i >= 5 || i == 3 || i == 1 || i == 0)
+        {
+            r = fe_mul(r, z);
+        }
+    }
+    r
+}
+
+// 32 little-endian bytes as a field element, the top bit ignored (RFC 7748
+// §5); a value from p to 2^255 - 1 is taken mod p by the arithmetic.
+fn fe_from_bytes(slice<u8, shared> s) : array<u64, 5>
+{
+    [
+        read_le<u64>(s, 0) & FE_MASK,
+        (read_le<u64>(s, 6) >> 3) & FE_MASK,
+        (read_le<u64>(s, 12) >> 6) & FE_MASK,
+        (read_le<u64>(s, 19) >> 1) & FE_MASK,
+        (read_le<u64>(s, 24) >> 12) & FE_MASK,
+    ]
+}
+
+// The element's value below p, as 32 little-endian bytes.
+fn fe_to_bytes(array<u64, 5> f) : array<u8, 32>
+{
+    array<u64, 5> h = fe_carry(fe_carry(f));
+    // q is 1 exactly when h ≥ p: h + 19 then reaches 2^255.
+    u64 q = (h[0] + 19) >> 51;
+    q = (h[1] + q) >> 51;
+    q = (h[2] + q) >> 51;
+    q = (h[3] + q) >> 51;
+    q = (h[4] + q) >> 51;
+    h[0] += 19 * q;
+    for (usize i = 0; i < 4; i += 1)
+    {
+        h[i + 1] += h[i] >> 51;
+        h[i] = h[i] & FE_MASK;
+    }
+    h[4] = h[4] & FE_MASK;
+    array<u64, 4> w = [
+        h[0] | (h[1] << 51),
+        (h[1] >> 13) | (h[2] << 38),
+        (h[2] >> 26) | (h[3] << 25),
+        (h[3] >> 39) | (h[4] << 12),
+    ];
+    array<u8, 32> out = [0; 32];
+    for (usize i = 0; i < 4; i += 1)
+    {
+        for (usize j = 0; j < 8; j += 1)
+        {
+            out[8 * i + j] = narrow_wrapping<u8>(w[i] >> narrow<u32>(8 * j));
+        }
+    }
+    out
+}
+
+// The Montgomery ladder (RFC 7748 §5): the clamped `scalar` times the
+// point with u-coordinate `u`.
+fn x25519_ladder(slice<u8, shared> scalar, slice<u8, shared> u) : array<u8, 32>
+{
+    array<u8, 32> k = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        k[i] = scalar[i];
+    }
+    k[0] = k[0] & 248;
+    k[31] = (k[31] & 127) | 64;
+    array<u64, 5> x1 = fe_from_bytes(u);
+    array<u64, 5> x2 = [1, 0, 0, 0, 0];
+    array<u64, 5> z2 = [0, 0, 0, 0, 0];
+    array<u64, 5> x3 = x1;
+    array<u64, 5> z3 = [1, 0, 0, 0, 0];
+    array<u64, 5> a24 = [121665, 0, 0, 0, 0];
+    u64 swap = 0;
+    for (usize step = 0; step < 255; step += 1)
+    {
+        usize t = 254 - step;
+        u64 bit = widen<u64>((k[t >> 3] >> narrow<u32>(t & 7)) & 1);
+        swap = swap ^ bit;
+        fe_cswap(&mut x2, &mut x3, swap);
+        fe_cswap(&mut z2, &mut z3, swap);
+        swap = bit;
+        array<u64, 5> a = fe_add(x2, z2);
+        array<u64, 5> aa = fe_mul(a, a);
+        array<u64, 5> b = fe_sub(x2, z2);
+        array<u64, 5> bb = fe_mul(b, b);
+        array<u64, 5> e = fe_sub(aa, bb);
+        array<u64, 5> c = fe_add(x3, z3);
+        array<u64, 5> d = fe_sub(x3, z3);
+        array<u64, 5> da = fe_mul(d, a);
+        array<u64, 5> cb = fe_mul(c, b);
+        array<u64, 5> sum = fe_add(da, cb);
+        x3 = fe_mul(sum, sum);
+        array<u64, 5> diff = fe_sub(da, cb);
+        z3 = fe_mul(x1, fe_mul(diff, diff));
+        x2 = fe_mul(aa, bb);
+        z2 = fe_mul(e, fe_add(aa, fe_mul(a24, e)));
+    }
+    fe_cswap(&mut x2, &mut x3, swap);
+    fe_cswap(&mut z2, &mut z3, swap);
+    fe_to_bytes(fe_mul(x2, fe_invert(z2)))
+}
+
+// The shared secret of a private key and the other side's public key
+// (RFC 7748 §6.1), each 32 bytes (another length is `diag.crypto-length`):
+// `None` when the result is all zeros, which a public key of small order
+// gives and which must never be used as a secret (RFC 7748 §6.1; TLS 1.3
+// requires the check). The comparison with zero takes the same time
+// whatever the result.
+export fn x25519(slice<u8, shared> private_key, slice<u8, shared> public_key) : Option<array<u8, 32>>
+{
+    if (slice_len(private_key) != 32 || slice_len(public_key) != 32)
+    {
+        fault(crypto_length);
+    }
+    array<u8, 32> shared = x25519_ladder(private_key, public_key);
+    u8 acc = 0;
+    for (usize i = 0; i < 32; i += 1)
+    {
+        acc = acc | shared[i];
+    }
+    if (acc == 0)
+    {
+        return None;
+    }
+    Some(shared)
+}
+
+// The public key of a 32-byte private key (another length is
+// `diag.crypto-length`): the private key times the base point, u = 9.
+export fn x25519_public_key(slice<u8, shared> private_key) : array<u8, 32>
+{
+    if (slice_len(private_key) != 32)
+    {
+        fault(crypto_length);
+    }
+    array<u8, 32> base = [0; 32];
+    base[0] = 9;
+    x25519_ladder(private_key, &base[0..$])
+}
+
+// A new private key: 32 bytes from the operating system's secure source
+// (`os_random_bytes`, D-0142), never from `Rng`.
+export fn x25519_private_key() : array<u8, 32>
+{
+    array<u8, 32> k = [0; 32];
+    os_random_bytes(&mut k[0..$]);
+    k
+}
+
+// An RSA public key: the modulus and the public exponent.
+export struct RsaPublicKey
+{
+    export BigUint n;
+    export BigUint e;
+}
+
+// s^e mod n as exactly `k` bytes, or None when the signature is not a
+// number below n of n's byte length.
+fn rsa_open(ref<RsaPublicKey, shared> key, slice<u8, shared> signature, usize k) : Option<Vec<u8>>
+{
+    BigUint s = BigUint::from_bytes_be(signature);
+    if (!BigUint::less(&s, &key.n))
+    {
+        return None;
+    }
+    BigUint m = BigUint::mod_pow(&s, &key.e, &key.n);
+    if (BigUint::bit_len(&m) > 8 * k)
+    {
+        return None;
+    }
+    Some(BigUint::to_bytes_be_padded(&m, k))
+}
+
+// The DER of the DigestInfo that precedes a digest in a PKCS #1 v1.5
+// signature (RFC 8017 §9.2, note 1).
+fn digest_info_prefix(HashKind kind) : Vec<u8>
+{
+    Result::unwrap_or(from_hex(match (kind)
+    {
+        Sha1     : "3021300906052b0e03021a05000414",
+        Sha2_256 : "3031300d060960864801650304020105000420",
+        Sha2_384 : "3041300d060960864801650304020205000430",
+        Sha2_512 : "3051300d060960864801650304020305000440",
+    }), Vec::new())
+}
+
+// Whether `signature` is `key`'s RSASSA-PKCS1-v1_5 signature (RFC 8017
+// §8.2.2) of a message whose `kind` digest is `digest`. The encoded block
+// is rebuilt and compared whole, so no part of it is parsed.
+export fn rsa_verify_pkcs1v15(
+    ref<RsaPublicKey, shared> key,
+    HashKind kind,
+    slice<u8, shared> digest,
+    slice<u8, shared> signature,
+) : bool
+{
+    usize k = (BigUint::bit_len(&key.n) + 7) / 8;
+    if (slice_len(signature) != k || slice_len(digest) != hash_len(kind))
+    {
+        return false;
+    }
+    Vec<u8> prefix = digest_info_prefix(kind);
+    usize t_len = Vec::len(&prefix) + slice_len(digest);
+    if (k < t_len + 11)
+    {
+        return false;
+    }
+    Vec<u8> want = Vec::new();
+    Vec::push(&mut want, 0);
+    Vec::push(&mut want, 1);
+    for (usize i = 0; i < k - t_len - 3; i += 1)
+    {
+        Vec::push(&mut want, 0xff);
+    }
+    Vec::push(&mut want, 0);
+    Vec::extend_from(&mut want, &prefix[0..$]);
+    Vec::extend_from(&mut want, digest);
+    match (rsa_open(key, signature, k))
+    {
+        Some(em) : digest_eq(&em[0..$], &want[0..$]),
+        None     : false,
+    }
+}
+
+// MGF1 (RFC 8017 §B.2.1): `len` bytes from hashing `seed` with a counter.
+fn mgf1(HashKind kind, slice<u8, shared> seed, usize len) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    u32 counter = 0;
+    while (Vec::len(&out) < len)
+    {
+        Vec<u8> input = Vec::from_slice(seed);
+        Vec::push_be(&mut input, counter);
+        Vec<u8> h = hash(kind, &input[0..$]);
+        for (usize i = 0; i < Vec::len(&h) && Vec::len(&out) < len; i += 1)
+        {
+            Vec::push(&mut out, h[i]);
+        }
+        counter += 1;
+    }
+    out
+}
+
+// Whether `signature` is `key`'s RSASSA-PSS signature (RFC 8017 §8.1.2)
+// of a message whose `kind` digest is `digest`, with MGF1 over the same
+// hash and a salt as long as the digest, as TLS 1.3 and most X.509 use.
+export fn rsa_verify_pss(
+    ref<RsaPublicKey, shared> key,
+    HashKind kind,
+    slice<u8, shared> digest,
+    slice<u8, shared> signature,
+) : bool
+{
+    usize mod_bits = BigUint::bit_len(&key.n);
+    usize k = (mod_bits + 7) / 8;
+    usize h_len = hash_len(kind);
+    usize s_len = h_len;
+    if (slice_len(signature) != k || slice_len(digest) != h_len || mod_bits < 2)
+    {
+        return false;
+    }
+    usize em_bits = mod_bits - 1;
+    usize em_len = (em_bits + 7) / 8;
+    if (em_len < h_len + s_len + 2)
+    {
+        return false;
+    }
+    Vec<u8> em = match (rsa_open(key, signature, em_len))
+    {
+        Some(e) : e,
+        None    : return false,
+    };
+    if (em[em_len - 1] != 0xbc)
+    {
+        return false;
+    }
+    usize db_len = em_len - h_len - 1;
+    u32 unused = narrow<u32>(8 * em_len - em_bits);
+    u8 top_mask = narrow_wrapping<u8>((0xff: u32) >> unused);
+    if ((em[0] & ~top_mask) != 0)
+    {
+        return false;
+    }
+    Vec<u8> db_mask = mgf1(kind, &em[db_len..db_len + h_len], db_len);
+    Vec<u8> db = Vec::new();
+    for (usize i = 0; i < db_len; i += 1)
+    {
+        Vec::push(&mut db, em[i] ^ db_mask[i]);
+    }
+    db[0] = db[0] & top_mask;
+    usize ps_len = em_len - h_len - s_len - 2;
+    for (usize i = 0; i < ps_len; i += 1)
+    {
+        if (db[i] != 0)
+        {
+            return false;
+        }
+    }
+    if (db[ps_len] != 1)
+    {
+        return false;
+    }
+    Vec<u8> m2 = Vec::filled(8, 0: u8);
+    Vec::extend_from(&mut m2, digest);
+    Vec::extend_from(&mut m2, &db[db_len - s_len..$]);
+    Vec<u8> h2 = hash(kind, &m2[0..$]);
+    digest_eq(&h2[0..$], &em[db_len..db_len + h_len])
+}
+
+// The elliptic curves ECDSA signatures are checked on.
+export enum EcCurve
+{
+    P256,
+    P384,
+}
+
+// Arithmetic modulo a curve's prime or its group order, in Montgomery
+// form: up to six 64-bit limbs, least significant first; `n` of them used;
+// `minv` = -m⁻¹ mod 2^64; `r2` = R² mod m, R = 2^(64·n). An element is a
+// plain array, so it is copied, not owned.
+struct Field
+{
+    array<u64, 6> m;
+    usize n;
+    u64 minv;
+    array<u64, 6> r2;
+}
+
+fn field_of(EcCurve c, bool order) : Field
+{
+    match (c)
+    {
+        P256 : if (order)
+        {
+            Field { .m = [
+                0xf3b9cac2fc632551,
+                0xbce6faada7179e84,
+                0xffffffffffffffff,
+                0xffffffff00000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ], .n = 4, .minv = 0xccd1c8aaee00bc4f, .r2 = [
+                0x83244c95be79eea2,
+                0x4699799c49bd6fa6,
+                0x2845b2392b6bec59,
+                0x66e12d94f3d95620,
+                0x0000000000000000,
+                0x0000000000000000,
+            ] }
+        }
+        else
+        {
+            Field { .m = [
+                0xffffffffffffffff,
+                0x00000000ffffffff,
+                0x0000000000000000,
+                0xffffffff00000001,
+                0x0000000000000000,
+                0x0000000000000000,
+            ], .n = 4, .minv = 0x0000000000000001, .r2 = [
+                0x0000000000000003,
+                0xfffffffbffffffff,
+                0xfffffffffffffffe,
+                0x00000004fffffffd,
+                0x0000000000000000,
+                0x0000000000000000,
+            ] }
+        },
+        P384 : if (order)
+        {
+            Field { .m = [
+                0xecec196accc52973,
+                0x581a0db248b0a77a,
+                0xc7634d81f4372ddf,
+                0xffffffffffffffff,
+                0xffffffffffffffff,
+                0xffffffffffffffff,
+            ], .n = 6, .minv = 0x6ed46089e88fdc45, .r2 = [
+                0x2d319b2419b409a9,
+                0xff3d81e5df1aa419,
+                0xbc3e483afcb82947,
+                0xd40d49174aab1cc5,
+                0x3fb05b7a28266895,
+                0x0c84ee012b39bf21,
+            ] }
+        }
+        else
+        {
+            Field { .m = [
+                0x00000000ffffffff,
+                0xffffffff00000000,
+                0xfffffffffffffffe,
+                0xffffffffffffffff,
+                0xffffffffffffffff,
+                0xffffffffffffffff,
+            ], .n = 6, .minv = 0x0000000100000001, .r2 = [
+                0xfffffffe00000001,
+                0x0000000200000000,
+                0xfffffffe00000000,
+                0x0000000200000000,
+                0x0000000000000001,
+                0x0000000000000000,
+            ] }
+        },
+    }
+}
+
+// a·b·R⁻¹ mod m (coarsely integrated operand scanning).
+fn mont_mul(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    usize n = f.n;
+    array<u64, 8> t = [0; 8];
+    for (usize i = 0; i < n; i += 1)
+    {
+        u128 c = 0;
+        for (usize j = 0; j < n; j += 1)
+        {
+            u128 x = widen<u128>(t[j]) + widen<u128>(a[j]) * widen<u128>(b[i]) + c;
+            t[j] = narrow_wrapping<u64>(x);
+            c = x >> 64;
+        }
+        u128 y = widen<u128>(t[n]) + c;
+        t[n] = narrow_wrapping<u64>(y);
+        t[n + 1] = narrow_wrapping<u64>(y >> 64);
+        u64 k = wrapping_mul(t[0], f.minv);
+        u128 z = widen<u128>(t[0]) + widen<u128>(k) * widen<u128>(f.m[0]);
+        c = z >> 64;
+        for (usize j = 1; j < n; j += 1)
+        {
+            u128 x = widen<u128>(t[j]) + widen<u128>(k) * widen<u128>(f.m[j]) + c;
+            t[j - 1] = narrow_wrapping<u64>(x);
+            c = x >> 64;
+        }
+        u128 w = widen<u128>(t[n]) + c;
+        t[n - 1] = narrow_wrapping<u64>(w);
+        t[n] = t[n + 1] + narrow_wrapping<u64>(w >> 64);
+    }
+    array<u64, 6> r = [0; 6];
+    for (usize j = 0; j < n; j += 1)
+    {
+        r[j] = t[j];
+    }
+    // r - m unless r (with its carry t[n]) is below m: chosen by a mask.
+    Borrowed d = f_sub_borrow(f, r, f.m);
+    f_select(wrapping_sub(0, (1 - t[n]) & d.borrow), r, d.v)
+}
+
+fn f_less(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : bool
+{
+    usize i = f.n;
+    while (i > 0)
+    {
+        i -= 1;
+        if (a[i] != b[i])
+        {
+            return a[i] < b[i];
+        }
+    }
+    false
+}
+
+// A difference and whether it borrowed (1) past the top limb.
+struct Borrowed
+{
+    array<u64, 6> v;
+    u64 borrow;
+}
+
+// a - b, wrapping at 2^(64·n), and the borrow out; no branch on the limbs.
+fn f_sub_borrow(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : Borrowed
+{
+    array<u64, 6> r = [0; 6];
+    u64 borrow = 0;
+    for (usize i = 0; i < f.n; i += 1)
+    {
+        u128 x = wrapping_sub(wrapping_sub(widen<u128>(a[i]), widen<u128>(b[i])), widen<u128>(borrow));
+        r[i] = narrow_wrapping<u64>(x);
+        borrow = narrow_wrapping<u64>(x >> 127);
+    }
+    Borrowed { .v = r, .borrow = borrow }
+}
+
+// a - b, wrapping at 2^(64·n).
+fn f_sub_raw(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    f_sub_borrow(f, a, b).v
+}
+
+// a where mask is all ones, b where it is zero, limb by limb.
+fn f_select(u64 mask, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    array<u64, 6> r = [0; 6];
+    for (usize i = 0; i < 6; i += 1)
+    {
+        r[i] = (a[i] & mask) | (b[i] & ~mask);
+    }
+    r
+}
+
+// The field operations take the same steps whatever the limbs hold: the
+// reduction is chosen by a mask (D-0165), so a secret scalar's arithmetic
+// (P-256 key agreement) shows nothing through its timing.
+fn f_add(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    array<u64, 6> r = [0; 6];
+    u64 carry = 0;
+    for (usize i = 0; i < f.n; i += 1)
+    {
+        u128 s = widen<u128>(a[i]) + widen<u128>(b[i]) + widen<u128>(carry);
+        r[i] = narrow_wrapping<u64>(s);
+        carry = narrow_wrapping<u64>(s >> 64);
+    }
+    Borrowed d = f_sub_borrow(f, r, f.m);
+    f_select(wrapping_sub(0, (1 - carry) & d.borrow), r, d.v)
+}
+
+fn f_sub(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    Borrowed d = f_sub_borrow(f, a, b);
+    array<u64, 6> m = f_select(wrapping_sub(0, d.borrow), f.m, [0; 6]);
+    f_add_raw(f, d.v, m)
+}
+
+// a + b, wrapping at 2^(64·n).
+fn f_add_raw(ref<Field, shared> f, array<u64, 6> a, array<u64, 6> b) : array<u64, 6>
+{
+    array<u64, 6> r = [0; 6];
+    u64 carry = 0;
+    for (usize i = 0; i < f.n; i += 1)
+    {
+        u128 s = widen<u128>(a[i]) + widen<u128>(b[i]) + widen<u128>(carry);
+        r[i] = narrow_wrapping<u64>(s);
+        carry = narrow_wrapping<u64>(s >> 64);
+    }
+    r
+}
+
+fn f_is_zero(ref<Field, shared> f, array<u64, 6> a) : bool
+{
+    u64 acc = 0;
+    for (usize i = 0; i < f.n; i += 1)
+    {
+        acc = acc | a[i];
+    }
+    acc == 0
+}
+
+fn f_to_mont(ref<Field, shared> f, array<u64, 6> a) : array<u64, 6>
+{
+    mont_mul(f, a, f.r2)
+}
+
+fn f_from_mont(ref<Field, shared> f, array<u64, 6> a) : array<u64, 6>
+{
+    mont_mul(f, a, [1, 0, 0, 0, 0, 0])
+}
+
+// a⁻¹ (Fermat: a^(m-2)), a and the result in Montgomery form.
+fn f_invert(ref<Field, shared> f, array<u64, 6> a) : array<u64, 6>
+{
+    array<u64, 6> e = f_sub_raw(f, f.m, [2, 0, 0, 0, 0, 0]);
+    array<u64, 6> r = f_to_mont(f, [1, 0, 0, 0, 0, 0]);
+    usize bits = 64 * f.n;
+    usize i = bits;
+    while (i > 0)
+    {
+        i -= 1;
+        r = mont_mul(f, r, r);
+        if (((e[i / 64] >> narrow<u32>(i % 64)) & 1) == 1)
+        {
+            r = mont_mul(f, r, a);
+        }
+    }
+    r
+}
+
+// Big-endian bytes (at most 8·n of them) as limbs; None when they do not
+// name a number below m.
+fn f_from_be(ref<Field, shared> f, slice<u8, shared> b) : Option<array<u64, 6>>
+{
+    usize len = slice_len(b);
+    if (len > 8 * f.n)
+    {
+        return None;
+    }
+    array<u64, 6> r = [0; 6];
+    for (usize k = 0; k < len; k += 1)
+    {
+        usize pos = len - 1 - k;
+        r[k / 8] = r[k / 8] | (widen<u64>(b[pos]) << narrow<u32>(8 * (k % 8)));
+    }
+    if (!f_less(f, r, f.m))
+    {
+        return None;
+    }
+    Some(r)
+}
+
+fn f_bit(array<u64, 6> a, usize i) : bool
+{
+    ((a[i / 64] >> narrow<u32>(i % 64)) & 1) == 1
+}
+
+// k·a for a small public constant k (2, 3, 4, 8): doublings and one
+// addition per set bit below the top, not k additions.
+fn f_small(ref<Field, shared> f, u64 k, array<u64, 6> a) : array<u64, 6>
+{
+    array<u64, 6> r = a;
+    u32 top = 63 - leading_zeros(k);
+    u32 i = top;
+    while (i > 0)
+    {
+        i -= 1;
+        r = f_add(f, r, r);
+        if (((k >> i) & 1) == 1)
+        {
+            r = f_add(f, r, a);
+        }
+    }
+    r
+}
+
+// A point in Jacobian coordinates (X/Z², Y/Z³), Montgomery form; Z = 0 is
+// the point at infinity.
+struct Jacobian
+{
+    array<u64, 6> x;
+    array<u64, 6> y;
+    array<u64, 6> z;
+}
+
+fn jac_double(ref<Field, shared> f, Jacobian q) : Jacobian
+{
+    if (f_is_zero(f, q.z) || f_is_zero(f, q.y))
+    {
+        return Jacobian { .x = q.x, .y = q.y, .z = [0; 6] };
+    }
+    array<u64, 6> delta = mont_mul(f, q.z, q.z);
+    array<u64, 6> gamma = mont_mul(f, q.y, q.y);
+    array<u64, 6> beta = mont_mul(f, q.x, gamma);
+    array<u64, 6> alpha = f_small(f, 3, mont_mul(f, f_sub(f, q.x, delta), f_add(f, q.x, delta)));
+    array<u64, 6> x3 = f_sub(f, mont_mul(f, alpha, alpha), f_small(f, 8, beta));
+    array<u64, 6> yz = f_add(f, q.y, q.z);
+    array<u64, 6> z3 = f_sub(f, f_sub(f, mont_mul(f, yz, yz), gamma), delta);
+    array<u64, 6> y3 = f_sub(
+        f,
+        mont_mul(f, alpha, f_sub(f, f_small(f, 4, beta), x3)),
+        f_small(f, 8, mont_mul(f, gamma, gamma)),
+    );
+    Jacobian { .x = x3, .y = y3, .z = z3 }
+}
+
+fn jac_add(ref<Field, shared> f, Jacobian a, Jacobian b) : Jacobian
+{
+    if (f_is_zero(f, a.z))
+    {
+        return b;
+    }
+    if (f_is_zero(f, b.z))
+    {
+        return a;
+    }
+    array<u64, 6> z1z1 = mont_mul(f, a.z, a.z);
+    array<u64, 6> z2z2 = mont_mul(f, b.z, b.z);
+    array<u64, 6> u1 = mont_mul(f, a.x, z2z2);
+    array<u64, 6> u2 = mont_mul(f, b.x, z1z1);
+    array<u64, 6> s1 = mont_mul(f, mont_mul(f, a.y, b.z), z2z2);
+    array<u64, 6> s2 = mont_mul(f, mont_mul(f, b.y, a.z), z1z1);
+    array<u64, 6> h = f_sub(f, u2, u1);
+    array<u64, 6> r = f_small(f, 2, f_sub(f, s2, s1));
+    if (f_is_zero(f, h))
+    {
+        if (f_is_zero(f, r))
+        {
+            return jac_double(f, a);
+        }
+        return Jacobian { .x = a.x, .y = a.y, .z = [0; 6] };
+    }
+    array<u64, 6> h2 = f_small(f, 2, h);
+    array<u64, 6> i = mont_mul(f, h2, h2);
+    array<u64, 6> j = mont_mul(f, h, i);
+    array<u64, 6> v = mont_mul(f, u1, i);
+    array<u64, 6> x3 = f_sub(f, f_sub(f, mont_mul(f, r, r), j), f_small(f, 2, v));
+    array<u64, 6> y3 = f_sub(f, mont_mul(f, r, f_sub(f, v, x3)), f_small(f, 2, mont_mul(f, s1, j)));
+    array<u64, 6> zs = f_add(f, a.z, b.z);
+    array<u64, 6> z3 = mont_mul(f, f_sub(f, f_sub(f, mont_mul(f, zs, zs), z1z1), z2z2), h);
+    Jacobian { .x = x3, .y = y3, .z = z3 }
+}
+
+// 0·P to 15·P, P's multiples for a 4-bit window.
+fn jac_table(ref<Field, shared> f, Jacobian p) : Vec<Jacobian>
+{
+    Vec<Jacobian> t = Vec::new();
+    Vec::push(&mut t, Jacobian { .x = p.x, .y = p.y, .z = [0; 6] });
+    Vec::push(&mut t, p);
+    for (usize i = 2; i < 16; i += 1)
+    {
+        Jacobian next = if (i % 2 == 0) { jac_double(f, t[i / 2]) } else { jac_add(f, t[i - 1], p) };
+        Vec::push(&mut t, next);
+    }
+    t
+}
+
+// The 4-bit digit of a at window w (bits 4w to 4w+3).
+fn f_nibble(array<u64, 6> a, usize w) : usize
+{
+    narrow<usize>((a[w / 16] >> narrow<u32>(4 * (w % 16))) & 15)
+}
+
+// u1·G + u2·Q, sharing the doublings (Shamir's trick) over 4-bit windows:
+// four doublings and at most two additions per window. u1, u2 plain; the
+// values are public (verification), so the additions skipped for zero
+// digits show nothing secret.
+fn jac_twin(ref<Field, shared> f, array<u64, 6> u1, Jacobian g, array<u64, 6> u2, Jacobian q, usize bits) : Jacobian
+{
+    Vec<Jacobian> tg = jac_table(f, g);
+    Vec<Jacobian> tq = jac_table(f, q);
+    Jacobian acc = tg[0];
+    usize w = bits / 4;
+    while (w > 0)
+    {
+        w -= 1;
+        for (usize k = 0; k < 4; k += 1)
+        {
+            acc = jac_double(f, acc);
+        }
+        usize d1 = f_nibble(u1, w);
+        usize d2 = f_nibble(u2, w);
+        if (d1 != 0)
+        {
+            acc = jac_add(f, acc, tg[d1]);
+        }
+        if (d2 != 0)
+        {
+            acc = jac_add(f, acc, tq[d2]);
+        }
+    }
+    acc
+}
+
+// The bit-at-a-time form, kept for reference by the windowed one above.
+fn jac_twin_bits(
+    ref<Field, shared> f,
+    array<u64, 6> u1,
+    Jacobian g,
+    array<u64, 6> u2,
+    Jacobian q,
+    usize bits,
+) : Jacobian
+{
+    Jacobian gq = jac_add(f, g, q);
+    Jacobian acc = Jacobian { .x = g.x, .y = g.y, .z = [0; 6] };
+    usize i = bits;
+    while (i > 0)
+    {
+        i -= 1;
+        acc = jac_double(f, acc);
+        bool b1 = f_bit(u1, i);
+        bool b2 = f_bit(u2, i);
+        if (b1 && b2)
+        {
+            acc = jac_add(f, acc, gq);
+        }
+        else if (b1)
+        {
+            acc = jac_add(f, acc, g);
+        }
+        else if (b2)
+        {
+            acc = jac_add(f, acc, q);
+        }
+    }
+    acc
+}
+
+fn curve_hex(ref<Field, shared> f, str hex) : array<u64, 6>
+{
+    Vec<u8> b = Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new());
+    Option::unwrap(f_from_be(f, &b[0..$]))
+}
+
+// A positive DER INTEGER at `at`: its content bytes' range, or None.
+struct DerSpan
+{
+    usize start;
+    usize end;
+}
+
+fn der_positive_int(slice<u8, shared> d, usize at) : Option<DerSpan>
+{
+    if (at + 2 > slice_len(d) || d[at] != 0x02)
+    {
+        return None;
+    }
+    usize len = widen<usize>(d[at + 1]);
+    usize start = at + 2;
+    if (len == 0 || len > 0x7f || start + len > slice_len(d))
+    {
+        return None;
+    }
+    if ((d[start] & 0x80) != 0)
+    {
+        return None;
+    }
+    if (len > 1 && d[start] == 0 && (d[start + 1] & 0x80) == 0)
+    {
+        return None;
+    }
+    // A leading zero byte only marks the number positive.
+    usize from = if (d[start] == 0 && len > 1) { start + 1 } else { start };
+    Some(DerSpan { .start = from, .end = start + len })
+}
+
+// Whether `signature`, the DER `SEQUENCE { r INTEGER, s INTEGER }` of
+// X.509 and TLS, is an ECDSA signature on `curve` by the holder of
+// `public_key` (an uncompressed point, 0x04 ‖ x ‖ y) of a message whose
+// digest is `digest` (FIPS 186-4 §6.4.2). A malformed key or signature is
+// false.
+export fn ecdsa_verify(
+    EcCurve curve,
+    slice<u8, shared> public_key,
+    slice<u8, shared> digest,
+    slice<u8, shared> signature,
+) : bool
+{
+    Field fp = field_of(curve, false);
+    Field fn_ = field_of(curve, true);
+    usize size = 8 * fp.n;
+    if (slice_len(public_key) != 1 + 2 * size || public_key[0] != 0x04)
+    {
+        return false;
+    }
+    array<u64, 6> qx = match (f_from_be(&fp, &public_key[1..1 + size]))
+    {
+        Some(v) : f_to_mont(&fp, v),
+        None    : return false,
+    };
+    array<u64, 6> qy = match (f_from_be(&fp, &public_key[1 + size..$]))
+    {
+        Some(v) : f_to_mont(&fp, v),
+        None    : return false,
+    };
+    str b_hex = match (curve)
+    {
+        P256 : "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+        P384 : "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef",
+    };
+    array<u64, 6> b = f_to_mont(&fp, curve_hex(&fp, b_hex));
+    // y² = x³ - 3x + b
+    array<u64, 6> lhs = mont_mul(&fp, qy, qy);
+    array<u64, 6> rhs = f_add(&fp, f_sub(&fp, mont_mul(&fp, mont_mul(&fp, qx, qx), qx), f_small(&fp, 3, qx)), b);
+    if (!f_is_zero(&fp, f_sub(&fp, lhs, rhs)))
+    {
+        return false;
+    }
+    usize sl = slice_len(signature);
+    if (sl < 8 || signature[0] != 0x30 || signature[1] > 0x7f || widen<usize>(signature[1]) != sl - 2)
+    {
+        return false;
+    }
+    DerSpan rs = match (der_positive_int(signature, 2))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    DerSpan ss = match (der_positive_int(signature, rs.end))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    if (ss.end != sl)
+    {
+        return false;
+    }
+    array<u64, 6> r = match (f_from_be(&fn_, &signature[rs.start..rs.end]))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    array<u64, 6> s = match (f_from_be(&fn_, &signature[ss.start..ss.end]))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    if (f_is_zero(&fn_, r) || f_is_zero(&fn_, s))
+    {
+        return false;
+    }
+    // e: the digest's leftmost 8·size bits (the order's bit length is the
+    // prime's for both curves), reduced once below n.
+    usize take = min(slice_len(digest), size);
+    array<u64, 6> e = [0; 6];
+    for (usize k = 0; k < take; k += 1)
+    {
+        usize pos = take - 1 - k;
+        e[k / 8] = e[k / 8] | (widen<u64>(digest[pos]) << narrow<u32>(8 * (k % 8)));
+    }
+    if (!f_less(&fn_, e, fn_.m))
+    {
+        e = f_sub_raw(&fn_, e, fn_.m);
+    }
+    array<u64, 6> w = f_invert(&fn_, f_to_mont(&fn_, s));
+    array<u64, 6> u1 = f_from_mont(&fn_, mont_mul(&fn_, f_to_mont(&fn_, e), w));
+    array<u64, 6> u2 = f_from_mont(&fn_, mont_mul(&fn_, f_to_mont(&fn_, r), w));
+    str gx = match (curve)
+    {
+        P256 : "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+        P384 : "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7",
+    };
+    str gy = match (curve)
+    {
+        P256 : "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        P384 : "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f",
+    };
+    array<u64, 6> one = f_to_mont(&fp, [1, 0, 0, 0, 0, 0]);
+    Jacobian g = Jacobian { .x = f_to_mont(
+        &fp,
+        curve_hex(&fp, gx),
+    ), .y = f_to_mont(&fp, curve_hex(&fp, gy)), .z = one };
+    Jacobian q = Jacobian { .x = qx, .y = qy, .z = one };
+    Jacobian p = jac_twin(&fp, u1, g, u2, q, size * 8);
+    if (f_is_zero(&fp, p.z))
+    {
+        return false;
+    }
+    // x mod n = r, without inverting Z: x = X/Z², and x mod n is r exactly
+    // when x is r or (as x < p < 2n for both curves) r + n, the latter only
+    // possible when r + n < p. So compare X with r·Z² and (r + n)·Z².
+    array<u64, 6> z2 = mont_mul(&fp, p.z, p.z);
+    if (f_is_zero(&fp, f_sub(&fp, p.x, mont_mul(&fp, f_to_mont(&fp, r), z2))))
+    {
+        return true;
+    }
+    array<u64, 6> rn = f_add_raw(&fp, r, fn_.m);
+    if (f_less(&fn_, rn, fp.m) && f_less(&fn_, r, rn))
+    {
+        return f_is_zero(&fp, f_sub(&fp, p.x, mont_mul(&fp, f_to_mont(&fp, rn), z2)));
+    }
+    false
+}
+
+// Elliptic-curve keys, key agreement and signing on P-256 and P-384
+// (SEC 1 §3.3.1, RFC 8446 §7.4.2, FIPS 186-4 §6.4.1, RFC 6979; D-0165,
+// D-0168). A private key is 32 or 48 bytes naming a number in [1, n-1]; a
+// public key is the uncompressed point 0x04 ‖ x ‖ y; a shared secret is
+// the x-coordinate of the private key times the peer's point. The scalar
+// multiplication runs the same steps for every scalar: the scalar is made
+// one bit longer than the order by adding n or 2n (the same point), every
+// bit doubles and adds, and the sum is kept or dropped by a mask.
+
+fn curve_b_hex(EcCurve c) : str
+{
+    match (c)
+    {
+        P256 : "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+        P384 : "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef",
+    }
+}
+
+// The base point G, Montgomery form, z = 1.
+fn curve_base(ref<Field, shared> fp, EcCurve c) : Jacobian
+{
+    str gx = match (c)
+    {
+        P256 : "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+        P384 : "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7",
+    };
+    str gy = match (c)
+    {
+        P256 : "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+        P384 : "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f",
+    };
+    Jacobian { .x = f_to_mont(
+        fp,
+        curve_hex(fp, gx),
+    ), .y = f_to_mont(fp, curve_hex(fp, gy)), .z = f_to_mont(fp, [1, 0, 0, 0, 0, 0]) }
+}
+
+// The point 0x04 ‖ x ‖ y, Montgomery form, or None when the bytes are not
+// an uncompressed point on the curve (y² = x³ - 3x + b): a point off the
+// curve could leak the key it is multiplied by.
+fn curve_point(ref<Field, shared> fp, EcCurve c, slice<u8, shared> public_key) : Option<Jacobian>
+{
+    usize size = 8 * fp.n;
+    if (slice_len(public_key) != 1 + 2 * size || public_key[0] != 0x04)
+    {
+        return None;
+    }
+    array<u64, 6> qx = f_to_mont(fp, f_from_be(fp, &public_key[1..1 + size])?);
+    array<u64, 6> qy = f_to_mont(fp, f_from_be(fp, &public_key[1 + size..$])?);
+    array<u64, 6> b = f_to_mont(fp, curve_hex(fp, curve_b_hex(c)));
+    array<u64, 6> lhs = mont_mul(fp, qy, qy);
+    array<u64, 6> rhs = f_add(fp, f_sub(fp, mont_mul(fp, mont_mul(fp, qx, qx), qx), f_small(fp, 3, qx)), b);
+    if (!f_is_zero(fp, f_sub(fp, lhs, rhs)))
+    {
+        return None;
+    }
+    Some(Jacobian { .x = qx, .y = qy, .z = f_to_mont(fp, [1, 0, 0, 0, 0, 0]) })
+}
+
+// a where mask is all ones, b where it is zero.
+fn jac_select(u64 mask, Jacobian a, Jacobian b) : Jacobian
+{
+    Jacobian { .x = f_select(mask, a.x, b.x), .y = f_select(mask, a.y, b.y), .z = f_select(mask, a.z, b.z) }
+}
+
+// a + b over seven limbs (the scalar plus the order, one bit past it).
+fn limbs7_add(array<u64, 7> a, array<u64, 7> b) : array<u64, 7>
+{
+    array<u64, 7> r = [0; 7];
+    u64 carry = 0;
+    for (usize i = 0; i < 7; i += 1)
+    {
+        u128 s = widen<u128>(a[i]) + widen<u128>(b[i]) + widen<u128>(carry);
+        r[i] = narrow_wrapping<u64>(s);
+        carry = narrow_wrapping<u64>(s >> 64);
+    }
+    r
+}
+
+// k·P for k in [1, n-1], P with z = 1, in Jacobian form; the same steps
+// whatever k is.
+fn ec_mul(ref<Field, shared> fp, ref<Field, shared> fn_, array<u64, 6> k, Jacobian p) : Jacobian
+{
+    usize bits = 64 * fp.n;
+    array<u64, 7> n7 = [fn_.m[0], fn_.m[1], fn_.m[2], fn_.m[3], fn_.m[4], fn_.m[5], 0];
+    array<u64, 7> k1 = limbs7_add([k[0], k[1], k[2], k[3], k[4], k[5], 0], n7);
+    array<u64, 7> k2 = limbs7_add(k1, n7);
+    // k + n when that reaches 2^bits, k + 2n otherwise: bit `bits` is set
+    // and nothing above it.
+    u64 mask = wrapping_sub(0, k1[bits / 64] & 1);
+    array<u64, 7> kh = [0; 7];
+    for (usize i = 0; i < 7; i += 1)
+    {
+        kh[i] = (k1[i] & mask) | (k2[i] & ~mask);
+    }
+    Jacobian acc = p;
+    usize i = bits;
+    while (i > 0)
+    {
+        i -= 1;
+        acc = jac_double(fp, acc);
+        Jacobian sum = jac_add(fp, acc, p);
+        u64 bit = (kh[i / 64] >> narrow<u32>(i % 64)) & 1;
+        acc = jac_select(wrapping_sub(0, bit), sum, acc);
+    }
+    acc
+}
+
+// The low `len` bytes of the limbs, big-endian.
+fn limbs_be(array<u64, 6> a, usize len) : Vec<u8>
+{
+    Vec<u8> b = Vec::filled(len, 0: u8);
+    for (usize i = 0; i < len; i += 1)
+    {
+        b[len - 1 - i] = narrow_wrapping<u8>(a[i / 8] >> narrow<u32>(8 * (i % 8)));
+    }
+    b
+}
+
+// The private key as a scalar, None outside [1, n-1]; a length other than
+// the curve's is `diag.crypto-length`.
+fn ec_scalar(ref<Field, shared> fn_, slice<u8, shared> private_key) : Option<array<u64, 6>>
+{
+    if (slice_len(private_key) != 8 * fn_.n)
+    {
+        fault(crypto_length);
+    }
+    match (f_from_be(fn_, private_key))
+    {
+        Some(k) : if (f_is_zero(fn_, k)) { None } else { Some(k) },
+        None    : None,
+    }
+}
+
+// Affine x and y (plain, not Montgomery) of a point that is not infinity.
+fn ec_affine(ref<Field, shared> fp, Jacobian q) : array<array<u64, 6>, 2>
+{
+    array<u64, 6> zinv = f_invert(fp, q.z);
+    array<u64, 6> zinv2 = mont_mul(fp, zinv, zinv);
+    array<u64, 6> x = f_from_mont(fp, mont_mul(fp, q.x, zinv2));
+    array<u64, 6> y = f_from_mont(fp, mont_mul(fp, q.y, mont_mul(fp, zinv2, zinv)));
+    [x, y]
+}
+
+// A new private key for `curve`: 32 or 48 bytes of `os_random_bytes`
+// naming a number in [1, n-1] (drawn again in the rare case they do not).
+export fn ec_private_key(EcCurve curve) : Vec<u8>
+{
+    Field fn_ = field_of(curve, true);
+    Vec<u8> k = Vec::filled(8 * fn_.n, 0: u8);
+    while (true)
+    {
+        os_random_bytes(&mut k[0..$]);
+        if (Option::is_some(&ec_scalar(&fn_, &k[0..$])))
+        {
+            return k;
+        }
+    }
+}
+
+// The public key of `private_key` (the curve's length, another is
+// `diag.crypto-length`): 0x04 ‖ x ‖ y of the private key times the base
+// point, 65 or 97 bytes, or None when the private key is not in [1, n-1].
+export fn ec_public_key(EcCurve curve, slice<u8, shared> private_key) : Option<Vec<u8>>
+{
+    Field fp = field_of(curve, false);
+    Field fn_ = field_of(curve, true);
+    array<u64, 6> k = ec_scalar(&fn_, private_key)?;
+    usize size = 8 * fp.n;
+    array<array<u64, 6>, 2> xy = ec_affine(&fp, ec_mul(&fp, &fn_, k, curve_base(&fp, curve)));
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, 0x04);
+    Vec::extend_from(&mut out, &limbs_be(xy[0], size)[0..$]);
+    Vec::extend_from(&mut out, &limbs_be(xy[1], size)[0..$]);
+    Some(out)
+}
+
+// The shared secret of `private_key` and the peer's `public_key` on
+// `curve`: the x-coordinate of their product, 32 or 48 bytes, or None when
+// the private key is not in [1, n-1] or the public key is not an
+// uncompressed point on the curve.
+export fn ecdh(EcCurve curve, slice<u8, shared> private_key, slice<u8, shared> public_key) : Option<Vec<u8>>
+{
+    Field fp = field_of(curve, false);
+    Field fn_ = field_of(curve, true);
+    array<u64, 6> k = ec_scalar(&fn_, private_key)?;
+    Jacobian q = curve_point(&fp, curve, public_key)?;
+    Jacobian r = ec_mul(&fp, &fn_, k, q);
+    if (f_is_zero(&fp, r.z))
+    {
+        return None;
+    }
+    Some(limbs_be(ec_affine(&fp, r)[0], 8 * fp.n))
+}
+
+// The P-256 functions of D-0165: the curve-generic ones on P256, with
+// their fixed-length results.
+export fn p256_private_key() : array<u8, 32>
+{
+    Vec<u8> k = ec_private_key(P256);
+    array<u8, 32> out = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        out[i] = k[i];
+    }
+    out
+}
+
+export fn p256_public_key(slice<u8, shared> private_key) : Option<array<u8, 65>>
+{
+    Vec<u8> q = ec_public_key(P256, private_key)?;
+    array<u8, 65> out = [0; 65];
+    for (usize i = 0; i < 65; i += 1)
+    {
+        out[i] = q[i];
+    }
+    Some(out)
+}
+
+export fn p256_ecdh(slice<u8, shared> private_key, slice<u8, shared> public_key) : Option<array<u8, 32>>
+{
+    Vec<u8> z = ecdh(P256, private_key, public_key)?;
+    array<u8, 32> out = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        out[i] = z[i];
+    }
+    Some(out)
+}
+
+// The digest's leftmost 8·size bits as a number below n (bits2int of
+// RFC 6979 §2.3.2, then one reduction): ECDSA's e.
+fn digest_scalar(ref<Field, shared> fn_, slice<u8, shared> digest, usize size) : array<u64, 6>
+{
+    usize take = min(slice_len(digest), size);
+    array<u64, 6> e = [0; 6];
+    for (usize k = 0; k < take; k += 1)
+    {
+        usize pos = take - 1 - k;
+        e[k / 8] = e[k / 8] | (widen<u64>(digest[pos]) << narrow<u32>(8 * (k % 8)));
+    }
+    if (!f_less(fn_, e, fn_.m))
+    {
+        e = f_sub_raw(fn_, e, fn_.m);
+    }
+    e
+}
+
+// A DER INTEGER of the non-negative number with big-endian bytes `v`:
+// minimal, with a zero byte in front when the top bit is set.
+fn der_push_uint(ref<Vec<u8>, exclusive> out, slice<u8, shared> v)
+{
+    usize from = 0;
+    while (from + 1 < slice_len(v) && v[from] == 0)
+    {
+        from += 1;
+    }
+    bool pad = (v[from] & 0x80) != 0;
+    Vec::push(out, 0x02);
+    Vec::push(out, narrow<u8>(slice_len(v) - from + (if (pad) { 1 } else { 0 })));
+    if (pad)
+    {
+        Vec::push(out, 0);
+    }
+    Vec::extend_from(out, &v[from..$]);
+}
+
+// The ECDSA signature (FIPS 186-4 §6.4.1) by `private_key` on `curve` of a
+// message whose digest is `digest`: the DER `SEQUENCE { r, s }` that
+// `ecdsa_verify` checks, or None when the private key is not in [1, n-1].
+// The nonce k is RFC 6979's, derived from the key and the digest with
+// HMAC-SHA-256 (P-256) or HMAC-SHA-384 (P-384), so the same message signs
+// the same way every time and no random number can repeat.
+export fn ecdsa_sign(EcCurve curve, slice<u8, shared> private_key, slice<u8, shared> digest) : Option<Vec<u8>>
+{
+    Field fp = field_of(curve, false);
+    Field fn_ = field_of(curve, true);
+    usize size = 8 * fp.n;
+    array<u64, 6> x = ec_scalar(&fn_, private_key)?;
+    HashKind kind = match (curve)
+    {
+        P256 : Sha2_256,
+        P384 : Sha2_384,
+    };
+    array<u64, 6> e = digest_scalar(&fn_, digest, size);
+    Vec<u8> x_bytes = limbs_be(x, size);
+    Vec<u8> e_bytes = limbs_be(e, size);
+    Jacobian g = curve_base(&fp, curve);
+    array<u64, 6> xm = f_to_mont(&fn_, x);
+    array<u64, 6> em = f_to_mont(&fn_, e);
+    // RFC 6979 §3.2 steps b to h.
+    usize hlen = hash_len(kind);
+    Vec<u8> v = Vec::filled(hlen, 1: u8);
+    Vec<u8> key = Vec::filled(hlen, 0: u8);
+    for (u8 round = 0; round < 2; round += 1)
+    {
+        Hmac m = Hmac::new(kind, &key[0..$]);
+        Hmac::update(&mut m, &v[0..$]);
+        array<u8, 1> sep = [round];
+        Hmac::update(&mut m, &sep[0..$]);
+        Hmac::update(&mut m, &x_bytes[0..$]);
+        Hmac::update(&mut m, &e_bytes[0..$]);
+        overwrite(&mut key, Hmac::finish(m));
+        overwrite(&mut v, hmac(kind, &key[0..$], &v[0..$]));
+    }
+    while (true)
+    {
+        overwrite(&mut v, hmac(kind, &key[0..$], &v[0..$]));
+        // T is V itself: the hash is as long as the order for both curves.
+        Option<array<u64, 6>> candidate = f_from_be(&fn_, &v[0..size]);
+        if (Some(k) = candidate)
+        {
+            if (!f_is_zero(&fn_, k))
+            {
+                array<u64, 6> r = ec_affine(&fp, ec_mul(&fp, &fn_, k, g))[0];
+                if (!f_less(&fn_, r, fn_.m))
+                {
+                    r = f_sub_raw(&fn_, r, fn_.m);
+                }
+                if (!f_is_zero(&fn_, r))
+                {
+                    array<u64, 6> kinv = f_invert(&fn_, f_to_mont(&fn_, k));
+                    array<u64, 6> rx = mont_mul(&fn_, f_to_mont(&fn_, r), xm);
+                    array<u64, 6> s = f_from_mont(&fn_, mont_mul(&fn_, kinv, f_add(&fn_, em, rx)));
+                    if (!f_is_zero(&fn_, s))
+                    {
+                        Vec<u8> body = Vec::new();
+                        der_push_uint(&mut body, &limbs_be(r, size)[0..$]);
+                        der_push_uint(&mut body, &limbs_be(s, size)[0..$]);
+                        Vec<u8> out = Vec::new();
+                        Vec::push(&mut out, 0x30);
+                        Vec::push(&mut out, narrow<u8>(Vec::len(&body)));
+                        Vec::extend_from(&mut out, &body[0..$]);
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        Hmac m = Hmac::new(kind, &key[0..$]);
+        Hmac::update(&mut m, &v[0..$]);
+        array<u8, 1> zero = [0];
+        Hmac::update(&mut m, &zero[0..$]);
+        overwrite(&mut key, Hmac::finish(m));
+        overwrite(&mut v, hmac(kind, &key[0..$], &v[0..$]));
+    }
+}
+
+// ---- Ed25519 (RFC 8032, D-0167) ----
+//
+// Signatures over the twisted Edwards form of Curve25519, on the field
+// arithmetic X25519 uses (five 51-bit limbs) and, modulo the group order
+// L, on the Montgomery arithmetic the NIST curves use. A point is kept in
+// extended coordinates (x = X/Z, y = Y/Z, T = XY/Z); the addition formula
+// is complete, so one formula serves doubling, the identity and every
+// other case, and the scalar multiplication doubles and adds at every bit,
+// keeping the sum by a mask: no branch and no index depends on a secret.
+
+const array<u64, 5> ED_D = [0x34dca135978a3, 0x1a8283b156ebd, 0x5e7a26001c029, 0x739c663a03cbb, 0x52036cee2b6ff];
+
+const array<u64, 5> ED_2D = [0x69b9426b2f159, 0x35050762add7a, 0x3cf44c0038052, 0x6738cc7407977, 0x2406d9dc56dff];
+
+const array<u64, 5> ED_SQRT_M1 = [0x61b274a0ea0b0, 0xd5a5fc8f189d, 0x7ef5e9cbd0c60, 0x78595a6804c9e, 0x2b8324804fc1d];
+
+const array<u64, 5> ED_BX = [0x62d608f25d51a, 0x412a4b4f6592a, 0x75b7171a4b31d, 0x1ff60527118fe, 0x216936d3cd6e5];
+
+const array<u64, 5> ED_BY = [0x6666666666658, 0x4cccccccccccc, 0x1999999999999, 0x3333333333333, 0x6666666666666];
+
+fn fe_neg(array<u64, 5> a) : array<u64, 5>
+{
+    fe_sub([0, 0, 0, 0, 0], a)
+}
+
+fn fe_is_zero(array<u64, 5> a) : bool
+{
+    array<u8, 32> b = fe_to_bytes(a);
+    u8 acc = 0;
+    for (usize i = 0; i < 32; i += 1)
+    {
+        acc = acc | b[i];
+    }
+    acc == 0
+}
+
+fn fe_eq(array<u64, 5> a, array<u64, 5> b) : bool
+{
+    fe_is_zero(fe_sub(a, b))
+}
+
+// a where mask is all ones, b where it is zero.
+fn fe_select(u64 mask, array<u64, 5> a, array<u64, 5> b) : array<u64, 5>
+{
+    array<u64, 5> r = [0; 5];
+    for (usize i = 0; i < 5; i += 1)
+    {
+        r[i] = (a[i] & mask) | (b[i] & ~mask);
+    }
+    r
+}
+
+// z^(2^252 - 3), the power RFC 8032 §5.1.3 takes a square root with; the
+// exponent is public.
+fn fe_pow_p58(array<u64, 5> z) : array<u64, 5>
+{
+    array<u64, 5> r = [1, 0, 0, 0, 0];
+    for (usize k = 0; k < 252; k += 1)
+    {
+        usize i = 251 - k;
+        r = fe_mul(r, r);
+        if (i != 1)
+        {
+            r = fe_mul(r, z);
+        }
+    }
+    r
+}
+
+// A point in extended coordinates.
+struct Ed
+{
+    array<u64, 5> x;
+    array<u64, 5> y;
+    array<u64, 5> z;
+    array<u64, 5> t;
+}
+
+fn ed_identity() : Ed
+{
+    Ed { .x = [0, 0, 0, 0, 0], .y = [1, 0, 0, 0, 0], .z = [1, 0, 0, 0, 0], .t = [0, 0, 0, 0, 0] }
+}
+
+fn ed_base() : Ed
+{
+    Ed { .x = ED_BX, .y = ED_BY, .z = [1, 0, 0, 0, 0], .t = fe_mul(ED_BX, ED_BY) }
+}
+
+// p + q (RFC 8032 §5.1.4's complete formula).
+fn ed_add(Ed p, Ed q) : Ed
+{
+    array<u64, 5> a = fe_mul(fe_sub(p.y, p.x), fe_sub(q.y, q.x));
+    array<u64, 5> b = fe_mul(fe_add(p.y, p.x), fe_add(q.y, q.x));
+    array<u64, 5> c = fe_mul(fe_mul(p.t, ED_2D), q.t);
+    array<u64, 5> d = fe_mul(fe_add(p.z, p.z), q.z);
+    array<u64, 5> e = fe_sub(b, a);
+    array<u64, 5> f = fe_sub(d, c);
+    array<u64, 5> g = fe_add(d, c);
+    array<u64, 5> h = fe_add(b, a);
+    Ed { .x = fe_mul(e, f), .y = fe_mul(g, h), .z = fe_mul(f, g), .t = fe_mul(e, h) }
+}
+
+fn ed_double(Ed p) : Ed
+{
+    array<u64, 5> a = fe_mul(p.x, p.x);
+    array<u64, 5> b = fe_mul(p.y, p.y);
+    array<u64, 5> zz = fe_mul(p.z, p.z);
+    array<u64, 5> c = fe_add(zz, zz);
+    array<u64, 5> h = fe_add(a, b);
+    array<u64, 5> xy = fe_add(p.x, p.y);
+    array<u64, 5> e = fe_sub(h, fe_mul(xy, xy));
+    array<u64, 5> g = fe_sub(a, b);
+    array<u64, 5> f = fe_add(c, g);
+    Ed { .x = fe_mul(e, f), .y = fe_mul(g, h), .z = fe_mul(f, g), .t = fe_mul(e, h) }
+}
+
+fn ed_select(u64 mask, Ed a, Ed b) : Ed
+{
+    Ed { .x = fe_select(
+        mask,
+        a.x,
+        b.x,
+    ), .y = fe_select(mask, a.y, b.y), .z = fe_select(mask, a.z, b.z), .t = fe_select(mask, a.t, b.t) }
+}
+
+// The scalar (32 little-endian bytes) times p: a doubling and an addition
+// at every one of the 256 bits, the sum kept by a mask.
+fn ed_mul(slice<u8, shared> scalar, Ed p) : Ed
+{
+    Ed acc = ed_identity();
+    usize i = 256;
+    while (i > 0)
+    {
+        i -= 1;
+        acc = ed_double(acc);
+        Ed sum = ed_add(acc, p);
+        u64 bit = widen<u64>((scalar[i / 8] >> narrow<u32>(i % 8)) & 1);
+        acc = ed_select(wrapping_sub(0, bit), sum, acc);
+    }
+    acc
+}
+
+// The point's encoding (RFC 8032 §5.1.2): y, little-endian, with the low
+// bit of x in the top bit.
+fn ed_encode(Ed p) : array<u8, 32>
+{
+    array<u64, 5> zinv = fe_invert(p.z);
+    array<u8, 32> out = fe_to_bytes(fe_mul(p.y, zinv));
+    array<u8, 32> xb = fe_to_bytes(fe_mul(p.x, zinv));
+    out[31] = out[31] | ((xb[0] & 1) << 7);
+    out
+}
+
+// The point an encoding names (RFC 8032 §5.1.3), or None when it names
+// none: y not below p, no square root, or x = 0 with the sign bit set.
+fn ed_decode(slice<u8, shared> b) : Option<Ed>
+{
+    array<u64, 5> y = fe_from_bytes(b);
+    array<u8, 32> canon = fe_to_bytes(y);
+    u8 diff = 0;
+    for (usize i = 0; i < 31; i += 1)
+    {
+        diff = diff | (canon[i] ^ b[i]);
+    }
+    diff = diff | (canon[31] ^ (b[31] & 0x7f));
+    if (diff != 0)
+    {
+        return None;
+    }
+    u8 sign = b[31] >> 7;
+    array<u64, 5> y2 = fe_mul(y, y);
+    array<u64, 5> u = fe_sub(y2, [1, 0, 0, 0, 0]);
+    array<u64, 5> v = fe_add(fe_mul(ED_D, y2), [1, 0, 0, 0, 0]);
+    array<u64, 5> v3 = fe_mul(fe_mul(v, v), v);
+    array<u64, 5> v7 = fe_mul(fe_mul(v3, v3), v);
+    array<u64, 5> x = fe_mul(fe_mul(u, v3), fe_pow_p58(fe_mul(u, v7)));
+    array<u64, 5> vx2 = fe_mul(v, fe_mul(x, x));
+    if (!fe_eq(vx2, u))
+    {
+        if (!fe_eq(vx2, fe_neg(u)))
+        {
+            return None;
+        }
+        x = fe_mul(x, ED_SQRT_M1);
+    }
+    array<u8, 32> xb = fe_to_bytes(x);
+    if ((xb[0] & 1) == 0 && sign == 1 && fe_is_zero(x))
+    {
+        return None;
+    }
+    if ((xb[0] & 1) != sign)
+    {
+        x = fe_neg(x);
+    }
+    Some(Ed { .x = x, .y = y, .z = [1, 0, 0, 0, 0], .t = fe_mul(x, y) })
+}
+
+// Arithmetic modulo the group order L = 2^252 + 27742317777372353535851937790883648493.
+fn ed_order() : Field
+{
+    Field { .m = [
+        0x5812631a5cf5d3ed,
+        0x14def9dea2f79cd6,
+        0x0000000000000000,
+        0x1000000000000000,
+        0x0000000000000000,
+        0x0000000000000000,
+    ], .n = 4, .minv = 0xd2b51da312547e1b, .r2 = [
+        0xa40611e3449c0f01,
+        0xd00e1ba768859347,
+        0xceec73d217f5be65,
+        0x0399411b7c309a3d,
+        0x0000000000000000,
+        0x0000000000000000,
+    ] }
+}
+
+// 32 little-endian bytes as four limbs (any value below 2^256).
+fn le_limbs(slice<u8, shared> b) : array<u64, 6>
+{
+    array<u64, 6> r = [0; 6];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        r[i / 8] = r[i / 8] | (widen<u64>(b[i]) << narrow<u32>(8 * (i % 8)));
+    }
+    r
+}
+
+// A number below 2^256, as limbs, in Montgomery form mod L: one
+// multiplication by R² reduces it, whatever its size.
+fn sc_mont(ref<Field, shared> fl, array<u64, 6> a) : array<u64, 6>
+{
+    mont_mul(fl, a, fl.r2)
+}
+
+// A 64-byte hash, little-endian, mod L, in Montgomery form: lo + hi·2^256.
+fn sc_from_hash(ref<Field, shared> fl, slice<u8, shared> h) : array<u64, 6>
+{
+    array<u64, 6> lo = sc_mont(fl, le_limbs(&h[0..32]));
+    array<u64, 6> hi = sc_mont(fl, sc_mont(fl, le_limbs(&h[32..64])));
+    f_add(fl, lo, hi)
+}
+
+// A scalar in Montgomery form as 32 little-endian bytes.
+fn sc_bytes(ref<Field, shared> fl, array<u64, 6> m) : array<u8, 32>
+{
+    array<u64, 6> a = f_from_mont(fl, m);
+    array<u8, 32> out = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        out[i] = narrow_wrapping<u8>(a[i / 8] >> narrow<u32>(8 * (i % 8)));
+    }
+    out
+}
+
+// The expanded private key: the clamped scalar and the prefix (RFC 8032
+// §5.1.5).
+struct EdExpanded
+{
+    array<u8, 32> scalar;
+    array<u8, 32> prefix;
+}
+
+fn ed_expand(slice<u8, shared> private_key) : EdExpanded
+{
+    if (slice_len(private_key) != 32)
+    {
+        fault(crypto_length);
+    }
+    array<u8, 64> h = sha512(private_key);
+    array<u8, 32> s = [0; 32];
+    array<u8, 32> prefix = [0; 32];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        s[i] = h[i];
+        prefix[i] = h[32 + i];
+    }
+    s[0] = s[0] & 248;
+    s[31] = (s[31] & 127) | 64;
+    EdExpanded { .scalar = s, .prefix = prefix }
+}
+
+// A new private key: 32 bytes of `os_random_bytes`.
+export fn ed25519_private_key() : array<u8, 32>
+{
+    array<u8, 32> k = [0; 32];
+    os_random_bytes(&mut k[0..$]);
+    k
+}
+
+// The public key of a 32-byte private key (another length is
+// `diag.crypto-length`): the encoding of the clamped scalar times the base
+// point.
+export fn ed25519_public_key(slice<u8, shared> private_key) : array<u8, 32>
+{
+    EdExpanded e = ed_expand(private_key);
+    ed_encode(ed_mul(&e.scalar[0..$], ed_base()))
+}
+
+// The signature of `message` by `private_key` (RFC 8032 §5.1.6): R ‖ S,
+// 64 bytes, the same for the same key and message every time, with no
+// random number to repeat.
+export fn ed25519_sign(slice<u8, shared> private_key, slice<u8, shared> message) : array<u8, 64>
+{
+    EdExpanded e = ed_expand(private_key);
+    Field fl = ed_order();
+    array<u8, 32> a = ed_encode(ed_mul(&e.scalar[0..$], ed_base()));
+    Sha512 hr = Sha512::new();
+    Sha512::update(&mut hr, &e.prefix[0..$]);
+    Sha512::update(&mut hr, message);
+    array<u64, 6> r = sc_from_hash(&fl, &Sha512::finish(hr)[0..$]);
+    array<u8, 32> r_bytes = sc_bytes(&fl, r);
+    array<u8, 32> big_r = ed_encode(ed_mul(&r_bytes[0..$], ed_base()));
+    Sha512 hk = Sha512::new();
+    Sha512::update(&mut hk, &big_r[0..$]);
+    Sha512::update(&mut hk, &a[0..$]);
+    Sha512::update(&mut hk, message);
+    array<u64, 6> k = sc_from_hash(&fl, &Sha512::finish(hk)[0..$]);
+    array<u64, 6> s = f_add(&fl, r, mont_mul(&fl, k, sc_mont(&fl, le_limbs(&e.scalar[0..$]))));
+    array<u8, 32> s_bytes = sc_bytes(&fl, s);
+    array<u8, 64> out = [0; 64];
+    for (usize i = 0; i < 32; i += 1)
+    {
+        out[i] = big_r[i];
+        out[32 + i] = s_bytes[i];
+    }
+    out
+}
+
+// Whether `signature` is `public_key`'s Ed25519 signature of `message`
+// (RFC 8032 §5.1.7): [S]B = R + [k]A, with S below L and R and A valid
+// encodings. A key or signature of another length is false.
+export fn ed25519_verify(slice<u8, shared> public_key, slice<u8, shared> message, slice<u8, shared> signature) : bool
+{
+    if (slice_len(public_key) != 32 || slice_len(signature) != 64)
+    {
+        return false;
+    }
+    Ed a = match (ed_decode(public_key))
+    {
+        Some(p) : p,
+        None    : return false,
+    };
+    Ed big_r = match (ed_decode(&signature[0..32]))
+    {
+        Some(p) : p,
+        None    : return false,
+    };
+    Field fl = ed_order();
+    array<u64, 6> s = le_limbs(&signature[32..64]);
+    if (!f_less(&fl, s, fl.m))
+    {
+        return false;
+    }
+    Sha512 hk = Sha512::new();
+    Sha512::update(&mut hk, &signature[0..32]);
+    Sha512::update(&mut hk, public_key);
+    Sha512::update(&mut hk, message);
+    array<u8, 32> k = sc_bytes(&fl, sc_from_hash(&fl, &Sha512::finish(hk)[0..$]));
+    array<u8, 32> lhs = ed_encode(ed_mul(&signature[32..64], ed_base()));
+    array<u8, 32> rhs = ed_encode(ed_add(big_r, ed_mul(&k[0..$], a)));
+    digest_eq(&lhs[0..$], &rhs[0..$])
+}
+
+// ---- RSA private keys, signing and key generation (D-0169) ----
+//
+// The private operation runs on Montgomery arithmetic over 64-bit limbs of
+// a fixed length, the exponent taken in 4-bit windows whose table entry is
+// chosen by scanning the whole table with masks: the same multiplications
+// in the same order whatever the key. The two prime halves are combined by
+// the Chinese remainder theorem on the same fixed-length arithmetic, and
+// the result is checked against the public key before it is given out, so
+// a miscomputation can never reveal the primes. `BigUint` (std::math),
+// which takes time that depends on its values, touches only public
+// numbers: the padded message, the result and the public key.
+
+// Montgomery arithmetic modulo an odd `m` of `n` limbs: `minv` = -m⁻¹ mod
+// 2^64, `r2` = R² mod m, R = 2^(64·n).
+struct Mont
+{
+    Vec<u64> m;
+    usize n;
+    u64 minv;
+    Vec<u64> r2;
+}
+
+// The limbs of `a`, least significant first, padded to `n`.
+fn limbs_of(ref<BigUint, shared> a, usize n) : Vec<u64>
+{
+    Vec<u8> be = BigUint::to_bytes_be_padded(a, 8 * n);
+    Vec<u64> out = Vec::filled(n, 0: u64);
+    for (usize i = 0; i < 8 * n; i += 1)
+    {
+        out[i / 8] = out[i / 8] | (widen<u64>(be[8 * n - 1 - i]) << narrow<u32>(8 * (i % 8)));
+    }
+    out
+}
+
+fn biguint_of(ref<Vec<u64>, shared> limbs) : BigUint
+{
+    usize n = Vec::len(limbs);
+    Vec<u8> be = Vec::filled(8 * n, 0: u8);
+    for (usize i = 0; i < 8 * n; i += 1)
+    {
+        be[8 * n - 1 - i] = narrow_wrapping<u8>(limbs[i / 8] >> narrow<u32>(8 * (i % 8)));
+    }
+    BigUint::from_bytes_be(&be[0..$])
+}
+
+fn mont_new(ref<BigUint, shared> modulus) : Mont
+{
+    usize n = (BigUint::bit_len(modulus) + 63) / 64;
+    Vec<u64> m = limbs_of(modulus, n);
+    // m⁻¹ mod 2^64 by Newton's iteration from the odd m's own low limb.
+    u64 inv = 1;
+    for (usize i = 0; i < 7; i += 1)
+    {
+        inv = wrapping_mul(inv, wrapping_sub(2, wrapping_mul(m[0], inv)));
+    }
+    BigUint one = BigUint::from_u64(1);
+    BigUint r2 = BigUint::rem(&BigUint::shift_left(&one, 128 * n), modulus);
+    Mont { .m = m, .n = n, .minv = wrapping_sub(0, inv), .r2 = limbs_of(&r2, n) }
+}
+
+// a·b·R⁻¹ mod m (coarsely integrated operand scanning), a and b below m.
+fn mont_mul_v(ref<Mont, shared> f, ref<Vec<u64>, shared> a, ref<Vec<u64>, shared> b) : Vec<u64>
+{
+    usize n = f.n;
+    Vec<u64> t = Vec::filled(n + 2, 0: u64);
+    for (usize i = 0; i < n; i += 1)
+    {
+        u128 c = 0;
+        u128 bi = widen<u128>(b[i]);
+        for (usize j = 0; j < n; j += 1)
+        {
+            u128 x = widen<u128>(t[j]) + widen<u128>(a[j]) * bi + c;
+            t[j] = narrow_wrapping<u64>(x);
+            c = x >> 64;
+        }
+        u128 y = widen<u128>(t[n]) + c;
+        t[n] = narrow_wrapping<u64>(y);
+        t[n + 1] = narrow_wrapping<u64>(y >> 64);
+        u64 k = wrapping_mul(t[0], f.minv);
+        u128 kk = widen<u128>(k);
+        u128 z = widen<u128>(t[0]) + kk * widen<u128>(f.m[0]);
+        c = z >> 64;
+        for (usize j = 1; j < n; j += 1)
+        {
+            u128 x = widen<u128>(t[j]) + kk * widen<u128>(f.m[j]) + c;
+            t[j - 1] = narrow_wrapping<u64>(x);
+            c = x >> 64;
+        }
+        u128 w = widen<u128>(t[n]) + c;
+        t[n - 1] = narrow_wrapping<u64>(w);
+        t[n] = t[n + 1] + narrow_wrapping<u64>(w >> 64);
+    }
+    // t - m unless t (with its carry) is below m: chosen by a mask.
+    Vec<u64> r = Vec::filled(n, 0: u64);
+    u64 borrow = 0;
+    for (usize j = 0; j < n; j += 1)
+    {
+        u128 x = wrapping_sub(wrapping_sub(widen<u128>(t[j]), widen<u128>(f.m[j])), widen<u128>(borrow));
+        r[j] = narrow_wrapping<u64>(x);
+        borrow = narrow_wrapping<u64>(x >> 127);
+    }
+    u64 keep = wrapping_sub(0, (1 - t[n]) & borrow);
+    for (usize j = 0; j < n; j += 1)
+    {
+        r[j] = (t[j] & keep) | (r[j] & ~keep);
+    }
+    r
+}
+
+// base^exp mod m, base below m: a fixed 4-bit window over every bit of
+// `exp`'s `n` limbs, the table entry selected by masks, so the work does
+// not depend on the exponent.
+fn mont_pow(ref<Mont, shared> f, ref<BigUint, shared> base, ref<BigUint, shared> exp) : BigUint
+{
+    biguint_of(&mont_pow_limbs(f, &limbs_of(base, f.n), exp))
+}
+
+fn mont_pow_limbs(ref<Mont, shared> f, ref<Vec<u64>, shared> base, ref<BigUint, shared> exp) : Vec<u64>
+{
+    usize n = f.n;
+    Vec<u64> one = Vec::filled(n, 0: u64);
+    one[0] = 1;
+    Vec<u64> one_m = mont_mul_v(f, &one, &f.r2);
+    Vec<u64> base_m = mont_mul_v(f, base, &f.r2);
+    Vec<Vec<u64>> table = Vec::new();
+    Vec::push(&mut table, Vec::clone(&one_m));
+    for (usize i = 1; i < 16; i += 1)
+    {
+        Vec<u64> next = mont_mul_v(f, &table[i - 1], &base_m);
+        Vec::push(&mut table, next);
+    }
+    Vec<u64> e = limbs_of(exp, n);
+    Vec<u64> acc = Vec::clone(&one_m);
+    usize windows = 16 * n;
+    usize w = windows;
+    while (w > 0)
+    {
+        w -= 1;
+        for (usize s = 0; s < 4; s += 1)
+        {
+            overwrite(&mut acc, mont_mul_v(f, &acc, &acc));
+        }
+        u64 bits = (e[w / 16] >> narrow<u32>(4 * (w % 16))) & 15;
+        Vec<u64> entry = Vec::filled(n, 0: u64);
+        for (u64 i = 0; i < 16; i += 1)
+        {
+            u64 x = i ^ bits;
+            u64 mask = wrapping_sub(((x | wrapping_sub(0, x)) >> 63), 1);
+            for (usize j = 0; j < n; j += 1)
+            {
+                entry[j] = entry[j] | (table[narrow<usize>(i)][j] & mask);
+            }
+        }
+        overwrite(&mut acc, mont_mul_v(f, &acc, &entry));
+    }
+    mont_mul_v(f, &acc, &one)
+}
+
+// An RSA private key: the public modulus and exponent, the private
+// exponent and the two primes, with the CRT values the private operation
+// uses.
+export struct RsaPrivateKey
+{
+    export BigUint n;
+    export BigUint e;
+    export BigUint d;
+    export BigUint p;
+    export BigUint q;
+    BigUint dp;
+    BigUint dq;
+    BigUint qinv;
+}
+
+// The key with these parts, or None when they do not fit together: p·q
+// must be n, p and q odd and above 1, and e·d ≡ 1 modulo p-1 and q-1.
+export fn RsaPrivateKey::new(BigUint n, BigUint e, BigUint d, BigUint p, BigUint q) : Option<RsaPrivateKey>
+{
+    BigUint one = BigUint::from_u64(1);
+    BigUint two = BigUint::from_u64(2);
+    if (!BigUint::less(&two, &p) || !BigUint::less(&two, &q) || !BigUint::bit(&p, 0) || !BigUint::bit(&q, 0))
+    {
+        return None;
+    }
+    if (!BigUint::eq(&BigUint::mul(&p, &q), &n))
+    {
+        return None;
+    }
+    BigUint p1 = BigUint::sub(&p, &one);
+    BigUint q1 = BigUint::sub(&q, &one);
+    BigUint ed = BigUint::mul(&e, &d);
+    if (!BigUint::eq(&BigUint::rem(&ed, &p1), &one) || !BigUint::eq(&BigUint::rem(&ed, &q1), &one))
+    {
+        return None;
+    }
+    BigUint dp = BigUint::rem(&d, &p1);
+    BigUint dq = BigUint::rem(&d, &q1);
+    BigUint qinv = BigUint::mod_inverse(&q, &p)?;
+    Some(RsaPrivateKey { .n = n, .e = e, .d = d, .p = p, .q = q, .dp = dp, .dq = dq, .qinv = qinv })
+}
+
+export fn RsaPrivateKey::public_key(ref<RsaPrivateKey, shared> key) : RsaPublicKey
+{
+    RsaPublicKey { .n = BigUint::clone(&key.n), .e = BigUint::clone(&key.e) }
+}
+
+// a - b mod m over `n` limbs, a and b below m, by masks.
+fn limbs_sub_mod(ref<Mont, shared> f, ref<Vec<u64>, shared> a, ref<Vec<u64>, shared> b) : Vec<u64>
+{
+    usize n = f.n;
+    Vec<u64> r = Vec::filled(n, 0: u64);
+    u64 borrow = 0;
+    for (usize j = 0; j < n; j += 1)
+    {
+        u128 x = wrapping_sub(wrapping_sub(widen<u128>(a[j]), widen<u128>(b[j])), widen<u128>(borrow));
+        r[j] = narrow_wrapping<u64>(x);
+        borrow = narrow_wrapping<u64>(x >> 127);
+    }
+    // Add m back where it borrowed.
+    u64 mask = wrapping_sub(0, borrow);
+    u64 carry = 0;
+    for (usize j = 0; j < n; j += 1)
+    {
+        u128 x = widen<u128>(r[j]) + widen<u128>(f.m[j] & mask) + widen<u128>(carry);
+        r[j] = narrow_wrapping<u64>(x);
+        carry = narrow_wrapping<u64>(x >> 64);
+    }
+    r
+}
+
+// m^d mod n for m below n: the two halves modulo p and q, combined by
+// Garner's formula on fixed-length limbs, and checked.
+fn rsa_private_op(ref<RsaPrivateKey, shared> key, ref<BigUint, shared> m) : BigUint
+{
+    Mont mp = mont_new(&key.p);
+    Mont mq = mont_new(&key.q);
+    usize np = mp.n;
+    usize nq = mq.n;
+    // m1 = m^dp mod p, m2 = m^dq mod q (m reduced: public values).
+    Vec<u64> m1 = mont_pow_limbs(&mp, &limbs_of(&BigUint::rem(m, &key.p), np), &key.dp);
+    Vec<u64> m2 = mont_pow_limbs(&mq, &limbs_of(&BigUint::rem(m, &key.q), nq), &key.dq);
+    // h = qinv·(m1 - m2 mod p) mod p, on p's arithmetic.
+    Vec<u64> m2_mod_p = limbs_of(&BigUint::rem(&biguint_of(&m2), &key.p), np);
+    Vec<u64> diff = limbs_sub_mod(&mp, &m1, &m2_mod_p);
+    Vec<u64> qinv_m = mont_mul_v(&mp, &limbs_of(&key.qinv, np), &mp.r2);
+    Vec<u64> h = mont_mul_v(&mp, &diff, &qinv_m);
+    // s = m2 + h·q: a plain product over limbs, then the sum.
+    Vec<u64> q_limbs = limbs_of(&key.q, nq);
+    Vec<u64> s = Vec::filled(np + nq + 1, 0: u64);
+    for (usize i = 0; i < np; i += 1)
+    {
+        u128 carry = 0;
+        u128 hi = widen<u128>(h[i]);
+        for (usize j = 0; j < nq; j += 1)
+        {
+            u128 x = widen<u128>(s[i + j]) + hi * widen<u128>(q_limbs[j]) + carry;
+            s[i + j] = narrow_wrapping<u64>(x);
+            carry = x >> 64;
+        }
+        s[i + nq] = narrow_wrapping<u64>(carry);
+    }
+    u128 c = 0;
+    for (usize j = 0; j < np + nq + 1; j += 1)
+    {
+        u128 x = widen<u128>(s[j]) + (if (j < nq) { widen<u128>(m2[j]) } else { 0 }) + c;
+        s[j] = narrow_wrapping<u64>(x);
+        c = x >> 64;
+    }
+    BigUint result = biguint_of(&s);
+    // Checked against the public key: a wrong result would leak the
+    // primes, so a key that fails is used without the CRT instead.
+    if (BigUint::eq(&BigUint::mod_pow(&result, &key.e, &key.n), m))
+    {
+        return result;
+    }
+    Mont mn = mont_new(&key.n);
+    mont_pow(&mn, m, &key.d)
+}
+
+// The EMSA-PKCS1-v1_5 encoding (RFC 8017 §9.2) of `digest` in `k` bytes;
+// too short a modulus is `diag.crypto-length`.
+fn pkcs1v15_encode(HashKind kind, slice<u8, shared> digest, usize k) : Vec<u8>
+{
+    Vec<u8> prefix = digest_info_prefix(kind);
+    usize t_len = Vec::len(&prefix) + slice_len(digest);
+    if (slice_len(digest) != hash_len(kind) || k < t_len + 11)
+    {
+        fault(crypto_length);
+    }
+    Vec<u8> em = Vec::new();
+    Vec::push(&mut em, 0);
+    Vec::push(&mut em, 1);
+    for (usize i = 0; i < k - t_len - 3; i += 1)
+    {
+        Vec::push(&mut em, 0xff);
+    }
+    Vec::push(&mut em, 0);
+    Vec::extend_from(&mut em, &prefix[0..$]);
+    Vec::extend_from(&mut em, digest);
+    em
+}
+
+// `key`'s RSASSA-PKCS1-v1_5 signature (RFC 8017 §8.2.1) of a message
+// whose `kind` digest is `digest`: as many bytes as the modulus, the same
+// every time. A digest of the wrong length, or a modulus too short for the
+// encoding, is `diag.crypto-length`.
+export fn rsa_sign_pkcs1v15(ref<RsaPrivateKey, shared> key, HashKind kind, slice<u8, shared> digest) : Vec<u8>
+{
+    usize k = (BigUint::bit_len(&key.n) + 7) / 8;
+    Vec<u8> em = pkcs1v15_encode(kind, digest, k);
+    BigUint s = rsa_private_op(key, &BigUint::from_bytes_be(&em[0..$]));
+    BigUint::to_bytes_be_padded(&s, k)
+}
+
+// `key`'s RSASSA-PSS signature (RFC 8017 §8.1.1) of a message whose
+// `kind` digest is `digest`, with MGF1 over the same hash and a random
+// salt as long as the digest, as `rsa_verify_pss` expects: a different
+// signature every time, each of them valid.
+export fn rsa_sign_pss(ref<RsaPrivateKey, shared> key, HashKind kind, slice<u8, shared> digest) : Vec<u8>
+{
+    usize mod_bits = BigUint::bit_len(&key.n);
+    usize k = (mod_bits + 7) / 8;
+    usize h_len = hash_len(kind);
+    usize em_bits = mod_bits - 1;
+    usize em_len = (em_bits + 7) / 8;
+    if (slice_len(digest) != h_len || em_len < 2 * h_len + 2)
+    {
+        fault(crypto_length);
+    }
+    Vec<u8> salt = Vec::filled(h_len, 0: u8);
+    os_random_bytes(&mut salt[0..$]);
+    Vec<u8> m2 = Vec::filled(8, 0: u8);
+    Vec::extend_from(&mut m2, digest);
+    Vec::extend_from(&mut m2, &salt[0..$]);
+    Vec<u8> h = hash(kind, &m2[0..$]);
+    usize db_len = em_len - h_len - 1;
+    Vec<u8> db = Vec::filled(db_len - h_len - 1, 0: u8);
+    Vec::push(&mut db, 1);
+    Vec::extend_from(&mut db, &salt[0..$]);
+    Vec<u8> mask = mgf1(kind, &h[0..$], db_len);
+    Vec<u8> em = Vec::new();
+    for (usize i = 0; i < db_len; i += 1)
+    {
+        Vec::push(&mut em, db[i] ^ mask[i]);
+    }
+    u32 unused = narrow<u32>(8 * em_len - em_bits);
+    em[0] = em[0] & narrow_wrapping<u8>((0xff: u32) >> unused);
+    Vec::extend_from(&mut em, &h[0..$]);
+    Vec::push(&mut em, 0xbc);
+    BigUint s = rsa_private_op(key, &BigUint::from_bytes_be(&em[0..$]));
+    BigUint::to_bytes_be_padded(&s, k)
+}
+
+// The odd primes below 1000, for trial division.
+fn small_primes() : Vec<u32>
+{
+    Vec<u32> out = Vec::new();
+    for (u32 c = 3; c < 1000; c += 2)
+    {
+        bool prime = true;
+        for (usize i = 0; i < Vec::len(&out) && out[i] * out[i] <= c; i += 1)
+        {
+            if (c % out[i] == 0)
+            {
+                prime = false;
+                break;
+            }
+        }
+        if (prime)
+        {
+            Vec::push(&mut out, c);
+        }
+    }
+    out
+}
+
+// Whether the odd `c` is prime beyond reasonable doubt: no small factor,
+// then `rounds` of Miller-Rabin with random bases (FIPS 186-4 C.3.1).
+fn probably_prime(ref<BigUint, shared> c, ref<Vec<u32>, shared> primes, usize rounds) : bool
+{
+    for (usize i = 0; i < Vec::len(primes); i += 1)
+    {
+        BigUint p = BigUint::from_u64(widen<u64>(primes[i]));
+        if (BigUint::is_zero(&BigUint::rem(c, &p)))
+        {
+            return BigUint::eq(c, &p);
+        }
+    }
+    BigUint one = BigUint::from_u64(1);
+    BigUint c1 = BigUint::sub(c, &one);
+    usize a = 0;
+    while (!BigUint::bit(&c1, a))
+    {
+        a += 1;
+    }
+    BigUint m = BigUint::shift_right(&c1, a);
+    Mont f = mont_new(c);
+    usize k = (BigUint::bit_len(c) + 7) / 8;
+    Vec<u8> rb = Vec::filled(k, 0: u8);
+    BigUint two = BigUint::from_u64(2);
+    for (usize round = 0; round < rounds; round += 1)
+    {
+        os_random_bytes(&mut rb[0..$]);
+        BigUint b = BigUint::add(
+            &BigUint::rem(&BigUint::from_bytes_be(&rb[0..$]), &BigUint::sub(c, &BigUint::from_u64(3))),
+            &two,
+        );
+        BigUint z = mont_pow(&f, &b, &m);
+        if (BigUint::eq(&z, &one) || BigUint::eq(&z, &c1))
+        {
+            continue;
+        }
+        bool witness = true;
+        for (usize j = 1; j < a; j += 1)
+        {
+            overwrite(&mut z, BigUint::rem(&BigUint::mul(&z, &z), c));
+            if (BigUint::eq(&z, &c1))
+            {
+                witness = false;
+                break;
+            }
+            if (BigUint::eq(&z, &one))
+            {
+                return false;
+            }
+        }
+        if (witness)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// A random prime of exactly `bits` bits (its top two bits set, so a
+// product of two is exactly twice as long), odd, with p - 1 prime to `e`.
+fn random_prime(usize bits, ref<BigUint, shared> e, ref<Vec<u32>, shared> primes) : BigUint
+{
+    usize k = (bits + 7) / 8;
+    Vec<u8> rb = Vec::filled(k, 0: u8);
+    BigUint one = BigUint::from_u64(1);
+    while (true)
+    {
+        os_random_bytes(&mut rb[0..$]);
+        BigUint c = BigUint::from_bytes_be(&rb[0..$]);
+        // Exactly `bits` bits with the top two set, and odd.
+        BigUint top = BigUint::shift_left(&one, bits - 1);
+        BigUint second = BigUint::shift_left(&one, bits - 2);
+        BigUint mask = BigUint::sub(&BigUint::shift_left(&one, bits), &one);
+        BigUint c2 = BigUint::rem(&c, &BigUint::add(&mask, &one));
+        BigUint c3 = BigUint::add(&BigUint::rem(&c2, &second), &BigUint::add(&top, &second));
+        if (!BigUint::bit(&c3, 0))
+        {
+            overwrite(&mut c3, BigUint::add(&c3, &one));
+        }
+        BigUint c4 = BigUint::sub(&c3, &one);
+        if (BigUint::is_zero(&BigUint::rem(&c4, e)))
+        {
+            continue;
+        }
+        if (probably_prime(&c3, primes, 5))
+        {
+            return c3;
+        }
+    }
+}
+
+// A new key of `bits` bits (1024 to 8192, a multiple of 64; another is
+// `diag.crypto-length`) with the public exponent 65537: two random primes
+// of half the length, found by trial division and Miller-Rabin
+// (FIPS 186-4 B.3.3), from `os_random_bytes`. Slow under an interpreter,
+// as every key generation is.
+export fn rsa_generate_key(usize bits) : RsaPrivateKey
+{
+    if (bits < 1024 || bits > 8192 || bits % 64 != 0)
+    {
+        fault(crypto_length);
+    }
+    Vec<u32> primes = small_primes();
+    BigUint e = BigUint::from_u64(65537);
+    BigUint one = BigUint::from_u64(1);
+    while (true)
+    {
+        BigUint p = random_prime(bits / 2, &e, &primes);
+        BigUint q = random_prime(bits / 2, &e, &primes);
+        if (BigUint::eq(&p, &q))
+        {
+            continue;
+        }
+        BigUint n = BigUint::mul(&p, &q);
+        BigUint p1 = BigUint::sub(&p, &one);
+        BigUint q1 = BigUint::sub(&q, &one);
+        BigUint phi = BigUint::mul(&p1, &q1);
+        BigUint d = match (BigUint::mod_inverse(&e, &phi))
+        {
+            Some(v) : v,
+            None    : continue,
+        };
+        if (Some(key) = RsaPrivateKey::new(n, BigUint::clone(&e), d, p, q))
+        {
+            return key;
+        }
+    }
+}

@@ -1,0 +1,119 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.spawn [Spawn] [Join]; rule.conc.channel; rule.conc.mutex; D-0202; conf.heaps-meet
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 73756d2031323630332070697065642039206c6f6767656420362072656c6561736564203236300a
+//
+// The places where threads' runtime state meets (D-0202, `cbrt` keeps
+// each running thread's records in a heap of its own): three readers go
+// through one `Vec<String>` of the main thread at once by a shared
+// reference, each building its own map; each appends to a mutex-guarded
+// `Vec<String>` and sends a clone through a channel to a collector; then
+// 260 threads are alive at once, each waiting on a channel (more threads
+// than `cbrt` has heaps for: the last ones share one), and are released.
+// The totals are the same in every run.
+
+import std;
+
+fn reader(
+    ref<Vec<String>, shared> words,
+    ref<mutex<Vec<String>>, shared> log,
+    ref<Channel<String>, shared> out,
+    usize id,
+    usize rounds,
+) : usize
+{
+    usize total = 0;
+    HashMap<String, usize> seen = HashMap::new();
+    foreach (r in 0..rounds)
+    {
+        foreach (w in words)
+        {
+            total += String::len(w);
+            *HashMap::entry(&mut seen, String::clone(w), 0) += 1;
+        }
+        {
+            auto g = lock(log);
+            Vec::push(&mut *g, String::from_str("round"));
+        }
+        _ = Channel::send(out, String::clone(&words[r % Vec::len(words)]));
+    }
+    total + HashMap::len(&seen)
+}
+
+fn collect(ref<Channel<String>, shared> inp) : usize
+{
+    usize n = 0;
+    while (Some(s) = Channel::recv(inp))
+    {
+        n += String::len(&s);
+    }
+    n
+}
+
+fn sleeper(ref<Channel<usize>, shared> go) : usize
+{
+    match (Channel::recv(go))
+    {
+        Some(v) : v,
+        None    : 0,
+    }
+}
+
+fn main() : u8
+{
+    usize readers = 3;
+    usize rounds = 2;
+    usize many = 260;
+    Vec<String> words = Vec::new();
+    foreach (i in 0..300)
+    {
+        String s = String::from_str("w");
+        foreach (k in 0..(i % 13))
+        {
+            String::append(&mut s, "x");
+        }
+        Vec::push(&mut words, s);
+    }
+    Vec<String> empty = Vec::new();
+    auto log = Mutex::new(empty);
+    Channel<String> ch = Channel::new(8);
+    usize sum = 0;
+    usize piped = 0;
+    {
+        auto c = spawn(collect, &ch);
+        Vec<handle<usize>> hs = Vec::new();
+        foreach (i in 0..readers)
+        {
+            Vec::push(&mut hs, spawn(reader, &words, &log, &ch, i, rounds));
+        }
+        while (Vec::len(&hs) > 0)
+        {
+            sum += join(Option::unwrap(Vec::pop(&mut hs)));
+        }
+        Channel::close(&ch);
+        piped = join(c);
+    }
+    usize logged = Vec::len(&*lock(&log));
+    // Many threads alive at once.
+    Channel<usize> go = Channel::new(1);
+    usize released = 0;
+    {
+        Vec<handle<usize>> ss = Vec::new();
+        foreach (i in 0..many)
+        {
+            Vec::push(&mut ss, spawn(sleeper, &go));
+        }
+        foreach (i in 0..many)
+        {
+            _ = Channel::send(&go, 1);
+        }
+        while (Vec::len(&ss) > 0)
+        {
+            released += join(Option::unwrap(Vec::pop(&mut ss)));
+        }
+    }
+    printf("sum %v piped %v logged %v released %v\n", sum, piped, logged, released);
+    0
+}

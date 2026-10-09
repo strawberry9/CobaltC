@@ -1,0 +1,141 @@
+// Log rotation
+//
+// Shows: dates, paths and file metadata together, as a deployed service
+// keeps its logs. Each day's log is named from a `DateTime` (fixed here,
+// so the output is the same every run; a real service takes
+// `DateTime::now()`), placed with `path_join` rather than glued with
+// `/`, and its parts read back with `path_stem` and `path_extension`.
+// Rotation keeps the newest three days: older logs are copied into an
+// `archive/` directory made with `make_dir_all` (and `copy_file` says how
+// many bytes moved) before the originals are removed, and `file_info`
+// reports each survivor's size. Everything happens in a scratch
+// directory under the run's directory argument, removed at the end with
+// `remove_dir_all`.
+
+import std;
+
+fn log_name(ref<DateTime, shared> day) : String
+{
+    sprintf("service-%04d-%02d-%02d.log", day.year, day.month, day.day)
+}
+
+fn is_log(ref<String, shared> name) : bool
+{
+    match (path_extension(&name[0..$]))
+    {
+        Some(e) : String::eq_str(&e, "log"),
+        None    : false,
+    }
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: logrotate DIR\n");
+        return 2;
+    }
+    String base = match (arg(0))
+    {
+        Ok(b)  : b,
+        Err(e) :
+        {
+            eprintf("logrotate: DIR: %s\n", Utf8Error::text(&e));
+            return 2;
+        },
+    };
+    String root = path_join(&base[0..$], "logs");
+    String archive = path_join(&root[0..$], "archive");
+    if (Err(e) = make_dir_all(&archive[0..$]))
+    {
+        eprintf("logrotate: %s: %s\n", &archive, FileError::text(&e));
+        return 1;
+    }
+    // Five days of logs, ending 2026-10-03; each day writes one more line.
+    DateTime end = Result::unwrap(DateTime::from_iso("2026-10-03T23:00:00Z"));
+    Vec<String> names = Vec::new();
+    for (i64 back = 4; back >= 0; back -= 1)
+    {
+        DateTime day = DateTime::from_unix(DateTime::to_unix(&end) - back * 86400);
+        String name = log_name(&day);
+        String path = path_join(&root[0..$], &name[0..$]);
+        String text = String::new();
+        for (i64 line = 0; line <= 4 - back; line += 1)
+        {
+            String stamp = DateTime::to_iso(&day);
+            String::appendf(&mut text, "%s request %d served\n", &stamp, line);
+        }
+        if (Err(e) = write_file(&path[0..$], &text[0..$]))
+        {
+            eprintf("logrotate: %s: %s\n", &path, FileError::text(&e));
+            return 1;
+        }
+        Vec::push(&mut names, name);
+    }
+    printf("%u logs written, the last %s\n", Vec::len(&names), &names[Vec::len(&names) - 1]);
+    // The names sort by date, because the date is written year first.
+    match (list_dir(&root[0..$]))
+    {
+        Ok(found) :
+        {
+            usize logs = 0;
+            foreach (n in &found)
+            {
+                if (is_log(n))
+                {
+                    logs += 1;
+                }
+            }
+            usize keep = 3;
+            usize seen = 0;
+            foreach (n in &found)
+            {
+                if (!is_log(n))
+                {
+                    continue;
+                }
+                seen += 1;
+                String from = path_join(&root[0..$], &n[0..$]);
+                if (seen + keep <= logs)
+                {
+                    String to = path_join(&archive[0..$], &n[0..$]);
+                    match (copy_file(&from[0..$], &to[0..$]))
+                    {
+                        Ok(bytes) :
+                        {
+                            _ = remove_file(&from[0..$]);
+                            String stem = Option::unwrap_or(path_stem(&n[0..$]), String::new());
+                            printf("archived %s (%u bytes)\n", &stem, bytes);
+                        },
+                        Err(e)    : printf("could not archive %s: %s\n", n, FileError::text(&e)),
+                    }
+                }
+                else
+                {
+                    match (file_info(&from[0..$]))
+                    {
+                        Ok(info) : printf("kept     %s (%u bytes)\n", n, info.len),
+                        Err(e)   : printf("%s: %s\n", n, FileError::text(&e)),
+                    }
+                }
+            }
+        },
+        Err(e)    :
+        {
+            eprintf("logrotate: %s\n", FileError::text(&e));
+            return 1;
+        },
+    }
+    match (list_dir(&archive[0..$]))
+    {
+        Ok(a)  : printf("archive holds %u files\n", Vec::len(&a)),
+        Err(e) : printf("archive: %s\n", FileError::text(&e)),
+    }
+    if (Err(e) = remove_dir_all(&root[0..$]))
+    {
+        eprintf("logrotate: %s\n", FileError::text(&e));
+        return 1;
+    }
+    printf("cleaned up: %v\n", Result::is_err(&path_kind(&root[0..$])));
+    0
+}

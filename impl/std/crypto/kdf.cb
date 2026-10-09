@@ -1,0 +1,741 @@
+// `std::crypto::kdf` (spec/21 §2m, D-0187): keyed hashing and key
+// derivation. HMAC-SHA-256 (RFC 2104, D-0151) and HKDF (RFC 5869, D-0152),
+// `Hmac` and the `_with` forms over any `HashKind` (D-0166), TLS's
+// `hkdf_expand_label` (D-0161), PBKDF2, Argon2id and password hashing
+// (D-0170).
+
+// An HMAC-SHA-256 computation in progress: the inner hash and the outer
+// one, each already fed its padded key. A plain value: a copy of a keyed
+// `HmacSha256` continues on its own.
+export struct HmacSha256
+{
+    Sha256 inner;
+    Sha256 outer;
+}
+
+// A MAC under `key`, of any length (one longer than 64 bytes is hashed
+// first, as RFC 2104 says).
+export fn HmacSha256::new(slice<u8, shared> key) : HmacSha256
+{
+    array<u8, 64> k = [0; 64];
+    if (slice_len(key) > 64)
+    {
+        array<u8, 32> d = sha256(key);
+        for (usize i = 0; i < 32; i += 1)
+        {
+            k[i] = d[i];
+        }
+    }
+    else
+    {
+        for (usize i = 0; i < slice_len(key); i += 1)
+        {
+            k[i] = key[i];
+        }
+    }
+    array<u8, 64> ipad = [0; 64];
+    array<u8, 64> opad = [0; 64];
+    for (usize i = 0; i < 64; i += 1)
+    {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    Sha256 inner = Sha256::new();
+    Sha256::update(&mut inner, &ipad[0..$]);
+    Sha256 outer = Sha256::new();
+    Sha256::update(&mut outer, &opad[0..$]);
+    HmacSha256 { .inner = inner, .outer = outer }
+}
+
+export fn HmacSha256::update(ref<HmacSha256, exclusive> m, slice<u8, shared> data)
+{
+    Sha256::update(&mut m.inner, data);
+}
+
+// The MAC of everything given: 32 bytes.
+export fn HmacSha256::finish(HmacSha256 m) : array<u8, 32>
+{
+    array<u8, 32> inner_digest = Sha256::finish(m.inner);
+    Sha256 outer = m.outer;
+    Sha256::update(&mut outer, &inner_digest[0..$]);
+    Sha256::finish(outer)
+}
+
+// The HMAC-SHA-256 of `data` under `key` in one call.
+export fn hmac_sha256(slice<u8, shared> key, slice<u8, shared> data) : array<u8, 32>
+{
+    HmacSha256 m = HmacSha256::new(key);
+    HmacSha256::update(&mut m, data);
+    HmacSha256::finish(m)
+}
+
+// HKDF-SHA-256 (RFC 5869, D-0152): key derivation over HMAC-SHA-256.
+// `hkdf_extract` condenses input keying material and an optional salt
+// into a 32-byte pseudorandom key; `hkdf_expand` stretches that key,
+// bound to `info`, to `len` bytes, at most 8160 (255 blocks). TLS 1.3's
+// key schedule is these two.
+
+// The pseudorandom key of `ikm` under `salt`; an empty `salt` stands for
+// 32 zero bytes, as the RFC says.
+export fn hkdf_extract(slice<u8, shared> salt, slice<u8, shared> ikm) : array<u8, 32>
+{
+    if (slice_len(salt) == 0)
+    {
+        array<u8, 32> zero = [0; 32];
+        return hmac_sha256(&zero[0..$], ikm);
+    }
+    hmac_sha256(salt, ikm)
+}
+
+// `len` bytes of output keying material from `prk` and `info`: block i is
+// HMAC(prk, block i-1 ‖ info ‖ i), i counted from 1 in one byte. A `len`
+// above 8160 is `diag.hkdf-length`.
+export fn hkdf_expand(slice<u8, shared> prk, slice<u8, shared> info, usize len) : Vec<u8>
+{
+    if (len > 8160)
+    {
+        fault(hkdf_length);
+    }
+    Vec<u8> out = Vec::new();
+    Vec::reserve(&mut out, len);
+    array<u8, 32> t = [0; 32];
+    usize have = 0;
+    u8 counter = 1;
+    while (Vec::len(&out) < len)
+    {
+        HmacSha256 m = HmacSha256::new(prk);
+        HmacSha256::update(&mut m, &t[0..have]);
+        HmacSha256::update(&mut m, info);
+        array<u8, 1> c = [counter];
+        HmacSha256::update(&mut m, &c[0..$]);
+        t = HmacSha256::finish(m);
+        have = 32;
+        for (usize i = 0; i < 32 && Vec::len(&out) < len; i += 1)
+        {
+            Vec::push(&mut out, t[i]);
+        }
+        if (Vec::len(&out) < len)
+        {
+            counter += 1;
+        }
+    }
+    out
+}
+
+// Extract, then expand, in one call: `len` bytes derived from `ikm` with
+// `salt` and `info`.
+export fn hkdf_sha256(slice<u8, shared> salt, slice<u8, shared> ikm, slice<u8, shared> info, usize len) : Vec<u8>
+{
+    array<u8, 32> prk = hkdf_extract(salt, ikm);
+    hkdf_expand(&prk[0..$], info, len)
+}
+
+// TLS 1.3's HKDF-Expand-Label (RFC 8446 §7.1, D-0161): HKDF-Expand of
+// `secret` with the label "tls13 " ‖ `label` and `context`, `len` bytes.
+// TLS's key schedule, and QUIC's and DTLS 1.3's, are built from it.
+export fn hkdf_expand_label(slice<u8, shared> secret, str label, slice<u8, shared> context, usize len) : Vec<u8>
+{
+    Vec<u8> info = Vec::new();
+    Vec::push_be(&mut info, narrow<u16>(len));
+    Vec::push(&mut info, narrow<u8>(6 + str_len(label)));
+    Vec::extend_from(&mut info, &b"tls13 "[0..$]);
+    for (usize i = 0; i < str_len(label); i += 1)
+    {
+        Vec::push(&mut info, str_byte(label, i));
+    }
+    Vec::push(&mut info, narrow<u8>(slice_len(context)));
+    Vec::extend_from(&mut info, context);
+    hkdf_expand(secret, &info[0..$], len)
+}
+
+// An HMAC (RFC 2104) over a `HashKind` chosen at run time: the inner hash,
+// already fed the padded key, and the outer padded key for `finish`. A
+// plain value: a copy of a keyed `Hmac` continues on its own, which is how
+// `pbkdf2` reuses one key setup for every iteration.
+export struct Hmac
+{
+    Hasher inner;
+    array<u8, 128> outer_key;
+}
+
+// A MAC under `key`, of any length (one longer than the hash's block is
+// hashed first).
+export fn Hmac::new(HashKind kind, slice<u8, shared> key) : Hmac
+{
+    usize b = block_len(kind);
+    Vec<u8> k = Vec::filled(b, 0: u8);
+    if (slice_len(key) > b)
+    {
+        Vec<u8> d = hash(kind, key);
+        for (usize i = 0; i < Vec::len(&d); i += 1)
+        {
+            k[i] = d[i];
+        }
+    }
+    else
+    {
+        for (usize i = 0; i < slice_len(key); i += 1)
+        {
+            k[i] = key[i];
+        }
+    }
+    Vec<u8> ipad = Vec::filled(b, 0: u8);
+    array<u8, 128> opad = [0; 128];
+    for (usize i = 0; i < b; i += 1)
+    {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    Hasher inner = Hasher::new(kind);
+    Hasher::update(&mut inner, &ipad[0..$]);
+    Hmac { .inner = inner, .outer_key = opad }
+}
+
+export fn Hmac::update(ref<Hmac, exclusive> m, slice<u8, shared> data)
+{
+    Hasher::update(&mut m.inner, data);
+}
+
+// The MAC of everything given: as long as the hash's digest.
+export fn Hmac::finish(Hmac m) : Vec<u8>
+{
+    HashKind kind = m.inner.kind;
+    Vec<u8> inner_digest = Hasher::finish(m.inner);
+    Hasher outer = Hasher::new(kind);
+    Hasher::update(&mut outer, &m.outer_key[0..block_len(kind)]);
+    Hasher::update(&mut outer, &inner_digest[0..$]);
+    Hasher::finish(outer)
+}
+
+// The HMAC of `data` under `key` over `kind`, in one call.
+export fn hmac(HashKind kind, slice<u8, shared> key, slice<u8, shared> data) : Vec<u8>
+{
+    Hmac m = Hmac::new(kind, key);
+    Hmac::update(&mut m, data);
+    Hmac::finish(m)
+}
+
+// HKDF (RFC 5869) over `kind`: as `hkdf_extract`, `hkdf_expand` and
+// `hkdf_sha256`, with the hash's own digest length in place of 32 and a
+// `len` of at most 255 digests (`diag.hkdf-length` above that).
+export fn hkdf_extract_with(HashKind kind, slice<u8, shared> salt, slice<u8, shared> ikm) : Vec<u8>
+{
+    if (slice_len(salt) == 0)
+    {
+        Vec<u8> zero = Vec::filled(hash_len(kind), 0: u8);
+        return hmac(kind, &zero[0..$], ikm);
+    }
+    hmac(kind, salt, ikm)
+}
+
+export fn hkdf_expand_with(HashKind kind, slice<u8, shared> prk, slice<u8, shared> info, usize len) : Vec<u8>
+{
+    usize h = hash_len(kind);
+    if (len > 255 * h)
+    {
+        fault(hkdf_length);
+    }
+    Vec<u8> out = Vec::new();
+    Vec::reserve(&mut out, len);
+    Vec<u8> t = Vec::new();
+    u8 counter = 1;
+    while (Vec::len(&out) < len)
+    {
+        Hmac m = Hmac::new(kind, prk);
+        Hmac::update(&mut m, &t[0..$]);
+        Hmac::update(&mut m, info);
+        array<u8, 1> c = [counter];
+        Hmac::update(&mut m, &c[0..$]);
+        overwrite(&mut t, Hmac::finish(m));
+        for (usize i = 0; i < h && Vec::len(&out) < len; i += 1)
+        {
+            Vec::push(&mut out, t[i]);
+        }
+        if (Vec::len(&out) < len)
+        {
+            counter += 1;
+        }
+    }
+    out
+}
+
+export fn hkdf_with(
+    HashKind kind,
+    slice<u8, shared> salt,
+    slice<u8, shared> ikm,
+    slice<u8, shared> info,
+    usize len,
+) : Vec<u8>
+{
+    Vec<u8> prk = hkdf_extract_with(kind, salt, ikm);
+    hkdf_expand_with(kind, &prk[0..$], info, len)
+}
+
+// TLS 1.3's HKDF-Expand-Label over `kind` (RFC 8446 §7.1), for the SHA-384
+// suites.
+export fn hkdf_expand_label_with(
+    HashKind kind,
+    slice<u8, shared> secret,
+    str label,
+    slice<u8, shared> context,
+    usize len,
+) : Vec<u8>
+{
+    Vec<u8> info = Vec::new();
+    Vec::push_be(&mut info, narrow<u16>(len));
+    Vec::push(&mut info, narrow<u8>(6 + str_len(label)));
+    Vec::extend_from(&mut info, &b"tls13 "[0..$]);
+    for (usize i = 0; i < str_len(label); i += 1)
+    {
+        Vec::push(&mut info, str_byte(label, i));
+    }
+    Vec::push(&mut info, narrow<u8>(slice_len(context)));
+    Vec::extend_from(&mut info, context);
+    hkdf_expand_with(kind, secret, &info[0..$], len)
+}
+
+// PBKDF2 (RFC 8018 §5.2) over HMAC of `kind`: `len` bytes from `password`
+// and `salt` after `iterations` rounds of HMAC per block; no iterations is
+// `diag.kdf-parameters`.
+export fn pbkdf2(
+    HashKind kind,
+    slice<u8, shared> password,
+    slice<u8, shared> salt,
+    usize iterations,
+    usize len,
+) : Vec<u8>
+{
+    if (iterations == 0)
+    {
+        fault(kdf_parameters);
+    }
+    if (match (kind) { Sha2_256 : true, _ : false })
+    {
+        return pbkdf2_sha256(password, salt, iterations, len);
+    }
+    Hmac base = Hmac::new(kind, password);
+    Vec<u8> out = Vec::new();
+    u32 block = 1;
+    while (Vec::len(&out) < len)
+    {
+        Hmac first = base;
+        Hmac::update(&mut first, salt);
+        Vec<u8> counter = Vec::new();
+        Vec::push_be(&mut counter, block);
+        Hmac::update(&mut first, &counter[0..$]);
+        Vec<u8> u = Hmac::finish(first);
+        Vec<u8> t = Vec::clone(&u);
+        for (usize j = 1; j < iterations; j += 1)
+        {
+            Hmac m = base;
+            Hmac::update(&mut m, &u[0..$]);
+            overwrite(&mut u, Hmac::finish(m));
+            for (usize i = 0; i < Vec::len(&t); i += 1)
+            {
+                t[i] = t[i] ^ u[i];
+            }
+        }
+        for (usize i = 0; i < Vec::len(&t) && Vec::len(&out) < len; i += 1)
+        {
+            Vec::push(&mut out, t[i]);
+        }
+        block += 1;
+    }
+    out
+}
+
+// `pbkdf2` over HMAC-SHA-256 (SCRAM's, among others): the same rounds on
+// fixed-size digests, with no `Vec` per round.
+fn pbkdf2_sha256(slice<u8, shared> password, slice<u8, shared> salt, usize iterations, usize len) : Vec<u8>
+{
+    HmacSha256 base = HmacSha256::new(password);
+    Vec<u8> out = Vec::new();
+    u32 block = 1;
+    while (Vec::len(&out) < len)
+    {
+        HmacSha256 first = base;
+        HmacSha256::update(&mut first, salt);
+        array<u8, 4> counter = [
+            narrow_wrapping<u8>(block >> 24),
+            narrow_wrapping<u8>(block >> 16),
+            narrow_wrapping<u8>(block >> 8),
+            narrow_wrapping<u8>(block),
+        ];
+        HmacSha256::update(&mut first, &counter[0..$]);
+        array<u8, 32> u = HmacSha256::finish(first);
+        array<u8, 32> t = u;
+        for (usize j = 1; j < iterations; j += 1)
+        {
+            HmacSha256 m = base;
+            HmacSha256::update(&mut m, &u[0..$]);
+            u = HmacSha256::finish(m);
+            for (usize i = 0; i < 32; i += 1)
+            {
+                t[i] = t[i] ^ u[i];
+            }
+        }
+        for (usize i = 0; i < 32 && Vec::len(&out) < len; i += 1)
+        {
+            Vec::push(&mut out, t[i]);
+        }
+        block += 1;
+    }
+    out
+}
+
+// Argon2's variable-length hash H' (RFC 9106 §3.3).
+fn argon2_h_prime(usize out_len, slice<u8, shared> x) : Vec<u8>
+{
+    Vec<u8> prefix = Vec::new();
+    Vec::push_le(&mut prefix, narrow<u32>(out_len));
+    if (out_len <= 64)
+    {
+        Blake2b b = Blake2b::new(out_len);
+        Blake2b::update(&mut b, &prefix[0..$]);
+        Blake2b::update(&mut b, x);
+        return Blake2b::finish(b);
+    }
+    usize r = (out_len + 31) / 32 - 2;
+    Blake2b b = Blake2b::new(64);
+    Blake2b::update(&mut b, &prefix[0..$]);
+    Blake2b::update(&mut b, x);
+    Vec<u8> v = Blake2b::finish(b);
+    Vec<u8> out = Vec::from_slice(&v[0..32]);
+    for (usize i = 1; i < r; i += 1)
+    {
+        overwrite(&mut v, blake2b(&v[0..$], 64));
+        Vec::extend_from(&mut out, &v[0..32]);
+    }
+    Vec<u8> last = blake2b(&v[0..$], out_len - 32 * r);
+    Vec::extend_from(&mut out, &last[0..$]);
+    out
+}
+
+// Argon2's GB (RFC 9106 §3.6): BLAKE2b's G with a multiplication added.
+// The permutation P (RFC 9106 §3.6): BLAKE2b's round, its additions
+// carrying the products of the low halves, over the columns and the
+// diagonals of `v` (`BLAKE2B_G`'s positions). A value in and out.
+fn argon2_p(array<u64, 16> v) : array<u64, 16>
+{
+    u64 lo = 0xffffffff;
+    for (usize g = 0; g < 8; g += 1)
+    {
+        usize a = widen<usize>(BLAKE2B_G[4 * g]);
+        usize b = widen<usize>(BLAKE2B_G[4 * g + 1]);
+        usize c = widen<usize>(BLAKE2B_G[4 * g + 2]);
+        usize d = widen<usize>(BLAKE2B_G[4 * g + 3]);
+        v[a] = wrapping_add(wrapping_add(v[a], v[b]), wrapping_mul(2, (v[a] & lo) * (v[b] & lo)));
+        v[d] = rotate_right(v[d] ^ v[a], 32);
+        v[c] = wrapping_add(wrapping_add(v[c], v[d]), wrapping_mul(2, (v[c] & lo) * (v[d] & lo)));
+        v[b] = rotate_right(v[b] ^ v[c], 24);
+        v[a] = wrapping_add(wrapping_add(v[a], v[b]), wrapping_mul(2, (v[a] & lo) * (v[b] & lo)));
+        v[d] = rotate_right(v[d] ^ v[a], 16);
+        v[c] = wrapping_add(wrapping_add(v[c], v[d]), wrapping_mul(2, (v[c] & lo) * (v[d] & lo)));
+        v[b] = rotate_right(v[b] ^ v[c], 63);
+    }
+    v
+}
+
+// The compression G(X, Y) (RFC 9106 §3.5): P over the rows, then the
+// columns, of X ⊕ Y, exclusive-ored with X ⊕ Y again.
+fn argon2_g(array<u64, 128> x, array<u64, 128> y) : array<u64, 128>
+{
+    array<u64, 128> r = [0; 128];
+    for (usize i = 0; i < 128; i += 1)
+    {
+        r[i] = x[i] ^ y[i];
+    }
+    array<u64, 128> q = r;
+    for (usize row = 0; row < 8; row += 1)
+    {
+        array<u64, 16> v = [0; 16];
+        for (usize i = 0; i < 16; i += 1)
+        {
+            v[i] = q[16 * row + i];
+        }
+        v = argon2_p(v);
+        for (usize i = 0; i < 16; i += 1)
+        {
+            q[16 * row + i] = v[i];
+        }
+    }
+    for (usize col = 0; col < 8; col += 1)
+    {
+        array<u64, 16> v = [0; 16];
+        for (usize j = 0; j < 8; j += 1)
+        {
+            v[2 * j] = q[16 * j + 2 * col];
+            v[2 * j + 1] = q[16 * j + 2 * col + 1];
+        }
+        v = argon2_p(v);
+        for (usize j = 0; j < 8; j += 1)
+        {
+            q[16 * j + 2 * col] = v[2 * j];
+            q[16 * j + 2 * col + 1] = v[2 * j + 1];
+        }
+    }
+    for (usize i = 0; i < 128; i += 1)
+    {
+        q[i] = q[i] ^ r[i];
+    }
+    q
+}
+
+// A block's words out of memory, and back in (`xor`: combined with what
+// is there). The memory is reached through one slice per block, the
+// helper's only reference, whose element accesses need no check.
+fn argon2_get(slice<u64, shared> b) : array<u64, 128>
+{
+    array<u64, 128> out = [0; 128];
+    for (usize i = 0; i < 128; i += 1)
+    {
+        out[i] = b[i];
+    }
+    out
+}
+
+fn argon2_put(slice<u64, exclusive> b, array<u64, 128> v, bool xor)
+{
+    for (usize i = 0; i < 128; i += 1)
+    {
+        b[i] = if (xor) { b[i] ^ v[i] } else { v[i] };
+    }
+}
+
+fn argon2_load(ref<Vec<u64>, shared> mem, usize block) : array<u64, 128>
+{
+    argon2_get(&mem[128 * block..128 * block + 128])
+}
+
+// Argon2id (RFC 9106, type 2, version 0x13): `len` bytes (at least 4)
+// from `password` and `salt` (at least 8 bytes) after `iterations` passes
+// (at least 1) over `memory_kib` kibibytes of memory (at least 8 per
+// lane) in `parallelism` lanes (1 to 255, computed one after another);
+// other parameters are `diag.kdf-parameters`. The first two slices of the
+// first pass address memory independently of the password, the rest
+// depend on it, as Argon2id prescribes.
+export fn argon2id(
+    slice<u8, shared> password,
+    slice<u8, shared> salt,
+    usize iterations,
+    usize memory_kib,
+    usize parallelism,
+    usize len,
+) : Vec<u8>
+{
+    if (iterations == 0 || parallelism == 0 || parallelism > 255 || memory_kib < 8 * parallelism || len < 4 || slice_len(salt) < 8)
+    {
+        fault(kdf_parameters);
+    }
+    usize lanes = parallelism;
+    usize q = (memory_kib / (4 * lanes)) * 4;
+    usize m_prime = q * lanes;
+    usize seg = q / 4;
+    // H0 (§3.2).
+    Blake2b h = Blake2b::new(64);
+    Vec<u8> head = Vec::new();
+    Vec::push_le(&mut head, narrow<u32>(lanes));
+    Vec::push_le(&mut head, narrow<u32>(len));
+    Vec::push_le(&mut head, narrow<u32>(memory_kib));
+    Vec::push_le(&mut head, narrow<u32>(iterations));
+    Vec::push_le(&mut head, 0x13: u32);
+    Vec::push_le(&mut head, 2: u32);
+    Vec::push_le(&mut head, narrow<u32>(slice_len(password)));
+    Blake2b::update(&mut h, &head[0..$]);
+    Blake2b::update(&mut h, password);
+    Vec<u8> mid = Vec::new();
+    Vec::push_le(&mut mid, narrow<u32>(slice_len(salt)));
+    Blake2b::update(&mut h, &mid[0..$]);
+    Blake2b::update(&mut h, salt);
+    array<u8, 8> none = [0; 8];
+    Blake2b::update(&mut h, &none[0..$]);
+    Vec<u8> h0 = Blake2b::finish(h);
+    Vec<u64> mem = Vec::filled(128 * m_prime, 0: u64);
+    for (usize l = 0; l < lanes; l += 1)
+    {
+        for (usize col = 0; col < 2; col += 1)
+        {
+            Vec<u8> input = Vec::clone(&h0);
+            Vec::push_le(&mut input, narrow<u32>(col));
+            Vec::push_le(&mut input, narrow<u32>(l));
+            Vec<u8> block = argon2_h_prime(1024, &input[0..$]);
+            for (usize i = 0; i < 128; i += 1)
+            {
+                mem[128 * (l * q + col) + i] = read_le<u64>(&block[0..$], 8 * i);
+            }
+        }
+    }
+    array<u64, 128> zero = [0; 128];
+    for (usize r = 0; r < iterations; r += 1)
+    {
+        for (usize s = 0; s < 4; s += 1)
+        {
+            for (usize l = 0; l < lanes; l += 1)
+            {
+                bool independent = r == 0 && s < 2;
+                array<u64, 128> addresses = [0; 128];
+                array<u64, 128> input = [0; 128];
+                input[0] = widen<u64>(r);
+                input[1] = widen<u64>(l);
+                input[2] = widen<u64>(s);
+                input[3] = widen<u64>(m_prime);
+                input[4] = widen<u64>(iterations);
+                input[5] = 2;
+                usize start_i = if (r == 0 && s == 0) { 2 } else { 0 };
+                for (usize i = start_i; i < seg; i += 1)
+                {
+                    usize j = s * seg + i;
+                    usize prev = if (j == 0) { q - 1 } else { j - 1 };
+                    u64 pseudo = 0;
+                    if (independent)
+                    {
+                        if (i % 128 == 0 || i == start_i)
+                        {
+                            input[6] = widen<u64>(i / 128 + 1);
+                            addresses = argon2_g(zero, argon2_g(zero, input));
+                        }
+                        pseudo = addresses[i % 128];
+                    }
+                    else
+                    {
+                        pseudo = mem[128 * (l * q + prev)];
+                    }
+                    u64 j1 = pseudo & 0xffffffff;
+                    u64 j2 = pseudo >> 32;
+                    usize ref_lane = if (r == 0 && s == 0) { l } else { narrow<usize>(j2 % widen<u64>(lanes)) };
+                    usize w = 0;
+                    if (r == 0)
+                    {
+                        w = if (ref_lane == l) { s * seg + i - 1 } else { s * seg - (if (i == 0) { 1 } else { 0 }) };
+                    }
+                    else
+                    {
+                        w = if (ref_lane == l) { q - seg + i - 1 } else { q - seg - (if (i == 0) { 1 } else { 0 }) };
+                    }
+                    u64 x = (j1 * j1) >> 32;
+                    u64 y = narrow<u64>((widen<u128>(w) * widen<u128>(x)) >> 32);
+                    usize z = w - 1 - narrow<usize>(y);
+                    usize start = if (r == 0) { 0 } else { ((s + 1) % 4) * seg };
+                    usize ref_col = (start + z) % q;
+                    array<u64, 128> fresh = argon2_g(
+                        argon2_load(&mem, l * q + prev),
+                        argon2_load(&mem, ref_lane * q + ref_col),
+                    );
+                    usize at = 128 * (l * q + j);
+                    argon2_put(&mut mem[at..at + 128], fresh, r > 0);
+                }
+            }
+        }
+    }
+    array<u64, 128> c = [0; 128];
+    for (usize l = 0; l < lanes; l += 1)
+    {
+        for (usize k = 0; k < 128; k += 1)
+        {
+            c[k] = c[k] ^ mem[128 * (l * q + q - 1) + k];
+        }
+    }
+    Vec<u8> c_bytes = Vec::new();
+    for (usize k = 0; k < 128; k += 1)
+    {
+        Vec::push_le(&mut c_bytes, c[k]);
+    }
+    argon2_h_prime(len, &c_bytes[0..$])
+}
+
+// Base64 without padding, as PHC strings carry it.
+fn b64_unpadded(slice<u8, shared> bytes) : String
+{
+    String s = base64_encode(bytes);
+    usize n = String::len(&s);
+    while (n > 0 && String::as_bytes(&s)[n - 1] == 0x3d)
+    {
+        n -= 1;
+    }
+    String::truncate(&mut s, n);
+    s
+}
+
+fn b64_decode_unpadded(StringView text) : Option<Vec<u8>>
+{
+    String padded = String::from_view(text);
+    while (String::len(&padded) % 4 != 0)
+    {
+        String::push_ascii(&mut padded, 0x3d);
+    }
+    match (base64_decode(String::as_view(&padded)))
+    {
+        Ok(v)  : Some(v),
+        Err(_) : None,
+    }
+}
+
+// `password` hashed for storage: Argon2id with a fresh 16-byte salt, 19
+// MiB of memory, two passes and one lane (the OWASP recommendation), as
+// the PHC string `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`, which
+// `verify_password` and every password library read.
+export fn hash_password(slice<u8, shared> password) : String
+{
+    array<u8, 16> salt = [0; 16];
+    os_random_bytes(&mut salt[0..$]);
+    Vec<u8> digest = argon2id(password, &salt[0..$], 2, 19456, 1, 32);
+    String out = String::from_str("$argon2id$v=19$m=19456,t=2,p=1$");
+    String::append(&mut out, String::as_view(&b64_unpadded(&salt[0..$])));
+    String::append(&mut out, "$");
+    String::append(&mut out, String::as_view(&b64_unpadded(&digest[0..$])));
+    out
+}
+
+// Whether `password` is the one `stored`, a PHC string of `hash_password`
+// or of any Argon2id implementation, was made from; the parameters are
+// taken from the string. A string that is not such a hash is false.
+export fn verify_password(StringView stored, slice<u8, shared> password) : bool
+{
+    Vec<StringView> parts = StringView::split(stored, "$");
+    if (Vec::len(&parts) != 6 || StringView::len(parts[0]) != 0 || !StringView::eq(
+        parts[1],
+        "argon2id",
+    ) || !StringView::eq(parts[2], "v=19"))
+    {
+        return false;
+    }
+    Vec<StringView> params = StringView::split(parts[3], ",");
+    if (Vec::len(&params) != 3 || !StringView::starts_with(
+        params[0],
+        "m=",
+    ) || !StringView::starts_with(params[1], "t=") || !StringView::starts_with(params[2], "p="))
+    {
+        return false;
+    }
+    usize m = match (StringView::parse<usize>(StringView::sub(params[0], 2, StringView::len(params[0]))))
+    {
+        Ok(v)  : v,
+        Err(_) : return false,
+    };
+    usize t = match (StringView::parse<usize>(StringView::sub(params[1], 2, StringView::len(params[1]))))
+    {
+        Ok(v)  : v,
+        Err(_) : return false,
+    };
+    usize p = match (StringView::parse<usize>(StringView::sub(params[2], 2, StringView::len(params[2]))))
+    {
+        Ok(v)  : v,
+        Err(_) : return false,
+    };
+    Vec<u8> salt = match (b64_decode_unpadded(parts[4]))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    Vec<u8> want = match (b64_decode_unpadded(parts[5]))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    if (t == 0 || p == 0 || p > 255 || m < 8 * p || Vec::len(&want) < 4 || Vec::len(&salt) < 8)
+    {
+        return false;
+    }
+    Vec<u8> got = argon2id(password, &salt[0..$], t, m, p, Vec::len(&want));
+    digest_eq(&got[0..$], &want[0..$])
+}

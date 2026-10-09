@@ -1,0 +1,125 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.index-vec [Index-Vec]; rule.stdlib.vec `Vec::len`
+// kind: positive
+// expect: ok
+//
+// A Vec that is a field of a local struct, indexed (read, written, its
+// elements' fields written, compound-assigned) and measured in loops,
+// beside functions that also push to it, borrow an element of it, move
+// the struct or capture it. Every element must hold what was written,
+// whatever the implementation proves about which accesses need checks.
+
+import std;
+
+struct P
+{
+    i64 x;
+    i64 y;
+}
+
+struct H
+{
+    Vec<i64> v;
+    Vec<P> ps;
+    String name;
+    i64 count;
+}
+
+fn make(usize n) : H
+{
+    H h = H { .v = Vec::new(), .ps = Vec::new(), .name = String::from_str("h"), .count = 0 };
+    foreach (i in 0..n)
+    {
+        Vec::push(&mut h.v, narrow<i64>(i));
+        Vec::push(&mut h.ps, P { .x = narrow<i64>(i), .y = 0 });
+    }
+    h
+}
+
+fn sum(ref<Vec<i64>, shared> v) : i64
+{
+    i64 s = 0;
+    foreach (i in 0..Vec::len(v))
+    {
+        s += v[i];
+    }
+    s
+}
+
+// Only indexing and `Vec::len` on `h.v` and `h.ps`; other fields freely.
+fn only_indexed(usize n) : i64
+{
+    H h = make(n);
+    usize i = 0;
+    while (i < Vec::len(&h.v))
+    {
+        h.v[i] = h.v[i] * 2 + h.v[Vec::len(&h.v) - 1 - i];
+        h.v[i] += 1;
+        h.ps[i].y = h.v[i] + h.ps[i].x;
+        h.ps[i].y *= 2;
+        h.count += 1;
+        String::append(&mut h.name, "x");
+        i += 1;
+    }
+    i64 t = 0;
+    foreach (k in 0..Vec::len(&h.ps))
+    {
+        t += h.ps[k].y - h.v[k];
+    }
+    t + h.count + narrow<i64>(String::len(&h.name))
+}
+
+// Indexed, and also pushed to and handed on in the same function.
+fn indexed_and_pushed(usize n) : i64
+{
+    H h = make(n);
+    i64 t = 0;
+    foreach (i in 0..Vec::len(&h.v))
+    {
+        t += h.v[i];
+        if (i == 2)
+        {
+            Vec::push(&mut h.v, 1000);
+        }
+    }
+    h.v[0] = 7;
+    t + sum(&h.v)
+}
+
+// An element borrowed: the write through it shows in later reads.
+fn element_borrowed(usize n) : i64
+{
+    H h = make(n);
+    ref<i64, exclusive> r = &mut h.v[1];
+    *r += 100;
+    h.v[1] + h.v[0]
+}
+
+fn moved(usize n) : i64
+{
+    H h = make(n);
+    h.v[0] = 9;
+    H g = h;
+    g.v[0]
+}
+
+fn captured(usize n) : i64
+{
+    H h = make(n);
+    h.v[0] = 3;
+    auto f = [h]() : i64 { h.v[0] * 2 };
+    f()
+}
+
+fn main()
+{
+    assert(only_indexed(10) == 306);
+    // 0+1+2+3+4 (the loop runs over the length it read first), then
+    // 7+1+2+3+4+1000.
+    assert(indexed_and_pushed(5) == 10 + 1017);
+    assert(element_borrowed(5) == 101);
+    assert(moved(3) == 9);
+    assert(captured(3) == 6);
+    printf("ok\n");
+}

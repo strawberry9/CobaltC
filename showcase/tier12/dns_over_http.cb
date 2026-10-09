@@ -1,0 +1,401 @@
+// DNS over HTTP
+//
+// Shows: a binary protocol on top of `std::http`, both ends in one
+// program. The server is a tiny authoritative resolver for `example.test`
+// served as RFC 8484 says: a DNS message (RFC 1035 wire format) arrives
+// as `POST /dns-query` with `Content-Type: application/dns-message`, or
+// as `GET /dns-query?dns=…` with the message in base64url; the answer is a
+// DNS message back. The client encodes questions (names as length-
+// prefixed labels, big-endian counts with `Vec::push_be`), decodes answers
+// (`read_be`, and the name-compression pointer every real resolver uses),
+// and prints what it learned. The same codec, pointed at a public
+// resolver over `https`, is a working DNS-over-HTTPS client; here it is
+// loopback, so the output is the same on every run.
+
+import std;
+
+// ---- the wire format ----
+
+fn push_name(ref<Vec<u8>, exclusive> out, StringView name)
+{
+    Vec<StringView> labels = StringView::split(name, ".");
+    foreach (label in &labels)
+    {
+        if (StringView::len(*label) > 0)
+        {
+            Vec::push(out, narrow<u8>(StringView::len(*label)));
+            Vec::extend_from(out, StringView::as_bytes(*label));
+        }
+    }
+    Vec::push(out, 0);
+}
+
+// A query for `name` of record type `qtype`, with the message id `id`.
+fn encode_query(u16 id, StringView name, u16 qtype) : Vec<u8>
+{
+    Vec<u8> m = Vec::new();
+    Vec::push_be(&mut m, id);
+    Vec::push_be(&mut m, 0x0100: u16);          // recursion desired
+    Vec::push_be(&mut m, 1: u16);               // one question
+    Vec::push_be(&mut m, 0: u16);
+    Vec::push_be(&mut m, 0: u16);
+    Vec::push_be(&mut m, 0: u16);
+    push_name(&mut m, name);
+    Vec::push_be(&mut m, qtype);
+    Vec::push_be(&mut m, 1: u16);               // class IN
+    m
+}
+
+// A name at `at`, following compression pointers (RFC 1035 §4.1.4);
+// the position after it in the uncompressed stream, or None if malformed.
+struct Name
+{
+    String text;
+    usize next;
+}
+
+fn read_name(slice<u8, shared> m, usize at) : Option<Name>
+{
+    String text = String::new();
+    usize pos = at;
+    Option<usize> after = None;
+    for (usize hops = 0; hops < 64; hops += 1)
+    {
+        if (pos >= slice_len(m))
+        {
+            return None;
+        }
+        u8 len = m[pos];
+        if (len == 0)
+        {
+            if (Option::is_none(&after))
+            {
+                overwrite(&mut after, Some(pos + 1));
+            }
+            return Some(Name { .text = text, .next = Option::unwrap(after) });
+        }
+        if ((len & 0xc0) == 0xc0)
+        {
+            if (pos + 1 >= slice_len(m))
+            {
+                return None;
+            }
+            if (Option::is_none(&after))
+            {
+                overwrite(&mut after, Some(pos + 2));
+            }
+            pos = widen<usize>(len & 0x3f) << 8 | widen<usize>(m[pos + 1]);
+            continue;
+        }
+        usize n = widen<usize>(len);
+        if (pos + 1 + n > slice_len(m))
+        {
+            return None;
+        }
+        if (String::len(&text) > 0)
+        {
+            String::append(&mut text, ".");
+        }
+        String::append(
+            &mut text,
+            &Result::unwrap_or(String::from_utf8(Vec::from_slice(&m[pos + 1..pos + 1 + n])), String::from_str("?")),
+        );
+        pos += 1 + n;
+    }
+    None
+}
+
+// ---- the server: the zone, and answers ----
+
+struct Record
+{
+    str name;
+    array<u8, 4> address;
+}
+
+fn zone() : Vec<Record>
+{
+    Vec<Record> z = Vec::new();
+    Vec::push(&mut z, Record { .name = "example.test", .address = [192, 0, 2, 10] });
+    Vec::push(&mut z, Record { .name = "www.example.test", .address = [192, 0, 2, 11] });
+    Vec::push(&mut z, Record { .name = "mail.example.test", .address = [192, 0, 2, 25] });
+    z
+}
+
+// The response to `query`: the question echoed, A records for names in
+// the zone, NXDOMAIN (rcode 3) for names outside it, FORMERR (1) for a
+// malformed message.
+fn answer(slice<u8, shared> query) : Vec<u8>
+{
+    Vec<u8> r = Vec::new();
+    if (slice_len(query) < 12)
+    {
+        return r;
+    }
+    u16 id = read_be<u16>(query, 0);
+    Option<Name> q = if (read_be<u16>(query, 4) == 1) { read_name(query, 12) } else { None };
+    Vec::push_be(&mut r, id);
+    Name question = match (q)
+    {
+        Some(n) : if (n.next + 4 <= slice_len(query)) { n } else { Name { .text = String::new(), .next = 0 } },
+        None    : Name { .text = String::new(), .next = 0 },
+    };
+    if (question.next == 0)
+    {
+        Vec::push_be(&mut r, 0x8181: u16);      // response, recursion, FORMERR
+        for (usize i = 0; i < 4; i += 1)
+        {
+            Vec::push_be(&mut r, 0: u16);
+        }
+        return r;
+    }
+    u16 qtype = read_be<u16>(query, question.next);
+    Vec<Record> z = zone();
+    Option<array<u8, 4>> found = None;
+    foreach (rec in &z)
+    {
+        if (StringView::eq(String::as_view(&question.text), StringView::of(rec.name)))
+        {
+            overwrite(&mut found, Some(rec.address));
+        }
+    }
+    u16 rcode = if (Option::is_some(&found)) { 0 } else { 3 };
+    bool answers = Option::is_some(&found) && qtype == 1;
+    Vec::push_be(&mut r, 0x8180 | rcode);       // response, authoritative answer flags as a recursor sets them
+    Vec::push_be(&mut r, 1: u16);
+    Vec::push_be(&mut r, if (answers) { 1: u16 } else { 0: u16 });
+    Vec::push_be(&mut r, 0: u16);
+    Vec::push_be(&mut r, 0: u16);
+    Vec::extend_from(&mut r, &query[12..question.next + 4]);
+    if (answers)
+    {
+        Vec::push_be(&mut r, 0xc00c: u16);      // the name: a pointer to the question's
+        Vec::push_be(&mut r, 1: u16);
+        Vec::push_be(&mut r, 1: u16);
+        Vec::push_be(&mut r, 300: u32);
+        Vec::push_be(&mut r, 4: u16);
+        Vec::extend_from(&mut r, &Option::unwrap(found)[0..$]);
+    }
+    r
+}
+
+fn b64url_decode(StringView text) : Option<Vec<u8>>
+{
+    String plain = String::new();
+    foreach (c in StringView::as_bytes(text))
+    {
+        String::push_ascii(&mut plain, if (*c == b'-') { b'+' } else if (*c == b'_') { b'/' } else { *c });
+    }
+    while (String::len(&plain) % 4 != 0)
+    {
+        String::push_ascii(&mut plain, b'=');
+    }
+    match (base64_decode(String::as_view(&plain)))
+    {
+        Ok(v)  : Some(v),
+        Err(_) : None,
+    }
+}
+
+fn serve(HttpServer s, usize count) : u8
+{
+    for (usize i = 0; i < count; i += 1)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(_) : return 1,
+        };
+        while (true)
+        {
+            Request req = match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) : r,
+                _           : break,
+            };
+            Vec<Header> h = Vec::new();
+            StringView url = String::as_view(&req.url);
+            Option<Vec<u8>> query = None;
+            if (req.method == "POST" && req.url == "/dns-query")
+            {
+                bool dns_type = match (Request::header(&req, "content-type"))
+                {
+                    Some(t) : StringView::eq(t, "application/dns-message"),
+                    None    : false,
+                };
+                if (dns_type)
+                {
+                    overwrite(&mut query, Some(Vec::clone(&req.body)));
+                }
+                else
+                {
+                    Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+                    _ = HttpConnection::respond(&mut c, 415, &h[0..$], &b"send application/dns-message\n"[0..$]);
+                    continue;
+                }
+            }
+            else if (req.method == "GET" && StringView::starts_with(url, "/dns-query?dns="))
+            {
+                overwrite(&mut query, b64url_decode(StringView::sub(url, 15, StringView::len(url))));
+            }
+            match (query)
+            {
+                Some(q) :
+                {
+                    Vec<u8> reply = answer(&q[0..$]);
+                    if (Vec::len(&reply) == 0)
+                    {
+                        Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+                        _ = HttpConnection::respond(&mut c, 400, &h[0..$], &b"not a DNS message\n"[0..$]);
+                        continue;
+                    }
+                    Vec::push(&mut h, Header::new("Content-Type", "application/dns-message"));
+                    Vec::push(&mut h, Header::new("Cache-Control", "max-age=300"));
+                    _ = HttpConnection::respond(&mut c, 200, &h[0..$], &reply[0..$]);
+                },
+                None    :
+                {
+                    Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+                    _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"POST or GET /dns-query\n"[0..$]);
+                },
+            }
+        }
+    }
+    0
+}
+
+// ---- the client ----
+
+fn rcode_name(u16 flags) : str
+{
+    match (flags & 15)
+    {
+        0 : "NOERROR",
+        1 : "FORMERR",
+        3 : "NXDOMAIN",
+        _ : "other",
+    }
+}
+
+fn b64url(slice<u8, shared> bytes) : String
+{
+    String plain = base64_encode(bytes);
+    String out = String::new();
+    foreach (c in String::as_bytes(&plain))
+    {
+        if (*c == b'+') { String::push_ascii(&mut out, b'-'); }
+        else if (*c == b'/') { String::push_ascii(&mut out, b'_'); }
+        else if (*c != b'=') { String::push_ascii(&mut out, *c); }
+    }
+    out
+}
+
+// Asks for `name`'s A record, by POST or by GET, and prints the answer.
+fn lookup(ref<HttpClient, exclusive> c, ref<String, shared> base, str name, u16 id, bool by_post)
+{
+    Vec<u8> q = encode_query(id, StringView::of(name), 1);
+    String url = String::clone(base);
+    String::append(&mut url, "/dns-query");
+    Request req = Request::new(if (by_post) { "POST" } else { "GET" }, "http://unset/");
+    if (by_post)
+    {
+        Vec::push(&mut req.headers, Header::new("Content-Type", "application/dns-message"));
+        Vec::extend_from(&mut req.body, &q[0..$]);
+    }
+    else
+    {
+        String::append(&mut url, "?dns=");
+        String::append(&mut url, String::as_view(&b64url(&q[0..$])));
+    }
+    overwrite(&mut req.url, url);
+    Vec::push(&mut req.headers, Header::new("Accept", "application/dns-message"));
+    Response resp = match (HttpClient::send(c, &req))
+    {
+        Ok(r)  : r,
+        Err(e) :
+        {
+            printf("%-20s error: %s\n", name, HttpError::text(&e));
+            return;
+        },
+    };
+    slice<u8, shared> m = &resp.body[0..$];
+    if (resp.status != 200 || slice_len(m) < 12)
+    {
+        printf("%-20s HTTP %u\n", name, resp.status);
+        return;
+    }
+    u16 flags = read_be<u16>(m, 2);
+    u16 ancount = read_be<u16>(m, 6);
+    printf(
+        "%-20s %-4s id ok %v, %s, %u answer(s), %v bytes",
+        name,
+        if (by_post) { "POST" } else { "GET" },
+        read_be<u16>(m, 0) == id,
+        rcode_name(flags),
+        ancount,
+        slice_len(m),
+    );
+    // Past the question, then each answer: name, type, class, ttl, rdlength, rdata.
+    usize at = match (read_name(m, 12))
+    {
+        Some(n) : n.next + 4,
+        None    : slice_len(m),
+    };
+    for (u16 i = 0; i < ancount; i += 1)
+    {
+        Name owner = match (read_name(m, at))
+        {
+            Some(n) : n,
+            None    : break,
+        };
+        at = owner.next;
+        if (at + 10 > slice_len(m))
+        {
+            break;
+        }
+        u16 rtype = read_be<u16>(m, at);
+        u32 ttl = read_be<u32>(m, at + 4);
+        usize rdlen = widen<usize>(read_be<u16>(m, at + 8));
+        at += 10;
+        if (rtype == 1 && rdlen == 4 && at + 4 <= slice_len(m))
+        {
+            printf(": %s A %u.%u.%u.%u ttl %u", &owner.text, m[at], m[at + 1], m[at + 2], m[at + 3], ttl);
+        }
+        at += rdlen;
+    }
+    printf("\n");
+}
+
+fn main()
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto server = spawn(serve, s, 7);
+    HttpClient c = HttpClient::new();
+    lookup(&mut c, &base, "example.test", 0x1234, true);
+    lookup(&mut c, &base, "www.example.test", 0x1235, false);
+    lookup(&mut c, &base, "mail.example.test", 0x1236, true);
+    lookup(&mut c, &base, "nothing.example.test", 0x1237, false);
+    lookup(&mut c, &base, "www.example.test", 0x1238, true);
+    // Not a DNS message at all, and the wrong content type.
+    Request bad = Request::new("POST", String::as_view(&sprintf("%s/dns-query", &base)));
+    Vec::push(&mut bad.headers, Header::new("Content-Type", "application/dns-message"));
+    Vec::extend_from(&mut bad.body, &b"hello"[0..$]);
+    match (HttpClient::send(&mut c, &bad))
+    {
+        Ok(r)  : printf("%-20s %u %s\n", "5 bytes of text", r.status, &resp_text(&r)),
+        Err(e) : printf("error: %s\n", HttpError::text(&e)),
+    }
+    match (http_post(String::as_view(&sprintf("%s/dns-query", &base)), "text/plain", &b"example.test"[0..$]))
+    {
+        Ok(r)  : printf("%-20s %u %s\n", "text/plain query", r.status, &resp_text(&r)),
+        Err(e) : printf("error: %s\n", HttpError::text(&e)),
+    }
+    printf("server: %u\n", join(server));
+}
+
+fn resp_text(ref<Response, shared> r) : String
+{
+    String body = Result::unwrap_or(String::from_utf8(Vec::clone(&r.body)), String::new());
+    String::from_view(String::trim_end(&body))
+}

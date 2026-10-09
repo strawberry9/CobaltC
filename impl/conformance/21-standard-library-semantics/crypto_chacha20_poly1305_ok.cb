@@ -1,0 +1,93 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.crypto [ChaCha20] [Poly1305] [Aead-Seal] [Aead-Open] (D-0153); conf.chacha20-vector, conf.poly1305-vector, conf.aead-vector, conf.aead-tamper
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 636861636861323020322e342e323a206f6b0a706f6c793133303520322e352e323a206f6b0a6165616420322e382e323a206f6b0a6f70656e3a20747275650a63697068657274657874206368616e6765643a207265667573656420747275650a746167206368616e6765643a207265667573656420747275650a616164206368616e6765643a207265667573656420747275650a746f6f2073686f72743a207265667573656420747275650a726573746f7265643a206f70656e7320747275650a
+//
+// RFC 8439's vectors: ChaCha20 at counter 1 (§2.4.2), Poly1305 (§2.5.2)
+// and the AEAD (§2.8.2); the sealed message opens to its plaintext, and a
+// one-bit change to the ciphertext, the tag or the associated data, or a
+// message shorter than a tag, is refused with `None`.
+
+import std;
+fn show(str name, slice<u8, shared> got, str want)
+{
+    String g = to_hex(got);
+    printf("%s: %s\n", name, if (String::eq_str(&g, want)) { "ok" } else { "WRONG" });
+    if (!String::eq_str(&g, want))
+    {
+        printf("  got  %s\n  want %s\n", &g, want);
+    }
+}
+
+fn range(usize from, usize to) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    for (usize i = from; i < to; i += 1)
+    {
+        Vec::push(&mut v, narrow_wrapping<u8>(i));
+    }
+    v
+}
+
+fn main() : u8
+{
+    str sunscreen = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    Vec<u8> pt = String::into_bytes(String::from_str(sunscreen));
+    Vec<u8> nonce1 = Result::unwrap_or(from_hex("000000000000004a00000000"), Vec::new());
+    Vec<u8> c = chacha20(&range(0, 32)[0..$], &nonce1[0..$], 1, &pt[0..$]);
+    show(
+        "chacha20 2.4.2",
+        &c[0..$],
+        "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d",
+    );
+    Vec<u8> pk = Result::unwrap_or(
+        from_hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"),
+        Vec::new(),
+    );
+    Vec<u8> msg = String::into_bytes("Cryptographic Forum Research Group");
+    show("poly1305 2.5.2", &poly1305(&pk[0..$], &msg[0..$])[0..$], "a8061dc1305136c6c22b8baf0c0127a9");
+    Vec<u8> nonce2 = Result::unwrap_or(from_hex("070000004041424344454647"), Vec::new());
+    Vec<u8> aad = Result::unwrap_or(from_hex("50515253c0c1c2c3c4c5c6c7"), Vec::new());
+    Vec<u8> key2 = range(0x80, 0xa0);
+    Vec<u8> sealed = chacha20_poly1305_seal(&key2[0..$], &nonce2[0..$], &aad[0..$], &pt[0..$]);
+    show(
+        "aead 2.8.2",
+        &sealed[0..$],
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691",
+    );
+    match (chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..$]))
+    {
+        Some(back) : printf("open: %v\n", digest_eq(&back[0..$], &pt[0..$])),
+        None       : printf("open: refused\n"),
+    }
+    sealed[3] = sealed[3] ^ 1;
+    printf(
+        "ciphertext changed: refused %v\n",
+        Option::is_none(&chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..$])),
+    );
+    sealed[3] = sealed[3] ^ 1;
+    usize last = Vec::len(&sealed) - 1;
+    sealed[last] = sealed[last] ^ 0x80;
+    printf(
+        "tag changed: refused %v\n",
+        Option::is_none(&chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..$])),
+    );
+    sealed[last] = sealed[last] ^ 0x80;
+    aad[0] = aad[0] ^ 1;
+    printf(
+        "aad changed: refused %v\n",
+        Option::is_none(&chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..$])),
+    );
+    aad[0] = aad[0] ^ 1;
+    printf(
+        "too short: refused %v\n",
+        Option::is_none(&chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..15])),
+    );
+    printf(
+        "restored: opens %v\n",
+        Option::is_some(&chacha20_poly1305_open(&key2[0..$], &nonce2[0..$], &aad[0..$], &sealed[0..$])),
+    );
+    0
+}

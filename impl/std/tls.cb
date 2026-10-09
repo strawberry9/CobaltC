@@ -1,0 +1,1516 @@
+// `std::tls` (spec/21 §2o, D-0161): a TLS 1.3 client (RFC 8446) over a
+// `TcpStream`. The cipher suites TLS_CHACHA20_POLY1305_SHA256,
+// TLS_AES_128_GCM_SHA256 (D-0165) and TLS_AES_256_GCM_SHA384 (D-0172),
+// the key exchanges X25519 and, when the server asks for one with a
+// HelloRetryRequest, P-256 or P-384, the signature schemes ECDSA, RSA-PSS
+// and Ed25519, and the server's certificate chain verified with
+// `std::x509` against a `TrustStore` and the server's name: RFC 8446's
+// mandatory set and the common additions. No TLS 1.2, no session
+// resumption, no early data, no client certificates. Written in CobaltC
+// over `std::crypto`.
+
+// Why a TLS connection failed.
+export enum TlsError
+{
+    NetFailure(NetError),
+    CertRejected(CertError),
+    HandshakeFailed,
+    ProtocolError,
+    PeerAlert(u8),
+    RecordRejected,
+}
+
+export fn TlsError::text(ref<TlsError, shared> e) : str
+{
+    match (e)
+    {
+        NetFailure(n)   : NetError::text(n),
+        CertRejected(c) : CertError::text(c),
+        HandshakeFailed : "TLS handshake failed",
+        ProtocolError   : "TLS protocol violation",
+        PeerAlert(code) : match (*code)
+        {
+            40  : "the server refused the handshake (alert 40): it supports none of the suites (ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM) or key exchanges (X25519, P-256, P-384) this client offers",
+            42  : "the server refused a certificate (alert 42)",
+            70  : "the server does not speak TLS 1.3 (alert 70)",
+            80  : "the server failed internally (alert 80)",
+            109 : "the server requires an extension this client does not send (alert 109)",
+            112 : "the server does not know the name asked for (alert 112)",
+            _   : "the server sent a TLS alert",
+        },
+        RecordRejected  : "a TLS record did not authenticate",
+    }
+}
+
+// The hash of a cipher suite's key schedule, and its AEAD key length.
+fn suite_hash(u16 suite) : HashKind
+{
+    if (suite == 0x1302) { Sha2_384 } else { Sha2_256 }
+}
+
+fn suite_key_len(u16 suite) : usize
+{
+    if (suite == 0x1301) { 16 } else { 32 }
+}
+
+// One direction's record protection: the key, the IV and the sequence
+// number (RFC 8446 §5.3), the traffic secret they came from, and the
+// suite (0x1303 ChaCha20-Poly1305, 0x1301 AES-128-GCM, 0x1302
+// AES-256-GCM).
+struct RecordKeys
+{
+    Vec<u8> key;
+    Vec<u8> iv;
+    u64 seq;
+    Vec<u8> secret;
+    u16 suite;
+}
+
+fn keys_from(slice<u8, shared> secret, u16 suite) : RecordKeys
+{
+    Vec<u8> none = Vec::new();
+    HashKind kind = suite_hash(suite);
+    RecordKeys {
+        .key = hkdf_expand_label_with(kind, secret, "key", &none[0..$], suite_key_len(suite)),
+        .iv = hkdf_expand_label_with(kind, secret, "iv", &none[0..$], 12),
+        .seq = 0,
+        .secret = Vec::from_slice(secret),
+        .suite = suite,
+    }
+}
+
+fn record_nonce(ref<RecordKeys, shared> k) : Vec<u8>
+{
+    Vec<u8> n = Vec::clone(&k.iv);
+    for (usize i = 0; i < 8; i += 1)
+    {
+        n[4 + i] = n[4 + i] ^ narrow_wrapping<u8>(k.seq >> narrow<u32>(56 - 8 * i));
+    }
+    n
+}
+
+// A TLS 1.3 connection: as a client, to a server whose certificate has
+// been verified (kept in `peer`); as a server (D-0186), to a client.
+export resource struct TlsStream
+{
+    TcpStream tcp;
+    RecordKeys send;
+    RecordKeys recv;
+    Vec<u8> pending;
+    usize pending_at;
+    bool closed;
+    Option<Certificate> peer;
+}
+
+// D-0181: the peer's certificate, the leaf the handshake verified: for a
+// client, the server's; `None` on a server's side (clients send none).
+// A program that pins a key or a certificate compares it here.
+export fn TlsStream::peer_certificate(ref<TlsStream, shared> s) : Option<ref<Certificate, shared>>
+{
+    match (&s.peer)
+    {
+        Some(c) : Some(c),
+        None    : None,
+    }
+}
+
+export fn TlsStream::peer_addr(ref<TlsStream, shared> s) : SocketAddr
+{
+    TcpStream::peer_addr(&s.tcp)
+}
+
+export fn TlsStream::local_addr(ref<TlsStream, shared> s) : SocketAddr
+{
+    TcpStream::local_addr(&s.tcp)
+}
+
+// The record header and body: one record from the network.
+struct Record
+{
+    u8 kind;
+    Vec<u8> header;
+    Vec<u8> body;
+}
+
+fn read_record(ref<TcpStream, exclusive> tcp) : Result<Record, TlsError>
+{
+    Vec<u8> header = Vec::new();
+    match (TcpStream::read_exact(tcp, &mut header, 5))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(NetFailure(e)),
+    }
+    usize len = widen<usize>(read_be<u16>(&header[0..$], 3));
+    if (len > 16384 + 256)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u8> body = Vec::new();
+    match (TcpStream::read_exact(tcp, &mut body, len))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(NetFailure(e)),
+    }
+    Ok(Record { .kind = header[0], .header = header, .body = body })
+}
+
+fn write_all(ref<TcpStream, exclusive> tcp, slice<u8, shared> data) : Result<void, TlsError>
+{
+    match (TcpStream::write(tcp, data))
+    {
+        Ok(_)  : Ok(()),
+        Err(e) : Err(NetFailure(e)),
+    }
+}
+
+// An encrypted record (application_data on the wire) of `content` with
+// inner type `kind`.
+fn seal_record(ref<RecordKeys, exclusive> k, u8 kind, slice<u8, shared> content) : Vec<u8>
+{
+    Vec<u8> inner = Vec::from_slice(content);
+    Vec::push(&mut inner, kind);
+    Vec<u8> header = Vec::new();
+    Vec::push(&mut header, 23);
+    Vec::push_be(&mut header, 0x0303: u16);
+    Vec::push_be(&mut header, narrow<u16>(Vec::len(&inner) + 16));
+    Vec<u8> nonce = record_nonce(k);
+    Vec<u8> sealed = if (k.suite != 0x1303)
+    {
+        aes_gcm_seal(&k.key[0..$], &nonce[0..$], &header[0..$], &inner[0..$])
+    }
+    else
+    {
+        chacha20_poly1305_seal(&k.key[0..$], &nonce[0..$], &header[0..$], &inner[0..$])
+    };
+    k.seq += 1;
+    Vec::extend_from(&mut header, &sealed[0..$]);
+    header
+}
+
+// The content and inner type of an encrypted record.
+struct Inner
+{
+    u8 kind;
+    Vec<u8> content;
+}
+
+fn open_record(ref<RecordKeys, exclusive> k, ref<Record, shared> r) : Result<Inner, TlsError>
+{
+    if (r.kind != 23)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u8> nonce = record_nonce(k);
+    Option<Vec<u8>> opened = if (k.suite != 0x1303)
+    {
+        aes_gcm_open(&k.key[0..$], &nonce[0..$], &r.header[0..$], &r.body[0..$])
+    }
+    else
+    {
+        chacha20_poly1305_open(&k.key[0..$], &nonce[0..$], &r.header[0..$], &r.body[0..$])
+    };
+    Vec<u8> plain = match (opened)
+    {
+        Some(p) : p,
+        None    : return Err(RecordRejected),
+    };
+    k.seq += 1;
+    usize n = Vec::len(&plain);
+    while (n > 0 && plain[n - 1] == 0)
+    {
+        n -= 1;
+    }
+    if (n == 0 || n - 1 > 16384)
+    {
+        return Err(ProtocolError);
+    }
+    u8 kind = plain[n - 1];
+    Vec::truncate(&mut plain, n - 1);
+    Ok(Inner { .kind = kind, .content = plain })
+}
+
+// The handshake messages arriving in records, and the transcript of every
+// message so far: kept under both hashes until the ServerHello names the
+// suite, then read from the suite's.
+struct Handshake
+{
+    Vec<u8> buffer;
+    Hasher t256;
+    Hasher t384;
+    HashKind kind;
+}
+
+fn transcript_add(ref<Handshake, exclusive> hs, slice<u8, shared> msg)
+{
+    Hasher::update(&mut hs.t256, msg);
+    Hasher::update(&mut hs.t384, msg);
+}
+
+// The next whole handshake message (type, 3-byte length, body), read from
+// `buffer` or, when it holds less, from more records; the message joins
+// the transcript.
+fn next_message(
+    ref<Handshake, exclusive> hs,
+    ref<TcpStream, exclusive> tcp,
+    ref<Option<RecordKeys>, exclusive> keys,
+) : Result<Vec<u8>, TlsError>
+{
+    while (Vec::len(&hs.buffer) < 4 || Vec::len(&hs.buffer) < 4 + (widen<usize>(hs.buffer[1]) << 16 | widen<usize>(hs.buffer[2]) << 8 | widen<usize>(hs.buffer[3])))
+    {
+        Record r = read_record(tcp)?;
+        if (r.kind == 20)
+        {
+            // A compatibility ChangeCipherSpec (RFC 8446 §D.4): ignored.
+            continue;
+        }
+        if (r.kind == 21)
+        {
+            if (Vec::len(&r.body) == 2)
+            {
+                return Err(PeerAlert(r.body[1]));
+            }
+            return Err(ProtocolError);
+        }
+        match (keys)
+        {
+            Some(k) :
+            {
+                Inner i = open_record(k, &r)?;
+                if (i.kind == 21)
+                {
+                    return Err(PeerAlert(if (Vec::len(&i.content) == 2) { i.content[1] } else { 0 }));
+                }
+                if (i.kind != 22)
+                {
+                    return Err(ProtocolError);
+                }
+                Vec::extend_from(&mut hs.buffer, &i.content[0..$]);
+            },
+            None    :
+            {
+                if (r.kind != 22)
+                {
+                    return Err(ProtocolError);
+                }
+                Vec::extend_from(&mut hs.buffer, &r.body[0..$]);
+            },
+        }
+    }
+    usize len = 4 + (widen<usize>(hs.buffer[1]) << 16 | widen<usize>(hs.buffer[2]) << 8 | widen<usize>(hs.buffer[3]));
+    Vec<u8> msg = Vec::from_slice(&hs.buffer[0..len]);
+    Vec<u8> rest = Vec::from_slice(&hs.buffer[len..$]);
+    overwrite(&mut hs.buffer, rest);
+    transcript_add(hs, &msg[0..$]);
+    Ok(msg)
+}
+
+fn push_u24(ref<Vec<u8>, exclusive> v, usize n)
+{
+    Vec::push(v, narrow<u8>(n >> 16));
+    Vec::push(v, narrow_wrapping<u8>(n >> 8));
+    Vec::push(v, narrow_wrapping<u8>(n));
+}
+
+// One extension: its type and its data with a 2-byte length.
+fn push_extension(ref<Vec<u8>, exclusive> out, u16 kind, slice<u8, shared> data)
+{
+    Vec::push_be(out, kind);
+    Vec::push_be(out, narrow<u16>(slice_len(data)));
+    Vec::extend_from(out, data);
+}
+
+// The ClientHello: a key share for `group` (X25519 first, P-256 or P-384
+// after a HelloRetryRequest asks for one), and the HelloRetryRequest's
+// cookie when it gave one.
+fn client_hello(
+    StringView server_name,
+    slice<u8, shared> random,
+    slice<u8, shared> session,
+    u16 group,
+    slice<u8, shared> public_key,
+    slice<u8, shared> cookie,
+) : Vec<u8>
+{
+    Vec<u8> ext = Vec::new();
+    if (Result::is_err(&IpAddr::parse(server_name)))
+    {
+        Vec<u8> sni = Vec::new();
+        Vec::push_be(&mut sni, narrow<u16>(StringView::len(server_name) + 3));
+        Vec::push(&mut sni, 0);
+        Vec::push_be(&mut sni, narrow<u16>(StringView::len(server_name)));
+        Vec::extend_from(&mut sni, server_name.bytes);
+        push_extension(&mut ext, 0x0000, &sni[0..$]);
+    }
+    array<u8, 8> groups = [0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18];
+    push_extension(&mut ext, 0x000a, &groups[0..$]);
+    array<u8, 20> algs = [
+        0x00,
+        0x12,
+        0x04,
+        0x03,
+        0x05,
+        0x03,
+        0x08,
+        0x04,
+        0x08,
+        0x05,
+        0x08,
+        0x06,
+        0x08,
+        0x07,
+        0x04,
+        0x01,
+        0x05,
+        0x01,
+        0x06,
+        0x01,
+    ];
+    push_extension(&mut ext, 0x000d, &algs[0..$]);
+    array<u8, 3> versions = [0x02, 0x03, 0x04];
+    push_extension(&mut ext, 0x002b, &versions[0..$]);
+    Vec<u8> share = Vec::new();
+    Vec::push_be(&mut share, narrow<u16>(4 + slice_len(public_key)));
+    Vec::push_be(&mut share, group);
+    Vec::push_be(&mut share, narrow<u16>(slice_len(public_key)));
+    Vec::extend_from(&mut share, public_key);
+    push_extension(&mut ext, 0x0033, &share[0..$]);
+    if (slice_len(cookie) > 0)
+    {
+        push_extension(&mut ext, 0x002c, cookie);
+    }
+    Vec<u8> body = Vec::new();
+    Vec::push_be(&mut body, 0x0303: u16);
+    Vec::extend_from(&mut body, random);
+    Vec::push(&mut body, 32);
+    Vec::extend_from(&mut body, session);
+    array<u8, 8> suites = [0x00, 0x06, 0x13, 0x03, 0x13, 0x01, 0x13, 0x02];
+    Vec::extend_from(&mut body, &suites[0..$]);
+    Vec::push(&mut body, 1);
+    Vec::push(&mut body, 0);
+    Vec::push_be(&mut body, narrow<u16>(Vec::len(&ext)));
+    Vec::extend_from(&mut body, &ext[0..$]);
+    Vec<u8> msg = Vec::new();
+    Vec::push(&mut msg, 1);
+    push_u24(&mut msg, Vec::len(&body));
+    Vec::extend_from(&mut msg, &body[0..$]);
+    msg
+}
+
+// What a ServerHello or HelloRetryRequest chose.
+struct ServerHello
+{
+    bool retry;
+    u16 suite;
+    u16 group;
+    Vec<u8> share;
+    Vec<u8> cookie;
+}
+
+// The suite, the group and the key share of a ServerHello, or the suite,
+// the group asked for and the cookie of a HelloRetryRequest (RFC 8446
+// §4.1.3, §4.1.4), after checking the version, the session id echo and
+// that the suite is one offered.
+fn server_hello(slice<u8, shared> sh, slice<u8, shared> session) : Result<ServerHello, TlsError>
+{
+    usize n = slice_len(sh);
+    if (n < 4 + 2 + 32 + 1 || sh[0] != 2)
+    {
+        return Err(ProtocolError);
+    }
+    // HelloRetryRequest's fixed random.
+    Vec<u8> hrr = Result::unwrap_or(
+        from_hex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"),
+        Vec::new(),
+    );
+    bool retry = digest_eq(&sh[6..38], &hrr[0..$]);
+    usize at = 38;
+    usize sid_len = widen<usize>(sh[at]);
+    if (sid_len != slice_len(session) || at + 1 + sid_len + 3 + 2 > n || !digest_eq(
+        &sh[at + 1..at + 1 + sid_len],
+        session,
+    ))
+    {
+        return Err(ProtocolError);
+    }
+    at = at + 1 + sid_len;
+    u16 suite = read_be<u16>(sh, at);
+    if ((suite != 0x1303 && suite != 0x1301 && suite != 0x1302) || sh[at + 2] != 0)
+    {
+        return Err(HandshakeFailed);
+    }
+    at += 3;
+    usize ext_end = at + 2 + widen<usize>(read_be<u16>(sh, at));
+    if (ext_end != n)
+    {
+        return Err(ProtocolError);
+    }
+    at += 2;
+    bool tls13 = false;
+    Option<u16> group = None;
+    Vec<u8> share = Vec::new();
+    Vec<u8> cookie = Vec::new();
+    while (at + 4 <= ext_end)
+    {
+        u16 kind = read_be<u16>(sh, at);
+        usize len = widen<usize>(read_be<u16>(sh, at + 2));
+        usize start = at + 4;
+        if (start + len > ext_end)
+        {
+            return Err(ProtocolError);
+        }
+        if (kind == 0x002b)
+        {
+            tls13 = len == 2 && sh[start] == 0x03 && sh[start + 1] == 0x04;
+        }
+        else if (kind == 0x0033)
+        {
+            if (len < 2)
+            {
+                return Err(ProtocolError);
+            }
+            u16 g = read_be<u16>(sh, start);
+            if (g != 0x001d && g != 0x0017 && g != 0x0018)
+            {
+                return Err(HandshakeFailed);
+            }
+            group = Some(g);
+            if (!retry)
+            {
+                usize want = if (g == 0x001d) { 32 } else if (g == 0x0017) { 65 } else { 97 };
+                if (len != 4 + want || widen<usize>(read_be<u16>(sh, start + 2)) != want)
+                {
+                    return Err(HandshakeFailed);
+                }
+                overwrite(&mut share, Vec::from_slice(&sh[start + 4..start + len]));
+            }
+            else if (len != 2)
+            {
+                return Err(ProtocolError);
+            }
+        }
+        else if (kind == 0x002c && retry)
+        {
+            overwrite(&mut cookie, Vec::from_slice(&sh[start..start + len]));
+        }
+        at = start + len;
+    }
+    if (!tls13)
+    {
+        return Err(HandshakeFailed);
+    }
+    match (group)
+    {
+        Some(g) : Ok(ServerHello { .retry = retry, .suite = suite, .group = g, .share = share, .cookie = cookie }),
+        None    : Err(HandshakeFailed),
+    }
+}
+
+// A handshake record carrying `msg`.
+fn handshake_record(slice<u8, shared> msg, u16 version) : Vec<u8>
+{
+    Vec<u8> rec = Vec::new();
+    Vec::push(&mut rec, 22);
+    Vec::push_be(&mut rec, version);
+    Vec::push_be(&mut rec, narrow<u16>(slice_len(msg)));
+    Vec::extend_from(&mut rec, msg);
+    rec
+}
+
+fn transcript_hash(ref<Handshake, shared> hs) : Vec<u8>
+{
+    match (hs.kind)
+    {
+        Sha2_384 : Hasher::finish(hs.t384),
+        _        : Hasher::finish(hs.t256),
+    }
+}
+
+fn derive_secret(HashKind kind, slice<u8, shared> secret, str label, slice<u8, shared> transcript) : Vec<u8>
+{
+    hkdf_expand_label_with(kind, secret, label, transcript, slice_len(secret))
+}
+
+// The certificates of a Certificate message (RFC 8446 §4.4.2), leaf first.
+fn certificate_list(slice<u8, shared> m) : Result<Vec<Certificate>, TlsError>
+{
+    usize n = slice_len(m);
+    if (n < 8 || m[0] != 11 || m[4] != 0)
+    {
+        return Err(ProtocolError);
+    }
+    usize at = 5;
+    usize list_end = at + 3 + (widen<usize>(m[at]) << 16 | widen<usize>(m[at + 1]) << 8 | widen<usize>(m[at + 2]));
+    if (list_end != n)
+    {
+        return Err(ProtocolError);
+    }
+    at += 3;
+    Vec<Certificate> out = Vec::new();
+    while (at < list_end)
+    {
+        if (at + 3 > list_end)
+        {
+            return Err(ProtocolError);
+        }
+        usize len = widen<usize>(m[at]) << 16 | widen<usize>(m[at + 1]) << 8 | widen<usize>(m[at + 2]);
+        usize start = at + 3;
+        if (start + len + 2 > list_end)
+        {
+            return Err(ProtocolError);
+        }
+        match (Certificate::parse(&m[start..start + len]))
+        {
+            Ok(c)  : Vec::push(&mut out, c),
+            Err(e) : return Err(CertRejected(e)),
+        }
+        usize ext_len = widen<usize>(read_be<u16>(m, start + len));
+        at = start + len + 2 + ext_len;
+    }
+    if (Vec::len(&out) == 0)
+    {
+        return Err(HandshakeFailed);
+    }
+    Ok(out)
+}
+
+// Whether a CertificateVerify (RFC 8446 §4.4.3) holds for the leaf's key
+// over the transcript hash so far.
+fn certificate_verify_ok(slice<u8, shared> m, ref<Certificate, shared> leaf, slice<u8, shared> transcript) : bool
+{
+    if (slice_len(m) < 8 || m[0] != 15)
+    {
+        return false;
+    }
+    u16 code = read_be<u16>(m, 4);
+    usize len = widen<usize>(read_be<u16>(m, 6));
+    if (8 + len != slice_len(m))
+    {
+        return false;
+    }
+    SignatureScheme scheme = UnsupportedSignature;
+    bool curve_ok = true;
+    if (code == 0x0403 || code == 0x0503)
+    {
+        EcCurve want = if (code == 0x0403) { P256 } else { P384 };
+        curve_ok = match (&leaf.key)
+        {
+            EcKey(k) : k.curve == want,
+            _        : false,
+        };
+        scheme = Ecdsa(if (code == 0x0403) { Sha2_256 } else { Sha2_384 });
+    }
+    else if (code == 0x0804)
+    {
+        scheme = RsaPss(Sha2_256);
+    }
+    else if (code == 0x0805)
+    {
+        scheme = RsaPss(Sha2_384);
+    }
+    else if (code == 0x0806)
+    {
+        scheme = RsaPss(Sha2_512);
+    }
+    else if (code == 0x0807)
+    {
+        scheme = Ed25519;
+    }
+    if (!curve_ok)
+    {
+        return false;
+    }
+    Vec<u8> content = Vec::filled(64, 0x20: u8);
+    Vec::extend_from(&mut content, &b"TLS 1.3, server CertificateVerify"[0..$]);
+    Vec::push(&mut content, 0);
+    Vec::extend_from(&mut content, transcript);
+    verify_signature(&leaf.key, &scheme, &content[0..$], &m[8..$])
+}
+
+fn finished_data(HashKind kind, slice<u8, shared> secret, slice<u8, shared> transcript) : Vec<u8>
+{
+    Vec<u8> none = Vec::new();
+    Vec<u8> key = hkdf_expand_label_with(kind, secret, "finished", &none[0..$], slice_len(secret));
+    hmac(kind, &key[0..$], transcript)
+}
+
+// Performs the TLS 1.3 handshake over a connected `tcp` as a client of
+// `server_name` (a DNS name, sent as SNI and checked against the
+// certificate, or an IP address literal, checked against its IP
+// addresses), verifying the server's chain against `roots` at the current
+// time. The stream's own timeouts apply to every read and write.
+export fn TlsStream::client(
+    TcpStream tcp,
+    StringView server_name,
+    ref<TrustStore, shared> roots,
+) : Result<TlsStream, TlsError>
+{
+    array<u8, 32> private_key = x25519_private_key();
+    array<u8, 32> public_key = x25519_public_key(&private_key[0..$]);
+    array<u8, 32> random = [0; 32];
+    os_random_bytes(&mut random[0..$]);
+    array<u8, 32> session = [0; 32];
+    os_random_bytes(&mut session[0..$]);
+    Handshake hs = Handshake { .buffer = Vec::new(), .t256 = Hasher::new(Sha2_256), .t384 = Hasher::new(Sha2_384), .kind = Sha2_256 };
+    Vec<u8> none = Vec::new();
+    Vec<u8> ch = client_hello(server_name, &random[0..$], &session[0..$], 0x001d, &public_key[0..$], &none[0..$]);
+    transcript_add(&mut hs, &ch[0..$]);
+    write_all(&mut tcp, &handshake_record(&ch[0..$], 0x0301)[0..$])?;
+    Option<RecordKeys> plain = None;
+    Vec<u8> sh = next_message(&mut hs, &mut tcp, &mut plain)?;
+    ServerHello hello = server_hello(&sh[0..$], &session[0..$])?;
+    hs.kind = suite_hash(hello.suite);
+    HashKind kind = hs.kind;
+    Vec<u8> ec_key = Vec::new();
+    if (hello.retry)
+    {
+        // A HelloRetryRequest (RFC 8446 §4.1.4): it may only ask for a
+        // group this client offered without a share, P-256 or P-384. The
+        // transcript restarts from message_hash(ClientHello1) ‖
+        // HelloRetryRequest, under the suite's hash.
+        if ((hello.group != 0x0017 && hello.group != 0x0018) || Vec::len(&hs.buffer) != 0)
+        {
+            return Err(HandshakeFailed);
+        }
+        EcCurve curve = if (hello.group == 0x0017) { P256 } else { P384 };
+        Vec<u8> ch_hash = hash(kind, &ch[0..$]);
+        array<u8, 4> head = [254, 0, 0, narrow<u8>(Vec::len(&ch_hash))];
+        Handshake restarted = Handshake { .buffer = Vec::new(), .t256 = Hasher::new(Sha2_256), .t384 = Hasher::new(Sha2_384), .kind = kind };
+        transcript_add(&mut restarted, &head[0..$]);
+        transcript_add(&mut restarted, &ch_hash[0..$]);
+        transcript_add(&mut restarted, &sh[0..$]);
+        overwrite(&mut ec_key, ec_private_key(curve));
+        Vec<u8> ec_public = Option::unwrap(ec_public_key(curve, &ec_key[0..$]));
+        Vec<u8> ch2 = client_hello(
+            server_name,
+            &random[0..$],
+            &session[0..$],
+            hello.group,
+            &ec_public[0..$],
+            &hello.cookie[0..$],
+        );
+        transcript_add(&mut restarted, &ch2[0..$]);
+        overwrite(&mut hs, restarted);
+        write_all(&mut tcp, &handshake_record(&ch2[0..$], 0x0303)[0..$])?;
+        Vec<u8> sh2 = next_message(&mut hs, &mut tcp, &mut plain)?;
+        ServerHello second = server_hello(&sh2[0..$], &session[0..$])?;
+        if (second.retry || second.group != hello.group || second.suite != hello.suite)
+        {
+            return Err(HandshakeFailed);
+        }
+        overwrite(&mut hello, second);
+    }
+    else if (hello.group != 0x001d)
+    {
+        return Err(HandshakeFailed);
+    }
+    u16 suite = hello.suite;
+    Vec<u8> shared = Vec::new();
+    if (hello.group == 0x001d)
+    {
+        match (x25519(&private_key[0..$], &hello.share[0..$]))
+        {
+            Some(z) : Vec::extend_from(&mut shared, &z[0..$]),
+            None    : return Err(HandshakeFailed),
+        }
+    }
+    else
+    {
+        EcCurve curve = if (hello.group == 0x0017) { P256 } else { P384 };
+        match (ecdh(curve, &ec_key[0..$], &hello.share[0..$]))
+        {
+            Some(z) : overwrite(&mut shared, z),
+            None    : return Err(HandshakeFailed),
+        }
+    }
+    // The key schedule (RFC 8446 §7.1), under the suite's hash.
+    Vec<u8> empty_hash = hash(kind, &none[0..$]);
+    Vec<u8> zeros = Vec::filled(Vec::len(&empty_hash), 0: u8);
+    Vec<u8> early = hkdf_extract_with(kind, &none[0..$], &zeros[0..$]);
+    Vec<u8> derived = derive_secret(kind, &early[0..$], "derived", &empty_hash[0..$]);
+    Vec<u8> handshake_secret = hkdf_extract_with(kind, &derived[0..$], &shared[0..$]);
+    Vec<u8> th = transcript_hash(&hs);
+    Vec<u8> c_hs = derive_secret(kind, &handshake_secret[0..$], "c hs traffic", &th[0..$]);
+    Vec<u8> s_hs = derive_secret(kind, &handshake_secret[0..$], "s hs traffic", &th[0..$]);
+    Option<RecordKeys> server_keys = Some(keys_from(&s_hs[0..$], suite));
+    Vec<u8> ee = next_message(&mut hs, &mut tcp, &mut server_keys)?;
+    if (Vec::len(&ee) < 6 || ee[0] != 8)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u8> cm = next_message(&mut hs, &mut tcp, &mut server_keys)?;
+    Vec<Certificate> chain = certificate_list(&cm[0..$])?;
+    Certificate leaf = Vec::remove(&mut chain, 0);
+    DateTime now = DateTime::now();
+    match (verify_chain(&leaf, &chain[0..$], roots, server_name, &now))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(CertRejected(e)),
+    }
+    Vec<u8> th_cert = transcript_hash(&hs);
+    Vec<u8> cv = next_message(&mut hs, &mut tcp, &mut server_keys)?;
+    if (!certificate_verify_ok(&cv[0..$], &leaf, &th_cert[0..$]))
+    {
+        return Err(HandshakeFailed);
+    }
+    Vec<u8> th_cv = transcript_hash(&hs);
+    Vec<u8> fin = next_message(&mut hs, &mut tcp, &mut server_keys)?;
+    Vec<u8> want = finished_data(kind, &s_hs[0..$], &th_cv[0..$]);
+    if (Vec::len(&fin) != 4 + Vec::len(&want) || fin[0] != 20 || !digest_eq(&fin[4..$], &want[0..$]))
+    {
+        return Err(HandshakeFailed);
+    }
+    if (Vec::len(&hs.buffer) != 0)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u8> th_fin = transcript_hash(&hs);
+    Vec<u8> derived2 = derive_secret(kind, &handshake_secret[0..$], "derived", &empty_hash[0..$]);
+    Vec<u8> master = hkdf_extract_with(kind, &derived2[0..$], &zeros[0..$]);
+    Vec<u8> c_ap = derive_secret(kind, &master[0..$], "c ap traffic", &th_fin[0..$]);
+    Vec<u8> s_ap = derive_secret(kind, &master[0..$], "s ap traffic", &th_fin[0..$]);
+    // The client's flight: a compatibility ChangeCipherSpec, then Finished
+    // under the client handshake keys.
+    array<u8, 6> ccs = [20, 0x03, 0x03, 0x00, 0x01, 0x01];
+    write_all(&mut tcp, &ccs[0..$])?;
+    Vec<u8> mine = finished_data(kind, &c_hs[0..$], &th_fin[0..$]);
+    Vec<u8> cfin = Vec::new();
+    Vec::push(&mut cfin, 20);
+    push_u24(&mut cfin, Vec::len(&mine));
+    Vec::extend_from(&mut cfin, &mine[0..$]);
+    RecordKeys client_hs = keys_from(&c_hs[0..$], suite);
+    Vec<u8> out = seal_record(&mut client_hs, 22, &cfin[0..$]);
+    write_all(&mut tcp, &out[0..$])?;
+    Ok(TlsStream {
+        .tcp = tcp,
+        .send = keys_from(&c_ap[0..$], suite),
+        .recv = keys_from(&s_ap[0..$], suite),
+        .pending = Vec::new(),
+        .pending_at = 0,
+        .closed = false,
+        .peer = Some(leaf),
+    })
+}
+
+// Connects to `addr` and performs the handshake as `client` does.
+export fn TlsStream::connect(
+    SocketAddr addr,
+    StringView server_name,
+    ref<TrustStore, shared> roots,
+) : Result<TlsStream, TlsError>
+{
+    match (TcpStream::connect(addr))
+    {
+        Ok(tcp) : TlsStream::client(tcp, server_name, roots),
+        Err(e)  : Err(NetFailure(e)),
+    }
+}
+
+// Sends all of `data`, in records of at most 16 KiB.
+export fn TlsStream::write(ref<TlsStream, exclusive> s, slice<u8, shared> data) : Result<void, TlsError>
+{
+    usize at = 0;
+    usize n = slice_len(data);
+    while (at < n)
+    {
+        usize take = min(n - at, 16384);
+        Vec<u8> rec = seal_record(&mut s.send, 23, &data[at..at + take]);
+        write_all(&mut s.tcp, &rec[0..$])?;
+        at += take;
+    }
+    Ok(())
+}
+
+export fn TlsStream::write_text(ref<TlsStream, exclusive> s, StringView text) : Result<void, TlsError>
+{
+    TlsStream::write(s, text.bytes)
+}
+
+// Reads records until application data arrives, handling what TLS 1.3
+// sends after the handshake: a NewSessionTicket is ignored, a KeyUpdate
+// changes the keys (and is answered when asked), close_notify ends the
+// stream.
+fn TlsStream::fill(ref<TlsStream, exclusive> s) : Result<void, TlsError>
+{
+    while (s.pending_at >= Vec::len(&s.pending) && !s.closed)
+    {
+        Record r = read_record(&mut s.tcp)?;
+        if (r.kind == 20)
+        {
+            continue;
+        }
+        Inner { kind, content } = open_record(&mut s.recv, &r)?;
+        if (kind == 23)
+        {
+            overwrite(&mut s.pending, content);
+            s.pending_at = 0;
+        }
+        else if (kind == 21)
+        {
+            if (Vec::len(&content) == 2 && content[1] == 0)
+            {
+                s.closed = true;
+            }
+            else
+            {
+                return Err(PeerAlert(if (Vec::len(&content) == 2) { content[1] } else { 0 }));
+            }
+        }
+        else if (kind == 22)
+        {
+            usize at = 0;
+            while (at + 4 <= Vec::len(&content))
+            {
+                u8 t = content[at];
+                usize len = widen<usize>(content[at + 1]) << 16 | widen<usize>(content[at + 2]) << 8 | widen<usize>(content[at + 3]);
+                if (at + 4 + len > Vec::len(&content))
+                {
+                    return Err(ProtocolError);
+                }
+                if (t == 24)
+                {
+                    if (len != 1)
+                    {
+                        return Err(ProtocolError);
+                    }
+                    Vec<u8> none = Vec::new();
+                    HashKind kind = suite_hash(s.recv.suite);
+                    Vec<u8> next = hkdf_expand_label_with(
+                        kind,
+                        &s.recv.secret[0..$],
+                        "traffic upd",
+                        &none[0..$],
+                        Vec::len(&s.recv.secret),
+                    );
+                    overwrite(&mut s.recv, keys_from(&next[0..$], s.recv.suite));
+                    if (content[at + 4] == 1)
+                    {
+                        array<u8, 5> reply = [24, 0, 0, 1, 0];
+                        Vec<u8> rec = seal_record(&mut s.send, 22, &reply[0..$]);
+                        write_all(&mut s.tcp, &rec[0..$])?;
+                        Vec<u8> mine = hkdf_expand_label_with(
+                            kind,
+                            &s.send.secret[0..$],
+                            "traffic upd",
+                            &none[0..$],
+                            Vec::len(&s.send.secret),
+                        );
+                        overwrite(&mut s.send, keys_from(&mine[0..$], s.send.suite));
+                    }
+                }
+                else if (t != 4)
+                {
+                    return Err(ProtocolError);
+                }
+                at = at + 4 + len;
+            }
+        }
+        else
+        {
+            return Err(ProtocolError);
+        }
+    }
+    Ok(())
+}
+
+// Appends up to `max` bytes the server sent to `buf`, waiting for some;
+// 0 when the server has closed the connection (close_notify).
+export fn TlsStream::read(ref<TlsStream, exclusive> s, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, TlsError>
+{
+    if (max == 0)
+    {
+        return Ok(0);
+    }
+    TlsStream::fill(s)?;
+    usize have = Vec::len(&s.pending) - s.pending_at;
+    usize take = min(have, max);
+    Vec::extend_from(buf, &s.pending[s.pending_at..s.pending_at + take]);
+    s.pending_at += take;
+    Ok(take)
+}
+
+// Appends exactly `n` bytes to `buf`; `Err(NetFailure(Closed))` when the
+// server closes first.
+export fn TlsStream::read_exact(
+    ref<TlsStream, exclusive> s,
+    ref<Vec<u8>, exclusive> buf,
+    usize n,
+) : Result<void, TlsError>
+{
+    usize got = 0;
+    while (got < n)
+    {
+        usize k = TlsStream::read(s, buf, n - got)?;
+        if (k == 0)
+        {
+            return Err(NetFailure(Closed));
+        }
+        got += k;
+    }
+    Ok(())
+}
+
+// D-0181: the next line the peer sent, without its `\n` (nor a `\r`
+// before it), as `TcpStream::read_line` reads one; `None` when the peer
+// has closed (close_notify) before any byte.
+export fn TlsStream::read_line(ref<TlsStream, exclusive> s) : Result<Option<String>, TlsError>
+{
+    Vec<u8> line = Vec::new();
+    while (true)
+    {
+        TlsStream::fill(s)?;
+        usize n = Vec::len(&s.pending);
+        if (s.pending_at >= n)
+        {
+            if (Vec::len(&line) == 0)
+            {
+                return Ok(None);
+            }
+            break;
+        }
+        usize i = s.pending_at;
+        while (i < n && s.pending[i] != 10)
+        {
+            i += 1;
+        }
+        if (i < n)
+        {
+            Vec::extend_from(&mut line, &s.pending[s.pending_at..i]);
+            s.pending_at = i + 1;
+            break;
+        }
+        Vec::extend_from(&mut line, &s.pending[s.pending_at..n]);
+        s.pending_at = n;
+    }
+    usize k = Vec::len(&line);
+    if (k > 0 && line[k - 1] == 13)
+    {
+        Vec::pop(&mut line);
+    }
+    match (String::from_utf8(line))
+    {
+        Ok(t)  : Ok(Some(t)),
+        Err(e) : Err(NetFailure(NotUtf8(e))),
+    }
+}
+
+// Sends close_notify (RFC 8446 §6.1); the server may still send what it
+// had in flight. Dropping a `TlsStream` without `close` just closes the
+// connection.
+export fn TlsStream::close(ref<TlsStream, exclusive> s) : Result<void, TlsError>
+{
+    array<u8, 2> alert = [1, 0];
+    Vec<u8> rec = seal_record(&mut s.send, 21, &alert[0..$]);
+    write_all(&mut s.tcp, &rec[0..$])
+}
+
+// ---- the server side (D-0186) ----
+//
+// `TlsStream::server` answers a client's handshake with the server's own
+// certificate chain and private key: the same suites, groups and
+// signature schemes the client side speaks, chosen in the client's order
+// of preference; a HelloRetryRequest when the client sent a key share
+// for none of the server's groups; no client certificates, no
+// resumption, no early data.
+
+// What a ClientHello offers.
+struct ClientHello
+{
+    Vec<u8> session;
+    Vec<u16> suites;
+    Vec<u16> groups;                    // supported_groups
+    Vec<u16> schemes;                   // signature_algorithms
+    Vec<u16> share_groups;              // key_share, in order
+    Vec<Vec<u8>> shares;
+    bool tls13;
+    bool has_cookie;
+}
+
+fn u16_list(slice<u8, shared> b, usize start, usize end, ref<Vec<u16>, exclusive> out) : bool
+{
+    if ((end - start) % 2 != 0)
+    {
+        return false;
+    }
+    usize at = start;
+    while (at < end)
+    {
+        Vec::push(out, read_be<u16>(b, at));
+        at += 2;
+    }
+    true
+}
+
+// A ClientHello (RFC 8446 §4.1.2) taken apart; ProtocolError when
+// malformed.
+fn client_hello_parse(slice<u8, shared> m) : Result<ClientHello, TlsError>
+{
+    usize n = slice_len(m);
+    if (n < 4 + 2 + 32 + 1 || m[0] != 1)
+    {
+        return Err(ProtocolError);
+    }
+    usize at = 38;
+    usize sid_len = widen<usize>(m[at]);
+    if (sid_len > 32 || at + 1 + sid_len + 2 > n)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u8> session = Vec::from_slice(&m[at + 1..at + 1 + sid_len]);
+    at = at + 1 + sid_len;
+    usize suites_len = widen<usize>(read_be<u16>(m, at));
+    at += 2;
+    if (at + suites_len + 1 > n)
+    {
+        return Err(ProtocolError);
+    }
+    Vec<u16> suites = Vec::new();
+    if (!u16_list(m, at, at + suites_len, &mut suites))
+    {
+        return Err(ProtocolError);
+    }
+    at += suites_len;
+    usize comp_len = widen<usize>(m[at]);
+    at += 1 + comp_len;
+    ClientHello ch = ClientHello {
+        .session = session,
+        .suites = suites,
+        .groups = Vec::new(),
+        .schemes = Vec::new(),
+        .share_groups = Vec::new(),
+        .shares = Vec::new(),
+        .tls13 = false,
+        .has_cookie = false,
+    };
+    if (at == n)
+    {
+        return Ok(ch);
+    }
+    if (at + 2 > n)
+    {
+        return Err(ProtocolError);
+    }
+    usize ext_end = at + 2 + widen<usize>(read_be<u16>(m, at));
+    if (ext_end != n)
+    {
+        return Err(ProtocolError);
+    }
+    at += 2;
+    while (at + 4 <= ext_end)
+    {
+        u16 kind = read_be<u16>(m, at);
+        usize len = widen<usize>(read_be<u16>(m, at + 2));
+        usize start = at + 4;
+        if (start + len > ext_end)
+        {
+            return Err(ProtocolError);
+        }
+        if (kind == 0x002b)
+        {
+            // supported_versions: a 1-byte length and the versions.
+            if (len < 1 || widen<usize>(m[start]) + 1 != len)
+            {
+                return Err(ProtocolError);
+            }
+            Vec<u16> versions = Vec::new();
+            if (!u16_list(m, start + 1, start + len, &mut versions))
+            {
+                return Err(ProtocolError);
+            }
+            foreach (v in &versions)
+            {
+                if (*v == 0x0304)
+                {
+                    ch.tls13 = true;
+                }
+            }
+        }
+        else if (kind == 0x000a || kind == 0x000d)
+        {
+            if (len < 2 || widen<usize>(read_be<u16>(m, start)) + 2 != len)
+            {
+                return Err(ProtocolError);
+            }
+            Vec<u16> list = Vec::new();
+            if (!u16_list(m, start + 2, start + len, &mut list))
+            {
+                return Err(ProtocolError);
+            }
+            if (kind == 0x000a)
+            {
+                overwrite(&mut ch.groups, list);
+            }
+            else
+            {
+                overwrite(&mut ch.schemes, list);
+            }
+        }
+        else if (kind == 0x0033)
+        {
+            if (len < 2 || widen<usize>(read_be<u16>(m, start)) + 2 != len)
+            {
+                return Err(ProtocolError);
+            }
+            usize p = start + 2;
+            while (p + 4 <= start + len)
+            {
+                u16 g = read_be<u16>(m, p);
+                usize klen = widen<usize>(read_be<u16>(m, p + 2));
+                if (p + 4 + klen > start + len)
+                {
+                    return Err(ProtocolError);
+                }
+                Vec::push(&mut ch.share_groups, g);
+                Vec::push(&mut ch.shares, Vec::from_slice(&m[p + 4..p + 4 + klen]));
+                p += 4 + klen;
+            }
+            if (p != start + len)
+            {
+                return Err(ProtocolError);
+            }
+        }
+        else if (kind == 0x002c)
+        {
+            ch.has_cookie = true;
+        }
+        at = start + len;
+    }
+    if (at != ext_end)
+    {
+        return Err(ProtocolError);
+    }
+    Ok(ch)
+}
+
+// A plaintext alert (before the handshake keys exist), best effort.
+fn send_plain_alert(ref<TcpStream, exclusive> tcp, u8 code)
+{
+    array<u8, 7> rec = [21, 0x03, 0x03, 0, 2, 2, code];
+    _ = TcpStream::write(tcp, &rec[0..$]);
+}
+
+// The ServerHello, or the HelloRetryRequest when `retry` (then `share`
+// is empty and the key_share names the group alone).
+fn server_hello_bytes(
+    slice<u8, shared> random,
+    slice<u8, shared> session,
+    u16 suite,
+    u16 group,
+    slice<u8, shared> share,
+    bool retry,
+) : Vec<u8>
+{
+    Vec<u8> ext = Vec::new();
+    array<u8, 2> v13 = [0x03, 0x04];
+    push_extension(&mut ext, 0x002b, &v13[0..$]);
+    Vec<u8> ks = Vec::new();
+    Vec::push_be(&mut ks, group);
+    if (!retry)
+    {
+        Vec::push_be(&mut ks, narrow<u16>(slice_len(share)));
+        Vec::extend_from(&mut ks, share);
+    }
+    push_extension(&mut ext, 0x0033, &ks[0..$]);
+    Vec<u8> body = Vec::new();
+    Vec::push_be(&mut body, 0x0303: u16);
+    Vec::extend_from(&mut body, random);
+    Vec::push(&mut body, narrow<u8>(slice_len(session)));
+    Vec::extend_from(&mut body, session);
+    Vec::push_be(&mut body, suite);
+    Vec::push(&mut body, 0);
+    Vec::push_be(&mut body, narrow<u16>(Vec::len(&ext)));
+    Vec::extend_from(&mut body, &ext[0..$]);
+    Vec<u8> msg = Vec::new();
+    Vec::push(&mut msg, 2);
+    push_u24(&mut msg, Vec::len(&body));
+    Vec::extend_from(&mut msg, &body[0..$]);
+    msg
+}
+
+// A handshake message sent encrypted under `keys`, in records of at most
+// 16 KiB, and added to the transcript.
+fn send_handshake(
+    ref<TcpStream, exclusive> tcp,
+    ref<RecordKeys, exclusive> keys,
+    ref<Handshake, exclusive> hs,
+    slice<u8, shared> msg,
+) : Result<void, TlsError>
+{
+    transcript_add(hs, msg);
+    usize at = 0;
+    while (at < slice_len(msg))
+    {
+        usize take = min(slice_len(msg) - at, 16384);
+        Vec<u8> rec = seal_record(keys, 22, &msg[at..at + take]);
+        write_all(tcp, &rec[0..$])?;
+        at += take;
+    }
+    Ok(())
+}
+
+// The signature scheme the server's key signs with, if the client
+// accepts it.
+fn server_scheme(ref<PrivateKey, shared> key, ref<Vec<u16>, shared> offered) : Option<u16>
+{
+    u16 want = match (key)
+    {
+        RsaPrivate(_)     : 0x0804,
+        EcPrivate(k)      : if (k.curve == P256) { 0x0403 } else { 0x0503 },
+        Ed25519Private(_) : 0x0807,
+    };
+    foreach (s in offered)
+    {
+        if (*s == want)
+        {
+            return Some(want);
+        }
+    }
+    None
+}
+
+fn scheme_of(u16 code) : SignatureScheme
+{
+    if (code == 0x0403) { Ecdsa(Sha2_256) }
+    else if (code == 0x0503) { Ecdsa(Sha2_384) }
+    else if (code == 0x0807) { Ed25519 }
+    else { RsaPss(Sha2_256) }
+}
+
+// Performs the TLS 1.3 handshake over an accepted `tcp` as the server
+// holding `key` and `chain` (the server's certificate first, then its
+// issuers up to, but not including, the root); the client verifies them.
+// The stream's own timeouts apply to every read and write. A client that
+// does not speak TLS 1.3, or offers no suite, group or signature scheme
+// in common, is answered with an alert and `HandshakeFailed`.
+export fn TlsStream::server(
+    TcpStream tcp,
+    ref<PrivateKey, shared> key,
+    slice<Certificate, shared> chain,
+) : Result<TlsStream, TlsError>
+{
+    if (slice_len(chain) == 0)
+    {
+        return Err(HandshakeFailed);
+    }
+    Handshake hs = Handshake { .buffer = Vec::new(), .t256 = Hasher::new(Sha2_256), .t384 = Hasher::new(Sha2_384), .kind = Sha2_256 };
+    Option<RecordKeys> plain = None;
+    Vec<u8> chm = next_message(&mut hs, &mut tcp, &mut plain)?;
+    ClientHello ch = client_hello_parse(&chm[0..$])?;
+    if (!ch.tls13)
+    {
+        send_plain_alert(&mut tcp, 70);
+        return Err(HandshakeFailed);
+    }
+    // The suite: the client's first that this server has.
+    u16 suite = 0;
+    foreach (s in &ch.suites)
+    {
+        if (suite == 0 && (*s == 0x1303 || *s == 0x1301 || *s == 0x1302))
+        {
+            suite = *s;
+        }
+    }
+    u16 scheme_code = match (server_scheme(key, &ch.schemes))
+    {
+        Some(c) : c,
+        None    : 0,
+    };
+    if (suite == 0 || scheme_code == 0)
+    {
+        send_plain_alert(&mut tcp, 40);
+        return Err(HandshakeFailed);
+    }
+    hs.kind = suite_hash(suite);
+    HashKind kind = hs.kind;
+    // The group: the client's first key share for a group this server
+    // has; else a HelloRetryRequest for the first group it supports.
+    u16 group = 0;
+    Vec<u8> client_share = Vec::new();
+    for (usize i = 0; i < Vec::len(&ch.share_groups) && group == 0; i += 1)
+    {
+        u16 g = ch.share_groups[i];
+        if (g == 0x001d || g == 0x0017 || g == 0x0018)
+        {
+            group = g;
+            overwrite(&mut client_share, Vec::clone(&ch.shares[i]));
+        }
+    }
+    Vec<u8> session = Vec::clone(&ch.session);
+    if (group == 0)
+    {
+        u16 ask = 0;
+        foreach (g in &ch.groups)
+        {
+            if (ask == 0 && (*g == 0x001d || *g == 0x0017 || *g == 0x0018))
+            {
+                ask = *g;
+            }
+        }
+        if (ask == 0 || ch.has_cookie)
+        {
+            send_plain_alert(&mut tcp, 40);
+            return Err(HandshakeFailed);
+        }
+        // RFC 8446 §4.1.4: the transcript restarts from
+        // message_hash(ClientHello1) ‖ HelloRetryRequest.
+        Vec<u8> ch_hash = hash(kind, &chm[0..$]);
+        array<u8, 4> head = [254, 0, 0, narrow<u8>(Vec::len(&ch_hash))];
+        Handshake restarted = Handshake { .buffer = Vec::new(), .t256 = Hasher::new(Sha2_256), .t384 = Hasher::new(Sha2_384), .kind = kind };
+        transcript_add(&mut restarted, &head[0..$]);
+        transcript_add(&mut restarted, &ch_hash[0..$]);
+        Vec<u8> hrr_random = Result::unwrap_or(
+            from_hex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c"),
+            Vec::new(),
+        );
+        Vec<u8> none = Vec::new();
+        Vec<u8> hrr = server_hello_bytes(&hrr_random[0..$], &session[0..$], suite, ask, &none[0..$], true);
+        transcript_add(&mut restarted, &hrr[0..$]);
+        overwrite(&mut hs, restarted);
+        write_all(&mut tcp, &handshake_record(&hrr[0..$], 0x0303)[0..$])?;
+        Vec<u8> chm2 = next_message(&mut hs, &mut tcp, &mut plain)?;
+        ClientHello ch2 = client_hello_parse(&chm2[0..$])?;
+        bool suite_ok = false;
+        foreach (s in &ch2.suites)
+        {
+            if (*s == suite)
+            {
+                suite_ok = true;
+            }
+        }
+        for (usize i = 0; i < Vec::len(&ch2.share_groups) && group == 0; i += 1)
+        {
+            if (ch2.share_groups[i] == ask)
+            {
+                group = ask;
+                overwrite(&mut client_share, Vec::clone(&ch2.shares[i]));
+            }
+        }
+        if (group == 0 || !suite_ok || !ch2.tls13 || !same_session(&ch2.session, &session))
+        {
+            send_plain_alert(&mut tcp, 47);
+            return Err(HandshakeFailed);
+        }
+    }
+    // This server's share and the shared secret.
+    Vec<u8> public_key = Vec::new();
+    Vec<u8> shared = Vec::new();
+    if (group == 0x001d)
+    {
+        array<u8, 32> private_key = x25519_private_key();
+        Vec::extend_from(&mut public_key, &x25519_public_key(&private_key[0..$])[0..$]);
+        match (x25519(&private_key[0..$], &client_share[0..$]))
+        {
+            Some(z) : Vec::extend_from(&mut shared, &z[0..$]),
+            None    :
+            {
+                send_plain_alert(&mut tcp, 47);
+                return Err(HandshakeFailed);
+            },
+        }
+    }
+    else
+    {
+        EcCurve curve = if (group == 0x0017) { P256 } else { P384 };
+        Vec<u8> ec_key = ec_private_key(curve);
+        overwrite(&mut public_key, Option::unwrap(ec_public_key(curve, &ec_key[0..$])));
+        match (ecdh(curve, &ec_key[0..$], &client_share[0..$]))
+        {
+            Some(z) : overwrite(&mut shared, z),
+            None    :
+            {
+                send_plain_alert(&mut tcp, 47);
+                return Err(HandshakeFailed);
+            },
+        }
+    }
+    array<u8, 32> random = [0; 32];
+    os_random_bytes(&mut random[0..$]);
+    Vec<u8> sh = server_hello_bytes(&random[0..$], &session[0..$], suite, group, &public_key[0..$], false);
+    transcript_add(&mut hs, &sh[0..$]);
+    write_all(&mut tcp, &handshake_record(&sh[0..$], 0x0303)[0..$])?;
+    array<u8, 6> ccs = [20, 0x03, 0x03, 0x00, 0x01, 0x01];
+    write_all(&mut tcp, &ccs[0..$])?;
+    // The key schedule (RFC 8446 §7.1).
+    Vec<u8> none = Vec::new();
+    Vec<u8> empty_hash = hash(kind, &none[0..$]);
+    Vec<u8> zeros = Vec::filled(Vec::len(&empty_hash), 0: u8);
+    Vec<u8> early = hkdf_extract_with(kind, &none[0..$], &zeros[0..$]);
+    Vec<u8> derived = derive_secret(kind, &early[0..$], "derived", &empty_hash[0..$]);
+    Vec<u8> handshake_secret = hkdf_extract_with(kind, &derived[0..$], &shared[0..$]);
+    Vec<u8> th = transcript_hash(&hs);
+    Vec<u8> c_hs = derive_secret(kind, &handshake_secret[0..$], "c hs traffic", &th[0..$]);
+    Vec<u8> s_hs = derive_secret(kind, &handshake_secret[0..$], "s hs traffic", &th[0..$]);
+    RecordKeys server_hs = keys_from(&s_hs[0..$], suite);
+    // EncryptedExtensions (none), Certificate, CertificateVerify, Finished.
+    array<u8, 6> ee = [8, 0, 0, 2, 0, 0];
+    send_handshake(&mut tcp, &mut server_hs, &mut hs, &ee[0..$])?;
+    Vec<u8> list = Vec::new();
+    foreach (c in chain)
+    {
+        push_u24(&mut list, Vec::len(&c.der));
+        Vec::extend_from(&mut list, &c.der[0..$]);
+        Vec::push_be(&mut list, 0: u16);
+    }
+    Vec<u8> cert = Vec::new();
+    Vec::push(&mut cert, 11);
+    push_u24(&mut cert, 4 + Vec::len(&list));
+    Vec::push(&mut cert, 0);
+    push_u24(&mut cert, Vec::len(&list));
+    Vec::extend_from(&mut cert, &list[0..$]);
+    send_handshake(&mut tcp, &mut server_hs, &mut hs, &cert[0..$])?;
+    Vec<u8> th_cert = transcript_hash(&hs);
+    Vec<u8> content = Vec::filled(64, 0x20: u8);
+    Vec::extend_from(&mut content, &b"TLS 1.3, server CertificateVerify"[0..$]);
+    Vec::push(&mut content, 0);
+    Vec::extend_from(&mut content, &th_cert[0..$]);
+    SignatureScheme scheme = scheme_of(scheme_code);
+    Vec<u8> signature = match (sign(key, &scheme, &content[0..$]))
+    {
+        Some(s) : s,
+        None    : return Err(HandshakeFailed),
+    };
+    Vec<u8> cv = Vec::new();
+    Vec::push(&mut cv, 15);
+    push_u24(&mut cv, 4 + Vec::len(&signature));
+    Vec::push_be(&mut cv, scheme_code);
+    Vec::push_be(&mut cv, narrow<u16>(Vec::len(&signature)));
+    Vec::extend_from(&mut cv, &signature[0..$]);
+    send_handshake(&mut tcp, &mut server_hs, &mut hs, &cv[0..$])?;
+    Vec<u8> th_cv = transcript_hash(&hs);
+    Vec<u8> fin_data = finished_data(kind, &s_hs[0..$], &th_cv[0..$]);
+    Vec<u8> fin = Vec::new();
+    Vec::push(&mut fin, 20);
+    push_u24(&mut fin, Vec::len(&fin_data));
+    Vec::extend_from(&mut fin, &fin_data[0..$]);
+    send_handshake(&mut tcp, &mut server_hs, &mut hs, &fin[0..$])?;
+    Vec<u8> th_fin = transcript_hash(&hs);
+    Vec<u8> derived2 = derive_secret(kind, &handshake_secret[0..$], "derived", &empty_hash[0..$]);
+    Vec<u8> master = hkdf_extract_with(kind, &derived2[0..$], &zeros[0..$]);
+    Vec<u8> c_ap = derive_secret(kind, &master[0..$], "c ap traffic", &th_fin[0..$]);
+    Vec<u8> s_ap = derive_secret(kind, &master[0..$], "s ap traffic", &th_fin[0..$]);
+    // The client's Finished, under its handshake keys.
+    Option<RecordKeys> client_hs = Some(keys_from(&c_hs[0..$], suite));
+    Vec<u8> cfin = next_message(&mut hs, &mut tcp, &mut client_hs)?;
+    Vec<u8> want = finished_data(kind, &c_hs[0..$], &th_fin[0..$]);
+    if (Vec::len(&cfin) != 4 + Vec::len(&want) || cfin[0] != 20 || !digest_eq(&cfin[4..$], &want[0..$]))
+    {
+        return Err(HandshakeFailed);
+    }
+    if (Vec::len(&hs.buffer) != 0)
+    {
+        return Err(ProtocolError);
+    }
+    Ok(TlsStream {
+        .tcp = tcp,
+        .send = keys_from(&s_ap[0..$], suite),
+        .recv = keys_from(&c_ap[0..$], suite),
+        .pending = Vec::new(),
+        .pending_at = 0,
+        .closed = false,
+        .peer = None,
+    })
+}
+
+fn same_session(ref<Vec<u8>, shared> a, ref<Vec<u8>, shared> b) : bool
+{
+    Vec::len(a) == Vec::len(b) && digest_eq(&(*a)[0..$], &(*b)[0..$])
+}

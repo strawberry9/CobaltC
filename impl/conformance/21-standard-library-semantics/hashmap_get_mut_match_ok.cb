@@ -1,0 +1,105 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.hashmap `HashMap::get`, `HashMap::get_mut`, `HashMap::contains`; rule.agg.match; rule.err.propagate
+// kind: positive
+// expect: ok
+//
+// Matching on calls that return `Option<ref<T>>`: `HashMap::get_mut`
+// with `*c += 1` as the whole `Some` arm and an insert in the `None` arm
+// (the counting idiom), a binder used several times, `Some(_)`, `get`
+// through a shared reference, `?` on the result, and a function of the
+// program's own returning `Option<ref<T>>`. The map is changed after each
+// match ends, so every reference has ended by then.
+
+import std;
+
+struct P
+{
+    usize x;
+    usize y;
+}
+
+fn find(ref<Vec<P>, exclusive> v, usize key) : Option<ref<P, exclusive>>
+{
+    foreach (i in 0..Vec::len(v))
+    {
+        if (v[i].x == key)
+        {
+            return Some(&mut v[i]);
+        }
+    }
+    None
+}
+
+fn bump(ref<HashMap<String, u32>, exclusive> m, StringView k) : Option<u32>
+{
+    ref<u32, exclusive> c = HashMap::get_mut(m, &String::from_view(k))?;
+    *c += 10;
+    Some(*c)
+}
+
+fn main()
+{
+    Vec<String> words = Vec::new();
+    foreach (w in ["a", "b", "a", "c", "a", "b"])
+    {
+        Vec::push(&mut words, String::from_str(w));
+    }
+    HashMap<String, u32> counts = HashMap::new();
+    foreach (w in &words)
+    {
+        match (HashMap::get_mut(&mut counts, w))
+        {
+            Some(c) : *c += 1,
+            None    : { _ = HashMap::insert(&mut counts, String::clone(w), 1); },
+        }
+    }
+    String a = String::from_str("a");
+    String b = String::from_str("b");
+    String z = String::from_str("z");
+    assert(HashMap::len(&counts) == 3);
+    assert(*Option::unwrap(HashMap::get(&counts, &a)) == 3);
+    assert(*Option::unwrap(HashMap::get(&counts, &b)) == 2);
+    u32 seen = 0;
+    match (HashMap::get(&counts, &a))
+    {
+        Some(c) : seen = *c * 10 + *c,
+        None    : {},
+    }
+    assert(seen == 33);
+    match (HashMap::get_mut(&mut counts, &b))
+    {
+        Some(c) : { *c *= 2; *c += 1; },
+        None    : {},
+    }
+    assert(*Option::unwrap(HashMap::get(&counts, &b)) == 5);
+    bool present = false;
+    match (HashMap::get_mut(&mut counts, &z))
+    {
+        Some(_) : present = true,
+        None    : {},
+    }
+    assert(!present);
+    _ = HashMap::insert(&mut counts, String::clone(&z), 7);
+    assert(bump(&mut counts, StringView::of("z")) == Some(17));
+    assert(bump(&mut counts, StringView::of("q")) == None);
+    assert(HashMap::contains(&counts, &z));
+    Vec<P> ps = Vec::new();
+    foreach (i in 0..5)
+    {
+        Vec::push(&mut ps, P { .x = i, .y = i * 10 });
+    }
+    usize hits = 0;
+    foreach (k in 0..7)
+    {
+        match (find(&mut ps, k))
+        {
+            Some(p) : { p.y += 1; p.y *= 2; hits += 1; },
+            None    : {},
+        }
+    }
+    assert(hits == 5);
+    usize total = match (find(&mut ps, 3)) { Some(p) : p.y, None : 0 };
+    assert(total == 62);
+    printf("ok\n");
+}

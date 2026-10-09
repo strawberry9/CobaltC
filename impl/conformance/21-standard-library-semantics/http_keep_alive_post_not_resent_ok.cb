@@ -1,0 +1,77 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Keep-Alive] (D-0195, CHG-0235); conf.http-keep-alive-post-not-resent
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 474554202f61203230300a504f5354202f622074686520636f6e6e656374696f6e2077617320636c6f7365640a474554202f63203230300a474554202f64203230300a736572766572207265616420352072657175657374730a
+//
+// A client keeping its connection alive, against a server that closes a
+// connection, now and then, after reading a request and before answering
+// it. A GET whose kept connection closed unanswered is sent again on a
+// fresh connection (it can do no harm twice); a POST is not -- the server
+// may have acted on it -- and is `ConnectionClosed`. The server counts
+// what it read: a POST sent again would have been a sixth request, and
+// the answers would have come out of step.
+
+import std;
+
+fn ok(ref<HttpConnection, exclusive> c)
+{
+    Vec<Header> h = Vec::new();
+    _ = HttpConnection::respond(c, 200, &h[0..$], &b"ok"[0..$]);
+}
+
+// Requests read; each connection's last read request is left unanswered
+// (the connection dropped) except the third's.
+fn server(HttpServer s) : usize
+{
+    usize seen = 0;
+    {
+        HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+        _ = Result::unwrap(HttpConnection::request(&mut c));          // GET /a
+        seen += 1;
+        ok(&mut c);
+        _ = Result::unwrap(HttpConnection::request(&mut c));          // POST /b: dropped
+        seen += 1;
+    }
+    {
+        HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+        _ = Result::unwrap(HttpConnection::request(&mut c));          // GET /c
+        seen += 1;
+        ok(&mut c);
+        _ = Result::unwrap(HttpConnection::request(&mut c));          // GET /d: dropped
+        seen += 1;
+    }
+    {
+        HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+        _ = Result::unwrap(HttpConnection::request(&mut c));          // GET /d again
+        seen += 1;
+        ok(&mut c);
+    }
+    seen
+}
+
+fn show(str what, Result<Response, HttpError> r)
+{
+    match (r)
+    {
+        Ok(resp) : printf("%s %v\n", what, resp.status),
+        Err(e)   : printf("%s %s\n", what, HttpError::text(&e)),
+    }
+}
+
+fn main()
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto srv = spawn(server, s);
+    HttpClient c = HttpClient::new();
+    c.keep_alive = true;
+    show("GET /a", HttpClient::send(&mut c, &Request::new("GET", String::as_view(&sprintf("%s/a", &base)))));
+    Request post = Request::new("POST", String::as_view(&sprintf("%s/b", &base)));
+    Vec::extend_from(&mut post.body, &b"once"[0..$]);
+    show("POST /b", HttpClient::send(&mut c, &post));
+    show("GET /c", HttpClient::send(&mut c, &Request::new("GET", String::as_view(&sprintf("%s/c", &base)))));
+    show("GET /d", HttpClient::send(&mut c, &Request::new("GET", String::as_view(&sprintf("%s/d", &base)))));
+    printf("server read %v requests\n", join(srv));
+}

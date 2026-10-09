@@ -1,0 +1,151 @@
+// An RPN Calculator, a Line at a Time
+//
+// Shows: an interactive-style loop that survives bad input. Each line of
+// standard input is one reverse-Polish expression (`3 4 + 2 *`) worked
+// out on a stack of `i64`s. Whatever goes wrong on a line — a word it
+// does not know, too few values for an operator, a division by zero, an
+// overflow — is an `RpnError` naming the column where it happened,
+// carried out of `eval` by `?`, printed under a caret, and then the next
+// line is read as if nothing happened. Checked arithmetic turns overflow
+// into `None`, and `Option::ok_or` into this program's own error. The
+// exit status says whether every line worked.
+//
+//   coby rpn.cb < FILE
+//
+// Operators: + - * / %, `neg`, `dup`, `swap`. A blank line, or one
+// starting with `#`, is skipped.
+
+import std;
+
+enum RpnError
+{
+    Unknown(usize),         // the column of a word that is neither a number nor an operator
+    TooFew(usize),          // an operator with too few values under it
+    DivByZero(usize),
+    Overflow(usize),
+    Leftover(usize),        // how many values were left instead of one
+    Empty,
+}
+
+fn pop(ref<Vec<i64>, exclusive> s, usize col) : Result<i64, RpnError>
+{
+    Option::ok_or(Vec::pop(s), TooFew(col))
+}
+
+// The value of one expression, or where and why it failed.
+fn eval(StringView line) : Result<i64, RpnError>
+{
+    Vec<i64> stack = Vec::new();
+    usize col = 0;
+    foreach (word in StringView::split(line, " "))
+    {
+        usize at = col + 1;
+        col += StringView::len(word) + 1;
+        if (StringView::len(word) == 0)
+        {
+            continue;                       // two spaces in a row
+        }
+        if (Ok(n) = StringView::parse<i64>(word))
+        {
+            Vec::push(&mut stack, n);
+            continue;
+        }
+        if (word == "dup")
+        {
+            i64 a = pop(&mut stack, at)?;
+            Vec::push(&mut stack, a);
+            Vec::push(&mut stack, a);
+            continue;
+        }
+        if (word == "neg")
+        {
+            i64 a = pop(&mut stack, at)?;
+            Vec::push(&mut stack, Option::ok_or(checked_neg(a), Overflow(at))?);
+            continue;
+        }
+        if (!(word == "+" || word == "-" || word == "*" || word == "/" || word == "%" || word == "swap"))
+        {
+            return Err(Unknown(at));
+        }
+        i64 b = pop(&mut stack, at)?;
+        i64 a = pop(&mut stack, at)?;
+        if (word == "swap")
+        {
+            Vec::push(&mut stack, b);
+            Vec::push(&mut stack, a);
+            continue;
+        }
+        if ((word == "/" || word == "%") && b == 0)
+        {
+            return Err(DivByZero(at));
+        }
+        Option<i64> r = if (word == "+") { checked_add(a, b) }
+                   else if (word == "-") { checked_sub(a, b) }
+                   else if (word == "*") { checked_mul(a, b) }
+                   else if (word == "/") { checked_div(a, b) }
+                   else { checked_rem(a, b) };
+        Vec::push(&mut stack, Option::ok_or(r, Overflow(at))?);
+    }
+    match (Vec::len(&stack))
+    {
+        0 : Err(Empty),
+        1 : Ok(stack[0]),
+        n : Err(Leftover(n)),
+    }
+}
+
+// Prints `line` with a caret under column `col` and the reason.
+fn show_error(StringView line, usize col, str why)
+{
+    printf("  %s\n  %*s^ %s\n", line, col - 1, "", why);
+}
+
+fn main() : u8
+{
+    u8 status = 0;
+    usize n = 0;
+    while (true)
+    {
+        String line = match (read_line())
+        {
+            Ok(Some(l))  : l,
+            Ok(None)     : break,
+            Err(Utf8(e)) :
+            {
+                n += 1;
+                printf("line %v: not UTF-8 at byte %v\n", n, e.offset);
+                status = 1;
+                continue;
+            },
+            Err(_)       :
+            {
+                eprintf("rpn: standard input could not be read\n");
+                return 1;
+            },
+        };
+        n += 1;
+        StringView text = String::trim(&line);
+        if (StringView::len(text) == 0 || StringView::starts_with(text, "#"))
+        {
+            continue;
+        }
+        match (eval(text))
+        {
+            Ok(v)  : printf("%s = %v\n", text, v),
+            Err(e) :
+            {
+                status = 1;
+                match (e)
+                {
+                    Unknown(c)   : show_error(text, c, "not a number or an operator"),
+                    TooFew(c)    : show_error(text, c, "needs more values"),
+                    DivByZero(c) : show_error(text, c, "division by zero"),
+                    Overflow(c)  : show_error(text, c, "the result does not fit in an i64"),
+                    Leftover(k)  : printf("  %s\n  %v values left; one was expected\n", text, k),
+                    Empty        : printf("  %s\n  nothing to compute\n", text),
+                }
+            },
+        }
+    }
+    status
+}

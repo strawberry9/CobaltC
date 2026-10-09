@@ -1,0 +1,195 @@
+// A static site
+//
+// Shows: serving files over HTTP without serving the wrong ones. The
+// program writes a small site into the scratch directory it is given,
+// then serves it: the request target is percent-decoded, split on `/`,
+// and refused with 400 if any segment is `..` (the classic traversal), a
+// directory serves its `index.html`, the content type comes from the
+// extension, `HEAD` gets the headers alone, and a missing file is 404.
+// Paths are built with `path_join`, so the same program serves on
+// Windows. The client then fetches each case and prints what came back.
+
+import std;
+
+fn content_type(StringView name) : str
+{
+    if (StringView::ends_with(name, ".html")) { "text/html; charset=utf-8" }
+    else if (StringView::ends_with(name, ".css")) { "text/css" }
+    else if (StringView::ends_with(name, ".svg")) { "image/svg+xml" }
+    else if (StringView::ends_with(name, ".txt")) { "text/plain; charset=utf-8" }
+    else { "application/octet-stream" }
+}
+
+struct Served
+{
+    Vec<u8> bytes;
+    String kind;
+}
+
+enum Lookup
+{
+    Found(Served),
+    Missing,
+    Forbidden,
+}
+
+// The file a request target names under `root`, or why not.
+fn resolve_target(StringView root, StringView target) : Lookup
+{
+    StringView path = target;
+    if (Some(q) = StringView::find(target, "?"))
+    {
+        path = StringView::sub(target, 0, q);
+    }
+    Vec<u8> decoded = match (percent_decode(path))
+    {
+        Some(d) : d,
+        None    : return Forbidden,
+    };
+    String text = match (String::from_utf8(decoded))
+    {
+        Ok(t)  : t,
+        Err(_) : return Forbidden,
+    };
+    String file = String::from_view(root);
+    Vec<StringView> segments = StringView::split(String::as_view(&text), "/");
+    foreach (segment in &segments)
+    {
+        if (StringView::len(*segment) == 0)
+        {
+            continue;
+        }
+        if (StringView::eq(*segment, "..") || StringView::contains(*segment, "\\"))
+        {
+            return Forbidden;
+        }
+        overwrite(&mut file, path_join(String::as_view(&file), *segment));
+    }
+    if (String::ends_with(&text, "/") || String::len(&text) == 0)
+    {
+        overwrite(&mut file, path_join(String::as_view(&file), "index.html"));
+    }
+    match (read_bytes(String::as_view(&file)))
+    {
+        Ok(bytes) : Found(Served { .bytes = bytes, .kind = String::from_str(content_type(String::as_view(&file))) }),
+        Err(_)    : Missing,
+    }
+}
+
+fn serve(HttpServer s, String root, usize count) : u8
+{
+    for (usize i = 0; i < count; i += 1)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(_) : return 1,
+        };
+        while (true)
+        {
+            Request req = match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) : r,
+                _           : break,
+            };
+            Vec<Header> h = Vec::new();
+            match (resolve_target(String::as_view(&root), String::as_view(&req.url)))
+            {
+                Found(f)  :
+                {
+                    Vec::push(&mut h, Header::new("Content-Type", String::as_view(&f.kind)));
+                    _ = HttpConnection::respond(&mut c, 200, &h[0..$], &f.bytes[0..$]);
+                },
+                Missing   :
+                {
+                    Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+                    _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"not found\n"[0..$]);
+                },
+                Forbidden :
+                {
+                    Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+                    _ = HttpConnection::respond(&mut c, 400, &h[0..$], &b"refused\n"[0..$]);
+                },
+            }
+        }
+    }
+    0
+}
+
+fn fetch(ref<HttpClient, exclusive> c, str method, ref<String, shared> base, str target)
+{
+    String url = String::clone(base);
+    String::append(&mut url, target);
+    Request req = Request::new(method, String::as_view(&url));
+    match (HttpClient::send(c, &req))
+    {
+        Ok(resp) :
+        {
+            String body = Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::from_str("(binary)"));
+            String first = match (String::find(&body, "\n"))
+            {
+                Some(i) : String::from_view(StringView::sub(String::as_view(&body), 0, i)),
+                None    : String::clone(&body),
+            };
+            printf(
+                "%-5s %-28s %u %-24s %4s bytes  %s\n",
+                method,
+                target,
+                resp.status,
+                Option::unwrap_or(Response::header(&resp, "content-type"), StringView::of("-")),
+                Option::unwrap_or(Response::header(&resp, "content-length"), StringView::of("?")),
+                &first,
+            );
+        },
+        Err(e)   : printf("%-5s %-28s error: %s\n", method, target, HttpError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    String root = match (arg(0))
+    {
+        Ok(d)  : d,
+        Err(_) :
+        {
+            printf("usage: static_site DIRECTORY (an empty scratch directory)\n");
+            return 2;
+        },
+    };
+    _ = make_dir_all(String::as_view(&path_join(String::as_view(&root), "docs")));
+    _ = write_file(
+        String::as_view(&path_join(String::as_view(&root), "index.html")),
+        "<h1>Welcome</h1>\n<p>Served by CobaltC.</p>\n",
+    );
+    _ = write_file(
+        String::as_view(&path_join(String::as_view(&root), "style.css")),
+        "body { font: 16px sans-serif; }\n",
+    );
+    _ = write_file(
+        String::as_view(&path_join(String::as_view(&root), "logo.svg")),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>\n",
+    );
+    _ = write_file(
+        String::as_view(&path_join(String::as_view(&path_join(String::as_view(&root), "docs")), "release notes.txt")),
+        "1.4.0: HTTP arrived.\n",
+    );
+    _ = write_file(
+        String::as_view(&path_join(String::as_view(&path_join(String::as_view(&root), "docs")), "index.html")),
+        "<h1>Docs</h1>\n",
+    );
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto server = spawn(serve, s, String::clone(&root), 9);
+    HttpClient c = HttpClient::new();
+    fetch(&mut c, "GET", &base, "/");
+    fetch(&mut c, "GET", &base, "/style.css");
+    fetch(&mut c, "GET", &base, "/logo.svg");
+    fetch(&mut c, "GET", &base, "/docs/");
+    fetch(&mut c, "GET", &base, "/docs/release%20notes.txt");
+    fetch(&mut c, "HEAD", &base, "/index.html");
+    fetch(&mut c, "GET", &base, "/missing.html");
+    fetch(&mut c, "GET", &base, "/../etc/passwd");
+    fetch(&mut c, "GET", &base, "/docs/%2e%2e/%2e%2e/etc/passwd");
+    printf("server: %u\n", join(server));
+    0
+}

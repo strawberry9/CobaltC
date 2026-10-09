@@ -1,0 +1,292 @@
+// WAV synthesiser
+//
+// Shows: sound made from numbers and saved as files any audio player
+// opens. Three tones are synthesised as 16-bit samples (a sine by a
+// recurrence, so no trigonometry library), mixed with `saturating_add`
+// (the loud tone clips, and the clipped samples are counted), smoothed by
+// a fixed-point low-pass filter (Q15 arithmetic in `i32`, an arithmetic
+// right shift), and written as two WAV files:
+//
+// - `tones16.wav`, streamed through a `File`. The RIFF header goes first
+//   with its two sizes unknown (zero), the samples follow in blocks as
+//   they are encoded, and `File::seek` goes back to patch the sizes in,
+//   as audio recorders do.
+// - `tones8.wav`, 8-bit unsigned samples, built whole in memory and
+//   written by one `write_bytes`.
+//
+// The 16-bit file is then read back as a player would: its RIFF chunks
+// walked with `File::seek` (each chunk's id and little-endian size by
+// `read_le`), the format checked, and samples read from the data chunk's
+// offset compared with those in memory.
+//
+//   coby wavsynth.cb DIR
+
+import std;
+
+const u32 RATE = 8000;
+const u32 FRAMES = 8000;    // one second
+
+fn push_text(ref<Vec<u8>, exclusive> b, str s)
+{
+    for (usize i = 0; i < str_len(s); i += 1)
+    {
+        Vec::push(b, str_byte(s, i));
+    }
+}
+
+// The 44-byte RIFF/WAVE header of a mono PCM file with `data_len` bytes
+// of samples of `bits` bits each.
+fn wav_header(u16 bits, u32 data_len) : Vec<u8>
+{
+    u32 block = widen<u32>(bits) / 8;
+    Vec<u8> b = Vec::new();
+    push_text(&mut b, "RIFF");
+    Vec::push_le(&mut b, 36 + data_len);    // the size of everything after these 8 bytes
+    push_text(&mut b, "WAVE");
+    push_text(&mut b, "fmt ");
+    Vec::push_le(&mut b, 16: u32);          // the fmt chunk's size
+    Vec::push_le(&mut b, 1: u16);           // PCM
+    Vec::push_le(&mut b, 1: u16);           // one channel
+    Vec::push_le(&mut b, RATE);
+    Vec::push_le(&mut b, RATE * block);     // bytes per second
+    Vec::push_le(&mut b, narrow<u16>(block));
+    Vec::push_le(&mut b, bits);
+    push_text(&mut b, "data");
+    Vec::push_le(&mut b, data_len);
+    b
+}
+
+// Adds a tone to `out` from sample `start` for `len` samples: a sine by
+// s[n+1] = 2 cos(w) s[n] - s[n-1], cos(w) and the first sample from short
+// Taylor series (w is small at these frequencies).
+fn tone(ref<Vec<i16>, exclusive> out, u32 start, u32 len, f64 freq, f64 amplitude)
+{
+    f64 w = 2.0 * 3.141592653589793 * freq / to_float<f64>(RATE);
+    f64 w2 = w * w;
+    f64 c = 1.0 - w2 / 2.0 + w2 * w2 / 24.0 - w2 * w2 * w2 / 720.0 + w2 * w2 * w2 * w2 / 40320.0;
+    f64 prev = 0.0;
+    f64 cur = amplitude * (w - w * w2 / 6.0 + w * w2 * w2 / 120.0 - w * w2 * w2 * w2 / 5040.0);
+    for (u32 n = 0; n < len; n += 1)
+    {
+        usize at = widen<usize>(start + n);
+        // Round half away from zero, then clamp into i16.
+        f64 r = if (prev >= 0.0) { prev + 0.5 } else { prev - 0.5 };
+        i16 sample = narrow<i16>(max(-32768, min(32767, to_int<i32>(r))));
+        out[at] = saturating_add(out[at], sample);
+        f64 next = 2.0 * c * cur - prev;
+        prev = cur;
+        cur = next;
+    }
+}
+
+fn stats(slice<i16, shared> s, str label)
+{
+    i32 peak = 0;
+    f64 squares = 0.0;
+    usize clipped = 0;
+    foreach (x in s)
+    {
+        i32 v = widen<i32>(*x);
+        peak = max(peak, abs(v));
+        squares += to_float<f64>(v) * to_float<f64>(v);
+        if (*x == 32767 || *x == -32768)
+        {
+            clipped += 1;
+        }
+    }
+    f64 rms = sqrt(squares / to_float<f64>(slice_len(s)));
+    printf("%-9s peak %5d  rms %8.2f  clipped %d\n", label, peak, rms, clipped);
+}
+
+// Writes the 16-bit file: a header with both sizes zero, the samples in
+// blocks of 1000, then the sizes patched in at offsets 4 and 40.
+fn write_wav16(StringView path, ref<Vec<i16>, shared> samples) : Result<u64, FileError>
+{
+    File f = File::create(path)?;
+    Vec<u8> header = wav_header(16, 0);
+    File::write(&mut f, &header[0..$])?;
+    Vec<u8> block = Vec::new();
+    for (usize i = 0; i < Vec::len(samples); i += 1)
+    {
+        Vec::push_le(&mut block, reinterpret<u16>(samples[i]));
+        if (Vec::len(&block) == 2000 || i + 1 == Vec::len(samples))
+        {
+            File::write(&mut f, &block[0..$])?;
+            Vec::clear(&mut block);
+        }
+    }
+    u64 total = File::len(&f)?;
+    Vec<u8> riff_size = Vec::new();
+    Vec::push_le(&mut riff_size, narrow<u32>(total - 8));
+    Vec<u8> data_size = Vec::new();
+    Vec::push_le(&mut data_size, narrow<u32>(total - 44));
+    File::seek(&mut f, 4)?;
+    File::write(&mut f, &riff_size[0..$])?;
+    File::seek(&mut f, 40)?;
+    File::write(&mut f, &data_size[0..$])?;
+    File::close(f)?;
+    Ok(total)
+}
+
+// Four bytes as text: a chunk id ("RIFF", "fmt ", "data").
+fn chunk_id(slice<u8, shared> b) : String
+{
+    Result::unwrap_or(String::from_utf8(Vec::from_slice(b)), "????")
+}
+
+// Exactly `n` bytes at `at`, or fewer at the end of the file.
+fn read_at(ref<File, exclusive> f, u64 at, usize n) : Result<Vec<u8>, FileError>
+{
+    File::seek(f, at)?;
+    Vec<u8> b = Vec::new();
+    while (Vec::len(&b) < n)
+    {
+        if (File::read(f, &mut b, n - Vec::len(&b))? == 0)
+        {
+            break;
+        }
+    }
+    Ok(b)
+}
+
+// Walks the file's chunks as a player does, prints the format, and
+// returns the data chunk's offset (0 when there is none).
+fn read_wav(StringView path) : Result<u64, FileError>
+{
+    File f = File::open(path)?;
+    u64 len = File::len(&f)?;
+    Vec<u8> head = read_at(&mut f, 0, 12)?;
+    if (Vec::len(&head) < 12 || !(chunk_id(&head[0..4]) == "RIFF"))
+    {
+        printf("  not a RIFF file\n");
+        return Ok(0);
+    }
+    printf("  RIFF size %u (file %u bytes), form %s\n", read_le<u32>(&head[0..$], 4), len, &chunk_id(&head[8..12]));
+    u64 at = 12;
+    u64 data = 0;
+    while (at + 8 <= len)
+    {
+        Vec<u8> chunk = read_at(&mut f, at, 8)?;
+        String id = chunk_id(&chunk[0..4]);
+        u32 size = read_le<u32>(&chunk[0..$], 4);
+        printf("  chunk '%s' at %u, %u bytes\n", &id, at, size);
+        if (id == "fmt ")
+        {
+            Vec<u8> fmt = read_at(&mut f, at + 8, 16)?;
+            printf(
+                "    format %u, %u channel, %u Hz, %u bits\n",
+                read_le<u16>(&fmt[0..$], 0),
+                read_le<u16>(&fmt[0..$], 2),
+                read_le<u32>(&fmt[0..$], 4),
+                read_le<u16>(&fmt[0..$], 14),
+            );
+        }
+        else if (id == "data")
+        {
+            data = at + 8;
+        }
+        // Chunks are padded to an even length.
+        at = at + 8 + widen<u64>(size) + widen<u64>(size % 2);
+    }
+    Ok(data)
+}
+
+fn main() : u8
+{
+    if (arg_count() != 1)
+    {
+        eprintf("usage: wavsynth DIR\n");
+        return 2;
+    }
+    String dir = Result::unwrap_or(arg(0), String::new());
+
+    Vec<i16> mix = Vec::filled(widen<usize>(FRAMES), 0: i16);
+    tone(&mut mix, 0, 4000, 440.0, 12000.0);
+    tone(&mut mix, 2000, 4000, 660.0, 12000.0);
+    tone(&mut mix, 3000, 4000, 110.0, 30000.0);
+    stats(&mix[0..$], "mixed");
+
+    // One-pole low-pass in Q15: y += a·(x - y), a = 0.2. `>>` of a
+    // negative i32 is arithmetic: it rounds toward minus infinity.
+    i32 a = 6554;    // 0.2 · 32768
+    Vec<i16> low = Vec::new();
+    i32 y = 0;
+    foreach (x in &mix)
+    {
+        y += (a * (widen<i32>(*x) - y)) >> 15;
+        Vec::push(&mut low, narrow<i16>(y));
+    }
+    stats(&low[0..$], "low-pass");
+
+    String path16 = path_join(String::as_view(&dir), "tones16.wav");
+    match (write_wav16(String::as_view(&path16), &low))
+    {
+        Ok(n)  : printf("wrote tones16.wav: %u bytes, streamed, sizes patched by seek\n", n),
+        Err(e) :
+        {
+            printf("wavsynth: cannot write tones16.wav: %s\n", FileError::text(&e));
+            return 1;
+        },
+    }
+
+    // 8-bit unsigned PCM: the top byte of each sample, offset by 128.
+    Vec<u8> file8 = wav_header(8, FRAMES);
+    foreach (x in &low)
+    {
+        Vec::push(&mut file8, narrow<u8>((widen<i32>(*x) >> 8) + 128));
+    }
+    String path8 = path_join(String::as_view(&dir), "tones8.wav");
+    match (write_bytes(String::as_view(&path8), &file8[0..$]))
+    {
+        Ok(_)  : printf("wrote tones8.wav: %u bytes, in one write\n", Vec::len(&file8)),
+        Err(e) :
+        {
+            printf("wavsynth: cannot write tones8.wav: %s\n", FileError::text(&e));
+            return 1;
+        },
+    }
+
+    // A coarse waveform: 40 columns, each the range of 200 samples.
+    printf("waveform (low-pass, 200 samples a column; rows at 24000, 12000, 0, -12000, -24000):\n");
+    for (i32 row = 0; row < 5; row += 1)
+    {
+        i32 level = 24000 - row * 12000;
+        String line = "  ";
+        for (usize col = 0; col < 40; col += 1)
+        {
+            i32 hi = -40000;
+            i32 lo = 40000;
+            for (usize k = col * 200; k < col * 200 + 200; k += 1)
+            {
+                hi = max(hi, widen<i32>(low[k]));
+                lo = min(lo, widen<i32>(low[k]));
+            }
+            String::push_ascii(
+                &mut line,
+                if (hi >= level && lo <= level) { b'#' } else if (level == 0) { b'-' } else { b' ' },
+            );
+        }
+        printf("%s\n", &line);
+    }
+
+    // Read tones16.wav back.
+    printf("reading tones16.wav back:\n");
+    u64 data = match (read_wav(String::as_view(&path16)))
+    {
+        Ok(d)  : d,
+        Err(e) :
+        {
+            printf("wavsynth: %s\n", FileError::text(&e));
+            return 1;
+        },
+    };
+    File f = Result::unwrap(File::open(String::as_view(&path16)));
+    Vec<u8> some = Result::unwrap(read_at(&mut f, data + 2 * 100, 8));
+    printf("  samples 100..103 on disk:");
+    for (usize i = 0; i < 4; i += 1)
+    {
+        printf(" %d", read_le<i16>(&some[0..$], 2 * i));
+    }
+    printf("\n  samples 100..103 in memory: %d %d %d %d\n", low[100], low[101], low[102], low[103]);
+    0
+}

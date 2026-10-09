@@ -1,0 +1,502 @@
+// `std::http::client` (spec/21 §2p, D-0173, D-0187): `HttpClient`,
+// `http_get` and `http_post`: fetching a URL or posting to one, following
+// redirects and decoding chunked bodies, with limits on what it will
+// read, over a plain or a TLS connection.
+
+// ---- the client (D-0173) ----
+
+// What a client carries from request to request: the roots `https`
+// verifies against (the system's, loaded at the first https request, or
+// a store the program puts there), the timeout for connecting and for
+// each read and write, how many redirects to follow, the most a body may
+// be, and headers sent with every request. A program that makes several
+// https requests keeps one client, so the roots are loaded once.
+// D-0195: with `keep_alive` set, the client keeps the last connection open
+// when the server allows it, and sends the next request to the same origin
+// on it; otherwise (the default) each request has a connection of its own.
+export struct HttpClient
+{
+    export Option<TrustStore> roots;
+    export u64 timeout_ms;
+    export usize max_redirects;
+    export usize max_body;
+    export Vec<Header> headers;
+    export bool keep_alive;
+    Option<IdleConn> idle;
+}
+
+// A connection kept for the next request to `origin` (scheme://host:port).
+struct IdleConn
+{
+    String origin;
+    Reader r;
+}
+
+// A client with no roots loaded yet, a 30 s timeout, up to 10 redirects,
+// a 16 MiB body limit, and a `User-Agent` header.
+export fn HttpClient::new() : HttpClient
+{
+    Vec<Header> headers = Vec::new();
+    Vec::push(&mut headers, Header::new("User-Agent", "CobaltC-std-http/1"));
+    Vec::push(&mut headers, Header::new("Accept-Encoding", "gzip, deflate"));
+    HttpClient { .roots = None, .timeout_ms = 30000, .max_redirects = 10, .max_body = 16777216, .headers = headers, .keep_alive = false, .idle = None }
+}
+
+fn method_has_body(StringView m) : bool
+{
+    StringView::eq(m, "POST") || StringView::eq(m, "PUT") || StringView::eq(m, "PATCH")
+}
+
+// Opens a connection to `u`: TCP, then TLS for https, the system roots
+// loaded into the client the first time they are needed.
+fn open_connection(ref<HttpClient, exclusive> c, ref<Url, shared> u) : Result<Conn, HttpError>
+{
+    bool secure = StringView::eq(String::as_view(&u.scheme), "https");
+    if (!secure && !StringView::eq(String::as_view(&u.scheme), "http"))
+    {
+        return Err(UnsupportedScheme);
+    }
+    if (secure && Option::is_none(&c.roots))
+    {
+        match (TrustStore::system())
+        {
+            Ok(t)  : overwrite(&mut c.roots, Some(t)),
+            Err(_) : return Err(NoRoots),
+        }
+    }
+    // A bracketed IPv6 host loses its brackets for resolution.
+    String host = String::clone(&u.host);
+    if (String::starts_with(&host, "[") && String::ends_with(&host, "]"))
+    {
+        overwrite(&mut host, String::from_view(StringView::sub(String::as_view(&u.host), 1, String::len(&u.host) - 1)));
+    }
+    Vec<SocketAddr> addrs = match (IpAddr::parse(String::as_view(&host)))
+    {
+        Ok(ip) :
+        {
+            Vec<SocketAddr> one = Vec::new();
+            Vec::push(&mut one, SocketAddr::new(ip, u.port));
+            one
+        },
+        Err(_) : match (resolve(String::as_view(&host), u.port))
+        {
+            Ok(a)  : a,
+            Err(e) : return Err(NetFailure(e)),
+        },
+    };
+    if (Vec::len(&addrs) == 0)
+    {
+        return Err(NetFailure(UnknownHost));
+    }
+    NetError last = Failed;
+    for (usize i = 0; i < Vec::len(&addrs); i += 1)
+    {
+        TcpStream tcp = match (TcpStream::connect_timeout(addrs[i], c.timeout_ms))
+        {
+            Ok(t)  : t,
+            Err(e) :
+            {
+                last = e;
+                continue;
+            },
+        };
+        TcpStream::set_read_timeout_ms(&mut tcp, c.timeout_ms);
+        TcpStream::set_write_timeout_ms(&mut tcp, c.timeout_ms);
+        TcpStream::set_nodelay(&mut tcp, true);
+        if (!secure)
+        {
+            return Ok(Plain(tcp));
+        }
+        ref<TrustStore, shared> roots = match (&c.roots)
+        {
+            Some(r) : r,
+            None    : return Err(NoRoots),
+        };
+        return match (TlsStream::client(tcp, String::as_view(&host), roots))
+        {
+            Ok(s)  : Ok(Secure(s)),
+            Err(e) : Err(TlsFailure(e)),
+        };
+    }
+    Err(NetFailure(last))
+}
+
+// The request as bytes: the request line, the Host, the client's and the
+// request's headers (the request's win), a Content-Length for a body,
+// and Connection: close unless the client keeps connections alive.
+fn request_bytes(
+    ref<HttpClient, shared> c,
+    ref<Request, shared> req,
+    ref<Url, shared> u,
+    StringView method,
+    slice<u8, shared> body,
+    bool with_content,
+) : Vec<u8>
+{
+    String head = String::from_view(method);
+    String::append(&mut head, " ");
+    String::append(&mut head, String::as_view(&Url::target(u)));
+    String::append(&mut head, " HTTP/1.1\r\nHost: ");
+    String::append(&mut head, String::as_view(&host_text(u)));
+    String::append(&mut head, "\r\n");
+    foreach (h in &c.headers)
+    {
+        if (!has_header(&req.headers[0..$], String::as_view(&h.name)))
+        {
+            String::append(&mut head, String::as_view(&h.name));
+            String::append(&mut head, ": ");
+            String::append(&mut head, String::as_view(&h.value));
+            String::append(&mut head, "\r\n");
+        }
+    }
+    foreach (h in &req.headers)
+    {
+        if (name_eq(
+            String::as_view(&h.name),
+            "host",
+        ) || name_eq(String::as_view(&h.name), "content-length") || name_eq(String::as_view(&h.name), "connection"))
+        {
+            continue;
+        }
+        // After a redirect that dropped the body, its Content-Type goes too.
+        if (!with_content && name_eq(String::as_view(&h.name), "content-type"))
+        {
+            continue;
+        }
+        String::append(&mut head, String::as_view(&h.name));
+        String::append(&mut head, ": ");
+        String::append(&mut head, String::as_view(&h.value));
+        String::append(&mut head, "\r\n");
+    }
+    if (slice_len(body) > 0 || method_has_body(method))
+    {
+        String::append(&mut head, "Content-Length: ");
+        String::append(&mut head, slice_len(body));
+        String::append(&mut head, "\r\n");
+    }
+    if (!c.keep_alive)
+    {
+        String::append(&mut head, "Connection: close\r\n");
+    }
+    String::append(&mut head, "\r\n");
+    Vec<u8> out = String::into_bytes(head);
+    Vec::extend_from(&mut out, body);
+    out
+}
+
+fn not_content_encoding(ref<Header, shared> h) : bool
+{
+    !name_eq(String::as_view(&h.name), "content-encoding") && !name_eq(String::as_view(&h.name), "content-length")
+}
+
+// The status line `HTTP/1.x NNN reason`.
+struct StatusLine
+{
+    u16 status;
+    String reason;
+}
+
+fn parse_status_line(StringView line) : Result<StatusLine, HttpError>
+{
+    if (!StringView::starts_with(line, "HTTP/1.") || StringView::len(line) < 12)
+    {
+        return Err(BadMessage);
+    }
+    u16 status = match (StringView::parse<u16>(StringView::sub(line, 9, 12)))
+    {
+        Ok(v)  : v,
+        Err(_) : return Err(BadMessage),
+    };
+    if (status < 100 || status > 599)
+    {
+        return Err(BadMessage);
+    }
+    String reason = if (StringView::len(line) > 13)
+    {
+        String::from_view(StringView::sub(
+            line,
+            13,
+            StringView::len(line),
+        ))
+    }
+    else { String::new() };
+    Ok(StatusLine { .status = status, .reason = reason })
+}
+
+fn origin_of(ref<Url, shared> u) : String
+{
+    String o = String::clone(&u.scheme);
+    String::append(&mut o, "://");
+    String::append(&mut o, String::as_view(&host_text(u)));
+    o
+}
+
+// The methods whose effect is the same however often they are sent
+// (RFC 9110 §9.2.2).
+fn idempotent(StringView method) : bool
+{
+    method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"
+}
+
+// One exchange: on the kept connection to `u`'s origin if there is one
+// (D-0195), again on a fresh one if that connection turns out closed
+// before any of the response arrived and the method is idempotent; else on
+// a fresh connection.
+fn exchange(
+    ref<HttpClient, exclusive> c,
+    ref<Request, shared> req,
+    ref<Url, shared> u,
+    StringView method,
+    slice<u8, shared> body,
+    bool with_content,
+) : Result<Response, HttpError>
+{
+    String want = origin_of(u);
+    if (Some(ic) = replace(&mut c.idle, None))
+    {
+        IdleConn { origin, r } = ic;
+        if (origin == want)
+        {
+            if (Some(resp) = exchange_on(c, r, true, req, u, method, body, with_content)?)
+            {
+                return Ok(resp);
+            }
+            // Closed with nothing answered: the server may still have
+            // acted on the request, so only an idempotent one is sent
+            // again (RFC 9110 §9.2.2) -- a POST twice could do twice what
+            // it asks.
+            if (!idempotent(method))
+            {
+                return Err(ConnectionClosed);
+            }
+        }
+        else
+        {
+            conn_close(&mut r.conn);
+        }
+    }
+    Reader fresh = Reader { .conn = open_connection(c, u)?, .buf = Vec::new(), .at = 0 };
+    match (exchange_on(c, fresh, false, req, u, method, body, with_content)?)
+    {
+        Some(resp) : Ok(resp),
+        None       : Err(ConnectionClosed),
+    }
+}
+
+// The exchange on `r`. None when `r` was a kept connection (`reused`) that
+// failed before any of the response arrived: the caller tries a fresh one.
+fn exchange_on(
+    ref<HttpClient, exclusive> c,
+    Reader r,
+    bool reused,
+    ref<Request, shared> req,
+    ref<Url, shared> u,
+    StringView method,
+    slice<u8, shared> body,
+    bool with_content,
+) : Result<Option<Response>, HttpError>
+{
+    match (conn_write(&mut r.conn, &request_bytes(c, req, u, method, body, with_content)[0..$]))
+    {
+        Ok(_)  : {},
+        Err(e) :
+        {
+            if (reused)
+            {
+                return Ok(None);
+            }
+            return Err(e);
+        },
+    }
+    bool first = true;
+    // Interim 1xx responses (a 100 Continue) are read past.
+    while (true)
+    {
+        String line = match (http_line(&mut r, MAX_HEAD))
+        {
+            Ok(Some(l)) : l,
+            Ok(None)    :
+            {
+                if (reused && first)
+                {
+                    return Ok(None);
+                }
+                return Err(ConnectionClosed);
+            },
+            Err(e)      :
+            {
+                if (reused && first && Vec::len(&r.buf) == 0)
+                {
+                    return Ok(None);
+                }
+                return Err(e);
+            },
+        };
+        first = false;
+        bool http11 = StringView::starts_with(String::as_view(&line), "HTTP/1.1");
+        StatusLine { status, reason } = parse_status_line(String::as_view(&line))?;
+        Vec<Header> headers = read_headers(&mut r, String::len(&line) + 2)?;
+        if (status >= 100 && status < 200)
+        {
+            continue;
+        }
+        bool no_body = StringView::eq(method, "HEAD") || status == 204 || status == 304;
+        BodyLength how = if (no_body) { NoBody } else { body_length(&headers[0..$], true)? };
+        bool until_close = match (how)
+        {
+            UntilClose : true,
+            _          : false,
+        };
+        Vec<u8> data = read_body(&mut r, how, c.max_body)?;
+        // Kept when asked for, allowed (HTTP/1.1, no `Connection: close`),
+        // the body's end known without the connection's, and nothing more
+        // read than the response.
+        bool keep = c.keep_alive && http11 && !until_close && r.at == Vec::len(&r.buf);
+        if (Some(v) = find_header(&headers[0..$], "connection"))
+        {
+            if (name_eq(StringView::trim(v), "close"))
+            {
+                keep = false;
+            }
+        }
+        if (keep)
+        {
+            c.idle = Some(IdleConn { .origin = String::clone(&origin_of(u)), .r = r });
+        }
+        else
+        {
+            conn_close(&mut r.conn);
+        }
+        // D-0183: a body sent compressed (`Content-Encoding: gzip` or
+        // `deflate`, which the client offers) arrives decoded, within
+        // `max_body`, and the header is dropped so the response reads as
+        // a plain one.
+        bool strip = false;
+        if (!no_body)
+        {
+            if (Some(enc) = find_header(&headers[0..$], "content-encoding"))
+            {
+                StringView e = StringView::trim(enc);
+                Option<Result<Vec<u8>, CompressError>> decoded = if (name_eq(e, "gzip") || name_eq(e, "x-gzip"))
+                {
+                    Some(gunzip(&data[0..$], c.max_body))
+                }
+                else if (name_eq(e, "deflate"))
+                {
+                    Some(match (zlib_inflate(&data[0..$], c.max_body))
+                    {
+                        Ok(v)  : Ok(v),
+                        Err(_) : inflate(&data[0..$], c.max_body),
+                    })
+                }
+                else { None };
+                if (Some(d) = decoded)
+                {
+                    overwrite(&mut data, match (d)
+                    {
+                        Ok(v)         : v,
+                        Err(Oversize) : return Err(TooLarge),
+                        Err(_)        : return Err(BadMessage),
+                    });
+                    strip = true;
+                }
+            }
+        }
+        if (strip)
+        {
+            Vec::retain(&mut headers, not_content_encoding);
+        }
+        return Ok(Some(Response { .status = status, .reason = reason, .headers = headers, .body = data }));
+    }
+}
+
+// `location` resolved against `base`: absolute, or a path on the same
+// origin, or relative to the base path's directory.
+fn redirect_target(ref<Url, shared> base, StringView location) : Result<Url, HttpError>
+{
+    if (Option::is_some(&StringView::find(location, "://")))
+    {
+        return Url::parse(location);
+    }
+    String text = String::clone(&base.scheme);
+    String::append(&mut text, "://");
+    String::append(&mut text, String::as_view(&host_text(base)));
+    if (StringView::starts_with(location, "/"))
+    {
+        String::append(&mut text, location);
+    }
+    else
+    {
+        StringView path = String::as_view(&base.path);
+        usize dir = 0;
+        slice<u8, shared> pb = StringView::as_bytes(path);
+        for (usize i = 0; i < slice_len(pb); i += 1)
+        {
+            if (pb[i] == b'/')
+            {
+                dir = i + 1;
+            }
+        }
+        String::append(&mut text, StringView::sub(path, 0, dir));
+        String::append(&mut text, location);
+    }
+    Url::parse(String::as_view(&text))
+}
+
+// Sends `req`, following up to `max_redirects` redirects (301, 302 and
+// 303 by GET without the body, 307 and 308 with the method and body
+// kept), and gives the final response. Each request opens its own
+// connection and closes it.
+export fn HttpClient::send(ref<HttpClient, exclusive> c, ref<Request, shared> req) : Result<Response, HttpError>
+{
+    Url u = Url::parse(String::as_view(&req.url))?;
+    String method = String::clone(&req.method);
+    Vec<u8> body = Vec::clone(&req.body);
+    usize hops = 0;
+    bool with_content = true;
+    while (true)
+    {
+        Response resp = exchange(c, req, &u, String::as_view(&method), &body[0..$], with_content)?;
+        bool redirect = resp.status == 301 || resp.status == 302 || resp.status == 303 || resp.status == 307 || resp.status == 308;
+        if (!redirect)
+        {
+            return Ok(resp);
+        }
+        StringView location = match (Response::header(&resp, "location"))
+        {
+            Some(l) : l,
+            None    : return Ok(resp),
+        };
+        if (hops == c.max_redirects)
+        {
+            return Err(TooManyRedirects);
+        }
+        hops += 1;
+        Url next = redirect_target(&u, location)?;
+        overwrite(&mut u, next);
+        if (resp.status != 307 && resp.status != 308 && !StringView::eq(String::as_view(&method), "HEAD"))
+        {
+            overwrite(&mut method, String::from_str("GET"));
+            Vec::clear(&mut body);
+            with_content = false;
+        }
+    }
+}
+
+// A GET of `url` with a fresh default client.
+export fn http_get(StringView url) : Result<Response, HttpError>
+{
+    HttpClient c = HttpClient::new();
+    Request req = Request::new("GET", url);
+    HttpClient::send(&mut c, &req)
+}
+
+// A POST of `body` as `content_type` to `url` with a fresh default client.
+export fn http_post(StringView url, str content_type, slice<u8, shared> body) : Result<Response, HttpError>
+{
+    HttpClient c = HttpClient::new();
+    Request req = Request::new("POST", url);
+    Vec::push(&mut req.headers, Header::new("Content-Type", StringView::of(content_type)));
+    Vec::extend_from(&mut req.body, body);
+    HttpClient::send(&mut c, &req)
+}

@@ -1,0 +1,135 @@
+// `std::io` (spec/21 §2b, §2f): standard output, error and input. `printf`
+// and `eprintf` are realized natively by both implementations. Files are in
+// `std::fs` (D-0176).
+
+export unsafe extern fn stdout_write(rawptr<u8> buf, usize len) : isize;
+
+export unsafe extern fn stdin_read(rawptr<u8> buf, usize len) : isize;
+
+// D-0178: standard output is buffered; this writes out what `printf` has
+// written so far. Needed only when standard output is not a terminal and
+// someone watches it while the program runs (progress into a pipe or a
+// log). Standard error, standard input, `exit` and the program's end
+// write the buffer out themselves.
+// trusted: [Extern-Call] stdout_flush touches no program storage.
+export fn flush_stdout()
+{
+    unsafe
+    {
+        stdout_flush();
+    }
+}
+
+// trusted: [Extern-Call] stdin_read_line writes bytes' spare capacity [len, cap), reserved just above, where no element object lies.
+export fn read_line() : Result<Option<String>, FileError>
+{
+    Vec<u8> bytes = Vec::new();
+    bool any = false;
+    while (true)
+    {
+        Vec::reserve(&mut bytes, 128);
+        isize n = unsafe
+        {
+            stdin_read_line(reinterpret_ptr<u8>(bytes.ptr + reinterpret<isize>(bytes.len)), bytes.cap - bytes.len)
+        };
+        if (n < 0)
+        {
+            return Err(FileError::Io);
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        any = true;
+        bytes.len = bytes.len + reinterpret<usize>(n);
+        if (bytes[bytes.len - 1] == 10)
+        {
+            Vec::pop(&mut bytes);
+            if (bytes.len > 0 && bytes[bytes.len - 1] == 13)
+            {
+                Vec::pop(&mut bytes);
+            }
+            break;
+        }
+    }
+    if (!any)
+    {
+        return Ok(None);
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// D-0145: the rest of standard input at once, as bytes; empty at its
+// end. Read in pieces of up to 64 KiB straight into the `Vec`'s room.
+// trusted: [Extern-Call] stdin_read writes out's spare capacity [len, cap), reserved just above, where no element object lies.
+export fn read_all_bytes() : Result<Vec<u8>, FileError>
+{
+    Vec<u8> out = Vec::new();
+    while (true)
+    {
+        while (out.cap - out.len < 65_536)
+        {
+            Vec::grow(&mut out);
+        }
+        isize n = unsafe
+        {
+            stdin_read(reinterpret_ptr<u8>(out.ptr + reinterpret<isize>(out.len)), out.cap - out.len)
+        };
+        if (n < 0)
+        {
+            return Err(FileError::Io);
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        out.len = out.len + reinterpret<usize>(n);
+    }
+    Ok(out)
+}
+
+// D-0145: the rest of standard input at once, as text; `Err(Utf8(e))`
+// when it is not UTF-8.
+export fn read_all() : Result<String, FileError>
+{
+    Vec<u8> b = read_all_bytes()?;
+    match (String::from_utf8(b))
+    {
+        Ok(s)  : Ok(s),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// `print<T>(T x)` is realized natively (`rule.stdlib.print`, spec/21
+// §2a). Its `str` and `ref<String, shared>` cases are these two
+// functions, which it calls; the others format in the implementation.
+// trusted: [Extern-Call] stdout_write reads the str's bytes, program data.
+fn print_str(str s)
+{
+    unsafe
+    {
+        stdout_write(str_ptr(s), str_len(s));
+    }
+}
+
+// trusted: [Extern-Call] stdout_write reads the String's len bytes, live for the call through the shared reference.
+fn print_string(ref<String, shared> s)
+{
+    unsafe
+    {
+        stdout_write(reinterpret_ptr<u8>(s.bytes.ptr), s.bytes.len);
+    }
+}
+
+// trusted: [Extern-Call] stderr_write reads the str's bytes, program data.
+fn eprint_str(str s)
+{
+    unsafe
+    {
+        stderr_write(str_ptr(s), str_len(s));
+    }
+}

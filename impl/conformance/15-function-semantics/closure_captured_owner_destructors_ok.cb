@@ -1,0 +1,68 @@
+// CONFORMANCE-CASE
+// spec: 15-function-semantics
+// facility: spec/15 closures, D-0089; conf.closure-captured-owner-destructors
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7020747275652071207472756520703220747275650a2d2d206f776e6572730a682074727565206b2074727565206d20747275650a656e64206f6620626c6f636b205b64726f7020335d5b64726f7020315d0a2d2d206c6f6f700a6163632066616c73650a646f6e650a5b64726f702033305d5b64726f702032305d5b64726f702031305d
+//
+// closures capturing closures, some of them owning a resource with a
+// destructor: copied where they own nothing, moved where they do, each
+// destructor run once, when the last holder ends (D-0193)
+
+import std;
+
+resource struct Noisy
+{
+    i64 id;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[drop %v]", self.id);
+}
+
+fn holder(i64 id) : fn(ref<i64, shared>) : bool
+{
+    Noisy n = Noisy { .id = id };
+    move [n](ref<i64, shared> r) : bool { *r > n.id }
+}
+
+fn plain(i64 lim) : fn(ref<i64, shared>) : bool
+{
+    move [lim](ref<i64, shared> r) : bool { *r > lim }
+}
+
+fn both(fn(ref<i64, shared>) : bool a, fn(ref<i64, shared>) : bool b) : fn(ref<i64, shared>) : bool
+{
+    move [a, b](ref<i64, shared> r) : bool { a(r) && b(r) }
+}
+
+fn main()
+{
+    i64 x = 5;
+    {
+        fn(ref<i64, shared>) : bool p = both(plain(1), plain(2));
+        fn(ref<i64, shared>) : bool q = both(p, plain(3));
+        fn(ref<i64, shared>) : bool p2 = p;
+        printf("p %v q %v p2 %v\n", p(&x), q(&x), p2(&x));
+    }
+    printf("-- owners\n");
+    {
+        fn(ref<i64, shared>) : bool h = both(holder(1), plain(2));
+        printf("h %v ", h(&x));
+        fn(ref<i64, shared>) : bool k = both(h, holder(3));
+        printf("k %v ", k(&x));
+        fn(ref<i64, shared>) : bool m = k;
+        printf("m %v\n", m(&x));
+        printf("end of block ");
+    }
+    printf("\n-- loop\n");
+    fn(ref<i64, shared>) : bool acc = plain(0);
+    foreach (i in 1..4: i64)
+    {
+        fn(ref<i64, shared>) : bool c = holder(i * 10);
+        acc = both(acc, c);
+    }
+    printf("acc %v\n", acc(&x));
+    printf("done\n");
+}

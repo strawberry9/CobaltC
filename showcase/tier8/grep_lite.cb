@@ -1,0 +1,146 @@
+// grep, Lite
+//
+// Shows: a filter with grep's own contract. The lines of standard input
+// that contain a fixed text are printed, and the exit status says what
+// happened, as grep's does: 0 when a line was selected, 1 when none
+// was, 2 when something went wrong — even if lines were also selected.
+// The options become a plain struct before any input is read; each line
+// is matched through `StringView`s that borrow it, so nothing is copied
+// unless `-i` asks for a lower-case copy. A line that is not UTF-8 is
+// an `Err(Utf8(e))` the loop reports and steps over, not a stop: the
+// next `read_line` reads the line after it.
+//
+//   coby grep_lite.cb [-i] [-v] [-n] [-c] TEXT < FILE
+//
+// -i  ignore ASCII case    -v  select the lines that do NOT contain TEXT
+// -n  number the lines     -c  print only how many lines were selected
+
+import std;
+
+struct Options
+{
+    String text;        // lower-cased already under -i
+    bool fold;
+    bool invert;
+    bool number;
+    bool count;
+}
+
+// The options from the arguments, or the message for a usage error.
+fn options() : Result<Options, String>
+{
+    Options o = Options { .text = String::new(), .fold = false, .invert = false, .number = false, .count = false };
+    bool have_text = false;
+    foreach (i in 0..arg_count())
+    {
+        String a = if (Ok(a) = arg(i)) { a } else { return Err(sprintf("argument %v is not UTF-8", i + 1)); };
+        if (&a[0..$] == "-i")
+        {
+            o.fold = true;
+        }
+        else if (&a[0..$] == "-v")
+        {
+            o.invert = true;
+        }
+        else if (&a[0..$] == "-n")
+        {
+            o.number = true;
+        }
+        else if (&a[0..$] == "-c")
+        {
+            o.count = true;
+        }
+        else if (String::starts_with(&a, "-") || have_text)
+        {
+            return Err(sprintf("unexpected argument \"%s\"", &a));
+        }
+        else
+        {
+            // `o.text = a;` is rejected: the field still holds a `String`
+            // that plain assignment would lose. `overwrite` destroys it.
+            overwrite(&mut o.text, a);
+            have_text = true;
+        }
+    }
+    if (!have_text)
+    {
+        return Err(String::from_str("no TEXT to look for"));
+    }
+    if (o.fold)
+    {
+        String lower = String::to_ascii_lower(&o.text);
+        overwrite(&mut o.text, lower);
+    }
+    Ok(o)
+}
+
+// Whether `line` is selected: it contains the text, or under -v it does not.
+fn selected(ref<Options, shared> o, ref<String, shared> line) : bool
+{
+    bool found = if (o.fold)
+    {
+        String lower = String::to_ascii_lower(line);
+        Option::is_some(&String::find(&lower, &o.text[0..$]))
+    }
+    else
+    {
+        Option::is_some(&String::find(line, &o.text[0..$]))
+    };
+    found != o.invert
+}
+
+fn main() : u8
+{
+    Options o = match (options())
+    {
+        Ok(o)  : o,
+        Err(m) :
+        {
+            eprintf("grep_lite: %s\nusage: grep_lite [-i] [-v] [-n] [-c] TEXT < FILE\n", &m);
+            return 2;
+        },
+    };
+
+    usize n = 0;
+    usize hits = 0;
+    bool trouble = false;
+    while (true)
+    {
+        match (read_line())
+        {
+            Ok(Some(line)) :
+            {
+                n += 1;
+                if (selected(&o, &line))
+                {
+                    hits += 1;
+                    if (o.number && !o.count)
+                    {
+                        printf("%v:%s\n", n, &line);
+                    }
+                    else if (!o.count)
+                    {
+                        printf("%s\n", &line);
+                    }
+                }
+            },
+            Ok(None)       : break,
+            Err(Utf8(e))   :
+            {
+                n += 1;
+                eprintf("grep_lite: line %v: not UTF-8 at byte %v, skipped\n", n, e.offset);
+                trouble = true;
+            },
+            Err(_)         :
+            {
+                eprintf("grep_lite: standard input could not be read after line %v\n", n);
+                return 2;
+            },
+        }
+    }
+    if (o.count)
+    {
+        printf("%v\n", hits);
+    }
+    if (trouble) { 2 } else if (hits > 0) { 0 } else { 1 }
+}

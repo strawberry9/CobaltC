@@ -1,0 +1,124 @@
+// Tiny Serializer
+//
+// Shows: a wire format with its byte order spelled out -- `Vec::push_le`
+// writes an integer's bytes low first, `read_le<T>` reads them back at
+// exactly the width asked for, signed or not -- and decoding as a
+// `Result` that names what was wrong: every read is checked against the
+// buffer first, so a short record is an error value, not a fault. The
+// round trip is verified with `==` on plain structs.
+
+import std;
+
+struct Reading
+{
+    u32 station;
+    i16 tenths;        // temperature in tenths of a degree
+    bool calibrated;
+}
+
+enum DecodeError
+{
+    Truncated(usize),  // needed more bytes at this offset
+    BadTag(u8)
+}
+
+// 'R', station (4 bytes, little-endian), tenths (2), calibrated (1).
+fn encode(ref<Vec<u8>, exclusive> o, Reading r)
+{
+    Vec::push(o, b'R');
+    Vec::push_le(o, r.station);                  // a u32: four bytes
+    Vec::push_le(o, r.tenths);                   // an i16: two, two's complement
+    Vec::push(o, if (r.calibrated) { 1 } else { 0 });
+}
+
+// `n` bytes from `at`, or the first one missing.
+fn need(ref<Vec<u8>, shared> b, usize at, usize n) : Result<slice<u8, shared>, DecodeError>
+{
+    if (at + n > Vec::len(b))
+    {
+        return Err(Truncated(max(at, Vec::len(b))));
+    }
+    Ok(&b[at .. at + n])
+}
+
+fn decode(ref<Vec<u8>, shared> b, usize at) : Result<Reading, DecodeError>
+{
+    u8 tag = need(b, at, 1)?[0];
+    if (tag != b'R')
+    {
+        return Err(BadTag(tag));
+    }
+    u32 station = read_le<u32>(need(b, at + 1, 4)?, 0);
+    i16 tenths = read_le<i16>(need(b, at + 5, 2)?, 0);
+    bool calibrated = need(b, at + 7, 1)?[0] != 0;
+    Ok(Reading { .station = station, .tenths = tenths, .calibrated = calibrated })
+}
+
+fn explain(str what, Result<Reading, DecodeError> r)
+{
+    printf("decoding %v: ", what);
+    match (r)
+    {
+        Ok(_)  :
+        {
+            printf("a reading");
+        },
+        Err(e) :
+        {
+            match (e)
+            {
+                Truncated(at) :
+                {
+                    printf("truncated, byte %v is missing", at);
+                },
+                BadTag(t)     :
+                {
+                    printf("not a record (tag %v)", t);
+                },
+            }
+        },
+    }
+    printf("\n");
+}
+
+fn main()
+{
+    array<Reading, 3> readings = [
+        Reading { .station = 7, .tenths = 215, .calibrated = true },
+        Reading { .station = 70000, .tenths = -42, .calibrated = false },
+        Reading { .station = 4294967295, .tenths = -32768, .calibrated = true }
+    ];
+    Vec<u8> wire = Vec::new();
+    foreach (r in readings)
+    {
+        encode(&mut wire, r);
+    }
+    printf("encoded %v bytes:", Vec::len(&wire));
+    foreach (k, byte in &wire)
+    {
+        if (k % 8 == 0)
+        {
+            printf("\n ");
+        }
+        printf(" %02x", byte);
+    }
+    printf("\n");
+
+    bool all_equal = true;
+    foreach (i, original in &readings)
+    {
+        bool same = if (Ok(r) = decode(&wire, i * 8)) { r == *original } else { false };
+        if (!same)
+        {
+            all_equal = false;
+        }
+    }
+    printf("decoded all three and they equal the originals? ");
+    printf("%v", if (all_equal) { "yes" } else { "no" });
+    printf("\n");
+
+    // Two broken inputs: a record cut short, and bytes that are not a record.
+    Vec<u8> cut = Vec::from_slice(&wire[0 .. 5]);
+    explain("the first 5 bytes", decode(&cut, 0));
+    explain("from offset 1", decode(&wire, 1));
+}

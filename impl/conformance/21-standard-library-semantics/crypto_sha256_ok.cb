@@ -1,0 +1,78 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.crypto [Sha256] (D-0151); rule.stdlib.text [Hex]; conf.sha256-vectors, conf.sha256-streaming
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 656d7074793a206f6b0a6162633a206f6b0a35362062797465733a206f6b0a3131322062797465733a206f6b0a35353a206f6b0a35363a206f6b0a36333a206f6b0a36343a206f6b0a36353a206f6b0a3130303020613a206f6b0a73747265616d696e673a206f6b0a636f70696564207072656669783a207472756520747275650a
+//
+// SHA-256 against FIPS 180-4's vectors (the empty message, "abc", the
+// 56-byte and 112-byte messages) and the padding boundaries (55, 56, 63,
+// 64 and 65 bytes, from Python's hashlib); the streaming form, fed in
+// three pieces, gives the one-shot digest; a copied computation continues
+// independently. Digests are shown with `to_hex`.
+
+import std;
+
+fn check(str name, slice<u8, shared> data, str want)
+{
+    String got = to_hex(&sha256(data)[0..$]);
+    printf("%s: %s\n", name, if (String::eq_str(&got, want)) { "ok" } else { "WRONG" });
+}
+
+fn bytes_up_to(usize n) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut v, narrow_wrapping<u8>(i));
+    }
+    v
+}
+
+fn main() : u8
+{
+    Vec<u8> none = Vec::new();
+    check("empty", &none[0..$], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    check("abc", &b"abc"[0..$], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    check(
+        "56 bytes",
+        &b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"[0..$],
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+    );
+    check(
+        "112 bytes",
+        &b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"[0..$],
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+    );
+    check("55", &bytes_up_to(55)[0..$], "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59");
+    check("56", &bytes_up_to(56)[0..$], "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562");
+    check("63", &bytes_up_to(63)[0..$], "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488");
+    check("64", &bytes_up_to(64)[0..$], "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108");
+    check("65", &bytes_up_to(65)[0..$], "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781");
+    Vec<u8> thousand = Vec::filled(1000, b'a');
+    check("1000 a", &thousand[0..$], "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
+    // Streaming: the same message in three pieces.
+    Sha256 s = Sha256::new();
+    Sha256::update(&mut s, &thousand[0..300]);
+    Sha256::update(&mut s, &thousand[300..301]);
+    Sha256::update(&mut s, &thousand[301..$]);
+    printf(
+        "streaming: %s\n",
+        if (digest_eq(&Sha256::finish(s)[0..$], &sha256(&thousand[0..$])[0..$])) { "ok" } else { "WRONG" },
+    );
+    // A copied computation continues on its own: "ab" + "c" and "ab" + "d".
+    Sha256 prefix = Sha256::new();
+    Sha256::update(&mut prefix, &b"ab"[0..$]);
+    Sha256 one = prefix;
+    Sha256 two = prefix;
+    Sha256::update(&mut one, &b"c"[0..$]);
+    Sha256::update(&mut two, &b"d"[0..$]);
+    String abc = to_hex(&Sha256::finish(one)[0..$]);
+    String abd = to_hex(&Sha256::finish(two)[0..$]);
+    printf(
+        "copied prefix: %v %v\n",
+        String::eq_str(&abc, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        !String::eq(&abc, &abd),
+    );
+    0
+}

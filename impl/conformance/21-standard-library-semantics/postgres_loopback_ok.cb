@@ -1,0 +1,772 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.postgres [Pg-Connect] [Pg-Auth] [Pg-Query] [Pg-Result] [Pg-Execute] [Pg-Script] [Pg-Error] [Pg-Notice] (D-0180); conf.postgres-loopback
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 746c7320726566757365643a207468652073657276657220646f6573206e6f742061636365707420544c530a77726f6e672070617373776f72643a2061757468656e7469636174696f6e206661696c65640a636c656172746578743a20746865207365727665722061736b7320666f72207468652070617373776f726420696e20636c656172206f76657220616e20756e656e6372797074656420636f6e6e656374696f6e0a73686131206f6e6c793a20746865207365727665722061736b7320666f7220616e2061757468656e7469636174696f6e206d6574686f642074686174206973206e6f7420737570706f727465640a6d64353a20746865207365727665722061736b7320666f7220616e2061757468656e7469636174696f6e206d6574686f642074686174206973206e6f7420737570706f727465640a0a636f6e6e65637465643a207365727665725f76657273696f6e3d31362e3320286d6f636b2920636c69656e745f656e636f64696e673d5554463820756e6b6e6f776e3d747275650a6563686f3a207461673d5b53454c45435420315d2061666665637465643d3120636f6c756d6e733d6e3a323320743a323520623a313620726f77733d310a202020205b375d205b73652c76656e5d205b745d0a6563686f20323a207461673d5b53454c45435420315d2061666665637465643d3120636f6c756d6e733d6e3a323320743a323520623a313620726f77733d310a202020204e554c4c205b2d302e355d205b5c78303130325d0a696e736572743a2061666665637465643d330a7370656369616c3a207461673d5b53454c45435420325d2061666665637465643d3220636f6c756d6e733d6e756c3a323520756e693a32352062696e3a313720726f77733d320a202020204e554c4c205b68c3a96c6c6f2077c3b6726c645d205b5c783030303166665d0a202020205b5d205b7365636f6e645d204e554c4c0a636f6c756d6e733a20756e693d31206e6f7468696e673d39393b2063656c6c20706173742074686520656e64206e6f6e653d747275650a626f6f6d3a20736572766572204552524f5220636f64653d3432503031206d6573736167653d5b72656c6174696f6e2022626f6f6d2220646f6573206e6f742065786973745d20706f736974696f6e3d382068696e743d747275650a616674657220626f6f6d3a207461673d5b53454c45435420315d2061666665637465643d3120636f6c756d6e733d6e3a323320743a323520623a313620726f77733d310a202020205b375d205b73652c76656e5d205b745d0a6269673a2074686520726573756c74206973206c6172676572207468616e20746865206c696d69740a6166746572206269673a207461673d5b53454c45435420315d2061666665637465643d3120636f6c756d6e733d6e3a323320743a323520623a313620726f77733d310a202020205b375d205b73652c76656e5d205b745d0a6e6f746963653a207461673d5b53454c45435420305d2061666665637465643d3020636f6c756d6e733d726f77733d300a6e6f74696365733a2031204e4f544943452f30303030302f5b746869732069732061206e6f746963655d0a7363726970743a206f6b0a626164207363726970743a204552524f523a2073796e746178206572726f7220696e207468652073637269707420283432363031290a6166746572207363726970743a207461673d5b53454c45435420315d2061666665637465643d3120636f6c756d6e733d6e3a323320743a323520623a313620726f77733d310a202020205b375d205b73652c76656e5d205b745d0a616674657220636c6f73653a2074686520636f6e6e656374696f6e20697320636c6f7365640a0a676172626167653a20746865207365727665722773206d657373616765206973206d616c666f726d65640a616674657220676172626167653a2074686520636f6e6e656374696f6e20697320636c6f7365640a7365727665723a20370a
+//
+// Hermetic: a mock PostgreSQL backend on a loopback port in one thread
+// (the wire protocol's startup, the server side of SCRAM-SHA-256, the
+// extended and the simple query protocol, with canned answers chosen by
+// the statement's text), the client in the main thread. An SSLRequest
+// answered N (TlsRefused); a wrong password (AuthFailed); a cleartext
+// request on a plain connection (AuthRefused); SASL without
+// SCRAM-SHA-256 and MD5 (UnsupportedAuth). Then one session: the
+// parameters reported at startup, a statement with bound parameters of
+// every kind echoed back with its columns, an INSERT's count and tag,
+// NULL, non-ASCII and bytea cells, a server error with its SQLSTATE,
+// position and hint after which the connection still works, a result
+// over `max_result` (ResultTooLarge) likewise, a notice kept, a script
+// run and a failing one, `close` then Disconnected; and a session the
+// server breaks with a message it may not send (ProtocolViolation, then
+// Disconnected).
+
+import std;
+
+// ---- the mock backend ----
+
+struct ClientMsg
+{
+    u8 kind;
+    Vec<u8> body;
+}
+
+fn read_client(ref<TcpStream, exclusive> t) : Option<ClientMsg>
+{
+    Vec<u8> head = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut head, 5)))
+    {
+        return None;
+    }
+    usize len = widen<usize>(read_be<u32>(&head[0..$], 1));
+    if (len < 4)
+    {
+        return None;
+    }
+    Vec<u8> body = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut body, len - 4)))
+    {
+        return None;
+    }
+    Some(ClientMsg { .kind = head[0], .body = body })
+}
+
+fn cstr(slice<u8, shared> b, ref<usize, exclusive> at) : String
+{
+    usize end = *at;
+    while (end < slice_len(b) && b[end] != 0)
+    {
+        end += 1;
+    }
+    String s = Result::unwrap_or(String::from_utf8(Vec::from_slice(&b[*at..end])), String::new());
+    *at = min(end + 1, slice_len(b));
+    s
+}
+
+fn msg(u8 kind, slice<u8, shared> body) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, kind);
+    Vec::push_be(&mut out, narrow<u32>(slice_len(body) + 4));
+    Vec::extend_from(&mut out, body);
+    out
+}
+
+fn push_cstr(ref<Vec<u8>, exclusive> out, str s)
+{
+    Vec::extend_from(out, StringView::as_bytes(StringView::of(s)));
+    Vec::push(out, 0);
+}
+
+fn push_view(ref<Vec<u8>, exclusive> out, StringView s)
+{
+    Vec::extend_from(out, StringView::as_bytes(s));
+    Vec::push(out, 0);
+}
+
+// An ErrorResponse (kind E) or NoticeResponse (kind N); hint "" and
+// position 0 mean none.
+fn report(u8 kind, str severity, str code, str message, str hint, u32 position) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, b'S');
+    push_cstr(&mut b, severity);
+    Vec::push(&mut b, b'V');
+    push_cstr(&mut b, severity);
+    Vec::push(&mut b, b'C');
+    push_cstr(&mut b, code);
+    Vec::push(&mut b, b'M');
+    push_cstr(&mut b, message);
+    if (StringView::len(StringView::of(hint)) > 0)
+    {
+        Vec::push(&mut b, b'H');
+        push_cstr(&mut b, hint);
+    }
+    if (position > 0)
+    {
+        Vec::push(&mut b, b'P');
+        String p = String::new();
+        String::append(&mut p, position);
+        push_view(&mut b, String::as_view(&p));
+    }
+    Vec::push(&mut b, 0);
+    msg(kind, &b[0..$])
+}
+
+fn auth(u32 code, slice<u8, shared> data) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push_be(&mut b, code);
+    Vec::extend_from(&mut b, data);
+    msg(b'R', &b[0..$])
+}
+
+fn status(str name, str value) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    push_cstr(&mut b, name);
+    push_cstr(&mut b, value);
+    msg(b'S', &b[0..$])
+}
+
+fn column(ref<Vec<u8>, exclusive> b, str name, u32 oid)
+{
+    push_cstr(b, name);
+    Vec::push_be<u32>(b, 0);
+    Vec::push_be<u16>(b, 0);
+    Vec::push_be(b, oid);
+    Vec::push_be<i16>(b, -1);
+    Vec::push_be<i32>(b, -1);
+    Vec::push_be<u16>(b, 0);
+}
+
+fn data_row(ref<Vec<Option<String>>, shared> cells) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push_be(&mut b, narrow<u16>(Vec::len(cells)));
+    foreach (c in cells)
+    {
+        match (c)
+        {
+            Some(s) :
+            {
+                Vec::push_be(&mut b, narrow<u32>(String::len(s)));
+                Vec::extend_from(&mut b, StringView::as_bytes(String::as_view(s)));
+            },
+            None    : Vec::push_be<i32>(&mut b, -1),
+        }
+    }
+    msg(b'D', &b[0..$])
+}
+
+fn complete(str tag) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    push_cstr(&mut b, tag);
+    msg(b'C', &b[0..$])
+}
+
+fn ready() : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, b'I');
+    msg(b'Z', &b[0..$])
+}
+
+fn cell(str text) : Option<String>
+{
+    Some(String::from_str(text))
+}
+
+fn add(ref<Vec<u8>, exclusive> out, Vec<u8> m)
+{
+    Vec::extend_from(out, &m[0..$]);
+}
+
+// The answer to a statement run through the extended protocol, by its text.
+fn answer(ref<String, shared> query, ref<Vec<Option<String>>, shared> params) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec<u8> none = Vec::new();
+    if (String::eq_str(query, "SELECT boom"))
+    {
+        add(&mut out, report(b'E', "ERROR", "42P01", "relation \"boom\" does not exist", "check the name", 8));
+        add(&mut out, ready());
+        return out;
+    }
+    add(&mut out, msg(b'1', &none[0..$]));
+    add(&mut out, msg(b'2', &none[0..$]));
+    if (String::eq_str(query, "SELECT $1::int AS n, $2 AS t, $3::bool AS b"))
+    {
+        Vec<u8> desc = Vec::new();
+        Vec::push_be<u16>(&mut desc, 3);
+        column(&mut desc, "n", 23);
+        column(&mut desc, "t", 25);
+        column(&mut desc, "b", 16);
+        add(&mut out, msg(b'T', &desc[0..$]));
+        add(&mut out, data_row(params));
+        add(&mut out, complete("SELECT 1"));
+    }
+    else if (String::eq_str(query, "INSERT INTO items VALUES ($1), ($2), ($3)"))
+    {
+        add(&mut out, msg(b'n', &none[0..$]));
+        add(&mut out, complete("INSERT 0 3"));
+    }
+    else if (String::eq_str(query, "SELECT special"))
+    {
+        Vec<u8> desc = Vec::new();
+        Vec::push_be<u16>(&mut desc, 3);
+        column(&mut desc, "nul", 25);
+        column(&mut desc, "uni", 25);
+        column(&mut desc, "bin", 17);
+        add(&mut out, msg(b'T', &desc[0..$]));
+        Vec<Option<String>> r1 = Vec::new();
+        Vec::push(&mut r1, None);
+        Vec::push(&mut r1, cell("héllo wörld"));
+        Vec::push(&mut r1, cell("\\x0001ff"));
+        add(&mut out, data_row(&r1));
+        Vec<Option<String>> r2 = Vec::new();
+        Vec::push(&mut r2, cell(""));
+        Vec::push(&mut r2, cell("second"));
+        Vec::push(&mut r2, None);
+        add(&mut out, data_row(&r2));
+        add(&mut out, complete("SELECT 2"));
+    }
+    else if (String::eq_str(query, "SELECT big"))
+    {
+        Vec<u8> desc = Vec::new();
+        Vec::push_be<u16>(&mut desc, 1);
+        column(&mut desc, "x", 25);
+        add(&mut out, msg(b'T', &desc[0..$]));
+        Vec<Option<String>> row = Vec::new();
+        Vec::push(&mut row, Some(Result::unwrap_or(String::from_utf8(Vec::filled(100, b'x')), String::new())));
+        for (usize i = 0; i < 50; i += 1)
+        {
+            add(&mut out, data_row(&row));
+        }
+        add(&mut out, complete("SELECT 50"));
+    }
+    else if (String::eq_str(query, "SELECT notice"))
+    {
+        add(&mut out, report(b'N', "NOTICE", "00000", "this is a notice", "", 0));
+        add(&mut out, msg(b'n', &none[0..$]));
+        add(&mut out, complete("SELECT 0"));
+    }
+    else if (String::eq_str(query, "SELECT garbage"))
+    {
+        add(&mut out, msg(b'?', &none[0..$]));
+    }
+    else
+    {
+        add(&mut out, report(b'E', "ERROR", "0A000", "mock: unknown statement", "", 0));
+    }
+    add(&mut out, ready());
+    out
+}
+
+// The answer to a script run through the simple protocol.
+fn answer_script(ref<String, shared> script) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec<StringView> statements = String::split(script, ";");
+    foreach (s in &statements)
+    {
+        StringView stmt = StringView::trim(*s);
+        if (StringView::len(stmt) == 0)
+        {
+            continue;
+        }
+        if (StringView::starts_with(stmt, "CREATE TABLE"))
+        {
+            add(&mut out, complete("CREATE TABLE"));
+        }
+        else if (StringView::starts_with(stmt, "INSERT"))
+        {
+            add(&mut out, complete("INSERT 0 1"));
+        }
+        else if (StringView::eq(stmt, "SELECT 1"))
+        {
+            Vec<u8> desc = Vec::new();
+            Vec::push_be<u16>(&mut desc, 1);
+            column(&mut desc, "?column?", 23);
+            add(&mut out, msg(b'T', &desc[0..$]));
+            Vec<Option<String>> row = Vec::new();
+            Vec::push(&mut row, cell("1"));
+            add(&mut out, data_row(&row));
+            add(&mut out, complete("SELECT 1"));
+        }
+        else
+        {
+            add(&mut out, report(b'E', "ERROR", "42601", "syntax error in the script", "", 0));
+            break;
+        }
+    }
+    add(&mut out, ready());
+    out
+}
+
+fn attribute(slice<StringView, shared> parts, str name) : StringView
+{
+    foreach (p in parts)
+    {
+        if (StringView::starts_with(*p, StringView::of(name)))
+        {
+            return StringView::sub(*p, 2, StringView::len(*p));
+        }
+    }
+    StringView::of("")
+}
+
+// The server side of SCRAM-SHA-256 for user "user", password "pencil",
+// 4 iterations (an interpreter-friendly count); true when the client
+// proved the password.
+fn scram_server(ref<TcpStream, exclusive> t) : bool
+{
+    _ = TcpStream::write(t, &auth(10, &b"SCRAM-SHA-256\x00\x00"[0..$])[0..$]);
+    ClientMsg first = match (read_client(t))
+    {
+        Some(m) : m,
+        None    : return false,
+    };
+    usize at = 0;
+    String mech = cstr(&first.body[0..$], &mut at);
+    if (!String::eq_str(&mech, "SCRAM-SHA-256") || first.kind != b'p')
+    {
+        return false;
+    }
+    String client_first = Result::unwrap_or(String::from_utf8(Vec::from_slice(&first.body[at + 4..$])), String::new());
+    if (!String::starts_with(&client_first, "n,,"))
+    {
+        return false;
+    }
+    StringView bare = StringView::sub(String::as_view(&client_first), 3, String::len(&client_first));
+    Vec<StringView> parts = StringView::split(bare, ",");
+    String nonce = String::from_view(attribute(&parts[0..$], "r="));
+    String::append(&mut nonce, "mockserver");
+    String server_first = String::from_str("r=");
+    String::append(&mut server_first, String::as_view(&nonce));
+    String::append(&mut server_first, ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4");
+    _ = TcpStream::write(t, &auth(11, StringView::as_bytes(String::as_view(&server_first)))[0..$]);
+    ClientMsg final = match (read_client(t))
+    {
+        Some(m) : m,
+        None    : return false,
+    };
+    String client_final = Result::unwrap_or(String::from_utf8(Vec::from_slice(&final.body[0..$])), String::new());
+    usize proof_at = match (String::find(&client_final, ",p="))
+    {
+        Some(i) : i,
+        None    : return false,
+    };
+    StringView without_proof = StringView::sub(String::as_view(&client_final), 0, proof_at);
+    Vec<u8> proof = match (base64_decode(StringView::sub(
+        String::as_view(&client_final),
+        proof_at + 3,
+        String::len(&client_final),
+    )))
+    {
+        Ok(p)  : p,
+        Err(_) : return false,
+    };
+    String auth_message = String::from_view(bare);
+    String::append(&mut auth_message, ",");
+    String::append(&mut auth_message, String::as_view(&server_first));
+    String::append(&mut auth_message, ",");
+    String::append(&mut auth_message, without_proof);
+    Vec<u8> salt = Result::unwrap(base64_decode("W22ZaJ0SNY7soEsUEjb6gQ=="));
+    Vec<u8> salted = scram_salted_password("pencil", &salt[0..$], 4);
+    array<u8, 32> client_key = hmac_sha256(&salted[0..$], &b"Client Key"[0..$]);
+    array<u8, 32> stored_key = sha256(&client_key[0..$]);
+    array<u8, 32> signature = hmac_sha256(&stored_key[0..$], StringView::as_bytes(String::as_view(&auth_message)));
+    if (Vec::len(&proof) != 32)
+    {
+        return false;
+    }
+    Vec<u8> recovered = Vec::new();
+    for (usize i = 0; i < 32; i += 1)
+    {
+        Vec::push(&mut recovered, proof[i] ^ signature[i]);
+    }
+    if (!digest_eq(&sha256(&recovered[0..$])[0..$], &stored_key[0..$]))
+    {
+        return false;
+    }
+    array<u8, 32> server_key = hmac_sha256(&salted[0..$], &b"Server Key"[0..$]);
+    array<u8, 32> server_signature = hmac_sha256(
+        &server_key[0..$],
+        StringView::as_bytes(String::as_view(&auth_message)),
+    );
+    String server_final = String::from_str("v=");
+    String::append(&mut server_final, String::as_view(&base64_encode(&server_signature[0..$])));
+    _ = TcpStream::write(t, &auth(12, StringView::as_bytes(String::as_view(&server_final)))[0..$]);
+    true
+}
+
+fn session(ref<TcpStream, exclusive> t)
+{
+    Vec<u8> head = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut head, 4)))
+    {
+        return;
+    }
+    usize len = widen<usize>(read_be<u32>(&head[0..$], 0));
+    Vec<u8> body = Vec::new();
+    if (len < 8 || Result::is_err(&TcpStream::read_exact(t, &mut body, len - 4)))
+    {
+        return;
+    }
+    u32 code = read_be<u32>(&body[0..$], 0);
+    if (code == 80877103)
+    {
+        // SSLRequest: no TLS here.
+        _ = TcpStream::write(t, &b"N"[0..$]);
+        return;
+    }
+    if (code != 196608)
+    {
+        return;
+    }
+    String user = String::new();
+    usize at = 4;
+    while (at < Vec::len(&body))
+    {
+        String key = cstr(&body[0..$], &mut at);
+        if (String::len(&key) == 0)
+        {
+            break;
+        }
+        String value = cstr(&body[0..$], &mut at);
+        if (String::eq_str(&key, "user"))
+        {
+            overwrite(&mut user, value);
+        }
+    }
+    Vec<u8> none = Vec::new();
+    if (String::eq_str(&user, "clear"))
+    {
+        _ = TcpStream::write(t, &auth(3, &none[0..$])[0..$]);
+        return;
+    }
+    if (String::eq_str(&user, "sha1"))
+    {
+        _ = TcpStream::write(t, &auth(10, &b"SCRAM-SHA-1\x00\x00"[0..$])[0..$]);
+        return;
+    }
+    if (String::eq_str(&user, "md5"))
+    {
+        _ = TcpStream::write(t, &auth(5, &b"salt"[0..$])[0..$]);
+        return;
+    }
+    if (!scram_server(t))
+    {
+        _ = TcpStream::write(
+            t,
+            &report(b'E', "FATAL", "28P01", "password authentication failed for user \"user\"", "", 0)[0..$],
+        );
+        return;
+    }
+    Vec<u8> hello = Vec::new();
+    add(&mut hello, auth(0, &none[0..$]));
+    add(&mut hello, status("server_version", "16.3 (mock)"));
+    add(&mut hello, status("client_encoding", "UTF8"));
+    Vec<u8> key = Vec::new();
+    Vec::push_be<u32>(&mut key, 4242);
+    Vec::push_be<u32>(&mut key, 7);
+    add(&mut hello, msg(b'K', &key[0..$]));
+    add(&mut hello, ready());
+    if (Result::is_err(&TcpStream::write(t, &hello[0..$])))
+    {
+        return;
+    }
+    String query = String::new();
+    Vec<Option<String>> params = Vec::new();
+    while (true)
+    {
+        ClientMsg m = match (read_client(t))
+        {
+            Some(m) : m,
+            None    : return,
+        };
+        slice<u8, shared> b = &m.body[0..$];
+        if (m.kind == b'P')
+        {
+            usize p = 0;
+            _ = cstr(b, &mut p);
+            overwrite(&mut query, cstr(b, &mut p));
+        }
+        else if (m.kind == b'B')
+        {
+            usize p = 0;
+            _ = cstr(b, &mut p);
+            _ = cstr(b, &mut p);
+            usize formats = widen<usize>(read_be<u16>(b, p));
+            p += 2 + 2 * formats;
+            usize n = widen<usize>(read_be<u16>(b, p));
+            p += 2;
+            Vec<Option<String>> got = Vec::new();
+            for (usize i = 0; i < n; i += 1)
+            {
+                i32 size = read_be<i32>(b, p);
+                p += 4;
+                if (size < 0)
+                {
+                    Vec::push(&mut got, None);
+                }
+                else
+                {
+                    usize k = narrow<usize>(size);
+                    Vec::push(
+                        &mut got,
+                        Some(Result::unwrap_or(String::from_utf8(Vec::from_slice(&b[p..p + k])), String::new())),
+                    );
+                    p += k;
+                }
+            }
+            overwrite(&mut params, got);
+        }
+        else if (m.kind == b'S')
+        {
+            if (Result::is_err(&TcpStream::write(t, &answer(&query, &params)[0..$])))
+            {
+                return;
+            }
+            if (String::eq_str(&query, "SELECT garbage"))
+            {
+                // The client drops a connection that spoke garbage; the
+                // mock need not wait out its read timeout to learn that.
+                return;
+            }
+        }
+        else if (m.kind == b'Q')
+        {
+            usize p = 0;
+            String script = cstr(b, &mut p);
+            if (Result::is_err(&TcpStream::write(t, &answer_script(&script)[0..$])))
+            {
+                return;
+            }
+        }
+        else if (m.kind == b'D' || m.kind == b'E' || m.kind == b'H')
+        {
+            continue;
+        }
+        else
+        {
+            // Terminate, or anything unexpected.
+            return;
+        }
+    }
+}
+
+fn serve(TcpListener l) : u8
+{
+    u8 served = 0;
+    while (served < 7)
+    {
+        TcpStream t = match (TcpListener::accept(&mut l))
+        {
+            Ok(t)  : t,
+            Err(_) : return 99,
+        };
+        TcpStream::set_read_timeout_ms(&mut t, 20000);
+        TcpStream::set_write_timeout_ms(&mut t, 20000);
+        served += 1;
+        session(&mut t);
+    }
+    served
+}
+
+// ---- the client ----
+
+fn url(ref<String, shared> base, str credentials, str mode) : String
+{
+    sprintf("postgres://%s@%s/db?sslmode=%s", credentials, base, mode)
+}
+
+fn refused(str label, Result<PgConnection, PgError> r)
+{
+    match (r)
+    {
+        Ok(c)  :
+        {
+            printf("%s: connected?!\n", label);
+            PgConnection::close(&mut c);
+        },
+        Err(e) : printf("%s: %s\n", label, &PgError::text(&e)),
+    }
+}
+
+fn cell_text(ref<PgRow, shared> r, usize i) : String
+{
+    match (PgRow::get(r, i))
+    {
+        Some(v) :
+        {
+            String t = String::from_str("[");
+            String::append(&mut t, v);
+            String::append(&mut t, "]");
+            t
+        },
+        None    : String::from_str("NULL"),
+    }
+}
+
+fn show(str label, Result<PgResult, PgError> r)
+{
+    match (r)
+    {
+        Ok(res) :
+        {
+            printf("%s: tag=[%s] affected=%v columns=", label, &res.tag, res.affected);
+            foreach (c in &res.columns)
+            {
+                printf("%s:%u ", &c.name, c.type_oid);
+            }
+            printf("rows=%v\n", Vec::len(&res.rows));
+            foreach (row in &res.rows)
+            {
+                printf("   ");
+                for (usize i = 0; i < Vec::len(&row.cells); i += 1)
+                {
+                    printf(" %s", &cell_text(row, i));
+                }
+                printf("\n");
+            }
+        },
+        Err(e) : match (&e)
+        {
+            Server(s) : printf(
+                "%s: server %s code=%s message=[%s] position=%v hint=%v\n",
+                label,
+                &s.severity,
+                &s.code,
+                &s.message,
+                Option::unwrap_or(s.position, 0),
+                Option::is_some(&s.hint),
+            ),
+            _ : printf("%s: %s\n", label, &PgError::text(&e)),
+        },
+    }
+}
+
+fn main() : u8
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    auto server = spawn(serve, l);
+    String base = sprintf("127.0.0.1:%u", at.port);
+    TrustStore no_roots = TrustStore::new();
+    refused(
+        "tls refused",
+        PgConnection::connect_with(String::as_view(&url(&base, "user:pencil", "verify-full")), &no_roots, 10000),
+    );
+    refused(
+        "wrong password",
+        PgConnection::connect_with(String::as_view(&url(&base, "user:wrong", "disable")), &no_roots, 10000),
+    );
+    refused(
+        "cleartext",
+        PgConnection::connect_with(String::as_view(&url(&base, "clear:pw", "disable")), &no_roots, 10000),
+    );
+    refused(
+        "sha1 only",
+        PgConnection::connect_with(String::as_view(&url(&base, "sha1:pw", "disable")), &no_roots, 10000),
+    );
+    refused("md5", PgConnection::connect_with(String::as_view(&url(&base, "md5:pw", "disable")), &no_roots, 10000));
+    printf("\n");
+    PgConnection c = match (PgConnection::connect_with(
+        String::as_view(&url(&base, "user:pencil", "disable")),
+        &no_roots,
+        10000,
+    ))
+    {
+        Ok(c)  : c,
+        Err(e) :
+        {
+            printf("connect: %s\n", &PgError::text(&e));
+            return 1;
+        },
+    };
+    printf(
+        "connected: server_version=%s client_encoding=%s unknown=%v\n",
+        Option::unwrap_or(PgConnection::parameter(&c, "server_version"), StringView::of("-")),
+        Option::unwrap_or(PgConnection::parameter(&c, "client_encoding"), StringView::of("-")),
+        Option::is_none(&PgConnection::parameter(&c, "nothing")),
+    );
+    Vec<PgValue> params = Vec::new();
+    Vec::push(&mut params, Int(7));
+    Vec::push(&mut params, Text(String::from_str("se,ven")));
+    Vec::push(&mut params, Bool(true));
+    show("echo", PgConnection::query(&mut c, "SELECT $1::int AS n, $2 AS t, $3::bool AS b", &params[0..$]));
+    Vec<PgValue> params2 = Vec::new();
+    Vec::push(&mut params2, Null);
+    Vec::push(&mut params2, Float(-0.5));
+    Vec::push(&mut params2, Bytes(Vec::from_slice(&b"\x01\x02"[0..$])));
+    show("echo 2", PgConnection::query(&mut c, "SELECT $1::int AS n, $2 AS t, $3::bool AS b", &params2[0..$]));
+    Vec<PgValue> three = Vec::new();
+    Vec::push(&mut three, Int(1));
+    Vec::push(&mut three, Int(2));
+    Vec::push(&mut three, Int(3));
+    match (PgConnection::execute(&mut c, "INSERT INTO items VALUES ($1), ($2), ($3)", &three[0..$]))
+    {
+        Ok(n)  : printf("insert: affected=%v\n", n),
+        Err(e) : printf("insert: %s\n", &PgError::text(&e)),
+    }
+    Vec<PgValue> no_params = Vec::new();
+    show("special", PgConnection::query(&mut c, "SELECT special", &no_params[0..$]));
+    match (PgConnection::query(&mut c, "SELECT special", &no_params[0..$]))
+    {
+        Ok(res) : printf(
+            "columns: uni=%v nothing=%v; cell past the end none=%v\n",
+            Option::unwrap_or(PgResult::column(&res, "uni"), 99),
+            Option::unwrap_or(PgResult::column(&res, "nothing"), 99),
+            Option::is_none(&PgRow::get(&res.rows[0], 3)),
+        ),
+        Err(e) : printf("special again: %s\n", &PgError::text(&e)),
+    }
+    show("boom", PgConnection::query(&mut c, "SELECT boom", &no_params[0..$]));
+    show("after boom", PgConnection::query(&mut c, "SELECT $1::int AS n, $2 AS t, $3::bool AS b", &params[0..$]));
+    c.max_result = 1000;
+    show("big", PgConnection::query(&mut c, "SELECT big", &no_params[0..$]));
+    show("after big", PgConnection::query(&mut c, "SELECT $1::int AS n, $2 AS t, $3::bool AS b", &params[0..$]));
+    show("notice", PgConnection::query(&mut c, "SELECT notice", &no_params[0..$]));
+    printf("notices: %v", Vec::len(&c.notices));
+    foreach (n in &c.notices)
+    {
+        printf(" %s/%s/[%s]", &n.severity, &n.code, &n.message);
+    }
+    printf("\n");
+    Vec::clear(&mut c.notices);
+    match (PgConnection::run_script(&mut c, "CREATE TABLE t (x int);\nINSERT INTO t VALUES (1);\nSELECT 1;\n"))
+    {
+        Ok(_)  : printf("script: ok\n"),
+        Err(e) : printf("script: %s\n", &PgError::text(&e)),
+    }
+    match (PgConnection::run_script(&mut c, "CREATE TABLE u (x int); SELEKT 1; INSERT INTO u VALUES (1)"))
+    {
+        Ok(_)  : printf("bad script: ok?!\n"),
+        Err(e) : printf("bad script: %s\n", &PgError::text(&e)),
+    }
+    show("after script", PgConnection::query(&mut c, "SELECT $1::int AS n, $2 AS t, $3::bool AS b", &params[0..$]));
+    PgConnection::close(&mut c);
+    show("after close", PgConnection::query(&mut c, "SELECT special", &no_params[0..$]));
+    printf("\n");
+    PgConnection g = match (PgConnection::connect_with(
+        String::as_view(&url(&base, "user:pencil", "disable")),
+        &no_roots,
+        10000,
+    ))
+    {
+        Ok(c)  : c,
+        Err(e) :
+        {
+            printf("connect 2: %s\n", &PgError::text(&e));
+            return 1;
+        },
+    };
+    show("garbage", PgConnection::query(&mut g, "SELECT garbage", &no_params[0..$]));
+    show("after garbage", PgConnection::query(&mut g, "SELECT special", &no_params[0..$]));
+    PgConnection::close(&mut g);
+    printf("server: %u\n", join(server));
+    0
+}

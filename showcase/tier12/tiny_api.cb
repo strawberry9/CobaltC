@@ -1,0 +1,214 @@
+// A key-value API
+//
+// Shows: a small HTTP service the way `std` is meant to be used. An
+// `HttpServer` on loopback port 0 accepts connections in one thread and
+// `spawn`s a handler for each, moving the `HttpConnection` into it; the
+// store they share is a `mutex<HashMap<String, String>>`, reachable only
+// through the guard `lock` returns, so two handlers never touch it at
+// once and the lock is released when the guard's block ends. Each handler
+// routes on method and path: `PUT /items/<key>` stores the body, `GET`
+// reads it back or answers 404, `DELETE` removes it, `GET /items` lists
+// the keys in order, and any other method is 405 with an `Allow` header.
+// The client is `http_get`, `http_post` and an `HttpClient` for PUT and
+// DELETE. Every response is printed by the main thread, in request
+// order, so the output is the same on every run.
+
+import std;
+
+// The key after `/items/`, or None for any other path.
+fn item_key(ref<Request, shared> req) : Option<String>
+{
+    StringView url = String::as_view(&req.url);
+    if (!StringView::starts_with(url, "/items/") || StringView::len(url) == 7)
+    {
+        return None;
+    }
+    Some(String::from_view(StringView::sub(url, 7, StringView::len(url))))
+}
+
+fn text_headers() : Vec<Header>
+{
+    Vec<Header> h = Vec::new();
+    Vec::push(&mut h, Header::new("Content-Type", "text/plain"));
+    h
+}
+
+fn handle_connection(HttpConnection c, ref<mutex<HashMap<String, String>>, shared> store) : u8
+{
+    while (true)
+    {
+        Request req = match (HttpConnection::request(&mut c))
+        {
+            Ok(Some(r)) : r,
+            Ok(None)    : return 0,
+            Err(_)      :
+            {
+                _ = HttpConnection::respond(&mut c, 400, &text_headers()[0..$], &b"bad request\n"[0..$]);
+                return 1;
+            },
+        };
+        Vec<Header> h = text_headers();
+        if (req.url == "/items" && req.method == "GET")
+        {
+            // The keys, sorted, one per line; the lock lasts this block.
+            String listing = String::new();
+            {
+                auto g = lock(store);
+                Vec<String> keys = Vec::new();
+                for (usize i = 0; i < HashMap::len(&*g); i += 1)
+                {
+                    Vec::push(&mut keys, String::clone(HashMap::key_at(&*g, i)));
+                }
+                Vec::sort_by(&mut keys, String::less);
+                foreach (k in &keys)
+                {
+                    String::append(&mut listing, String::as_view(k));
+                    String::append(&mut listing, "\n");
+                }
+            }
+            _ = HttpConnection::respond(&mut c, 200, &h[0..$], StringView::as_bytes(String::as_view(&listing)));
+            continue;
+        }
+        String key = match (item_key(&req))
+        {
+            Some(k) : k,
+            None    :
+            {
+                _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"no such route\n"[0..$]);
+                continue;
+            },
+        };
+        if (req.method == "PUT")
+        {
+            String value = Result::unwrap_or(String::from_utf8(Vec::clone(&req.body)), String::new());
+            bool existed = false;
+            {
+                auto g = lock(store);
+                existed = HashMap::contains(&*g, &key);
+                _ = HashMap::insert(&mut *g, key, value);
+            }
+            _ = HttpConnection::respond(&mut c, if (existed) { 200 } else { 201 }, &h[0..$], &b"stored\n"[0..$]);
+        }
+        else if (req.method == "GET")
+        {
+            Option<String> found = None;
+            {
+                auto g = lock(store);
+                if (Some(v) = HashMap::get(&*g, &key))
+                {
+                    overwrite(&mut found, Some(String::clone(v)));
+                }
+            }
+            match (found)
+            {
+                Some(v) : { _ = HttpConnection::respond(
+                    &mut c,
+                    200,
+                    &h[0..$],
+                    StringView::as_bytes(String::as_view(&v)),
+                ); },
+                None : { _ = HttpConnection::respond(&mut c, 404, &h[0..$], &b"no such item\n"[0..$]); },
+            }
+        }
+        else if (req.method == "DELETE")
+        {
+            bool removed = false;
+            {
+                auto g = lock(store);
+                removed = Option::is_some(&HashMap::remove(&mut *g, &key));
+            }
+            Vec<u8> none = Vec::new();
+            _ = HttpConnection::respond(&mut c, if (removed) { 204 } else { 404 }, &h[0..$], &none[0..$]);
+        }
+        else
+        {
+            Vec::push(&mut h, Header::new("Allow", "GET, PUT, DELETE"));
+            _ = HttpConnection::respond(&mut c, 405, &h[0..$], &b"method not allowed\n"[0..$]);
+        }
+    }
+    0
+}
+
+// Accepts `count` connections, a thread each, and waits for them all.
+fn serve(HttpServer s, ref<mutex<HashMap<String, String>>, shared> store, usize count) : u8
+{
+    Vec<handle<u8>> workers = Vec::new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : Vec::push(&mut workers, spawn(handle_connection, c, store)),
+            Err(_) : return 1,
+        }
+    }
+    u8 failures = 0;
+    while (Some(w) = Vec::pop(&mut workers))
+    {
+        failures += join(w);
+    }
+    failures
+}
+
+fn show(str label, Result<Response, HttpError> r)
+{
+    match (r)
+    {
+        Ok(resp) :
+        {
+            String body = Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::new());
+            printf(
+                "%-22s %u %s%s%s\n",
+                label,
+                resp.status,
+                &resp.reason,
+                if (String::len(&body) > 0) { ": " } else { "" },
+                String::trim_end(&body),
+            );
+            if (Some(allow) = Response::header(&resp, "allow"))
+            {
+                printf("%-22s   Allow: %s\n", "", allow);
+            }
+        },
+        Err(e)   : printf("%-22s error: %s\n", label, HttpError::text(&e)),
+    }
+}
+
+fn send(
+    ref<HttpClient, exclusive> c,
+    str method,
+    ref<String, shared> base,
+    str path,
+    str body,
+) : Result<Response, HttpError>
+{
+    String url = String::clone(base);
+    String::append(&mut url, path);
+    Request req = Request::new(method, String::as_view(&url));
+    Vec::extend_from(&mut req.body, StringView::as_bytes(StringView::of(body)));
+    if (str_len(body) > 0)
+    {
+        Vec::push(&mut req.headers, Header::new("Content-Type", "text/plain"));
+    }
+    HttpClient::send(c, &req)
+}
+
+fn main()
+{
+    auto store = Mutex::new(HashMap::new<String, String>());
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto server = spawn(serve, s, &store, 10);
+    HttpClient c = HttpClient::new();
+    show("PUT /items/colour", send(&mut c, "PUT", &base, "/items/colour", "blue"));
+    show("PUT /items/size", send(&mut c, "PUT", &base, "/items/size", "large"));
+    show("PUT /items/colour again", send(&mut c, "PUT", &base, "/items/colour", "green"));
+    show("GET /items/colour", send(&mut c, "GET", &base, "/items/colour", ""));
+    show("GET /items", send(&mut c, "GET", &base, "/items", ""));
+    show("DELETE /items/size", send(&mut c, "DELETE", &base, "/items/size", ""));
+    show("GET /items/size", send(&mut c, "GET", &base, "/items/size", ""));
+    show("POST /items/colour", send(&mut c, "POST", &base, "/items/colour", "red"));
+    show("GET /nothing/here", send(&mut c, "GET", &base, "/nothing/here", ""));
+    show("GET /items", send(&mut c, "GET", &base, "/items", ""));
+    printf("handlers that failed: %u\n", join(server));
+    printf("items left in the store: %v\n", HashMap::len(&*lock(&store)));
+}

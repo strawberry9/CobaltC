@@ -1,0 +1,736 @@
+// `std::net` (spec/21 §2l, D-0144): TCP, UDP and name resolution, over
+// `net_op` (src/netio.rs), shared by both implementations. Sockets block,
+// each with its own timeouts; a connection is served by its own thread
+// (`spawn` with a `move` closure), and threads coordinate through
+// channels. IPv4 and IPv6; no TLS.
+
+// An IP address: four bytes, or sixteen.
+export enum IpAddr
+{
+    V4(array<u8, 4>),
+    V6(array<u8, 16>),
+}
+
+// An IP address and a port: where a socket is bound or connected.
+export struct SocketAddr
+{
+    export IpAddr ip;
+    export u16 port;
+}
+
+// What a socket's operation failed with. `TimedOut` leaves the socket
+// usable; `Closed` is a peer gone while writing, or a read that ended
+// short; `UnknownHost` a name that resolves to nothing; `Failed` any
+// other failure. No variant shares a name with `FileError`'s, so either
+// may be written unqualified where `std` is imported.
+export enum NetError
+{
+    Refused,
+    Reset,
+    TimedOut,
+    Unreachable,
+    AddrInUse,
+    AddrNotAvailable,
+    UnknownHost,
+    NotPermitted,
+    Closed,
+    Failed,
+    NotUtf8(Utf8Error),
+}
+
+export fn NetError::text(ref<NetError, shared> e) : str
+{
+    match (e)
+    {
+        Refused          : "connection refused",
+        Reset            : "connection reset",
+        TimedOut         : "timed out",
+        Unreachable      : "unreachable",
+        AddrInUse        : "address in use",
+        AddrNotAvailable : "address not available",
+        UnknownHost      : "unknown host",
+        NotPermitted     : "permission denied",
+        Closed           : "closed",
+        Failed           : "input/output error",
+        NotUtf8(_)       : "not UTF-8",
+    }
+}
+
+fn net_error(i64 code) : NetError
+{
+    if (code == -1)
+    {
+        return NetError::UnknownHost;
+    }
+    if (code == -2)
+    {
+        return NetError::NotPermitted;
+    }
+    if (code == -4)
+    {
+        return NetError::Refused;
+    }
+    if (code == -5)
+    {
+        return NetError::Reset;
+    }
+    if (code == -6)
+    {
+        return NetError::TimedOut;
+    }
+    if (code == -7)
+    {
+        return NetError::Unreachable;
+    }
+    if (code == -8)
+    {
+        return NetError::AddrInUse;
+    }
+    if (code == -9)
+    {
+        return NetError::AddrNotAvailable;
+    }
+    if (code == -10)
+    {
+        return NetError::Closed;
+    }
+    NetError::Failed
+}
+
+// `net_op` with a number for `cap` (a timeout, a flag) and nothing out.
+fn net_num(usize op, usize h, slice<u8, shared> a, slice<u8, shared> b, usize n) : i64
+{
+    byte_op(2, op, h, bytes_ptr(a), slice_len(a), bytes_ptr(b), slice_len(b), dangling<u8>(), n)
+}
+
+// ---- addresses ----
+
+export fn IpAddr::localhost_v4() : IpAddr
+{
+    V4([127, 0, 0, 1])
+}
+
+export fn IpAddr::unspecified_v4() : IpAddr
+{
+    V4([0, 0, 0, 0])
+}
+
+export fn IpAddr::localhost_v6() : IpAddr
+{
+    V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+}
+
+export fn IpAddr::unspecified_v6() : IpAddr
+{
+    V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+export fn SocketAddr::new(IpAddr ip, u16 port) : SocketAddr
+{
+    SocketAddr { .ip = ip, .port = port }
+}
+
+// The 19-byte record `net_op` reads (src/netio.rs): the family (4 or 6),
+// 16 bytes of address, the port, little-endian.
+fn SocketAddr::record(ref<SocketAddr, shared> a) : Vec<u8>
+{
+    Vec<u8> r = Vec::filled(19, 0: u8);
+    match (a.ip)
+    {
+        V4(b) :
+        {
+            r[0] = 4;
+            for (usize i = 0; i < 4; i += 1)
+            {
+                r[1 + i] = b[i];
+            }
+        },
+        V6(b) :
+        {
+            r[0] = 6;
+            for (usize i = 0; i < 16; i += 1)
+            {
+                r[1 + i] = b[i];
+            }
+        },
+    }
+    r[17] = narrow_wrapping<u8>(a.port);
+    r[18] = narrow_wrapping<u8>(a.port >> 8);
+    r
+}
+
+fn SocketAddr::from_record(slice<u8, shared> r) : SocketAddr
+{
+    u16 port = read_le<u16>(r, 17);
+    if (r[0] == 4)
+    {
+        return SocketAddr { .ip = V4([r[1], r[2], r[3], r[4]]), .port = port };
+    }
+    SocketAddr { .ip = V6([
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15],
+        r[16],
+    ]), .port = port }
+}
+
+// Reads an address as the platform's library does: `127.0.0.1`, `::1`,
+// `2001:db8::8a2e:370:7334`, `::ffff:192.0.2.1`. `Invalid(0)` for text
+// that is not one.
+export fn IpAddr::parse(StringView text) : Result<IpAddr, ParseError>
+{
+    if (StringView::len(text) == 0)
+    {
+        return Err(Empty);
+    }
+    match (byte_answer(2, 18, 0, text.bytes, StringView::of("").bytes))
+    {
+        Ok(r)  : Ok(SocketAddr::from_record(&r[0..$]).ip),
+        Err(_) : Err(Invalid(0)),
+    }
+}
+
+// The address as text, IPv6 in its shortest form (`::1`).
+export fn IpAddr::text(ref<IpAddr, shared> ip) : String
+{
+    SocketAddr a = SocketAddr { .ip = *ip, .port = 0 };
+    Vec<u8> r = SocketAddr::record(&a);
+    match (byte_answer(2, 19, 0, &r[0..$], StringView::of("").bytes))
+    {
+        Ok(t)  : Result::unwrap_or(String::from_utf8(t), String::new()),
+        Err(_) : String::new(),
+    }
+}
+
+// Reads `127.0.0.1:8080` or `[::1]:8080`. `Invalid(i)` at the first byte
+// that does not fit (the address's first byte when the address is not
+// one); `OutOfRange` for a port above 65535.
+export fn SocketAddr::parse(StringView text) : Result<SocketAddr, ParseError>
+{
+    usize n = StringView::len(text);
+    if (n == 0)
+    {
+        return Err(Empty);
+    }
+    usize lo = 0;
+    usize hi = 0;
+    usize colon = 0;
+    if (text.bytes[0] == b'[')
+    {
+        lo = 1;
+        hi = match (StringView::find(text, "]"))
+        {
+            Some(i) : i,
+            None    : return Err(Invalid(n)),
+        };
+        colon = hi + 1;
+        if (colon >= n || text.bytes[colon] != b':')
+        {
+            return Err(Invalid(colon));
+        }
+    }
+    else
+    {
+        usize i = n;
+        while (i > 0 && text.bytes[i - 1] != b':')
+        {
+            i -= 1;
+        }
+        if (i == 0)
+        {
+            return Err(Invalid(n));
+        }
+        colon = i - 1;
+        hi = colon;
+        for (usize j = 0; j < colon; j += 1)
+        {
+            if (text.bytes[j] == b':')
+            {
+                return Err(Invalid(j));
+            }
+        }
+    }
+    IpAddr ip = match (IpAddr::parse(StringView::sub(text, lo, hi)))
+    {
+        Ok(ip) : ip,
+        Err(_) : return Err(Invalid(lo)),
+    };
+    if (text.bytes[0] == b'[')
+    {
+        if (V4(_) = ip)
+        {
+            return Err(Invalid(lo));
+        }
+    }
+    else if (V6(_) = ip)
+    {
+        return Err(Invalid(lo));
+    }
+    StringView digits = StringView::sub(text, colon + 1, n);
+    if (StringView::len(digits) == 0)
+    {
+        return Err(Invalid(n));
+    }
+    for (usize j = 0; j < StringView::len(digits); j += 1)
+    {
+        if (!ascii_is_digit(digits.bytes[j]))
+        {
+            return Err(Invalid(colon + 1 + j));
+        }
+    }
+    match (StringView::parse<u16>(digits))
+    {
+        Ok(p)  : Ok(SocketAddr { .ip = ip, .port = p }),
+        Err(_) : Err(OutOfRange),
+    }
+}
+
+// `127.0.0.1:8080`, `[::1]:8080`.
+export fn SocketAddr::text(ref<SocketAddr, shared> a) : String
+{
+    String ip = IpAddr::text(&a.ip);
+    match (a.ip)
+    {
+        V4(_) : sprintf("%s:%u", &ip, a.port),
+        V6(_) : sprintf("[%s]:%u", &ip, a.port),
+    }
+}
+
+// The addresses `host` names (through the system's resolver: the hosts
+// file, then DNS), each with `port`. "localhost" resolves without a
+// network. `Err(UnknownHost)` when the name resolves to nothing.
+export fn resolve(StringView host, u16 port) : Result<Vec<SocketAddr>, NetError>
+{
+    Vec<u8> p = Vec::new();
+    Vec::push_le(&mut p, port);
+    Vec<u8> all = match (byte_answer(2, 0, 0, host.bytes, &p[0..$]))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(net_error(c)),
+    };
+    Vec<SocketAddr> out = Vec::new();
+    for (usize i = 0; i + 19 <= Vec::len(&all); i += 19)
+    {
+        Vec::push(&mut out, SocketAddr::from_record(&all[i..i + 19]));
+    }
+    Ok(out)
+}
+
+fn net_addr(usize op, usize h) : SocketAddr
+{
+    match (byte_answer(2, op, h, StringView::of("").bytes, StringView::of("").bytes))
+    {
+        Ok(r)  : SocketAddr::from_record(&r[0..$]),
+        Err(_) : SocketAddr { .ip = IpAddr::unspecified_v4(), .port = 0 },
+    }
+}
+
+fn net_open(usize op, ref<SocketAddr, shared> a, usize n) : Result<usize, NetError>
+{
+    Vec<u8> r = SocketAddr::record(a);
+    i64 h = net_num(op, 0, &r[0..$], StringView::of("").bytes, n);
+    if (h < 0)
+    {
+        return Err(net_error(h));
+    }
+    Ok(reinterpret<usize>(h))
+}
+
+// ---- TCP ----
+
+// A socket that accepts connections.
+export resource struct TcpListener
+{
+    usize id;
+}
+
+// A TCP connection: a stream of bytes each way.
+export resource struct TcpStream
+{
+    usize id;
+}
+
+// Listens at `a`; port 0 picks a free port (`local_addr` tells which).
+export fn TcpListener::bind(SocketAddr a) : Result<TcpListener, NetError>
+{
+    usize id = net_open(1, &a, 0)?;
+    Ok(TcpListener { .id = id })
+}
+
+export fn TcpListener::local_addr(ref<TcpListener, shared> l) : SocketAddr
+{
+    net_addr(2, l.id)
+}
+
+// `accept` gives `Err(TimedOut)` after waiting `ms` milliseconds with no
+// connection; 0 waits for ever. A server loop that checks
+// `interrupt_requested()` sets one.
+export fn TcpListener::set_accept_timeout_ms(ref<TcpListener, exclusive> l, u64 ms)
+{
+    i64 r = net_num(4, l.id, StringView::of("").bytes, StringView::of("").bytes, narrow<usize>(ms));
+}
+
+// The next connection made to the listener.
+export fn TcpListener::accept(ref<TcpListener, exclusive> l) : Result<TcpStream, NetError>
+{
+    i64 h = net_num(5, l.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+    if (h < 0)
+    {
+        return Err(net_error(h));
+    }
+    Ok(TcpStream { .id = reinterpret<usize>(h) })
+}
+
+export fn TcpListener::drop(ref<TcpListener, exclusive> self)
+{
+    i64 r = net_num(14, self.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+}
+
+// Connects to `a`, waiting as long as the system does.
+export fn TcpStream::connect(SocketAddr a) : Result<TcpStream, NetError>
+{
+    usize id = net_open(6, &a, 0)?;
+    Ok(TcpStream { .id = id })
+}
+
+// Connects to `a`, waiting at most `ms` milliseconds.
+export fn TcpStream::connect_timeout(SocketAddr a, u64 ms) : Result<TcpStream, NetError>
+{
+    usize id = net_open(6, &a, narrow<usize>(max(ms, 1)))?;
+    Ok(TcpStream { .id = id })
+}
+
+export fn TcpStream::peer_addr(ref<TcpStream, shared> s) : SocketAddr
+{
+    net_addr(3, s.id)
+}
+
+export fn TcpStream::local_addr(ref<TcpStream, shared> s) : SocketAddr
+{
+    net_addr(2, s.id)
+}
+
+// A read that waits `ms` milliseconds with nothing arriving gives
+// `Err(TimedOut)`; 0 waits for ever.
+export fn TcpStream::set_read_timeout_ms(ref<TcpStream, exclusive> s, u64 ms)
+{
+    i64 r = net_num(7, s.id, StringView::of("").bytes, StringView::of("").bytes, narrow<usize>(ms));
+}
+
+// A write that cannot go on for `ms` milliseconds gives `Err(TimedOut)`;
+// 0 waits for ever.
+export fn TcpStream::set_write_timeout_ms(ref<TcpStream, exclusive> s, u64 ms)
+{
+    i64 r = net_num(8, s.id, StringView::of("").bytes, StringView::of("").bytes, narrow<usize>(ms));
+}
+
+// Whether small writes go out at once (true) rather than being gathered
+// for a moment into fewer packets (false, the default).
+export fn TcpStream::set_nodelay(ref<TcpStream, exclusive> s, bool on)
+{
+    usize flag = 0;
+    if (on)
+    {
+        flag = 1;
+    }
+    i64 r = net_num(9, s.id, StringView::of("").bytes, StringView::of("").bytes, flag);
+}
+
+// Appends up to `want` bytes of what has arrived to `buf`.
+// trusted: [Rawptr-Offset] to buf's spare capacity [len, len + want), reserved by the caller; the call below writes only there.
+fn TcpStream::take(ref<TcpStream, exclusive> s, ref<Vec<u8>, exclusive> buf, usize want) : Result<usize, NetError>
+{
+    while (buf.cap - buf.len < want)
+    {
+        Vec::grow(buf);
+    }
+    rawptr<u8> at = unsafe
+    {
+        reinterpret_ptr<u8>(buf.ptr + reinterpret<isize>(buf.len))
+    };
+    i64 r = byte_op(2, 10, s.id, dangling<u8>(), 0, dangling<u8>(), 0, at, want);
+    if (r < 0)
+    {
+        return Err(net_error(r));
+    }
+    usize n = reinterpret<usize>(r);
+    buf.len = buf.len + n;
+    Ok(n)
+}
+
+// Appends up to `max` bytes to `buf` (at most a MiB), waiting until at
+// least one has arrived, and returns how many: 0 only when the peer has
+// closed its side (when `max` > 0).
+export fn TcpStream::read(ref<TcpStream, exclusive> s, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, NetError>
+{
+    usize want = if (max > 1_048_576)
+    {
+        1_048_576
+    }
+    else
+    {
+        max
+    };
+    TcpStream::take(s, buf, want)
+}
+
+// Appends exactly `n` bytes to `buf`; `Err(Closed)` when the peer closes
+// first (what arrived stays in `buf`).
+export fn TcpStream::read_exact(
+    ref<TcpStream, exclusive> s,
+    ref<Vec<u8>, exclusive> buf,
+    usize n,
+) : Result<void, NetError>
+{
+    usize got = 0;
+    while (got < n)
+    {
+        usize k = TcpStream::read(s, buf, n - got)?;
+        if (k == 0)
+        {
+            return Err(Closed);
+        }
+        got += k;
+    }
+    Ok(())
+}
+
+// The next line without its '\n' (nor a '\r' before it), as
+// `File::read_line`; None when the peer has closed its side.
+export fn TcpStream::read_line(ref<TcpStream, exclusive> s) : Result<Option<String>, NetError>
+{
+    i64 r = net_num(11, s.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+    if (r < 0)
+    {
+        return Err(net_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = TcpStream::take(s, &mut bytes, reinterpret<usize>(r))?;
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(t)  : Ok(Some(t)),
+        Err(e) : Err(NetError::NotUtf8(e)),
+    }
+}
+
+// Sends all of `data`.
+export fn TcpStream::write(ref<TcpStream, exclusive> s, slice<u8, shared> data) : Result<void, NetError>
+{
+    if (slice_len(data) == 0)
+    {
+        return Ok(());
+    }
+    i64 r = net_num(12, s.id, StringView::of("").bytes, data, 0);
+    if (r < 0)
+    {
+        return Err(net_error(r));
+    }
+    Ok(())
+}
+
+export fn TcpStream::write_text(ref<TcpStream, exclusive> s, StringView text) : Result<void, NetError>
+{
+    TcpStream::write(s, text.bytes)
+}
+
+// `TcpStream::printf(s, format, …)` is `TcpStream::write_formatted(s,
+// $fmt(format, …))` after `modres`, as `File::printf` is.
+fn TcpStream::write_formatted(ref<TcpStream, exclusive> s, str text) : Result<void, NetError>
+{
+    TcpStream::write(s, StringView::of(text).bytes)
+}
+
+// Closes the sending side: the peer reads the end (0) after what was
+// sent; this side can still read.
+export fn TcpStream::shutdown_write(ref<TcpStream, exclusive> s) : Result<void, NetError>
+{
+    i64 r = net_num(13, s.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+    if (r < 0)
+    {
+        return Err(net_error(r));
+    }
+    Ok(())
+}
+
+export fn TcpStream::drop(ref<TcpStream, exclusive> self)
+{
+    i64 r = net_num(14, self.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+}
+
+// ---- UDP ----
+
+// A socket that sends and receives datagrams: messages of up to about
+// 64 KiB, each delivered whole or not at all, in any order.
+export resource struct UdpSocket
+{
+    usize id;
+}
+
+// A datagram received, and who sent it.
+export struct Datagram
+{
+    export Vec<u8> data;
+    export SocketAddr from;
+}
+
+export fn UdpSocket::bind(SocketAddr a) : Result<UdpSocket, NetError>
+{
+    usize id = net_open(15, &a, 0)?;
+    Ok(UdpSocket { .id = id })
+}
+
+// D-0205: a second handle on the same socket, as `TcpStream::try_clone`
+// gives one: a thread can wait for datagrams on one while others send on
+// another.
+export fn UdpSocket::try_clone(ref<UdpSocket, shared> u) : Result<UdpSocket, NetError>
+{
+    i64 h = net_num(24, u.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+    if (h < 0)
+    {
+        return Err(net_error(h));
+    }
+    Ok(UdpSocket { .id = reinterpret<usize>(h) })
+}
+
+export fn UdpSocket::local_addr(ref<UdpSocket, shared> u) : SocketAddr
+{
+    net_addr(2, u.id)
+}
+
+// `recv_from` gives `Err(TimedOut)` after `ms` milliseconds with nothing;
+// 0 waits for ever.
+export fn UdpSocket::set_read_timeout_ms(ref<UdpSocket, exclusive> u, u64 ms)
+{
+    i64 r = net_num(7, u.id, StringView::of("").bytes, StringView::of("").bytes, narrow<usize>(ms));
+}
+
+// Sends `data` as one datagram to `to`; the number of bytes sent.
+export fn UdpSocket::send_to(
+    ref<UdpSocket, exclusive> u,
+    slice<u8, shared> data,
+    SocketAddr to,
+) : Result<usize, NetError>
+{
+    Vec<u8> r = SocketAddr::record(&to);
+    i64 n = net_num(16, u.id, &r[0..$], data, 0);
+    if (n < 0)
+    {
+        return Err(net_error(n));
+    }
+    Ok(reinterpret<usize>(n))
+}
+
+// The next datagram, its first `max` bytes (the rest of a longer one is
+// lost), and its sender.
+export fn UdpSocket::recv_from(ref<UdpSocket, exclusive> u, usize max) : Result<Datagram, NetError>
+{
+    Vec<u8> b = Vec::new();
+    while (b.cap < max + 19)
+    {
+        Vec::grow(&mut b);
+    }
+    i64 n = byte_op(2, 17, u.id, dangling<u8>(), 0, dangling<u8>(), 0, reinterpret_ptr<u8>(b.ptr), max + 19);
+    if (n < 0)
+    {
+        return Err(net_error(n));
+    }
+    b.len = reinterpret<usize>(n);
+    Ok(Datagram { .data = Vec::from_slice(&b[19..$]), .from = SocketAddr::from_record(&b[0..19]) })
+}
+
+export fn UdpSocket::drop(ref<UdpSocket, exclusive> self)
+{
+    i64 r = net_num(14, self.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+}
+
+// ---- D-0181, D-0185: keepalive, a connected UDP socket, a second handle ----
+
+// D-0181: TCP keepalive on or off: with it on, the system probes an idle
+// connection now and then (after a couple of hours, by its default), so
+// a peer or a path that has silently gone is noticed and the next read
+// fails, rather than waiting for ever.
+export fn TcpStream::set_keepalive(ref<TcpStream, exclusive> s, bool on)
+{
+    i64 r = net_num(20, s.id, StringView::of("").bytes, StringView::of("").bytes, if (on) { 1 } else { 0 });
+}
+
+// D-0185: a second `TcpStream` on the same connection, for reading in
+// one thread while another writes (each takes its own by `move`). Bytes
+// read through one are not seen by the other, and each has its own
+// timeouts; the connection closes when the last of them is dropped, and
+// `shutdown_write` through either ends sending for both.
+export fn TcpStream::try_clone(ref<TcpStream, shared> s) : Result<TcpStream, NetError>
+{
+    i64 h = net_num(24, s.id, StringView::of("").bytes, StringView::of("").bytes, 0);
+    if (h < 0)
+    {
+        return Err(net_error(h));
+    }
+    Ok(TcpStream { .id = reinterpret<usize>(h) })
+}
+
+// D-0181: fixes the peer `send` sends to and `recv` receives from (a
+// datagram from anyone else is dropped); `send_to` and `recv_from` still
+// work.
+export fn UdpSocket::connect(ref<UdpSocket, exclusive> u, SocketAddr to) : Result<void, NetError>
+{
+    Vec<u8> r = SocketAddr::record(&to);
+    i64 n = net_num(21, u.id, &r[0..$], StringView::of("").bytes, 0);
+    if (n < 0)
+    {
+        return Err(net_error(n));
+    }
+    Ok(())
+}
+
+// Sends `data` as one datagram to the connected peer; how many bytes.
+export fn UdpSocket::send(ref<UdpSocket, exclusive> u, slice<u8, shared> data) : Result<usize, NetError>
+{
+    i64 n = net_num(22, u.id, StringView::of("").bytes, data, 0);
+    if (n < 0)
+    {
+        return Err(net_error(n));
+    }
+    Ok(reinterpret<usize>(n))
+}
+
+// The next datagram from the connected peer, its first `max` bytes.
+export fn UdpSocket::recv(ref<UdpSocket, exclusive> u, usize max) : Result<Vec<u8>, NetError>
+{
+    Vec<u8> b = Vec::new();
+    while (b.cap < max)
+    {
+        Vec::grow(&mut b);
+    }
+    i64 n = byte_op(2, 23, u.id, dangling<u8>(), 0, dangling<u8>(), 0, reinterpret_ptr<u8>(b.ptr), max);
+    if (n < 0)
+    {
+        return Err(net_error(n));
+    }
+    b.len = reinterpret<usize>(n);
+    Ok(b)
+}

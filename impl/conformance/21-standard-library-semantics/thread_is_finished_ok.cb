@@ -1,0 +1,62 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.sync `is_finished`, `try_join`, `ThreadFailure::text`; D-0204; conf.thread-is-finished
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 736c6f772066696e69736865643a2066616c73650a717569636b3a20320a736c6f773a20370a6572726f723a20646961672e696e6465782d6f75742d6f662d626f756e6473202864796e616d6963290a617420746869732066696c652773206c696e652032393a20747275650a
+//
+// `is_finished` looks without waiting: false while a thread runs, true once
+// it has ended, whether with a result or a failure, which `try_join` then
+// takes at once. A failure's `text` is the report the program would have
+// printed: its first line names the diagnostic, its second where it happened.
+
+import std;
+
+fn quick(u64 x) : u64
+{
+    x + 1
+}
+
+fn slow(ref<Channel<u8>, shared> go) : u64
+{
+    _ = Channel::recv(go);
+    7
+}
+
+fn bad(usize i) : u64
+{
+    Vec<u64> v = Vec::new();
+    v[i]
+}
+
+fn main()
+{
+    Channel<u8> go = Channel::new(1);
+    auto s = spawn(slow, &go);
+    auto q = spawn(quick, 1);
+    auto b = spawn(bad, 3);
+    while (!is_finished(&q) || !is_finished(&b))
+    {
+        sleep_ms(1);
+    }
+    printf("slow finished: %v\n", is_finished(&s));
+    printf("quick: %v\n", Result::unwrap(try_join(q)));
+    _ = Channel::send(&go, 1);
+    printf("slow: %v\n", join(s));
+    match (try_join(b))
+    {
+        Ok(v)  : printf("value %v\n", v),
+        Err(f) :
+        {
+            String t = ThreadFailure::text(&f);
+            Vec<StringView> lines = StringView::split(String::as_view(&t), "\n");
+            // The location's file is named as the program was given;
+            // its last part is the same however that was.
+            printf(
+                "%v\nat this file's line 29: %v\n",
+                lines[0],
+                StringView::ends_with(lines[1], "thread_is_finished_ok.cb:29"),
+            );
+        },
+    }
+}

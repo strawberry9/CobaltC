@@ -1,0 +1,52 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.fail.fault-contain [Fault-Contain]; rule.conc.cancel; D-0204; conf.thread-failure-deep-unwind
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 776f726b65723a20646961672e696e6465782d6f75742d6f662d626f756e64730a717569636b3a20747275650a
+//
+// A thread faults two hundred calls deep, holding a channel with a string
+// in it, a vector of strings and a thread of its own that sleeps for a minute. Its unwind runs
+// every destructor, cancels the sleeping thread and waits for it -- no thread
+// outlives its handle -- and the main thread sees the failure at once.
+
+import std;
+
+fn napper(u64 ms) : u8
+{
+    sleep_ms(ms);
+    1
+}
+
+fn dive(u64 n, ref<Vec<String>, exclusive> log) : u64
+{
+    String s = sprintf("level %v", n);
+    Vec::push(log, String::clone(&s));
+    if (n == 0)
+    {
+        Vec<u64> v = Vec::new();
+        return v[3];
+    }
+    dive(n - 1, log) + 1
+}
+
+fn worker(u64 n) : u64
+{
+    auto nap = spawn(napper, 60000);
+    Vec<String> log = Vec::new();
+    Channel<String> c = Channel::new(1);
+    _ = Channel::send(&c, String::from_str("held"));
+    dive(n, &mut log)
+}
+
+fn main()
+{
+    u64 t0 = monotonic_ns();
+    auto h = spawn(worker, 200);
+    match (try_join(h))
+    {
+        Ok(v)  : printf("value %v\n", v),
+        Err(e) : printf("worker: %s\n", &ThreadFailure::diagnostic(&e)),
+    }
+    printf("quick: %v\n", monotonic_ns() - t0 < 5000000000);
+}

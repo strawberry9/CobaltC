@@ -1,0 +1,83 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.control.stmt (statement temporaries per thread); CHG-0089; conf.temporaries-across-thread-switches
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 31350a
+//
+// Main merges each joined map as a temporary while the other workers are
+// still running. A thread switched out between statements of a call made
+// mid-statement keeps its own statement temporaries: no thread ends
+// another's.
+
+import std;
+
+fn count(slice<String, shared> lines) : HashMap<String, u32>
+{
+    HashMap<String, u32> m = HashMap::new();
+    foreach (line in lines)
+    {
+        foreach (w in StringView::split(String::view(line, 0, String::len(line)), " "))
+        {
+            if (StringView::len(w) > 0)
+            {
+                *HashMap::entry(&mut m, String::from_view(w), 0) += 1;
+            }
+        }
+    }
+    m
+}
+
+fn merge(ref<HashMap<String, u32>, exclusive> into, ref<HashMap<String, u32>, shared> from)
+{
+    for (usize i = 0; i < HashMap::len(from); i += 1)
+    {
+        *HashMap::entry(into, String::clone(HashMap::key_at(from, i)), 0) += *HashMap::value_at(from, i);
+    }
+}
+
+struct WC
+{
+    String w;
+    u32 n;
+}
+
+fn ranked(ref<WC, shared> a, ref<WC, shared> b) : bool
+{
+    if (a.n != b.n)
+    {
+        return a.n > b.n;
+    }
+    String::view(&a.w, 0, String::len(&a.w)) == String::view(&b.w, 0, String::len(&b.w)) || {
+        ref<Vec<u8>, shared> x = String::as_bytes(&a.w);
+        ref<Vec<u8>, shared> y = String::as_bytes(&b.w);
+        usize i = 0;
+        while (i < Vec::len(x) && i < Vec::len(y) && x[i] == y[i])
+        {
+            i += 1;
+        }
+        if (i < Vec::len(x) && i < Vec::len(y)) { x[i] < y[i] } else { Vec::len(x) < Vec::len(y) }
+    }
+}
+
+fn main()
+{
+    Vec<String> lines = Vec::new();
+    for (u32 l = 0; l < 200; l += 1)
+    {
+        Vec::push(&mut lines, sprintf("w%v x%v y%v", l % 7, l % 5, l % 3));
+    }
+    usize q = Vec::len(&lines) / 4;
+    HashMap<String, u32> total = HashMap::new();
+    {
+        auto h1 = spawn(count, &lines[0 .. q]);
+        auto h2 = spawn(count, &lines[q .. 2 * q]);
+        auto h3 = spawn(count, &lines[2 * q .. 3 * q]);
+        auto h4 = spawn(count, &lines[3 * q .. $]);
+        merge(&mut total, &join(h1));
+        merge(&mut total, &join(h2));
+        merge(&mut total, &join(h3));
+        merge(&mut total, &join(h4));
+    }
+    printf("%v\n", HashMap::len(&total));
+}

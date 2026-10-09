@@ -1,0 +1,678 @@
+// `std::fs` (spec/21 §2e, §2e′, D-0176): files and the file system. Reading
+// and writing whole files (`read_file`, `write_file`, `read_bytes`,
+// `write_bytes`), open files (`File`), the one error of input and output
+// (`FileError`, D-0134), directories, paths and file metadata. Moved here
+// from `std::io` and `std::sys` (D-0176); `import std;` sees every item by
+// its short name as before.
+
+// D-0134: the one error of input and output, for files and for standard
+// input alike.
+export enum FileError
+{
+    NotFound,
+    Denied,
+    Io,
+    Utf8(Utf8Error),
+}
+
+// D-0033 (6): the value, or `d` when there is none; an unused `d` (or
+// `Err` payload) is destroyed like any other.
+// D-0117: each std error as a sentence for a person, a `str` (the
+// offsets inside `Utf8Error` and `ParseError::Invalid` stay reachable by
+// `match`).
+export fn FileError::text(ref<FileError, shared> e) : str
+{
+    match (e)
+    {
+        NotFound : "not found",
+        Denied   : "permission denied",
+        Io       : "input/output error",
+        Utf8(_)  : "not UTF-8",
+    }
+}
+
+// trusted: [Extern-Call] file_read into [buf, cap), an allocation of this function; [Rawptr-Read] of the n <= cap bytes it filled; [Deallocate] of that allocation, once on each path.
+export fn read_file(StringView path) : Result<String, FileError>
+{
+    rawptr<u8> p = StringView::ptr(path);
+    usize pn = StringView::len(path);
+    usize cap = 4096;
+    while (true)
+    {
+        rawptr<u8> buf = match (allocate(cap, 1))
+        {
+            Ok(b)  : b,
+            Err(_) : fault(alloc_failure),
+        };
+        isize n = unsafe
+        {
+            file_read(p, pn, buf, cap)
+        };
+        if (n >= 0 && reinterpret<usize>(n) <= cap)
+        {
+            usize len = reinterpret<usize>(n);
+            Vec<u8> bytes = Vec::new();
+            usize i = 0;
+            while (i < len)
+            {
+                u8 b = unsafe
+                {
+                    *(buf + reinterpret<isize>(i))
+                };
+                Vec::push(&mut bytes, b);
+                i = i + 1;
+            }
+            unsafe
+            {
+                deallocate(buf, cap, 1);
+            }
+            return match (String::from_utf8(bytes))
+            {
+                Ok(s)  : Ok(s),
+                Err(e) : Err(FileError::Utf8(e)),
+            };
+        }
+        unsafe
+        {
+            deallocate(buf, cap, 1);
+        }
+        if (n < 0)
+        {
+            return Err(file_error(n));
+        }
+        // Longer than `cap`: again, with room for all of it.
+        cap = reinterpret<usize>(n);
+    }
+}
+
+// trusted: [Extern-Call] file_write reads the path's and the text's bytes, which the views keep live for the call.
+export fn write_file(StringView path, StringView text) : Result<void, FileError>
+{
+    isize r = unsafe
+    {
+        file_write(StringView::ptr(path), StringView::len(path), StringView::ptr(text), StringView::len(text))
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// An open file (`rule.stdlib.file-handle`, spec/21 §2e, D-0054): its
+// bytes read and written in order from a position, which `seek` moves.
+// Its destructor closes it; `close` closes it and reports a failure.
+export resource struct File
+{
+    usize id;
+    bool open;                          // false once close has closed it
+}
+
+// `file_error` for `file_at`'s codes.
+fn file_error_at(i64 code) : FileError
+{
+    if (code == -1)
+    {
+        return FileError::NotFound;
+    }
+    if (code == -2)
+    {
+        return FileError::Denied;
+    }
+    FileError::Io
+}
+
+// trusted: [Extern-Call] file_op(open) reads the path's bytes, which the view keeps live.
+fn File::start(StringView path, usize mode) : Result<File, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(0, mode, StringView::ptr(path), StringView::len(path))
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(File { .id = reinterpret<usize>(r), .open = true })
+}
+
+// For reading; the file must exist.
+export fn File::open(StringView path) : Result<File, FileError>
+{
+    File::start(path, 0)
+}
+
+// For writing, from empty: created, or its contents discarded.
+export fn File::create(StringView path) : Result<File, FileError>
+{
+    File::start(path, 1)
+}
+
+// For writing at its end, created if it does not exist.
+export fn File::append(StringView path) : Result<File, FileError>
+{
+    File::start(path, 2)
+}
+
+// For reading and writing, created if it does not exist, its contents kept.
+export fn File::open_rw(StringView path) : Result<File, FileError>
+{
+    File::start(path, 3)
+}
+
+// Appends exactly `want` bytes of what `file_op` reads, or fewer at the end.
+// trusted: [Extern-Call] file_op(read) writes buf's spare capacity [len, len + want), reserved by the caller, where no element object lies.
+fn File::take(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf, usize want) : Result<usize, FileError>
+{
+    while (buf.cap - buf.len < want)
+    {
+        Vec::grow(buf);
+    }
+    isize r = unsafe
+    {
+        file_op(3, f.id, reinterpret_ptr<u8>(buf.ptr + reinterpret<isize>(buf.len)), want)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    usize n = reinterpret<usize>(r);
+    buf.len = buf.len + n;
+    Ok(n)
+}
+
+// Appends up to `max` bytes to `buf` (at most a MiB, and fewer when fewer
+// are ready) and returns how many: 0 only at the end, when max > 0.
+export fn File::read(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, FileError>
+{
+    usize want = if (max > 1_048_576)
+    {
+        1_048_576
+    }
+    else
+    {
+        max
+    };
+    File::take(f, buf, want)
+}
+
+// Appends the rest of the file to `buf` and returns how many bytes.
+export fn File::read_to_end(ref<File, exclusive> f, ref<Vec<u8>, exclusive> buf) : Result<usize, FileError>
+{
+    usize total = 0;
+    while (true)
+    {
+        usize n = match (File::read(f, buf, 65_536))
+        {
+            Ok(n)  : n,
+            Err(e) : return Err(e),
+        };
+        if (n == 0)
+        {
+            break;
+        }
+        total = total + n;
+    }
+    Ok(total)
+}
+
+// The next line without its '\n', nor a '\r' just before it (D-0092),
+// as `read_line` reads standard input; None at the end of the file.
+// trusted: [Extern-Call] file_op with no buffer: it touches no program storage.
+export fn File::read_line(ref<File, exclusive> f) : Result<Option<String>, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(4, f.id, dangling<u8>(), 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    if (r == 0)
+    {
+        return Ok(None);
+    }
+    Vec<u8> bytes = Vec::new();
+    usize n = match (File::take(f, &mut bytes, reinterpret<usize>(r)))
+    {
+        Ok(n)  : n,
+        Err(e) : return Err(e),
+    };
+    if (n > 0 && bytes[n - 1] == 10)
+    {
+        Vec::pop(&mut bytes);
+        if (n > 1 && bytes[n - 2] == 13)
+        {
+            Vec::pop(&mut bytes);
+        }
+    }
+    match (String::from_utf8(bytes))
+    {
+        Ok(s)  : Ok(Some(s)),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// Writes all of `data` at the file's position (at its end, for append).
+// trusted: [Extern-Call] file_op(write) reads the n bytes the slice covers and keeps live.
+export fn File::write(ref<File, exclusive> f, slice<u8, shared> data) : Result<void, FileError>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return Ok(());
+    }
+    isize r = unsafe
+    {
+        file_op(5, f.id, rawptr_of(&data[0]), n)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// D-0134: writes the text at the file's position.
+export fn File::write_text(ref<File, exclusive> f, StringView text) : Result<void, FileError>
+{
+    File::write(f, text.bytes)
+}
+
+// `File::printf(f, format, …)` (D-0059) is `File::write_formatted(f,
+// $fmt(format, …))` after `modres`, as `String::appendf` is
+// `String::append` of it.
+// trusted: [Extern-Call] file_op(write) reads the str's n bytes, program data.
+fn File::write_formatted(ref<File, exclusive> f, str text) : Result<void, FileError>
+{
+    usize n = str_len(text);
+    if (n == 0)
+    {
+        return Ok(());
+    }
+    isize r = unsafe
+    {
+        file_op(5, f.id, str_ptr(text), n)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Moves the position to byte `pos` from the start.
+// trusted: [Extern-Call] file_at with no buffer: it touches no program storage.
+export fn File::seek(ref<File, exclusive> f, u64 pos) : Result<void, FileError>
+{
+    i64 r = unsafe
+    {
+        file_at(6, f.id, pos)
+    };
+    if (r < 0)
+    {
+        return Err(file_error_at(r));
+    }
+    Ok(())
+}
+
+// The file's length in bytes.
+// trusted: [Extern-Call] file_at with no buffer: it touches no program storage.
+export fn File::len(ref<File, shared> f) : Result<u64, FileError>
+{
+    i64 r = unsafe
+    {
+        file_at(7, f.id, 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error_at(r));
+    }
+    Ok(reinterpret<u64>(r))
+}
+
+// D-0181: for writing, created only if nothing is there: `Ok(None)` when
+// a file (or a directory) of that name already exists, so two programs
+// that race to make the same file see one win. A lock file, a pid file,
+// a file that must never be overwritten.
+// trusted: [Extern-Call] file_op(open) reads the path's bytes, which the view keeps live.
+export fn File::create_new(StringView path) : Result<Option<File>, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(0, 4, StringView::ptr(path), StringView::len(path))
+    };
+    if (r == -4)
+    {
+        return Ok(None);
+    }
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(Some(File { .id = reinterpret<usize>(r), .open = true }))
+}
+
+// D-0181: everything written so far made durable: handed to the
+// operating system and by it to the device, so it survives a crash or a
+// power loss from here on. The write-then-rename pattern flushes before
+// the rename.
+// trusted: [Extern-Call] file_op with no buffer: it touches no program storage.
+export fn File::flush(ref<File, exclusive> f) : Result<void, FileError>
+{
+    isize r = unsafe
+    {
+        file_op(8, f.id, dangling<u8>(), 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// D-0181: the position the next read or write starts at, in bytes from
+// the start.
+// trusted: [Extern-Call] file_at with no buffer: it touches no program storage.
+export fn File::position(ref<File, shared> f) : Result<u64, FileError>
+{
+    i64 r = unsafe
+    {
+        file_at(9, f.id, 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error_at(r));
+    }
+    Ok(reinterpret<u64>(r))
+}
+
+// Closes the file. A file open for writing is first made durable, so a
+// failure the environment reports late is reported here.
+// trusted: [Extern-Call] file_op with no buffer: it touches no program storage.
+export fn File::close(File f) : Result<void, FileError>
+{
+    f.open = false;
+    isize r = unsafe
+    {
+        file_op(1, f.id, dangling<u8>(), 0)
+    };
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// trusted: [Extern-Call] file_op with no buffer: it touches no program storage.
+export fn File::drop(ref<File, exclusive> self)
+{
+    if (self.open)
+    {
+        isize r = unsafe
+        {
+            file_op(2, self.id, dangling<u8>(), 0)
+        };
+    }
+}
+
+// The whole file's bytes, as `read_file` reads its text.
+export fn read_bytes(StringView path) : Result<Vec<u8>, FileError>
+{
+    File f = match (File::open(path))
+    {
+        Ok(f)  : f,
+        Err(e) : return Err(e),
+    };
+    Vec<u8> bytes = Vec::new();
+    match (File::read_to_end(&mut f, &mut bytes))
+    {
+        Ok(_)  : Ok(bytes),
+        Err(e) : Err(e),
+    }
+}
+
+// Makes the file hold exactly `data`, as `write_file` does its text.
+export fn write_bytes(StringView path, slice<u8, shared> data) : Result<void, FileError>
+{
+    File f = match (File::create(path))
+    {
+        Ok(f)  : f,
+        Err(e) : return Err(e),
+    };
+    File::write(&mut f, data)
+}
+
+// What a path names (`rule.stdlib.fs`, D-0061): a file and its length in
+// bytes, a directory, or something else (a device, a socket, …).
+export enum PathKind
+{
+    File(u64),
+    Dir,
+    Other,
+}
+
+// trusted: [Extern-Call] fs_op reads the two views' bytes, which the views keep live.
+fn fs_path_op(usize op, StringView a, StringView b) : isize
+{
+    unsafe
+    {
+        fs_op(op, StringView::ptr(a), StringView::len(a), StringView::ptr(b), StringView::len(b))
+    }
+}
+
+// Makes a directory: Ok(true) when it was made, Ok(false) when a
+// directory was already there (so it is safe to call again).
+export fn make_dir(StringView path) : Result<bool, FileError>
+{
+    isize r = fs_path_op(0, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(r == 1)
+}
+
+export fn remove_file(StringView path) : Result<void, FileError>
+{
+    isize r = fs_path_op(1, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Removes an empty directory.
+export fn remove_dir(StringView path) : Result<void, FileError>
+{
+    isize r = fs_path_op(2, path, "");
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// Renames (moves) `from` to `to`, replacing a file at `to`.
+export fn rename(StringView from, StringView to) : Result<void, FileError>
+{
+    isize r = fs_path_op(3, from, to);
+    if (r < 0)
+    {
+        return Err(file_error(r));
+    }
+    Ok(())
+}
+
+// The names in a directory (not `.` or `..`), sorted by their bytes.
+export fn list_dir(StringView path) : Result<Vec<String>, FileError>
+{
+    Vec<u8> all = match (fs_answer(0, StringView::ptr(path), StringView::len(path)))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(file_error(c)),
+    };
+    Vec<String> names = Vec::new();
+    Vec<u8> name = Vec::new();
+    foreach (b in &all)
+    {
+        match (*b)
+        {
+            0 :
+            {
+                Vec<u8> done = replace(&mut name, Vec::new());
+                match (String::from_utf8(done))
+                {
+                    Ok(n)  : Vec::push(&mut names, n),
+                    Err(e) : return Err(FileError::Utf8(e)),
+                }
+            },
+            c : Vec::push(&mut name, c),
+        }
+    }
+    Ok(names)
+}
+
+// What `path` names; `Err(NotFound)` when nothing does.
+export fn path_kind(StringView path) : Result<PathKind, FileError>
+{
+    Vec<u8> b = match (fs_answer(1, StringView::ptr(path), StringView::len(path)))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(file_error(c)),
+    };
+    u64 len = 0;
+    usize i = 8;
+    while (i > 0)
+    {
+        len = (len << 8) | widen<u64>(b[i]);
+        i -= 1;
+    }
+    match (b[0])
+    {
+        0 : Ok(File(len)),
+        1 : Ok(Dir),
+        _ : Ok(Other),
+    }
+}
+
+// `base` and then `tail`, with the platform's separator between; an
+// absolute `tail` replaces `base`.
+export fn path_join(StringView base, StringView tail) : String
+{
+    Option::unwrap_or(path_text(base, tail, 0), String::from_view(tail))
+}
+
+// All but the last part: `None` for a root or an empty path; the empty
+// path for a single relative name.
+export fn path_parent(StringView p) : Option<String>
+{
+    path_text(p, "", 1)
+}
+
+// The last part: `None` when it is `..`, or there is none (`/`, ``).
+export fn path_file_name(StringView p) : Option<String>
+{
+    path_text(p, "", 2)
+}
+
+// The file name without its extension (`archive.tar` of `archive.tar.gz`;
+// `.bashrc` of `.bashrc`).
+export fn path_stem(StringView p) : Option<String>
+{
+    path_text(p, "", 3)
+}
+
+// The file name's extension, without its dot (`gz` of `archive.tar.gz`);
+// `None` when there is none (a name with no dot, or only a leading one).
+export fn path_extension(StringView p) : Option<String>
+{
+    path_text(p, "", 4)
+}
+
+export fn path_is_absolute(StringView p) : bool
+{
+    match (path_result(5, p, ""))
+    {
+        Ok(r)  : r == 1,
+        Err(_) : false,
+    }
+}
+
+// The path with `.` parts removed and `x/..` resolved where `x` is a
+// name, by its text alone (a link is not followed); a leading `..` stays,
+// `/..` is `/`, and nothing left is `.`.
+export fn path_normalize(StringView p) : String
+{
+    Option::unwrap_or(path_text(p, "", 6), String::from_view(p))
+}
+
+// The absolute path the operating system resolves `p` to, every link
+// followed; `p` must exist.
+export fn path_canonical(StringView p) : Result<String, FileError>
+{
+    Vec<u8> b = match (byte_answer(0, 7, 0, p.bytes, StringView::of("").bytes))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(code_error(c)),
+    };
+    match (String::from_utf8(b))
+    {
+        Ok(s)  : Ok(s),
+        Err(e) : Err(FileError::Utf8(e)),
+    }
+}
+
+// What `file_info` tells: the kind (as `path_kind`'s), the length in
+// bytes, the last modification in seconds since 1970-01-01T00:00:00Z,
+// and whether the file is read-only.
+export struct FileInfo
+{
+    export PathKind kind;
+    export u64 len;
+    export i64 modified_unix;
+    export bool readonly;
+}
+
+// Following a symbolic link, as `path_kind` does.
+export fn file_info(StringView path) : Result<FileInfo, FileError>
+{
+    Vec<u8> b = match (byte_answer(0, 8, 0, path.bytes, StringView::of("").bytes))
+    {
+        Ok(b)  : b,
+        Err(c) : return Err(code_error(c)),
+    };
+    u64 len = read_le<u64>(&b[0..$], 1);
+    PathKind kind = match (b[0])
+    {
+        0 : File(len),
+        1 : Dir,
+        _ : Other,
+    };
+    Ok(FileInfo { .kind = kind, .len = len, .modified_unix = read_le<i64>(&b[0..$], 9), .readonly = b[17] != 0 })
+}
+
+// Copies the file `from` to `to`, replacing a file there; the number of
+// bytes copied.
+export fn copy_file(StringView from, StringView to) : Result<u64, FileError>
+{
+    i64 n = path_result(9, from, to)?;
+    Ok(reinterpret<u64>(n))
+}
+
+// Makes the directory and every missing directory above it; `Ok` when it
+// is there already.
+export fn make_dir_all(StringView path) : Result<void, FileError>
+{
+    path_result(10, path, "")?;
+    Ok(())
+}
+
+// Removes the directory and everything in it.
+export fn remove_dir_all(StringView path) : Result<void, FileError>
+{
+    path_result(11, path, "")?;
+    Ok(())
+}
