@@ -1,0 +1,133 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: §0 items no other case names (WI-6, CHG-0265); conf.std-small-items
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6d617073203120320a736574732031203220747275650a626f786573203520360a7765616b20370a65787065637420330a626974732066616c7365207472756520747275652066616c73650a617363696920747275652066616c736520747275652066616c73650a6c65737320747275652066616c73650a65715f7669657720747275652066616c73650a5b706174682f66696c652e7478745d0a626173652066696c650a616c6c6f63617465640a6d656d626572206b0a6d656d626572206a0a646f7420697320612064697220747275650a6469720a6661696c65642c2063616e63656c6c65642066616c73650a6e6f77206166746572203230323420747275650a
+//
+// One use of each: `HashMap::clone` and `HashSet::clone` (independent
+// copies), `Box::clone`, `Weak::clone` (a second weak reference that
+// upgrades while the value lives), `Option::expect` on `Some`,
+// `BigUint::bit`, the ASCII class tests, `StringView::less`,
+// `String::eq_view`, `StringView::trim_start`, `strip_prefix` and
+// `strip_suffix`, `allocate`'s `AllocError`, a `JsonMember` of a parsed
+// object, `file_info`'s `FileInfo` and `PathKind`, a `ThreadFailure` that
+// is not a cancellation, `DateTime::now` and `home_dir` (only what does
+// not change between runs is printed). `conf.std-keys-and-password` has
+// the slow ones.
+import std;
+
+fn fails(i32 k) : i32
+{
+    if (k > 0)
+    {
+        fault(unwrap_failed, "a contained failure");
+    }
+    k
+}
+
+fn main()
+{
+    HashMap<i64, i64> m = HashMap::new();
+    _ = HashMap::insert(&mut m, 1, 10);
+    HashMap<i64, i64> m2 = HashMap::clone(&m);
+    _ = HashMap::insert(&mut m2, 2, 20);
+    printf("maps %v %v\n", HashMap::len(&m), HashMap::len(&m2));
+    HashSet<String> s = HashSet::new();
+    _ = HashSet::insert(&mut s, "a");
+    HashSet<String> s2 = HashSet::clone(&s);
+    _ = HashSet::insert(&mut s2, "b");
+    printf("sets %v %v %v\n", HashSet::len(&s), HashSet::len(&s2), HashSet::contains_str(&s2, "a"));
+    Box<i32> b = Box::new(5);
+    Box<i32> b2 = Box::clone(&b);
+    *Box::get_mut(&mut b2) = 6;
+    printf("boxes %v %v\n", *Box::get(&b), *Box::get(&b2));
+    Rc<i32> rc = Rc::new(7);
+    Weak<i32> w = Rc::downgrade(&rc);
+    Weak<i32> w2 = Weak::clone(&w);
+    match (Weak::upgrade(&w2))
+    {
+        Some(r) : printf("weak %v\n", *Rc::get(&r)),
+        None    : printf("weak gone\n"),
+    }
+    printf("expect %v\n", Option::expect(Some(3), "a value is there"));
+    BigUint n = BigUint::from_u64(10);
+    printf("bits %v %v %v %v\n", BigUint::bit(&n, 0), BigUint::bit(&n, 1), BigUint::bit(&n, 3), BigUint::bit(&n, 64));
+    printf(
+        "ascii %v %v %v %v\n",
+        ascii_is_upper(b'Q'),
+        ascii_is_lower(b'Q'),
+        ascii_is_alnum(b'7'),
+        ascii_is_alnum(b'-'),
+    );
+    printf("less %v %v\n", StringView::less("abc", "abd"), StringView::less("b", "ab"));
+    String t = "hello";
+    printf("eq_view %v %v\n", String::eq_view(&t, "hello"), String::eq_view(&t, "help"));
+    StringView v = "  path/file.txt";
+    StringView core = StringView::trim_start(v);
+    printf("[%v]\n", core);
+    match (StringView::strip_prefix(core, "path/"))
+    {
+        Some(r) : match (StringView::strip_suffix(r, ".txt"))
+        {
+            Some(base) : printf("base %v\n", base),
+            None       : printf("no suffix\n"),
+        },
+        None : printf("no prefix\n"),
+    }
+    Result<rawptr<u8>, AllocError> a = unsafe
+    {
+        allocate(16, 8)
+    };
+    match (a)
+    {
+        Ok(p) : unsafe
+        {
+            deallocate(p, 16, 8);
+            printf("allocated\n");
+        },
+        Err(e) :
+        {
+            AllocError none = e;
+            printf("no memory\n");
+        },
+    }
+    match (Json::parse("{\"k\": 1, \"j\": true}"))
+    {
+        Ok(JsonObject(members)) : foreach (mem in &members)
+        {
+            ref<JsonMember, shared> each = mem;
+            printf("member %v\n", &each.key);
+        },
+        _ : printf("not an object\n"),
+    }
+    Result<FileInfo, FileError> fi = file_info(".");
+    PathKind dot = match (&fi)
+    {
+        Ok(info) : info.kind,
+        Err(_)   : Other,
+    };
+    printf("dot is a dir %v\n", match (dot)
+    {
+        Dir : true,
+        _   : false,
+    });
+    match (fi)
+    {
+        Ok(info) : match (info.kind)
+        {
+            Dir     : printf("dir\n"),
+            File(_) : printf("file\n"),
+            Other   : printf("other\n"),
+        },
+        Err(_) : printf("no info\n"),
+    }
+    match (try_join(spawn(fails, 1)))
+    {
+        Ok(_)  : printf("joined\n"),
+        Err(f) : printf("failed, cancelled %v\n", ThreadFailure::is_cancelled(&f)),
+    }
+    DateTime now = DateTime::now();
+    printf("now after 2024 %v\n", DateTime::to_unix(&now) > 1704067200);
+    _ = home_dir();
+}

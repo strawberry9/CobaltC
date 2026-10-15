@@ -1,0 +1,117 @@
+// table -- CSV rows given as arguments, checked, aligned and totalled.
+//
+//     table "item,qty,price" "apple,3,0.5" "pear,12,1.25"
+//
+// The first row names the columns; `qty` must be a whole number (a
+// `u32`) and `price` a number (an `f64`). Shows: `String::split` at `,`
+// into views of the line, each copied into a `String` of its own; rows
+// kept as `Vec<Vec<String>>` (resources inside resources, all freed
+// together); `parse` at two types, where its strictness does the checking
+// (`-2` is not a `u32`, ` 3` is not a number); `checked_add` for the
+// quantity total; columns sized by their characters (`String::chars`, so
+// text in any language lines up) and padded with `printf`'s `%-*s`, whose
+// width counts characters too; and an error naming the row and column,
+// with exit status 1.
+
+import std;
+
+// `line` split at every comma, each piece copied out of the line.
+fn split(ref<String, shared> line) : Vec<String>
+{
+    Vec<String> cells = Vec::new();
+    foreach (v in String::split(line, ","))       // views of the line, by value
+    {
+        Vec::push(&mut cells, String::from_view(v));
+    }
+    cells
+}
+
+fn fail(usize row, str column, ref<String, shared> text, str what) : u8
+{
+    eprintf("table: row %d, %s: \"%s\" %s\n", row + 1, column, text, what);
+    1
+}
+
+fn main() : u8
+{
+    usize n = arg_count();
+    if (n < 2)
+    {
+        eprintf("usage: table \"item,qty,price\" ROW...\n");
+        return 2;
+    }
+    Vec<Vec<String>> rows = Vec::new();
+    foreach (r in 0..n)
+    {
+        String line = Result::unwrap_or(arg(r), String::new());
+        Vec<String> cells = split(&line);
+        if (Vec::len(&cells) != 3)
+        {
+            eprintf("table: row %d has %d cells, not 3\n", r + 1, Vec::len(&cells));
+            return 1;
+        }
+        Vec::push(&mut rows, cells);
+    }
+
+    // Check and total every data row before printing any of them.
+    u32 total_qty = 0;
+    f64 total_value = 0.0;
+    foreach (r in 1..n)
+    {
+        ref<Vec<String>, shared> row = &rows[r];
+        u32 qty = if (Ok(q) = String::parse<u32>(&row[1])) { q } else
+        {
+            return fail(
+                r,
+                "qty",
+                &row[1],
+                "is not a whole number",
+            );
+        };
+        f64 price = if (Ok(p) = String::parse<f64>(&row[2])) { p } else
+        {
+            return fail(
+                r,
+                "price",
+                &row[2],
+                "is not a number",
+            );
+        };
+        total_qty = if (Some(t) = checked_add(total_qty, qty))
+        {
+            t
+        }
+        else
+        {
+            eprintf("table: the quantities add up to more than a u32 holds\n");
+            return 1;
+        };
+        total_value += to_float<f64>(qty) * price;
+    }
+
+    // Column widths, in characters: `String::len` would count bytes, and
+    // "é" is two of those but one character wide.
+    array<usize, 3> width = [5, 0, 0];
+    foreach (row in &rows)
+    {
+        foreach (c, text in row)
+        {
+            width[c] = max(width[c], Vec::len(&String::chars(text)));
+        }
+    }
+    foreach (row in &rows)
+    {
+        printf(
+            "%-*s%-*s%s\n",
+            width[0] + 2,
+            &row[0],
+            width[1] + 2,
+            &row[1],
+            &row[2],
+        );   // `*`: the width is an argument
+    }
+    String q = String::new();
+    String::append(&mut q, total_qty);
+    printf("%-*s%-*s%v\n", width[0] + 2, "total", width[1] + 2, &q, total_value);
+    0
+}

@@ -1,0 +1,100 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Body] [Http-Error] [Http-Redirect] (D-0173); conf.http-chunked, conf.http-until-close, conf.http-client-refusals
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6368756e6b656420202020202020202020323030204f4b2c203132206279746573205b68656c6c6f2c20776f726c645d2c206e6f7465202d0a616674657220313030202020202020202032303120437265617465642c2037206279746573205b637265617465645d2c206e6f74652061667465722d696e746572696d0a756e74696c20636c6f7365202020202020323030204f4b2c203135206279746573205b756e74696c2074686520636c6f73655d2c206e6f7465202d0a626f7468206c656e6774687320202020206572726f723a207468652048545450206d657373616765206973206d616c666f726d65640a6f76657220746865206c696d69742020206572726f723a207468652048545450206d657373616765206973206c6172676572207468616e20746865206c696d69740a7265646972656374206c6f6f70202020206572726f723a20746f6f206d616e79207265646972656374730a66747020202020202020202020202020206572726f723a207468652055524c277320736368656d65206973206e6569746865722068747470206e6f722068747470730a6261642075726c202020202020202020206572726f723a207468652055524c206973206d616c666f726d65640a7365727665723a20300a
+//
+// Hermetic: a raw TCP server thread writes hand-made responses, so the
+// client's decoding is tested against the wire, not against the std
+// server: a chunked body with an extension and a trailer, an interim
+// 100 Continue before the real response, a 1.0 response read until the
+// close, a response with both Content-Length and Transfer-Encoding
+// (refused), a body over the client's limit (refused), a redirect loop
+// (refused), and an unsupported scheme and a bad URL that never connect.
+
+import std;
+
+fn canned(usize i) : str
+{
+    match (i)
+    {
+        0 : "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n5;ext=1\r\nhello\r\n7\r\n, world\r\n0\r\nX-Sum: 12\r\n\r\n",
+        1 : "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 7\r\nX-Note: after-interim\r\n\r\ncreated",
+        2 : "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nuntil the close",
+        3 : "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        4 : "HTTP/1.1 200 OK\r\nContent-Length: 300\r\n\r\n",
+        _ : "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n",
+    }
+}
+
+fn serve(TcpListener l) : u8
+{
+    for (usize i = 0; i < 9; i += 1)
+    {
+        TcpStream s = match (TcpListener::accept(&mut l))
+        {
+            Ok(s)  : s,
+            Err(_) : return 1,
+        };
+        // Read the request head, then answer.
+        while (true)
+        {
+            match (TcpStream::read_line(&mut s))
+            {
+                Ok(Some(line)) : if (String::len(&line) == 0) { break; },
+                _              : break,
+            }
+        }
+        usize which = if (i < 5) { i } else { 5 };
+        _ = TcpStream::write_text(&mut s, StringView::of(canned(which)));
+        if (which == 4)
+        {
+            Vec<u8> filler = Vec::filled(300, b'z');
+            _ = TcpStream::write(&mut s, &filler[0..$]);
+        }
+        _ = TcpStream::shutdown_write(&mut s);
+    }
+    0
+}
+
+fn show(str label, Result<Response, HttpError> r)
+{
+    match (r)
+    {
+        Ok(resp) : printf(
+            "%-16s %u %s, %v bytes [%s], note %s\n",
+            label,
+            resp.status,
+            &resp.reason,
+            Vec::len(&resp.body),
+            &Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::new()),
+            Option::unwrap_or(Response::header(&resp, "x-note"), StringView::of("-")),
+        ),
+        Err(e) : printf("%-16s error: %s\n", label, HttpError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    auto server = spawn(serve, l);
+    String base = sprintf("http://127.0.0.1:%u/", at.port);
+    HttpClient c = HttpClient::new();
+    c.max_body = 200;
+    c.max_redirects = 3;
+    Request r = Request::new("GET", String::as_view(&base));
+    show("chunked", HttpClient::send(&mut c, &r));
+    show("after 100", HttpClient::send(&mut c, &r));
+    show("until close", HttpClient::send(&mut c, &r));
+    show("both lengths", HttpClient::send(&mut c, &r));
+    show("over the limit", HttpClient::send(&mut c, &r));
+    show("redirect loop", HttpClient::send(&mut c, &r));
+    Request f = Request::new("GET", "ftp://127.0.0.1/");
+    show("ftp", HttpClient::send(&mut c, &f));
+    Request b = Request::new("GET", "no scheme here");
+    show("bad url", HttpClient::send(&mut c, &b));
+    printf("server: %u\n", join(server));
+    0
+}

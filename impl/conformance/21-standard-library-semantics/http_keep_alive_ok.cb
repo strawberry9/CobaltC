@@ -1,0 +1,77 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: spec/21 §2p [Http-Keep-Alive]; conf.http-keep-alive
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 636f6e6e2031207265712031202f6974656d303b20636f6e6e2032207265712031202f6974656d313b20636f6e6e2033207265712031202f6974656d323b20636f6e6e2034207265712031202f6974656d333b20636f6e6e2035207265712031202f6974656d343b20636f6e6e2036207265712031202f6974656d353b20636f6e6e2037207265712031202f6974656d363b20636f6e6e2038207265712031202f6974656d373b20636f6e6e2039207265712031202f6974656d383b20636f6e6e203130207265712031202f6974656d393b200a776974686f7574206b6565705f616c6976653a20313120636f6e6e656374696f6e732c2031312072657175657374730a636f6e6e2031207265712031202f6974656d303b20636f6e6e2031207265712032202f6974656d313b20636f6e6e2031207265712033202f6974656d323b20636f6e6e2032207265712031202f6974656d333b20636f6e6e2032207265712032202f6974656d343b20636f6e6e2032207265712033202f6974656d353b20636f6e6e2033207265712031202f6974656d363b20636f6e6e2033207265712032202f6974656d373b20636f6e6e2033207265712033202f6974656d383b20636f6e6e2034207265712031202f6974656d393b200a77697468206b6565705f616c6976653a203420636f6e6e656374696f6e732c2031312072657175657374730a
+//
+// ten requests without keep_alive take ten connections; with it, a server
+// that closes each connection after three requests gets four, the kept
+// connection it closed replaced by a fresh one without the request
+// failing (D-0195)
+
+import std;
+
+// Serves each connection for at most `per` requests, then closes it.
+// Returns connections * 1000 + requests, after a GET /quit.
+fn serve(HttpServer s, usize per) : u64
+{
+    u64 conns = 0;
+    u64 reqs = 0;
+    while (true)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(_) : return 999999,
+        };
+        conns += 1;
+        usize here = 0;
+        while (here < per)
+        {
+            Request req = match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) : r,
+                _           : break,
+            };
+            here += 1;
+            reqs += 1;
+            Vec<Header> h = Vec::new();
+            String body = sprintf("conn %v req %v %s", conns, here, &req.url);
+            _ = HttpConnection::respond(&mut c, 200, &h[0..$], StringView::as_bytes(String::as_view(&body)));
+            if (req.url == "/quit")
+            {
+                return conns * 1000 + reqs;
+            }
+        }
+        HttpConnection::close(&mut c);
+    }
+    0
+}
+
+fn run(bool keep) : u64
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto server = spawn(serve, s, 3: usize);
+    HttpClient c = HttpClient::new();
+    c.keep_alive = keep;
+    for (usize i = 0; i < 10; i += 1)
+    {
+        Request r = Request::new("GET", String::as_view(&sprintf("%s/item%v", &base, i)));
+        Response resp = Result::unwrap(HttpClient::send(&mut c, &r));
+        printf("%s; ", &Result::unwrap(Response::text(&resp)));
+    }
+    Request q = Request::new("GET", String::as_view(&sprintf("%s/quit", &base)));
+    Response resp = Result::unwrap(HttpClient::send(&mut c, &q));
+    printf("\n");
+    join(server)
+}
+
+fn main()
+{
+    u64 a = run(false);
+    printf("without keep_alive: %v connections, %v requests\n", a / 1000, a % 1000);
+    u64 b = run(true);
+    printf("with keep_alive: %v connections, %v requests\n", b / 1000, b % 1000);
+}
