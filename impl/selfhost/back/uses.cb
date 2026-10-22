@@ -206,8 +206,10 @@ fn pin_root(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
 
 // The names a body borrows (`&x…`, `&mut x…`), captures (a closure's capture
 // list), or drops (`drop(x…)`): the bindings whose checks may not be proven,
-// so they keep their runtime objects (`pinned_names`; in the bootstrap form
-// no argument is a pure direct one).
+// so they keep their runtime objects (cobc's `pinned_names`). A `&x` passed
+// to a named callee, no other argument of the call naming `x`, is kept as a
+// candidate `"? x j a::b"` instead, since it pins `x` only when argument `j`
+// is not a pure direct one (`resolve_pinned`, which takes the candidates out).
 export fn pinned_names(ref<Block, shared> b) : HashSet<String>
 {
     HashSet<String> out = HashSet::new();
@@ -272,9 +274,15 @@ fn pinned_expr(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
                 _                  : {},
             }
             pinned_expr(&Box::get(c).callee, out);
+            usize j = 0;
             foreach (a in &Box::get(c).args)
             {
-                pinned_expr(a, out);
+                match (pin_candidate(Box::get(c), j))
+                {
+                    Some(k) : HashSet::insert(out, k),
+                    None    : pinned_expr(a, out),
+                }
+                j = j + 1;
             }
         },
         ExprKind::EClosure(c) :
@@ -295,6 +303,104 @@ fn pinned_expr(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
             }
         },
         _                     : each_child(e, out, pinned_expr, pinned_block),
+    }
+}
+
+// `pinned_names`' candidate for argument `j` of `c`: a `&x`/`&mut x` passed
+// to a path callee, no other argument naming `x`.
+fn pin_candidate(ref<CallExpr, shared> c, usize j) : Option<String>
+{
+    String callee = match (&c.callee.kind)
+    {
+        ExprKind::EPath(p) : String::join(&Box::get(p).segs[0..$], "::"),
+        _                  : return None,
+    };
+    String x = match (&c.args[j].kind)
+    {
+        ExprKind::EBorrow(b) :
+        {
+            match (&Box::get(b).e.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) != 1)
+                    {
+                        return None;
+                    }
+                    String::clone(&Box::get(p).segs[0])
+                },
+                _                  : return None,
+            }
+        },
+        _                    : return None,
+    };
+    usize k = 0;
+    foreach (o in &c.args)
+    {
+        if (k != j && mentions_captured(o, &x))
+        {
+            return None;
+        }
+        k = k + 1;
+    }
+    Some(sprintf("? %s %zu %s", &x, j, &callee))
+}
+
+// Whether `e` names `x`: a one-segment path, or a closure capturing it
+// (cobc's `uses::mentions`).
+export fn mentions_captured(ref<Expr, shared> e, ref<String, shared> x) : bool
+{
+    HashSet<String> names = HashSet::new();
+    mc_expr(e, &mut names);
+    HashSet::contains(&names, x)
+}
+
+fn mc_expr(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)    :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                HashSet::insert(out, String::clone(&Box::get(p).segs[0]));
+            }
+        },
+        ExprKind::EClosure(c) :
+        {
+            foreach (n in &Box::get(c).captures)
+            {
+                HashSet::insert(out, String::clone(n));
+            }
+            mc_block(&Box::get(c).body, out);
+        },
+        _                     : each_child(e, out, mc_expr, mc_block),
+    }
+}
+
+fn mc_block(ref<Block, shared> b, ref<HashSet<String>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : mc_expr(e, out),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : mc_expr(&Box::get(d).init, out),
+            Stmt::SExpr(e)        : mc_expr(Box::get(e), out),
+            Stmt::SBlockLike(e)   : mc_expr(Box::get(e), out),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : mc_expr(Box::get(t), out),
+        None    : {},
     }
 }
 

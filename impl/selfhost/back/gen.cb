@@ -266,7 +266,7 @@ export fn emit_fn_body(
     }
     g.closure_base = widen<u64>(h) << 24;
     // CHG-0368: the stage-4 analyses' answers (`COBC_DUMP_ANALYSES`).
-    dump_analyses(g, name, f);
+    dump_analyses(g, name, f, subst);
     // D-0274: the bootstrap form keeps every local's object and check, so
     // these analyses are not made (stage 4).
     Vec<String> pnames = Vec::new();
@@ -285,6 +285,11 @@ export fn emit_fn_body(
             },
             _               : {},
         }
+    }
+    HashSet<String> fn_bound = bound_names(&f.body);
+    foreach (n in &pnames)
+    {
+        HashSet::insert(&mut fn_bound, String::clone(n));
     }
     HashSet<String> confined_names = HashSet::new();
     Objectless objectless_names = empty_objectless();
@@ -309,7 +314,7 @@ export fn emit_fn_body(
         .ret = clone(ret),
         .notes = 0,
         .root_frame = 0,
-        .pinned = pinned_names(&f.body),
+        .pinned = resolve_pinned(g, pinned_names(&f.body), &fn_bound),
         .assigned = assigned_names(&f.body),
         .self_ref = None,
         .probes = HashMap::new(),
@@ -9422,6 +9427,16 @@ export fn lower_closure_body(
     for (usize pass = first; pass < 2; pass += 1)
     {
         bool probing = pass == 0;
+        // A closure's own parameters and its captures are its bindings.
+        HashSet<String> cl_bound = bound_names(body);
+        foreach (p in params)
+        {
+            HashSet::insert(&mut cl_bound, String::clone(&p.name));
+        }
+        foreach (c in &info.fields)
+        {
+            HashSet::insert(&mut cl_bound, String::clone(&c.name));
+        }
         u64 saved_uid = g.uid;
         NameSnap saved_names = snapshot_names(outer);
         u64 saved_nstr = g.nstr;
@@ -9435,7 +9450,7 @@ export fn lower_closure_body(
             .ret = clone(&ret),
             .notes = 0,
             .root_frame = 0,
-            .pinned = pinned_names(body),
+            .pinned = resolve_pinned(g, pinned_names(body), &cl_bound),
             .assigned = assigned_names(body),
             .self_ref = Some(SelfRef { .c = String::from_str("p_self"), .id = id }),
             .probes = HashMap::new(),
