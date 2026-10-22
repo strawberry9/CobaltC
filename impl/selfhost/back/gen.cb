@@ -17,6 +17,7 @@ import cnames;
 import uses;
 import direct;
 import natives;
+import analyses;
 import each;
 import state;
 import typeops;
@@ -190,6 +191,8 @@ fn emit_fn_body(
         h = wrapping_mul(h ^ widen<u32>(*b), 16777619);
     }
     g.closure_base = widen<u64>(h) << 24;
+    // CHG-0368: the stage-4 analyses' answers (`COBC_DUMP_ANALYSES`).
+    dump_analyses(g, name, f);
     Fx x = Fx {
         // cobc's `loc` reports no location for a prelude line: every line of
         // a `std` function's body (`in_prelude` decides by its first
@@ -233,6 +236,9 @@ fn emit_fn_body(
         .confined_params = HashMap::new(),
         .confined = HashSet::new(),
         .unminted_binders = HashMap::new(),
+        .inert_c = HashSet::new(),
+        .raw_substring = None,
+        .raw_call = None,
     };
     Vec::push(&mut x.scopes, HashMap::new());
     push_frame(g, &mut x);
@@ -301,6 +307,11 @@ fn into_temp(ref<Gen, exclusive> g, ref<Fx, exclusive> x, V v, usize line) : V
     String t = fresh(g, "t");
     String c = ctype(g, &v.ty);
     emit(x, String::as_view(&sprintf("%s %s = %s;", &c, &t, &v.c)));
+    if (Option::is_none(&v.obj) && HashSet::contains(&x.inert_c, &v.c))
+    {
+        HashSet::insert(&mut x.inert_c, String::clone(&t));
+        return V { .c = t, .ty = clone(&v.ty), .obj = None };
+    }
     Option<String> obj = None;
     if (is_resource(g, &v.ty))
     {
@@ -3316,6 +3327,86 @@ fn confined_elem_vec(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shar
     }
 }
 
+fn is_string_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::String") && Vec::len(&Box::get(n).args) == 0,
+        _               : false,
+    }
+}
+
+// D-0200: a `String` made by `e` with no object, where `e`'s maker has a form
+// that makes none: `String::clone`/`from_str` (their `_raw` variants),
+// `String::from_view(String::view(…))` (the substring helper's), or a
+// function with a `__raw` form (`raw_ret_ok`). Its value is inert
+// (`inert_c`). `None`: `e` is none of these (cobc's `lower_raw_string`).
+fn lower_raw_string(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<V>
+{
+    // D-0274: no `_raw` variants in the bootstrap form (no native bodies).
+    if (boot(g, 5))
+    {
+        return None;
+    }
+    Type string = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::String"), .args = Vec::new() }));
+    ref<Expr, shared> se = strip_parens(e);
+    ref<CallExpr, shared> call = match (&se.kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> path = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&path.targs) > 0 || (Vec::len(&path.segs) == 1 && Option::is_some(&lookup(x, String::as_view(&path.segs[0])))))
+    {
+        return None;
+    }
+    String k0 = String::join(&path.segs[0..$], "::");
+    String k = if (HashMap::contains(&g.prog.table.fns, &k0)) { k0 } else { sprintf("std::%s", &k0) };
+    FnDecl f = match (get_fn(g, &k))
+    {
+        Some(fd) : fd,
+        None     : return None,
+    };
+    bool prel = in_prelude(String::as_view(&k), &f);
+    usize n = Vec::len(&call.args);
+    if ((String::eq_str(&k, "std::String::clone") || String::eq_str(&k, "std::String::from_str")) && prel && n == 1)
+    {
+        Type st = Type::TStr;
+        V a0 = if (String::eq_str(&k, "std::String::from_str")) { lower_expr(g, x, &call.args[0], Some(&st)) } else { lower_expr(g, x, &call.args[0], None) };
+        if (is_never(&a0.ty))
+        {
+            return Some(a0);
+        }
+        V a = into_temp(g, x, a0, e.line);
+        String pname = request_fn(g, String::as_view(&k), Vec::new());
+        String sc = ctype(g, &string);
+        String t = fresh(g, "t");
+        at(g, x, e.line);
+        emit(x, String::as_view(&sprintf("%s %s = %s_raw(%s);", &sc, &t, &pname, &a.c)));
+        HashSet::insert(&mut x.inert_c, String::clone(&t));
+        return Some(V { .c = t, .ty = string, .obj = None });
+    }
+    if (String::eq_str(&k, "std::String::from_view") && prel && n == 1)
+    {
+        x.raw_substring = Some(se.id);
+        V v = lower_expr(g, x, e, Some(&string));
+        x.raw_substring = None;
+        return Some(v);
+    }
+    if (Vec::len(&f.type_params) == 0 && type_eq(&f.ret, &string) && raw_ret_ok(g, &k))
+    {
+        x.raw_call = Some(request_fn(g, String::as_view(&k), Vec::new()));
+        V v = lower_expr(g, x, e, Some(&string));
+        x.raw_call = None;
+        return Some(v);
+    }
+    None
+}
+
 // A place through fields of a direct reference (`box_rec_uses`).
 fn direct_place(ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
 {
@@ -3848,6 +3939,9 @@ fn lower_closure_body(
             .confined_params = HashMap::new(),
             .confined = HashSet::new(),
             .unminted_binders = HashMap::new(),
+        .inert_c = HashSet::new(),
+        .raw_substring = None,
+        .raw_call = None,
         };
         Vec::push(&mut fx.scopes, HashMap::new());
         push_frame(g, &mut fx);
@@ -5619,8 +5713,11 @@ fn lower_assign(
                     )),
                 );
                 store(g, x, String::as_view(&p.c), &p.ty, &v);
-                String o = Option::expect(clone(&v.obj), "resource value has object");
-                emit(x, String::as_view(&sprintf("cb_absorb(%s);", &o)));
+                if (!HashSet::contains(&x.inert_c, &v.c))
+                {
+                    String o = Option::expect(clone(&v.obj), "resource value has object");
+                    emit(x, String::as_view(&sprintf("cb_absorb(%s);", &o)));
+                }
                 return unit();
             }
             // D-0049: a resource target is live only if its value owns
@@ -5644,7 +5741,7 @@ fn lower_assign(
         None       : {},
     }
     store(g, x, String::as_view(&p.c), &p.ty, &v);
-    if (res)
+    if (res && !HashSet::contains(&x.inert_c, &v.c))
     {
         String o = Option::expect(clone(&v.obj), "resource value has object");
         match (&p.raw)
@@ -5987,7 +6084,7 @@ fn lower_vec_index_pre(
     emit(x, String::as_view(&sprintf("cb_borrow_check(%s, %s, %s, %s);", &base, &projs_args(&projs), m, &lc0)));
     Vec<Type> ta = Vec::new();
     Vec::push(&mut ta, clone(&elem));
-    request_fn(g, name, ta);
+    String pre_cname = request_fn(g, name, ta);
     bool exclusive = StringView::eq_str(name, "std::Vec::index_exclusive");
     str rm = if (exclusive) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
     String vec_c = ctype(g, &p.ty);
@@ -6031,8 +6128,14 @@ fn lower_vec_index_pre(
         },
         None        : {},
     }
-    // D-0274: no native bodies, so no `…_pre` variant: its body inline.
     String r = fresh(g, "r");
+    Mode rmode = if (exclusive) { Mode::Exclusive } else { Mode::Shared };
+    if (!boot(g, 5))
+    {
+        emit(x, String::as_view(&sprintf("cb_ref %s = %s_pre(((cb_ref){ (void *)&(%s), 0 }), %s);", &r, &pre_cname, &p.c, &it.c)));
+        return Some(V { .c = r, .ty = Type::TRef(Box::new(ModedTy { .inner = elem, .mode = rmode })), .obj = None });
+    }
+    // D-0274: no native bodies, so no `…_pre` variant: its body inline.
     String v = fresh(g, "v");
     String e = fresh(g, "e");
     at(g, x, line);
@@ -6053,7 +6156,6 @@ fn lower_vec_index_pre(
             rm,
         )),
     );
-    Mode rmode = if (exclusive) { Mode::Exclusive } else { Mode::Shared };
     Some(V { .c = r, .ty = Type::TRef(Box::new(ModedTy { .inner = elem, .mode = rmode })), .obj = None })
 }
 
@@ -9903,7 +10005,7 @@ fn construct_variant(
         {
             Type pty = clone(&v.ty);
             store_part(g, x, String::as_view(&sprintf("%s.u.v%v", &t, vi)), &pty, v);
-            if (is_resource(g, &pty))
+            if (is_resource(g, &pty) && !HashSet::contains(&x.inert_c, &v.c))
             {
                 emit(
                     x,
@@ -9971,6 +10073,25 @@ fn lower_struct_lit(
         }
         Type hint = apply(&sd.fields[k].ty, &m);
         bool known = resolved(&hint, &sd.type_params);
+        // D-0200: a `String` field made with no object where its maker can
+        // (`lower_raw_string`): the aggregate's object, made after, covers it.
+        if (known && is_string_ty(&hint))
+        {
+            match (lower_raw_string(g, x, &fi.value))
+            {
+                Some(rv) :
+                {
+                    if (is_never(&rv.ty))
+                    {
+                        return never();
+                    }
+                    Vec::push(&mut names, String::clone(&fi.name));
+                    Vec::push(&mut vals, into_temp(g, x, rv, fi.value.line));
+                    continue;
+                },
+                None     : {},
+            }
+        }
         V v = if (known) { lower_expr(g, x, &fi.value, Some(&hint)) } else { lower_expr(g, x, &fi.value, None) };
         if (is_never(&v.ty))
         {
@@ -10040,7 +10161,7 @@ fn lower_struct_lit(
     {
         Type fty = clone(&vals[k].ty);
         store_part(g, x, String::as_view(&sprintf("%s.%s", &t, &san(String::as_view(&names[k])))), &fty, &vals[k]);
-        if (is_resource(g, &fty))
+        if (is_resource(g, &fty) && !HashSet::contains(&x.inert_c, &vals[k].c))
         {
             emit(
                 x,

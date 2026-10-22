@@ -645,6 +645,17 @@ impl<'a> Gen<'a> {
             let quiet_ids = self.quiet_locals(&f.body, &names, &elem_ref_ids);
             (confined_names, objectless_names, elem_ref_ids, quiet_ids)
         };
+        // CHG-0368: the stage-4 analyses' answers, for comparing the code
+        // generator written in CobaltC with this one (`COBC_DUMP_ANALYSES`).
+        // At any level: in the bootstrap form they are made only to be shown.
+        if std::env::var_os("COBC_DUMP_ANALYSES").is_some() && self.probing == 0 {
+            let names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            let c = self.confined_vecs(&f.body, &names, &owned_vecs);
+            let o = self.objectless_strings(&f.body, &names);
+            let e = self.elem_ref_lets(&f.body, &names);
+            let q = self.quiet_locals(&f.body, &names, &e);
+            dump_analyses(name, &f.body, &c, &o, &e, &q);
+        }
         let all_checks = self.all_checks;
         let mut fx = Fx { g: self, subst, scopes: vec![HashMap::new()], out: String::new(), ret: ret.clone(), cleanup: Vec::new(), loops: Vec::new(), loop_broken: Vec::new(), ind: 1, self_ref: None, assigned: assigned_names(&f.body), rebind_frames: HashMap::new(), holder_roots: HashMap::new(), no_overflow: HashSet::new(), proven_next: false, pinned, confined_names, confined_fields: if all_checks { HashSet::new() } else { confined_fields(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, read_confined: if all_checks { HashSet::new() } else { read_confined_vecs(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, objectless_names, cur_let: None, raw_ret: false, raw_tail: None, raw_sinks: HashSet::new(), raw_substring: None, raw_return_path: false, raw_call: None, objectless_c: HashSet::new(), moved_flag: HashMap::new(), bare_trims: HashSet::new(), elem_ref_ids, quiet_ids, quiet_roots: HashSet::new(), drop_lines: Vec::new(), confined: HashSet::new(), confined_params: HashMap::new(), probes: HashMap::new(), kept: Vec::new(), dollar: Vec::new(), place_write: false,
             fused_scrut: None, map_acc: None, map_acc_used: false, compound_elem: false, datum_tok: None, datum_tok_out: None, map_get_acc: None, map_get_acc_out: None, elem_mode: None, temp_root: false, frame_line: None, vec_index_exprs: HashMap::new(), index_sugar: HashSet::new(), propagate_scrutinee: false, elem_alias: HashMap::new(), alias_kept: Vec::new(), stmt_match: false, branch_scope: false, objectless: false, inert_c: HashSet::new(), obj_temps: HashSet::new(), notes: 0, root_frame: 0, direct_params: HashSet::new(), entry_tested: false, direct_refs: HashSet::new(), direct_live: HashMap::new(), fast_half: false, elem_reader: false, frozen_on: false, pred_body: false, field_confined: HashMap::new(), pure_slices: HashSet::new(), pure_views: HashSet::new(), unstored: HashMap::new(), unstored_params: HashSet::new(), held_locals: HashSet::new(), held_c: HashSet::new(), unminted_binders: HashMap::new() };
@@ -738,4 +749,46 @@ impl<'a> Gen<'a> {
         }
         Ok((entry, exit))
     }
+}
+
+// CHG-0368: one line per analysis of a function body being lowered, its
+// answers sorted: names as they are, nodes as `e:LINE:COL` (an expression) or
+// `a:LINE:COL` (a match arm, by its body).
+fn dump_analyses(name: &str, body: &Block, confined: &HashSet<String>, objectless: &HashSet<usize>, elem_refs: &HashSet<usize>, quiet: &HashSet<usize>) {
+    let mut pos: HashMap<usize, String> = HashMap::new();
+    visit_exprs(body, &mut |e| {
+        pos.insert(e as *const Expr as usize, format!("e:{}:{}", e.line, e.col));
+        if let ExprKind::Match(_, arms) = &e.kind {
+            for a in arms {
+                pos.insert(a as *const Arm as usize, format!("a:{}:{}", a.body.line, a.body.col));
+            }
+        }
+    });
+    let nodes = |s: &HashSet<usize>| {
+        let mut v: Vec<String> = s.iter().map(|k| match pos.get(k) {
+            Some(p) => p.clone(),
+            // `objectless_strings` tags a binding it also reports compared
+            // (`|1`) or indexed (`|2`).
+            // A candidate moved away is also there as `!id` (`+m`).
+            None if pos.contains_key(&!*k) => format!("{}+m", pos[&!*k]),
+            None => match pos.get(&(k & !3)) {
+                Some(p) => format!("{}+{}", p, k & 3),
+                None => if *k == 0 { "0".to_string() } else { format!("?{:x}", k) },
+            },
+        }).collect();
+        v.sort();
+        v.join(" ")
+    };
+    let mut c: Vec<&String> = confined.iter().collect();
+    c.sort();
+    let held = {
+        let mut h: Vec<String> = held_locals(body).into_iter().collect();
+        h.sort();
+        h.join(" ")
+    };
+    eprintln!("ANALYSES {} confined [{}]", name, c.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "));
+    eprintln!("ANALYSES {} objectless [{}]", name, nodes(objectless));
+    eprintln!("ANALYSES {} elem_refs [{}]", name, nodes(elem_refs));
+    eprintln!("ANALYSES {} quiet [{}]", name, nodes(quiet));
+    eprintln!("ANALYSES {} held [{}]", name, held);
 }
