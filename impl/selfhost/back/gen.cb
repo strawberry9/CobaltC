@@ -12624,8 +12624,174 @@ fn lower_block_expr(
     usize line,
 ) : V
 {
+    match (lower_fused_text_loop(g, x, b, line))
+    {
+        Some(v) : return v,
+        None    : {},
+    }
     x.frame_line = Some(line);
     lower_block(g, x, b, expected)
+}
+
+// D-0200: `foreach (c in T::chars(x))` or `T::split_whitespace(x)` whose body
+// uses `c` only as a pure view (`fusion_plan`): the pieces are found in
+// place, one per turn, with no vector, and `c` is a bare view of each (cobc's
+// `lower_fused_text_loop`).
+fn lower_fused_text_loop(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared> b, usize line) : Option<V>
+{
+    bool local = match (fusion_name(b))
+    {
+        Some(n) : Option::is_some(&lookup(x, String::as_view(&n))),
+        None    : false,
+    };
+    FusionPlan plan = match (fusion_plan(g, b, local))
+    {
+        Some(p) : p,
+        None    : return None,
+    };
+    FusionPlan { cname, on_string, chars, derived, source_id, be_id } = plan;
+    ref<Expr, shared> source = fusion_source(b);
+    ref<Expr, shared> be = fusion_be(b);
+    match (&be.kind)
+    {
+        ExprKind::EBlock(_) : {},
+        _                   : return None,
+    }
+    Type svt = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::StringView"), .args = Vec::new() }));
+    String svc = ctype(g, &svt);
+    at(g, x, line);
+    // The text, evaluated as the call's argument, held for the loop.
+    push_stmt(g, x);
+    String data = String::new();
+    String len = String::new();
+    String src = String::new();
+    if (on_string)
+    {
+        Type st = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::String"), .args = Vec::new() }));
+        String sc = ctype(g, &st);
+        Type rst = ref_ty(st, Mode::Shared);
+        V a0 = lower_expr(g, x, source, Some(&rst));
+        if (is_never(&a0.ty))
+        {
+            pop_stmt(x);
+            return Some(a0);
+        }
+        V a = into_temp(g, x, a0, line);
+        data = sprintf("((%s *)(%s).p)->bytes.ptr", &sc, &a.c);
+        len = sprintf("((%s *)(%s).p)->bytes.len", &sc, &a.c);
+        src = sprintf("(void *)&((%s *)(%s).p)->bytes", &sc, &a.c);
+    }
+    else
+    {
+        V a0 = lower_expr(g, x, source, Some(&svt));
+        if (is_never(&a0.ty))
+        {
+            pop_stmt(x);
+            return Some(a0);
+        }
+        V a = into_temp(g, x, a0, line);
+        data = sprintf("(%s).bytes.data", &a.c);
+        len = sprintf("(%s).bytes.len", &a.c);
+        src = sprintf("(%s).bytes.src", &a.c);
+    }
+    String fd = fresh(g, "fd");
+    String fl = fresh(g, "fl");
+    String fp = fresh(g, "fp");
+    String fs = fresh(g, "fs");
+    emit(x, String::as_view(&sprintf("const uint8_t *%s = %s;", &fd, &data)));
+    emit(x, String::as_view(&sprintf("uint64_t %s = %s;", &fl, &len)));
+    emit(x, String::as_view(&sprintf("void *%s = %s;", &fs, &src)));
+    emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &fp)));
+    Vec::push(&mut x.loops, Loop { .depth = Vec::len(&x.cleanup), .cont = None });
+    Vec::push(&mut x.loop_broken, false);
+    emit(x, StringView::of("for (;;) {"));
+    x.ind += 1;
+    String start = fresh(g, "fa");
+    if (chars)
+    {
+        emit(x, String::as_view(&sprintf("if (%s >= %s) break;", &fp, &fl)));
+        emit(x, String::as_view(&sprintf("uint64_t %s = %s;", &start, &fp)));
+        emit(x, String::as_view(&sprintf("%s++;", &fp)));
+        emit(x, String::as_view(&sprintf("while (%s < %s && (%s[%s] & 0xc0) == 0x80) %s++;", &fp, &fl, &fd, &fp, &fp)));
+    }
+    else
+    {
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "while (%s < %s && (%s[%s] == ' ' || (%s[%s] >= 9 && %s[%s] <= 13))) %s++;",
+                &fp,
+                &fl,
+                &fd,
+                &fp,
+                &fd,
+                &fp,
+                &fd,
+                &fp,
+                &fp,
+            )),
+        );
+        emit(x, String::as_view(&sprintf("if (%s >= %s) break;", &fp, &fl)));
+        emit(x, String::as_view(&sprintf("uint64_t %s = %s;", &start, &fp)));
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "while (%s < %s && !(%s[%s] == ' ' || (%s[%s] >= 9 && %s[%s] <= 13))) %s++;",
+                &fp,
+                &fl,
+                &fd,
+                &fp,
+                &fd,
+                &fp,
+                &fd,
+                &fp,
+                &fp,
+            )),
+        );
+    }
+    // `c`: a bare view of the piece.
+    String cc = sprintf("l_%s_%s", &san(String::as_view(&cname)), &fresh(g, ""));
+    emit(x, String::as_view(&sprintf("%s %s;", &svc, &cc)));
+    emit(x, String::as_view(&sprintf("%s.bytes.src = %s;", &cc, &fs)));
+    emit(x, String::as_view(&sprintf("%s.bytes.data = (uint8_t *)%s + %s;", &cc, &fd, &start)));
+    emit(x, String::as_view(&sprintf("%s.bytes.len = %s - %s;", &cc, &fp, &start)));
+    HashSet::insert(&mut x.direct_refs, sprintf("%s.bytes", &cc));
+    Vec::push(&mut x.scopes, HashMap::new());
+    bind_in_scope(
+        x,
+        String::as_view(&cname),
+        Binding { .c = cc, .ty = svt, .root = String::new(), .kind = BindKind::Local },
+    );
+    HashSet<String> dset = HashSet::new();
+    foreach (d in &derived)
+    {
+        HashSet::insert(&mut dset, String::clone(d));
+    }
+    HashSet<String> saved_derived = replace(&mut x.bare_trims, dset);
+    // The body as the loop's own block lowers it: a statement whose value, if
+    // any, is discarded (the expression itself, not a copy).
+    V v = lower_expr(g, x, be, None);
+    x.bare_trims = saved_derived;
+    if (!is_void(&v.ty) && !is_never(&v.ty))
+    {
+        if (Option::is_none(&v.obj) && holds_fn(g, &v.ty))
+        {
+            V t = into_temp(g, x, v, be.line);
+            u32 tid = type_id(g, &t.ty);
+            emit(x, String::as_view(&sprintf("cb_drop_value(&%s, %vu);", &t.c, tid)));
+        }
+        else
+        {
+            emit(x, String::as_view(&sprintf("(void)(%s);", &v.c)));
+        }
+    }
+    Vec::pop(&mut x.scopes);
+    x.ind -= 1;
+    emit(x, StringView::of("}"));
+    Vec::pop(&mut x.loops);
+    Vec::pop(&mut x.loop_broken);
+    pop_stmt(x);
+    Some(unit())
 }
 
 // A part of an aggregate that holds references and arrives with an object
