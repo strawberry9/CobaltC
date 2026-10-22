@@ -1,0 +1,333 @@
+// The generator's entry: Gen::new, generate, and its request queues.
+
+use super::*;
+
+impl<'a> Gen<'a> {
+    pub fn new(items: &'a Items, map: &'a SourceMap) -> Self {
+        Gen {
+            items,
+            map,
+            files: Vec::new(),
+            file_ids: HashMap::new(),
+            fwd: String::new(),
+            types: String::new(),
+            type_names: HashMap::new(),
+            defined: HashSet::new(),
+            type_ids: HashMap::new(),
+            descs: Vec::new(),
+            desc_ids: Vec::new(),
+            type_pos: HashMap::new(),
+            desc_aux: String::new(),
+            strings: String::new(),
+            str_names: HashMap::new(),
+            units: Vec::new(),
+            nstr: 0,
+            protos: String::new(),
+            fns: String::new(),
+            substring_fn: false,
+            append_substring_fn: false,
+            native_ctx: None,
+            pending_field_confined: None,
+            pending_pred_closure: false,
+            pending_reader_closure: false,
+            pending_bare: false,
+            pending_raw_ret: false,
+            frozen_mode: false,
+            inline_sigs: HashSet::new(),
+            arrive_twins: HashSet::new(),
+            pending_tested: false,
+            all_checks: std::env::var("COBALTC_ALL_CHECKS").map_or(false, |v| !v.is_empty() && v != "0") || bootstrap_form(),
+            bootstrap: bootstrap_form(),
+            line_directives: true,
+            pure_closures: HashSet::new(),
+            fn_names: HashMap::new(),
+            queue: VecDeque::new(),
+            uid: 0,
+            closure_base: 0,
+            closures: HashMap::new(),
+            thunks: HashMap::new(),
+            thunks_out: String::new(),
+            eqs: HashMap::new(),
+            khs: HashMap::new(),
+            kcs: HashMap::new(),
+            externs_out: HashMap::new(),
+            probing: 0,
+            nscope: 0,
+            confining: HashMap::new(),
+            variants: HashMap::new(),
+            pure_memo: std::cell::RefCell::new(HashMap::new()),
+            view_memo: std::cell::RefCell::new(HashMap::new()),
+            reader_memo: std::cell::RefCell::new(HashMap::new()),
+            writer_memo: std::cell::RefCell::new(HashMap::new()),
+            fn_values: std::cell::RefCell::new(None),
+            lib: false,
+            globals: HashSet::new(),
+        }
+    }
+
+    // The program's C, in parts: cache.rs compiles pure-`std` units in
+    // translation units of their own and keeps their objects.
+    pub fn generate(mut self) -> R<Generated> {
+        self.debug_lent();
+        self.confining = if self.all_checks { HashMap::new() } else { self.confining_table() };
+        // D-0257: a library has no `main`; its entry points (`extern fn`
+        // with a body) are requested instead, each with a C-callable stub
+        // in the tail.
+        let main_c = if self.lib { String::new() } else { self.request_fn("main", vec![])? };
+        let main_u8 = self.items.fns.get("main").map_or(false, |m| m.ret != Type::Void);
+        let mut entries: Vec<(String, std::sync::Arc<FnDecl>)> = self.items.fns.iter().filter(|(_, f)| f.c_entry).map(|(k, f)| (k.clone(), f.clone())).collect();
+        entries.sort_by_key(|(_, f)| f.line);
+        let mut entry_c: Vec<(String, std::sync::Arc<FnDecl>)> = Vec::new();
+        if self.lib {
+            for (k, f) in &entries {
+                let c = self.request_fn(k, vec![])?;
+                entry_c.push((c, f.clone()));
+            }
+        }
+        while let Some((name, targs, mask)) = self.queue.pop_front() {
+            let start = self.fns.len();
+            let pure = name.starts_with("std::") && targs.iter().all(std_only);
+            self.lower_fn(&name, &targs, mask)?;
+            let text = self.fns[start..].to_string();
+            // A `spawn`'s block (`struct cb_env_N`) is defined with its
+            // trampoline among the thunks, in the program's translation
+            // unit: a function that spawns is compiled there too.
+            let pure = pure && !text.contains("struct cb_env_");
+            self.units.push(Unit { text, cacheable: pure });
+        }
+        // D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive`
+        // twin where it has one, and the callee itself where it has none.
+        let twins = std::mem::take(&mut self.arrive_twins);
+        for u in self.units.iter_mut() {
+            if u.text.contains(ARRIVE_MARK) {
+                u.text = resolve_arrive(&u.text, &twins);
+            }
+        }
+        if self.thunks_out.contains(ARRIVE_MARK) {
+            self.thunks_out = resolve_arrive(&self.thunks_out, &twins);
+        }
+        self.arrive_twins = twins;
+        if !self.bootstrap {
+            self.localize(&main_c);
+        }
+        // Last, when no pass reads the text line by line any more.
+        if self.line_directives {
+            for u in self.units.iter_mut().filter(|u| !u.cacheable) {
+                if u.text.contains("cb_at(") || u.text.contains(LINE_MARK) {
+                    u.text = line_directives(&u.text, &self.files);
+                }
+            }
+        }
+        let mut descs = String::new();
+        descs.push_str(&self.desc_aux);
+        descs.push_str("static const cb_type cb_types[] = {\n");
+        for d in &self.descs {
+            writeln!(descs, "    {},", d.as_deref().unwrap_or("{0}")).unwrap();
+        }
+        descs.push_str("    {0}\n};\n");
+        descs.push_str("static const uint32_t cb_type_ids[] = {");
+        for id in &self.desc_ids {
+            write!(descs, "{}u, ", id).unwrap();
+        }
+        descs.push_str("0};\n");
+        let mut out = String::new();
+        out.push_str("\n__thread uint32_t cb_at_file = CB_NOLOC, cb_at_line = 0;\n");
+        out.push_str("void cb_where(uint32_t *file, uint32_t *line) { *file = cb_at_file; *line = cb_at_line; }\n");
+        out.push_str("void cb_set_where(uint32_t file, uint32_t line) { cb_at_file = file; cb_at_line = line; }\n");
+        out.push_str("__thread uintptr_t cb_stack_floor = 0;\n");
+        out.push_str("void cb_set_stack_floor(uintptr_t floor) { cb_stack_floor = floor; }\n");
+        out.push_str("\nstatic const char *const cb_files[] = {");
+        for f in &self.files {
+            write!(out, "\"{}\", ", c_escape(f)).unwrap();
+        }
+        out.push_str("0};\n");
+        let mut header_text = String::new();
+        if self.lib {
+            // D-0257: no `main`. `cb_lib_init` is the runtime's start, run
+            // once by the first entry; each entry point is a stub that
+            // enters, calls the function, leaves; its `_try` twin contains
+            // a fault (`cb_lib_jmp`) and gives C a status and the result
+            // through a pointer. `cobalt_init`, `cobalt_shutdown` and
+            // `cobalt_last_fault` are the library's own API.
+            writeln!(out, "static void cb_lib_init(void)\n{{\n    cb_init(cb_files, {}, cb_types, {}, cb_type_ids);\n}}", self.files.len(), self.descs.len()).unwrap();
+            out.push_str("void cobalt_init(void)\n{\n    cb_lib_enter(cb_lib_init);\n    cb_lib_leave();\n}\n");
+            out.push_str("void cobalt_shutdown(void)\n{\n    cb_lib_shutdown();\n}\n");
+            out.push_str("int cobalt_last_fault(char *buf, size_t n)\n{\n    return cb_lib_last_fault(buf, n);\n}\n");
+            for (c, f) in &entry_c {
+                let mut params = Vec::new();
+                let mut args = Vec::new();
+                for (i, p) in f.params.iter().enumerate() {
+                    let pc = self.ctype(&p.ty)?;
+                    params.push(format!("{} a{}", pc, i));
+                    args.push(format!("a{}", i));
+                }
+                let plist = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+                let call = format!("{}({})", c, args.join(", "));
+                if f.ret == Type::Void {
+                    writeln!(out, "void {}({})\n{{\n    cb_lib_enter(cb_lib_init);\n    {};\n    cb_lib_leave();\n}}", f.name, plist, call).unwrap();
+                    let tplist = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+                    writeln!(
+                        out,
+                        "int {n}_try({pl})\n{{\n    cb_lib_enter(cb_lib_init);\n    jmp_buf cb_jb;\n    if (setjmp(cb_jb) == 0) {{\n        cb_lib_jmp((void *)cb_jb);\n        {call};\n        cb_lib_jmp(0);\n        cb_lib_leave();\n        return 0;\n    }}\n    cb_lib_leave();\n    return cb_lib_fault_code();\n}}",
+                        n = f.name, pl = tplist, call = call
+                    )
+                    .unwrap();
+                } else {
+                    let rc = self.ctype(&f.ret)?;
+                    writeln!(out, "{} {}({})\n{{\n    cb_lib_enter(cb_lib_init);\n    {} cb_r = {};\n    cb_lib_leave();\n    return cb_r;\n}}", rc, f.name, plist, rc, call).unwrap();
+                    let mut tparams = params.clone();
+                    tparams.push(format!("{} *cb_out", rc));
+                    writeln!(
+                        out,
+                        "int {n}_try({pl})\n{{\n    cb_lib_enter(cb_lib_init);\n    jmp_buf cb_jb;\n    if (setjmp(cb_jb) == 0) {{\n        cb_lib_jmp((void *)cb_jb);\n        {rc} cb_r = {call};\n        cb_lib_jmp(0);\n        cb_lib_leave();\n        *cb_out = cb_r;\n        return 0;\n    }}\n    cb_lib_leave();\n    return cb_lib_fault_code();\n}}",
+                        n = f.name, pl = tparams.join(", "), rc = rc, call = call
+                    )
+                    .unwrap();
+                }
+            }
+            header_text = self.header_text(&entry_c)?;
+        } else {
+            writeln!(
+                out,
+                // D-0077: the program runs on a thread with a large stack
+                // (reserved, not committed), as `coby` runs it; `main`'s own
+                // thread only starts it.
+                "static void cb_program(void)\n{{\n    cb_init(cb_files, {}, cb_types, {}, cb_type_ids);\n    cb_frame_push();\n    {}\n    cb_frame_pop();\n    cb_terminate_ok({});\n}}\nint main(int argc, char **argv)\n{{\n    cb_set_args(argc, argv);\n    cb_run_main(cb_program);\n}}",
+                self.files.len(),
+                self.descs.len(),
+                // `ok(s)`: `fn main() : u8`'s value, or 0 (`rule.fn.program`).
+                if main_u8 { format!("uint8_t cb_status = {}();", main_c) } else { format!("{}();", main_c) },
+                if main_u8 { "cb_status" } else { "0" }
+            )
+            .unwrap();
+        }
+        Ok(Generated {
+            fwd: self.fwd,
+            types: self.types,
+            strings: self.strings,
+            protos: self.protos,
+            thunks: self.thunks_out,
+            descs,
+            units: self.units,
+            tail: out,
+            header_text,
+        })
+    }
+
+    // External linkage only where it is needed. A function defined in a
+    // unit the program's own translation unit compiles, and named by no
+    // cacheable unit (cache.rs), is `static`: nothing outside that
+    // translation unit calls it by name (the runtime reaches functions
+    // through pointers, and foreign code is only called,
+    // `rule.trust.extern-code`), so the C compiler may inline it wherever
+    // it is called and drop it where it is not. Not `main`: inlined into
+    // `cb_program`, which only C's `main` calls, GCC would compile the
+    // whole program as code run once, for size (a `div` for a `%` by a
+    // constant, say).
+    pub(super) fn localize(&mut self, main_c: &str) {
+        let mut cached: HashSet<String> = HashSet::new();
+        for u in self.units.iter().filter(|u| u.cacheable) {
+            cached.extend(crate::cache::identifiers(&u.text).into_iter().map(str::to_string));
+        }
+        let mut local: HashSet<String> = HashSet::new();
+        let inline_sigs = std::mem::take(&mut self.inline_sigs);
+        for u in self.units.iter_mut().filter(|u| !u.cacheable) {
+            let mut out = String::with_capacity(u.text.len() + 64);
+            let mut lines = u.text.split('\n').peekable();
+            while let Some(l) = lines.next() {
+                if crate::cache::is_definition(l, lines.peek().copied()) {
+                    if let Some(n) = crate::cache::name_before_paren(l) {
+                        if n != main_c && !cached.contains(n) {
+                            local.insert(l.to_string());
+                            // D-0209: a direct-parameter dispatcher is
+                            // inlined at every call (`lower_fn_direct`).
+                            out.push_str(if inline_sigs.contains(l) { "static inline __attribute__((always_inline)) " } else { "static " });
+                        }
+                    }
+                }
+                out.push_str(l);
+                if lines.peek().is_some() {
+                    out.push('\n');
+                }
+            }
+            u.text = out;
+        }
+        let mut protos = String::with_capacity(self.protos.len() + 7 * local.len());
+        for l in self.protos.lines() {
+            if l.strip_suffix(';').map_or(false, |sig| local.contains(sig)) {
+                protos.push_str("static ");
+            }
+            protos.push_str(l);
+            protos.push('\n');
+        }
+        self.protos = protos;
+    }
+
+    // A closure's id (`closure_base`): unique in the program, the same
+    // whatever else the program contains.
+    pub(super) fn closure_id(&mut self) -> u64 {
+        self.uid += 1;
+        self.closure_base | self.uid as u64
+    }
+
+    pub(super) fn fresh(&mut self, prefix: &str) -> String {
+        self.uid += 1;
+        format!("{}{}", prefix, self.uid)
+    }
+
+    pub(super) fn loc(&mut self, line: usize) -> String {
+        let user = line.checked_sub(prelude::line_count()).filter(|&n| n >= 1);
+        match user.and_then(|n| self.map.resolve(n)) {
+            Some((file, l)) => {
+                let id = match self.file_ids.get(file) {
+                    Some(id) => *id,
+                    None => {
+                        let id = self.files.len() as u32;
+                        self.files.push(file.to_string());
+                        self.file_ids.insert(file.to_string(), id);
+                        id
+                    }
+                };
+                format!("{}u, {}u", id, l)
+            }
+            None => NOLOC.to_string(),
+        }
+    }
+
+    pub(super) fn request_fn(&mut self, name: &str, targs: Vec<Type>) -> R<String> {
+        let key = (name.to_string(), targs.clone());
+        if let Some(c) = self.fn_names.get(&key) {
+            return Ok(c.clone());
+        }
+        if !self.items.fns.contains_key(name) {
+            return internal(&format!("no function `{}`", name));
+        }
+        let c = fn_cname(name, &targs);
+        self.fn_names.insert(key.clone(), c.clone());
+        self.queue.push_back((key.0, key.1, 0));
+        Ok(c)
+    }
+
+    // The variant of a function compiled for confined arguments in the
+    // parameters `mask` names (`Fx::bind_confined`, `confining_table`).
+    pub(super) fn request_variant(&mut self, name: &str, targs: Vec<Type>, mask: u64) -> R<String> {
+        if mask == 0 {
+            return self.request_fn(name, targs);
+        }
+        let key = (name.to_string(), targs, mask);
+        if let Some(c) = self.variants.get(&key) {
+            return Ok(c.clone());
+        }
+        let c = format!("{}_c{}", fn_cname(name, &key.1), mask);
+        self.variants.insert(key.clone(), c.clone());
+        self.queue.push_back(key);
+        Ok(c)
+    }
+}
+
+// D-0274: `cobc --bootstrap-form` (`COBALTC_BOOTSTRAP_FORM=1`): every
+// optimisation off, the general checked form that the code generator
+// written in CobaltC reproduces.
+pub(crate) fn bootstrap_form() -> bool {
+    std::env::var("COBALTC_BOOTSTRAP_FORM").map_or(false, |v| !v.is_empty() && v != "0")
+}

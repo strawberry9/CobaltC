@@ -1,0 +1,214 @@
+// `--width N` (`private/cobfmt-proposal.md` §4.4), as
+// impl/cobfmt/src/width.rs gives it: a line longer than N whose
+// arguments, parameters or array elements are a bracketed list on that
+// line is broken one item per line, indented one level more, with a
+// trailing comma (D-0098), the closing bracket back at the line's
+// indentation. The outermost such list on the line is broken first; the
+// result is broken again while lines are still too long and a list is
+// left. A line holding a comment inside the list, or with no list of two
+// or more items, is left long. Nothing else is broken.
+
+import std;
+import lexer;
+import format;
+
+export fn break_long_lines(StringView text, usize width) : String
+{
+    String cur = String::from_view(text);
+    for (usize round = 0; round < 64; round += 1)
+    {
+        match (break_one(String::as_view(&cur), width))
+        {
+            Some(next) : cur = next,
+            None       : return cur,
+        }
+    }
+    cur
+}
+
+// The last line `k` whose start is at or before `pos`.
+fn line_of(ref<Vec<usize>, shared> starts, usize pos) : usize
+{
+    match (Vec::binary_search(starts, &pos))
+    {
+        Ok(k)  : k,
+        Err(k) : k - 1,
+    }
+}
+
+fn break_one(StringView text, usize width) : Option<String>
+{
+    bool crlf = StringView::contains(text, "\r\n");
+    String plain = StringView::replace(text, "\r\n", "\n");
+    bool bom = String::starts_with(&plain, "\u{feff}");
+    usize skip = if (bom) { 3 } else { 0 };
+    String body_text = String::from_view(String::view(&plain, skip, String::len(&plain)));
+    StringView body = String::as_view(&body_text);
+    Lexed lx = match (lex(&body_text))
+    {
+        Ok(lx) : lx,
+        Err(_) : return None,
+    };
+    ref<Vec<u8>, shared> bytes = String::as_bytes(&body_text);
+    usize len = StringView::len(body);
+    // Line start offsets.
+    Vec<usize> starts = Vec::new();
+    Vec::push(&mut starts, 0);
+    for (usize i = 0; i < len; i += 1)
+    {
+        if (bytes[i] == b'\n')
+        {
+            Vec::push(&mut starts, i + 1);
+        }
+    }
+    // Bracket matching.
+    usize nt = Vec::len(&lx.toks);
+    Vec<usize> close_of = Vec::filled(nt, NO);
+    Vec<usize> stack = Vec::new();
+    for (usize i = 0; i < nt; i += 1)
+    {
+        Tok t = lx.toks[i].tok;
+        if (t == Tok::LParen || t == Tok::LBracket || t == Tok::LBrace)
+        {
+            Vec::push(&mut stack, i);
+        }
+        else if (t == Tok::RParen || t == Tok::RBracket || t == Tok::RBrace)
+        {
+            match (Vec::pop(&mut stack))
+            {
+                Some(o) : close_of[o] = i,
+                None    : {},
+            }
+        }
+    }
+    usize nl = Vec::len(&starts);
+    // The first token at or after the current line's start: lines and
+    // tokens both run forward, so each token is passed once.
+    usize first = 0;
+    for (usize li = 0; li < nl; li += 1)
+    {
+        usize ls = starts[li];
+        usize le = if (li + 1 < nl) { starts[li + 1] - 1 } else { len };
+        while (first < nt && lx.toks[first].pos < ls)
+        {
+            first += 1;
+        }
+        StringView line = StringView::sub(body, ls, le);
+        if (char_count(line) <= width)
+        {
+            continue;
+        }
+        // The outermost `(`/`[` on this line closing on this line, with
+        // two or more items and no comment inside.
+        for (usize i = first; i < nt; i += 1)
+        {
+            Token t = lx.toks[i];
+            if (t.pos >= le)
+            {
+                break;
+            }
+            if (!(t.tok == Tok::LParen || t.tok == Tok::LBracket))
+            {
+                continue;
+            }
+            usize c = close_of[i];
+            if (c == NO || line_of(&starts, lx.toks[c].pos) != li)
+            {
+                continue;
+            }
+            bool commented = false;
+            for (usize k = i + 1; k <= c; k += 1)
+            {
+                if (lx.toks[k].tr_hi > lx.toks[k].tr_lo)
+                {
+                    commented = true;
+                }
+            }
+            if (commented)
+            {
+                continue;
+            }
+            // Top-level commas: not inside brackets, nor inside a type's
+            // `<…>` (`slice<u8, shared>`), which the house style writes
+            // against its name (`slice<`) while a comparison has spaces.
+            i32 depth = 0;
+            i32 angle = 0;
+            Vec<usize> commas = Vec::new();
+            for (usize k = i + 1; k < c; k += 1)
+            {
+                Tok tt = lx.toks[k].tok;
+                Token before = lx.toks[k - 1];
+                if (tt == Tok::LParen || tt == Tok::LBracket || tt == Tok::LBrace)
+                {
+                    depth += 1;
+                }
+                else if (tt == Tok::RParen || tt == Tok::RBracket || tt == Tok::RBrace)
+                {
+                    depth -= 1;
+                }
+                else if (tt == Tok::Lt)
+                {
+                    u8 last = bytes[before.pos + before.len - 1];
+                    if ((ascii_is_alnum(last) || last == b'_') && before.pos + before.len == lx.toks[k].pos)
+                    {
+                        angle += 1;
+                    }
+                }
+                else if (tt == Tok::Gt && angle > 0)
+                {
+                    angle -= 1;
+                }
+                else if (tt == Tok::Shr && angle > 0)
+                {
+                    angle = if (angle >= 2) { angle - 2 } else { 0 };
+                }
+                else if (tt == Tok::Comma && depth == 0 && angle == 0)
+                {
+                    Vec::push(&mut commas, k);
+                }
+            }
+            usize nc = Vec::len(&commas);
+            bool trailing = nc > 0 && commas[nc - 1] == c - 1;
+            usize items = nc + if (trailing) { 0 } else { 1 };
+            if (items < 2 || c == i + 1)
+            {
+                continue;
+            }
+            usize ind = 0;
+            while (ind < le - ls && bytes[ls + ind] == b' ')
+            {
+                ind += 1;
+            }
+            StringView indent = StringView::sub(line, 0, ind);
+            String out = String::from_view(StringView::sub(body, ls, t.pos + 1));
+            String::push_ascii(&mut out, b'\n');
+            usize from = i + 1;
+            if (!trailing)
+            {
+                Vec::push(&mut commas, c);
+            }
+            foreach (b in &commas)
+            {
+                usize s = lx.toks[from].pos;
+                usize e = lx.toks[*b - 1].pos + lx.toks[*b - 1].len;
+                String::append(&mut out, indent);
+                String::append(&mut out, "    ");
+                String::append(&mut out, StringView::sub(body, s, e));
+                String::append(&mut out, ",\n");
+                from = *b + 1;
+            }
+            String::append(&mut out, indent);
+            String::append(&mut out, StringView::sub(body, lx.toks[c].pos, le));
+            String whole = if (bom) { String::from_str("\u{feff}") } else { String::new() };
+            String::append(&mut whole, StringView::sub(body, 0, ls));
+            String::append(&mut whole, &out);
+            String::append(&mut whole, StringView::sub(body, le, len));
+            if (crlf)
+            {
+                return Some(String::replace(&whole, "\n", "\r\n"));
+            }
+            return Some(whole);
+        }
+    }
+    None
+}

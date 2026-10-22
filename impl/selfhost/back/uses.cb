@@ -1,0 +1,492 @@
+// What a function body does with its names, read off its syntax
+// (impl/cobc/src/lower/uses.rs): the bindings it assigns whole, and those it
+// borrows, captures or drops, which keep their runtime objects.
+
+import std;
+import ast;
+
+// The names a body assigns as a whole (`x = …`).
+export fn assigned_names(ref<Block, shared> b) : HashSet<String>
+{
+    HashSet<String> out = HashSet::new();
+    assigned_block(b, &mut out);
+    out
+}
+
+fn assigned_block(ref<Block, shared> b, ref<HashSet<String>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : assigned_expr(e, out),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : assigned_expr(&Box::get(d).init, out),
+            Stmt::SExpr(e)        : assigned_expr(Box::get(e), out),
+            Stmt::SBlockLike(e)   : assigned_expr(Box::get(e), out),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : assigned_expr(Box::get(t), out),
+        None    : {},
+    }
+}
+
+fn assigned_expr(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
+{
+    match (&e.kind)
+    {
+        ExprKind::EAssign(p) :
+        {
+            match (&Box::get(p).a.kind)
+            {
+                ExprKind::EPath(q) :
+                {
+                    if (Vec::len(&Box::get(q).segs) == 1)
+                    {
+                        HashSet::insert(out, String::clone(&Box::get(q).segs[0]));
+                    }
+                },
+                _                  : {},
+            }
+        },
+        _                    : {},
+    }
+    each_child(e, out, assigned_expr, assigned_block);
+}
+
+// Every direct sub-expression and sub-block of `e`, closures' bodies
+// included (`visit_expr`'s order).
+export fn each_child(
+    ref<Expr, shared> e,
+    ref<HashSet<String>, exclusive> out,
+    fn(ref<Expr, shared>, ref<HashSet<String>, exclusive>) on_expr,
+    fn(ref<Block, shared>, ref<HashSet<String>, exclusive>) on_block,
+)
+{
+    match (&e.kind)
+    {
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                on_expr(&f.value, out);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (x in es)
+            {
+                on_expr(x, out);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : on_expr(&Box::get(r).value, out),
+        ExprKind::EUnary(u)       : on_expr(&Box::get(u).e, out),
+        ExprKind::EBinary(b)      :
+        {
+            on_expr(&Box::get(b).a, out);
+            on_expr(&Box::get(b).b, out);
+        },
+        ExprKind::EBorrow(b)      : on_expr(&Box::get(b).e, out),
+        ExprKind::ESliceOf(s)     :
+        {
+            on_expr(&Box::get(s).base, out);
+            on_expr(&Box::get(s).lo, out);
+            on_expr(&Box::get(s).hi, out);
+        },
+        ExprKind::EDeref(x)       : on_expr(Box::get(x), out),
+        ExprKind::EField(f)       : on_expr(&Box::get(f).e, out),
+        ExprKind::EIndex(p)       :
+        {
+            on_expr(&Box::get(p).a, out);
+            on_expr(&Box::get(p).b, out);
+        },
+        ExprKind::ECall(c)        :
+        {
+            on_expr(&Box::get(c).callee, out);
+            foreach (a in &Box::get(c).args)
+            {
+                on_expr(a, out);
+            }
+        },
+        ExprKind::EAssign(p)      :
+        {
+            on_expr(&Box::get(p).a, out);
+            on_expr(&Box::get(p).b, out);
+        },
+        ExprKind::EPropagate(x)   : on_expr(Box::get(x), out),
+        ExprKind::EBlock(b)       : on_block(b, out),
+        ExprKind::EUnsafe(b)      : on_block(b, out),
+        ExprKind::EIf(i)          :
+        {
+            on_expr(&Box::get(i).cond, out);
+            on_block(&Box::get(i).then_, out);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : on_expr(x, out),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            on_expr(&Box::get(w).cond, out);
+            on_block(&Box::get(w).body, out);
+            match (&Box::get(w).step)
+            {
+                Some(x) : on_expr(x, out),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            on_expr(&Box::get(m).scrut, out);
+            foreach (a in &Box::get(m).arms)
+            {
+                match (&a.lit)
+                {
+                    Some(l) : on_expr(Box::get(l), out),
+                    None    : {},
+                }
+                on_expr(Box::get(&a.body), out);
+            }
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(x) : on_expr(Box::get(x), out),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(c)     : on_block(&Box::get(c).body, out),
+        ExprKind::EParen(x)       : on_expr(Box::get(x), out),
+        _                         : {},
+    }
+}
+
+// The binding whose own storage a place is part of. Through `*` the place is
+// the referent's: `&*r` borrows what `r` points to, and leaves `r` unborrowed.
+fn root(ref<Expr, shared> e) : Option<String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        ExprKind::EField(f) : root(&Box::get(f).e),
+        ExprKind::EIndex(p) : root(&Box::get(p).a),
+        ExprKind::EParen(x) : root(Box::get(x)),
+        _                   : None,
+    }
+}
+
+fn pin_root(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
+{
+    match (root(e))
+    {
+        Some(n) :
+        {
+            HashSet::insert(out, n);
+        },
+        None    : {},
+    }
+}
+
+// The names a body borrows (`&x…`, `&mut x…`), captures (a closure's capture
+// list), or drops (`drop(x…)`): the bindings whose checks may not be proven,
+// so they keep their runtime objects (`pinned_names`; in the bootstrap form
+// no argument is a pure direct one).
+export fn pinned_names(ref<Block, shared> b) : HashSet<String>
+{
+    HashSet<String> out = HashSet::new();
+    pinned_block(b, &mut out);
+    out
+}
+
+fn pinned_block(ref<Block, shared> b, ref<HashSet<String>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : pinned_expr(e, out),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : pinned_expr(&Box::get(d).init, out),
+            Stmt::SExpr(e)        : pinned_expr(Box::get(e), out),
+            Stmt::SBlockLike(e)   : pinned_expr(Box::get(e), out),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : pinned_expr(Box::get(t), out),
+        None    : {},
+    }
+}
+
+fn pinned_expr(ref<Expr, shared> e, ref<HashSet<String>, exclusive> out)
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(b)  :
+        {
+            pin_root(&Box::get(b).e, out);
+            pinned_expr(&Box::get(b).e, out);
+        },
+        ExprKind::ESliceOf(s) :
+        {
+            pin_root(&Box::get(s).base, out);
+            pinned_expr(&Box::get(s).base, out);
+            pinned_expr(&Box::get(s).lo, out);
+            pinned_expr(&Box::get(s).hi, out);
+        },
+        ExprKind::ECall(c)    :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    usize n = Vec::len(&Box::get(p).segs);
+                    if (n > 0 && String::eq_str(&Box::get(p).segs[n - 1], "drop") && Vec::len(&Box::get(c).args) > 0)
+                    {
+                        pin_root(&Box::get(c).args[0], out);
+                    }
+                },
+                _                  : {},
+            }
+            pinned_expr(&Box::get(c).callee, out);
+            foreach (a in &Box::get(c).args)
+            {
+                pinned_expr(a, out);
+            }
+        },
+        ExprKind::EClosure(c) :
+        {
+            foreach (n in &Box::get(c).captures)
+            {
+                HashSet::insert(out, String::clone(n));
+            }
+            pinned_block(&Box::get(c).body, out);
+        },
+        // A match arm's pattern literal is not visited.
+        ExprKind::EMatch(m)   :
+        {
+            pinned_expr(&Box::get(m).scrut, out);
+            foreach (a in &Box::get(m).arms)
+            {
+                pinned_expr(Box::get(&a.body), out);
+            }
+        },
+        _                     : each_child(e, out, pinned_expr, pinned_block),
+    }
+}
+
+// The line a statement's location is reported at.
+export fn stmt_line(ref<Stmt, shared> s) : Option<usize>
+{
+    match (s)
+    {
+        Stmt::SLet(l)         :
+        {
+            match (&Box::get(l).init)
+            {
+                Some(e) : Some(e.line),
+                None    : None,
+            }
+        },
+        Stmt::SDestructure(d) : Some(Box::get(d).init.line),
+        Stmt::SExpr(e)        : Some(Box::get(e).line),
+        Stmt::SBlockLike(e)   : Some(Box::get(e).line),
+    }
+}
+
+// `spec/15` §6: a capture is exclusive iff the body writes, exclusively
+// borrows, drops, or moves a place rooted at it (cobc's `body_writes`).
+export fn body_writes(ref<Block, shared> body, ref<String, shared> name) : bool
+{
+    bool found = false;
+    bw_block(body, name, &mut found);
+    found
+}
+
+fn bw_root_is(ref<Expr, shared> e, ref<String, shared> name) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)  : Vec::len(&Box::get(p).segs) == 1 && String::eq(&Box::get(p).segs[0], name),
+        ExprKind::EField(f) : bw_root_is(&Box::get(f).e, name),
+        ExprKind::EIndex(i) : bw_root_is(&Box::get(i).a, name),
+        ExprKind::EDeref(d) : bw_root_is(Box::get(d), name),
+        _                   : false,
+    }
+}
+
+fn bw_block(ref<Block, shared> b, ref<String, shared> name, ref<bool, exclusive> found)
+{
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SExpr(e)        : bw_expr(Box::get(e), name, found),
+            Stmt::SBlockLike(e)   : bw_expr(Box::get(e), name, found),
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : bw_expr(e, name, found),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : bw_expr(&Box::get(d).init, name, found),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : bw_expr(Box::get(t), name, found),
+        None    : {},
+    }
+}
+
+fn bw_expr(ref<Expr, shared> e, ref<String, shared> name, ref<bool, exclusive> found)
+{
+    match (&e.kind)
+    {
+        ExprKind::EAssign(pr)     :
+        {
+            if (bw_root_is(&Box::get(pr).a, name))
+            {
+                *found = true;
+            }
+            bw_expr(&Box::get(pr).a, name, found);
+            bw_expr(&Box::get(pr).b, name, found);
+        },
+        ExprKind::EBorrow(bb)     :
+        {
+            if (Box::get(bb).mode == Mode::Exclusive && bw_root_is(&Box::get(bb).e, name))
+            {
+                *found = true;
+            }
+            bw_expr(&Box::get(bb).e, name, found);
+        },
+        ExprKind::ESliceOf(sl)    :
+        {
+            if (Box::get(sl).mode == Mode::Exclusive && bw_root_is(&Box::get(sl).base, name))
+            {
+                *found = true;
+            }
+            bw_expr(&Box::get(sl).base, name, found);
+            bw_expr(&Box::get(sl).lo, name, found);
+            bw_expr(&Box::get(sl).hi, name, found);
+        },
+        ExprKind::EUnary(u)       : bw_expr(&Box::get(u).e, name, found),
+        ExprKind::EDeref(d)       : bw_expr(Box::get(d), name, found),
+        ExprKind::EField(f)       : bw_expr(&Box::get(f).e, name, found),
+        ExprKind::EParen(i)       : bw_expr(Box::get(i), name, found),
+        ExprKind::EPropagate(i)   : bw_expr(Box::get(i), name, found),
+        ExprKind::ECall(c)        :
+        {
+            bw_expr(&Box::get(c).callee, name, found);
+            foreach (a in &Box::get(c).args)
+            {
+                bw_expr(a, name, found);
+            }
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    usize n = Vec::len(&Box::get(p).segs);
+                    if (n > 0 && String::eq_str(
+                        &Box::get(p).segs[n - 1],
+                        "drop",
+                    ) && Vec::len(&Box::get(c).args) > 0 && bw_root_is(&Box::get(c).args[0], name))
+                    {
+                        *found = true;
+                    }
+                },
+                _                  : {},
+            }
+        },
+        ExprKind::EBinary(b)      :
+        {
+            bw_expr(&Box::get(b).a, name, found);
+            bw_expr(&Box::get(b).b, name, found);
+        },
+        ExprKind::EIndex(i)       :
+        {
+            bw_expr(&Box::get(i).a, name, found);
+            bw_expr(&Box::get(i).b, name, found);
+        },
+        ExprKind::EStructLit(sl)  :
+        {
+            foreach (f in &Box::get(sl).fields)
+            {
+                bw_expr(&f.value, name, found);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (x in es)
+            {
+                bw_expr(x, name, found);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : bw_expr(&Box::get(r).value, name, found),
+        ExprKind::EBlock(b)       : bw_block(b, name, found),
+        ExprKind::EUnsafe(b)      : bw_block(b, name, found),
+        ExprKind::EIf(i)          :
+        {
+            bw_expr(&Box::get(i).cond, name, found);
+            bw_block(&Box::get(i).then_, name, found);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : bw_expr(x, name, found),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            bw_expr(&Box::get(w).cond, name, found);
+            bw_block(&Box::get(w).body, name, found);
+            match (&Box::get(w).step)
+            {
+                Some(x) : bw_expr(x, name, found),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            bw_expr(&Box::get(m).scrut, name, found);
+            foreach (a in &Box::get(m).arms)
+            {
+                bw_expr(Box::get(&a.body), name, found);
+            }
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(x) : bw_expr(Box::get(x), name, found),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(c)     : bw_block(&Box::get(c).body, name, found),
+        _                         : {},
+    }
+}

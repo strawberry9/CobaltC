@@ -1,0 +1,88 @@
+// CONFORMANCE-CASE
+// spec: 08-alias-validity
+// facility: rule.alias.borrow, [Read]/[Write] (`¬clash`), `spec/08` §4 (a path's standing is stable); conf.state-and-input-arguments-disjoint
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3720320a3220310a380a33360a38340a31360a
+//
+// One exclusive reference beside shared ones, each to plain data, in the
+// arguments' every disjoint shape: a slice of a `Vec` with a shared
+// struct, two exclusive disjoint fields of one struct, a field beside a
+// slice of its sibling, a call through a fn value, the same calls in a
+// spawned thread, and a sub-range of an array. None of them clash.
+// (D-0188: `cobc` runs such a body without per-access checks once its
+// entry has found the arguments valid and disjoint.)
+
+import std;
+
+struct Cfg
+{
+    u8 add;
+    u8 mul;
+}
+
+struct Pair
+{
+    array<u8, 4> a;
+    array<u8, 4> b;
+    u32 n;
+}
+
+fn apply(slice<u8, exclusive> dst, ref<Cfg, shared> c)
+{
+    for (usize i = 0; i < slice_len(dst); i += 1)
+    {
+        dst[i] = wrapping_add(wrapping_mul(dst[i], c.mul), c.add);
+    }
+}
+
+fn swap_fields(ref<array<u8, 4>, exclusive> x, ref<array<u8, 4>, exclusive> y)
+{
+    for (usize i = 0; i < 4; i += 1)
+    {
+        u8 t = x[i];
+        x[i] = y[i];
+        y[i] = t;
+    }
+}
+
+fn count_into(ref<u32, exclusive> n, slice<u8, shared> s)
+{
+    for (usize i = 0; i < slice_len(s); i += 1)
+    {
+        *n = *n + widen<u32>(s[i]);
+    }
+}
+
+fn work(u8 k) : u32
+{
+    Vec<u8> v = Vec::filled(8, k);
+    Cfg c = Cfg { .add = 1, .mul = 3 };
+    apply(&mut v[0..4], &c);
+    u32 total = 0;
+    count_into(&mut total, &v[0..$]);
+    total
+}
+
+fn main()
+{
+    Vec<u8> v = Vec::filled(8, 2: u8);
+    Cfg c = Cfg { .add = 1, .mul = 3 };
+    apply(&mut v[0..4], &c);
+    printf("%u %u\n", v[0], v[5]);
+    Pair p = Pair { .a = [1; 4], .b = [2; 4], .n = 0 };
+    swap_fields(&mut p.a, &mut p.b);
+    printf("%u %u\n", p.a[0], p.b[0]);
+    count_into(&mut p.n, &p.a[0..$]);
+    printf("%u\n", p.n);
+    fn(ref<u32, exclusive>, slice<u8, shared>) g = count_into;
+    u32 m = 0;
+    g(&mut m, &v[0..$]);
+    printf("%u\n", m);
+    auto h = spawn(work, 5: u8);
+    printf("%u\n", join(h));
+    array<u8, 8> arr = [4; 8];
+    u32 q = 0;
+    count_into(&mut q, &arr[2..6]);
+    printf("%u\n", q);
+}

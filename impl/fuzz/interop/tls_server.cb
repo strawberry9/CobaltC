@@ -1,0 +1,50 @@
+// Interop (WI-7): std::tls's server for another client. Usage:
+// tls_server KEYFILE CERTFILE COUNT. Listens on a loopback port, prints
+// `port N`, and serves COUNT connections: each reads a line and answers
+// `echo <line>`; a handshake that fails prints `handshake failed: <text>`.
+import std;
+
+fn main() : u8
+{
+    String key_pem = Result::unwrap(read_file(String::as_view(&Result::unwrap(arg(0)))));
+    String crt_pem = Result::unwrap(read_file(String::as_view(&Result::unwrap(arg(1)))));
+    usize count = Result::unwrap(StringView::parse<usize>(String::as_view(&Result::unwrap(arg(2)))));
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(String::as_view(&key_pem)));
+    Vec<Certificate> chain = certificates_from_pem(String::as_view(&crt_pem));
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    printf("port %v\n", TcpListener::local_addr(&l).port);
+    flush_stdout();
+    for (usize i = 0; i < count; i += 1)
+    {
+        TcpStream tcp = match (TcpListener::accept(&mut l))
+        {
+            Ok(t)  : t,
+            Err(_) : continue,
+        };
+        TlsStream s = match (TlsStream::server(tcp, &key, &chain[0..$]))
+        {
+            Ok(s)  : s,
+            Err(e) :
+            {
+                printf("handshake failed: %v\n", TlsError::text(&e));
+                flush_stdout();
+                continue;
+            },
+        };
+        match (TlsStream::read_line(&mut s))
+        {
+            Ok(Some(line)) :
+            {
+                _ = TlsStream::write_text(&mut s, "echo ");
+                _ = TlsStream::write_text(&mut s, String::as_view(&line));
+                _ = TlsStream::write_text(&mut s, "\n");
+                printf("served %v\n", &line);
+            },
+            Ok(None)       : printf("closed\n"),
+            Err(e)         : printf("read failed: %v\n", TlsError::text(&e)),
+        }
+        flush_stdout();
+        _ = TlsStream::close(&mut s);
+    }
+    0
+}

@@ -1,0 +1,49 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.atomic `AtomicPtr` (all operations); D-0253; conf.atomic-ptr
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 696e7374616c6c65640a616c726561647920626173650a726561642033300a6e756c6c206e6f77206e6f0a
+//
+// One thread publishes the address of an array it owns through an
+// `AtomicPtr` and sets a ready flag; another waits for the flag, loads the
+// address and reads through it (`unsafe`). Taking and storing addresses is
+// safe; `compare_exchange` installs an address only over the one expected.
+
+import std;
+
+fn main()
+{
+    array<i64, 4> data = [10, 20, 30, 40];
+    i64 other = 0;
+    AtomicPtr<i64> slot = AtomicPtr::new(null_rawptr<i64>());
+    AtomicBool ready = AtomicBool::new(false);
+    {
+        handle<i64> reader = spawn(move [](ref<AtomicPtr<i64>, shared> slot, ref<AtomicBool, shared> ready) : i64
+        {
+            AtomicBool::wait(ready, false);
+            rawptr<i64> p = AtomicPtr::load(slot);
+            unsafe
+            {
+                *(p + 2)
+            }
+        }, &slot, &ready);
+        rawptr<i64> base = reinterpret_ptr<i64>(rawptr_of(&data));
+        match (AtomicPtr::compare_exchange(&slot, null_rawptr<i64>(), base))
+        {
+            Ok(_)  : printf("installed\n"),
+            Err(_) : printf("not installed\n"),
+        }
+        match (AtomicPtr::compare_exchange(&slot, null_rawptr<i64>(), rawptr_of(&other)))
+        {
+            Ok(_)  : printf("installed twice\n"),
+            Err(p) : printf("already %s\n", if (p == base) { "base" } else { "other" }),
+        }
+        AtomicBool::store(&ready, true);
+        AtomicBool::notify_all(&ready);
+        printf("read %d\n", join(reader));
+    }
+    rawptr<i64> old = AtomicPtr::swap(&slot, null_rawptr<i64>());
+    AtomicPtr::store(&slot, old);
+    printf("null now %s\n", if (is_null(AtomicPtr::load(&slot))) { "yes" } else { "no" });
+}

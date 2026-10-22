@@ -1,0 +1,1353 @@
+// The tokens of a CobaltC source file, as coby's lexer gives them
+// (impl/src/lexer.rs), in two forms: with what comes between them (line
+// breaks and comments) for the formatter (`lex`, as
+// `Lexer::tokenize_with_trivia`), and with their values decoded for the
+// parser (`lex_tokens`, as `Lexer::tokenize`: adjacent string literals
+// joined, D-0078). Both scan with the same code and fail with coby's
+// messages. A trivia token's text is never copied: it is
+// `src[pos..pos + len]`.
+
+import std;
+
+// A token's kind; a literal's or a name's text is in the source.
+export enum Tok
+{
+    Int,
+    Float,
+    Str,
+    Bytes,
+    True,
+    False,
+    Ident,
+    TypeName,
+    Fn,
+    Struct,
+    Enum,
+    Resource,
+    Bitstruct,
+    Match,
+    If,
+    Else,
+    While,
+    For,
+    Foreach,
+    Unittest,
+    Const,
+    Static,
+    Return,
+    Auto,
+    Module,
+    Import,
+    Export,
+    Unsafe,
+    Extern,
+    Break,
+    Continue,
+    Move,
+    Mut,
+    As,
+    Void,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semi,
+    Colon,
+    ColonColon,
+    Dot,
+    DotDot,
+    Dollar,
+    Question,
+    Eq,
+    EqEq,
+    NotEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    AndAnd,
+    OrOr,
+    Not,
+    Tilde,
+    Amp,
+    Pipe,
+    Caret,
+    Shl,
+    Shr,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+    Eof,
+}
+
+// What comes between tokens: a line break, a `// …` comment (without its
+// line break) or a `/* … */` comment (line breaks inside included).
+export const u8 TRIVIA_NEWLINE = 0;
+export const u8 TRIVIA_LINE = 1;
+export const u8 TRIVIA_BLOCK = 2;
+
+export struct Trivia
+{
+    export u8 kind;
+    export usize pos;                 // the comment's first byte
+    export usize len;
+}
+
+// A token: its kind, its text `src[pos..pos + len]`, and the trivia
+// before it, `trivia[tr_lo..tr_hi]`. The last token is
+// `Tok::Eof`, carrying the trivia at the end of the file.
+export struct Token
+{
+    export Tok tok;
+    export usize pos;
+    export usize len;
+    export usize tr_lo;
+    export usize tr_hi;
+}
+
+export struct Lexed
+{
+    export Vec<Token> toks;
+    export Vec<Trivia> trivia;
+}
+
+export struct LexError
+{
+    export String msg;
+    export usize line;
+    export usize col;
+}
+
+// A token for the parser: its kind and place, and its value: a name's or
+// a type name's text, a string literal's decoded text, a numeric
+// literal's value and `: type` suffix, a byte string's bytes.
+export struct PTok
+{
+    export Tok tok;
+    export usize line;
+    export usize col;
+    export String text;
+    export u128 ival;
+    export f64 fval;
+    export Option<String> sfx;
+    export Vec<u8> bytes;
+}
+
+fn ptok(Tok tok, usize line, usize col) : PTok
+{
+    PTok {
+        .tok = tok,
+        .line = line,
+        .col = col,
+        .text = String::new(),
+        .ival = 0,
+        .fval = 0.0,
+        .sfx = None,
+        .bytes = Vec::new(),
+    }
+}
+
+// The zeros after the text: more than any scanner reads past its end
+// (`b'\\x41'` at the very end reads six bytes on).
+const usize PAD = 8;
+
+// The text's bytes followed by `PAD` zeros, so a scanner reads `b[i]` a
+// few bytes past the end with no test of its own (a 0 is the end of the
+// text, as a NUL in it is to coby's lexer).
+fn padded(ref<String, shared> src) : Vec<u8>
+{
+    Vec<u8> b = Vec::clone(String::as_bytes(src));
+    for (usize i = 0; i < PAD; i += 1)
+    {
+        Vec::push(&mut b, 0);
+    }
+    b
+}
+
+// Where `pos` is, as a line and a column (in bytes), both from 1.
+fn locate(ref<Vec<u8>, shared> b, usize pos) : LexError
+{
+    usize line = 1;
+    usize col = 1;
+    for (usize i = 0; i < pos; i += 1)
+    {
+        if (b[i] == b'\n')
+        {
+            line += 1;
+            col = 1;
+        }
+        else
+        {
+            col += 1;
+        }
+    }
+    LexError { .msg = String::new(), .line = line, .col = col }
+}
+
+fn lex_error(ref<Vec<u8>, shared> b, StringView msg, usize pos) : LexError
+{
+    LexError e = locate(b, pos);
+    e.msg = String::from_view(msg);
+    e
+}
+
+fn is_word_byte(u8 c) : bool
+{
+    c == b'_' || ascii_is_alnum(c)
+}
+
+fn hex_val(u8 c) : u8
+{
+    if (ascii_is_digit(c))
+    {
+        return c - b'0';
+    }
+    if (c >= b'a' && c <= b'f')
+    {
+        return c - b'a' + 10;
+    }
+    if (c >= b'A' && c <= b'F')
+    {
+        return c - b'A' + 10;
+    }
+    16
+}
+
+fn hex_digit(u8 c) : bool
+{
+    hex_val(c) < 16
+}
+
+// A token ending at `end`, of kind `tok`; a number's value and suffix
+// (`sfx_lo..sfx_hi`, empty for none).
+struct Scanned
+{
+    Tok tok;
+    usize end;
+    u128 value;
+    usize sfx_lo;
+    usize sfx_hi;
+}
+
+fn scanned(Tok tok, usize end) : Result<Scanned, LexError>
+{
+    Ok(Scanned { .tok = tok, .end = end, .value = 0, .sfx_lo = 0, .sfx_hi = 0 })
+}
+
+// The trivia at `pos` (spaces skipped, line breaks and comments recorded
+// when `keep`); the position after it.
+fn skip_trivia(
+    ref<Vec<u8>, shared> b,
+    usize from,
+    bool keep,
+    ref<Vec<Trivia>, exclusive> trivia,
+) : Result<usize, LexError>
+{
+    usize pos = from;
+    while (true)
+    {
+        u8 c = b[pos];
+        if (c == b'\n')
+        {
+            if (keep)
+            {
+                Vec::push(trivia, Trivia { .kind = TRIVIA_NEWLINE, .pos = pos, .len = 1 });
+            }
+            pos += 1;
+        }
+        else if (c == b' ' || c == b'\t' || c == b'\r')
+        {
+            pos += 1;
+        }
+        else if (c == b'/' && b[pos + 1] == b'/')
+        {
+            usize start = pos;
+            while (b[pos] != b'\n' && b[pos] != 0)
+            {
+                pos += 1;
+            }
+            if (keep)
+            {
+                Vec::push(trivia, Trivia { .kind = TRIVIA_LINE, .pos = start, .len = pos - start });
+            }
+        }
+        else if (c == b'/' && b[pos + 1] == b'*')
+        {
+            usize start = pos;
+            pos += 2;
+            while (true)
+            {
+                if (b[pos] == 0)
+                {
+                    return Err(lex_error(b, "unterminated block comment", start));
+                }
+                if (b[pos] == b'*' && b[pos + 1] == b'/')
+                {
+                    pos += 2;
+                    break;
+                }
+                pos += 1;
+            }
+            if (keep)
+            {
+                Vec::push(trivia, Trivia { .kind = TRIVIA_BLOCK, .pos = start, .len = pos - start });
+            }
+        }
+        else
+        {
+            return Ok(pos);
+        }
+    }
+    Ok(pos)
+}
+
+// The source's tokens and trivia (for the formatter), or the first
+// lexical error.
+export fn lex(ref<String, shared> src) : Result<Lexed, LexError>
+{
+    Vec<u8> padded_bytes = padded(src);
+    ref<Vec<u8>, shared> b = &padded_bytes;
+    Vec<Token> toks = Vec::new();
+    Vec<Trivia> trivia = Vec::new();
+    usize pos = 0;
+    while (true)
+    {
+        usize tr_lo = Vec::len(&trivia);
+        pos = skip_trivia(b, pos, true, &mut trivia)?;
+        usize tr_hi = Vec::len(&trivia);
+        if (b[pos] == 0)
+        {
+            Vec::push(&mut toks, Token { .tok = Tok::Eof, .pos = pos, .len = 0, .tr_lo = tr_lo, .tr_hi = tr_hi });
+            break;
+        }
+        Scanned t = next_token(b, pos)?;
+        Tok tok = if (t.tok == Tok::Ident) { keyword(String::view(src, pos, t.end)) } else { t.tok };
+        Vec::push(&mut toks, Token { .tok = tok, .pos = pos, .len = t.end - pos, .tr_lo = tr_lo, .tr_hi = tr_hi });
+        pos = t.end;
+    }
+    Ok(Lexed { .toks = toks, .trivia = trivia })
+}
+
+// The source's tokens with their values (for the parser), or the first
+// lexical error, as `Lexer::tokenize` gives them: the last is `Tok::Eof`,
+// and adjacent string literals are one (D-0078).
+export fn lex_tokens(ref<String, shared> src) : Result<Vec<PTok>, LexError>
+{
+    Vec<u8> padded_bytes = padded(src);
+    ref<Vec<u8>, shared> b = &padded_bytes;
+    Vec<PTok> toks = Vec::new();
+    Vec<Trivia> none = Vec::new();
+    usize pos = 0;
+    // The line and column of `at`, carried forward.
+    usize at = 0;
+    usize line = 1;
+    usize col = 1;
+    while (true)
+    {
+        pos = skip_trivia(b, pos, false, &mut none)?;
+        while (at < pos)
+        {
+            if (b[at] == b'\n')
+            {
+                line += 1;
+                col = 1;
+            }
+            else
+            {
+                col += 1;
+            }
+            at += 1;
+        }
+        if (b[pos] == 0)
+        {
+            Vec::push(&mut toks, ptok(Tok::Eof, line, col));
+            break;
+        }
+        Scanned s = next_token(b, pos)?;
+        Tok tok = if (s.tok == Tok::Ident) { keyword(String::view(src, pos, s.end)) } else { s.tok };
+        PTok t = ptok(tok, line, col);
+        if (tok == Tok::Ident || tok == Tok::TypeName)
+        {
+            t.text = String::from_view(String::view(src, pos, s.end));
+        }
+        else if (tok == Tok::Int || tok == Tok::Float)
+        {
+            t.ival = s.value;
+            if (s.sfx_hi > s.sfx_lo)
+            {
+                t.sfx = Some(String::from_view(String::view(src, s.sfx_lo, s.sfx_hi)));
+            }
+            if (tok == Tok::Float)
+            {
+                t.fval = float_value(b, pos, s.end);
+            }
+            if (b[pos] == b'b' && b[pos + 1] == b'\'')
+            {
+                t.sfx = Some(String::from_str("byte"));
+            }
+        }
+        else if (tok == Tok::Str)
+        {
+            t.text = decode_str(b, pos);
+        }
+        else if (tok == Tok::Bytes)
+        {
+            t.bytes = decode_bytes(b, pos + 1);
+        }
+        pos = s.end;
+        // D-0078: adjacent string literals are one literal.
+        usize n = Vec::len(&toks);
+        if (tok == Tok::Str && n > 0 && toks[n - 1].tok == Tok::Str)
+        {
+            String::append(&mut toks[n - 1].text, &t.text);
+            continue;
+        }
+        Vec::push(&mut toks, t);
+    }
+    Ok(toks)
+}
+
+fn next_token(ref<Vec<u8>, shared> b, usize pos) : Result<Scanned, LexError>
+{
+    u8 c = b[pos];
+    if (ascii_is_digit(c))
+    {
+        return lex_number(b, pos);
+    }
+    if (c == b'"')
+    {
+        return lex_quoted(b, pos, false);
+    }
+    if (c == b'b' && b[pos + 1] == b'"')
+    {
+        return lex_quoted(b, pos + 1, true);
+    }
+    if (c == b'b' && b[pos + 1] == b'\'')
+    {
+        return lex_byte(b, pos + 1);
+    }
+    if (c == b'_' || ascii_is_alpha(c))
+    {
+        usize end = pos;
+        while (is_word_byte(b[end]))
+        {
+            end += 1;
+        }
+        // A name or a keyword: the caller tells which from the text.
+        return scanned(Tok::Ident, end);
+    }
+    u8 n = b[pos + 1];
+    // The operators of two or three bytes take what follows.
+    Tok two = match (c)
+    {
+        b'.' : if (n == b'.') { Tok::DotDot } else { Tok::Eof },
+        b'^' : if (n == b'=') { Tok::CaretEq } else { Tok::Eof },
+        b'+' : if (n == b'=') { Tok::PlusEq } else { Tok::Eof },
+        b'-' : if (n == b'=') { Tok::MinusEq } else { Tok::Eof },
+        b'*' : if (n == b'=') { Tok::StarEq } else { Tok::Eof },
+        b'/' : if (n == b'=') { Tok::SlashEq } else { Tok::Eof },
+        b'%' : if (n == b'=') { Tok::PercentEq } else { Tok::Eof },
+        b':' : if (n == b':') { Tok::ColonColon } else { Tok::Eof },
+        b'=' : if (n == b'=') { Tok::EqEq } else { Tok::Eof },
+        b'!' : if (n == b'=') { Tok::NotEq } else { Tok::Eof },
+        b'<' : if (n == b'=') { Tok::Le } else if (n == b'<') { Tok::Shl } else { Tok::Eof },
+        b'>' : if (n == b'=') { Tok::Ge } else if (n == b'>') { Tok::Shr } else { Tok::Eof },
+        b'&' : if (n == b'&') { Tok::AndAnd } else if (n == b'=') { Tok::AmpEq } else { Tok::Eof },
+        b'|' : if (n == b'|') { Tok::OrOr } else if (n == b'=') { Tok::PipeEq } else { Tok::Eof },
+        _    : Tok::Eof,
+    };
+    if (two != Tok::Eof)
+    {
+        if ((two == Tok::Shl || two == Tok::Shr) && b[pos + 2] == b'=')
+        {
+            return scanned(if (two == Tok::Shl) { Tok::ShlEq } else { Tok::ShrEq }, pos + 3);
+        }
+        return scanned(two, pos + 2);
+    }
+    Tok one = match (c)
+    {
+        b'(' : Tok::LParen,
+        b')' : Tok::RParen,
+        b'{' : Tok::LBrace,
+        b'}' : Tok::RBrace,
+        b'[' : Tok::LBracket,
+        b']' : Tok::RBracket,
+        b',' : Tok::Comma,
+        b';' : Tok::Semi,
+        b'.' : Tok::Dot,
+        b'$' : Tok::Dollar,
+        b'?' : Tok::Question,
+        b'~' : Tok::Tilde,
+        b'^' : Tok::Caret,
+        b'+' : Tok::Plus,
+        b'-' : Tok::Minus,
+        b'*' : Tok::Star,
+        b'/' : Tok::Slash,
+        b'%' : Tok::Percent,
+        b':' : Tok::Colon,
+        b'=' : Tok::Eq,
+        b'!' : Tok::Not,
+        b'<' : Tok::Lt,
+        b'>' : Tok::Gt,
+        b'&' : Tok::Amp,
+        b'|' : Tok::Pipe,
+        _    : Tok::Eof,
+    };
+    if (one != Tok::Eof)
+    {
+        return scanned(one, pos + 1);
+    }
+    Err(unexpected(b, pos))
+}
+
+// coby's message for a byte that begins no token.
+fn unexpected(ref<Vec<u8>, shared> b, usize pos) : LexError
+{
+    u8 c = b[pos];
+    u8 n = b[pos + 1];
+    if (c == b'#')
+    {
+        return lex_error(
+            b,
+            "unexpected character '#': CobaltC has no preprocessor; `import std;` brings in the standard library, `module m \"./m.cb\";` another file, and `const` names a constant",
+            pos,
+        );
+    }
+    if (c == b'\'' && (ascii_is_alpha(n) || n == b'_') && b[pos + 2] != b'\'')
+    {
+        return lex_error(
+            b,
+            "a lifetime (`'a`): CobaltC has no lifetime parameters (CHG-0022); a reference's validity is checked without them, so write `ref<T, shared>` alone",
+            pos,
+        );
+    }
+    if (c == b'\'')
+    {
+        return lex_error(
+            b,
+            "there is no character literal (spec/22 §5): a byte is `b'x'`, a `u8`; a code point is `widen<u32>(b'x')`; text is `\"x\"`",
+            pos,
+        );
+    }
+    if (c >= 0x80)
+    {
+        // The whole character, as Rust's `{:?}` shows it.
+        usize end = pos + 1;
+        while (end < pos + 4 && (b[end] & 0xC0) == 0x80)
+        {
+            end += 1;
+        }
+        String ch = String::from_str("'");
+        match (StringView::from_utf8(&b[pos..end]))
+        {
+            Ok(v)  : char_debug(&mut ch, v),
+            Err(_) : String::append(&mut ch, "\u{fffd}"),
+        }
+        String::push_ascii(&mut ch, b'\'');
+        return lex_error(
+            b,
+            String::as_view(&sprintf(
+                "unexpected character %s: a name is ASCII letters, digits and `_` (spec/22 §1); other text belongs in a text literal",
+                &ch,
+            )),
+            pos,
+        );
+    }
+    String shown = String::from_str("'");
+    if (c == b'\\')
+    {
+        String::append(&mut shown, "\\\\");
+    }
+    else if (c < 0x20 || c == 0x7F)
+    {
+        String::appendf(&mut shown, "\\u{%x}", c);
+    }
+    else
+    {
+        String::push_ascii(&mut shown, c);
+    }
+    String::push_ascii(&mut shown, b'\'');
+    lex_error(b, String::as_view(&sprintf("unexpected character %s", &shown)), pos)
+}
+
+// A character inside `'…'` as Rust's `char::escape_debug` writes it: as
+// itself, or `\u{…}` for one that is not printable (a control or a format
+// character, a combining mark).
+fn char_debug(ref<String, exclusive> out, StringView v)
+{
+    u32 cp = Option::unwrap_or(StringView::code_point(v), 0xFFFD);
+    bool hidden = (cp >= 0x80 && cp <= 0x9F) || cp == 0xAD || (cp >= 0x300 && cp <= 0x36F) || (cp >= 0x200B && cp <= 0x200F)
+        || (cp >= 0x2028 && cp <= 0x202E) || (cp >= 0x2060 && cp <= 0x2064) || cp == 0xFEFF || (cp >= 0xFFF9 && cp <= 0xFFFB);
+    if (hidden)
+    {
+        String::appendf(out, "\\u{%x}", cp);
+    }
+    else
+    {
+        String::append(out, v);
+    }
+}
+
+const array<str, 24> TYPE_NAMES = [
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "isize", "usize",
+    "f32", "f64", "bool", "str", "ref", "rawptr", "array", "handle", "mutex", "guard", "slice", "simd",
+];
+
+fn keyword(StringView w) : Tok
+{
+    match (StringView::len(w))
+    {
+        2 :
+        {
+            if (StringView::eq_str(w, "fn")) { return Tok::Fn; }
+            if (StringView::eq_str(w, "if")) { return Tok::If; }
+            if (StringView::eq_str(w, "as")) { return Tok::As; }
+        },
+        3 :
+        {
+            if (StringView::eq_str(w, "for")) { return Tok::For; }
+            if (StringView::eq_str(w, "mut")) { return Tok::Mut; }
+        },
+        4 :
+        {
+            if (StringView::eq_str(w, "enum")) { return Tok::Enum; }
+            if (StringView::eq_str(w, "else")) { return Tok::Else; }
+            if (StringView::eq_str(w, "auto")) { return Tok::Auto; }
+            if (StringView::eq_str(w, "move")) { return Tok::Move; }
+            if (StringView::eq_str(w, "void")) { return Tok::Void; }
+            if (StringView::eq_str(w, "true")) { return Tok::True; }
+        },
+        5 :
+        {
+            if (StringView::eq_str(w, "match")) { return Tok::Match; }
+            if (StringView::eq_str(w, "while")) { return Tok::While; }
+            if (StringView::eq_str(w, "const")) { return Tok::Const; }
+            if (StringView::eq_str(w, "break")) { return Tok::Break; }
+            if (StringView::eq_str(w, "false")) { return Tok::False; }
+        },
+        6 :
+        {
+            if (StringView::eq_str(w, "struct")) { return Tok::Struct; }
+            if (StringView::eq_str(w, "static")) { return Tok::Static; }
+            if (StringView::eq_str(w, "return")) { return Tok::Return; }
+            if (StringView::eq_str(w, "module")) { return Tok::Module; }
+            if (StringView::eq_str(w, "import")) { return Tok::Import; }
+            if (StringView::eq_str(w, "export")) { return Tok::Export; }
+            if (StringView::eq_str(w, "unsafe")) { return Tok::Unsafe; }
+            if (StringView::eq_str(w, "extern")) { return Tok::Extern; }
+        },
+        7 :
+        {
+            if (StringView::eq_str(w, "foreach")) { return Tok::Foreach; }
+        },
+        8 :
+        {
+            if (StringView::eq_str(w, "resource")) { return Tok::Resource; }
+            if (StringView::eq_str(w, "unittest")) { return Tok::Unittest; }
+            if (StringView::eq_str(w, "continue")) { return Tok::Continue; }
+        },
+        9 :
+        {
+            if (StringView::eq_str(w, "bitstruct")) { return Tok::Bitstruct; }
+        },
+        _ : {},
+    }
+    if (is_type_name(w))
+    {
+        return Tok::TypeName;
+    }
+    Tok::Ident
+}
+
+// The integer types and the other built-in type names, which the lexer
+// gives a kind of their own.
+export fn is_type_name(StringView w) : bool
+{
+    for (usize i = 0; i < 24; i += 1)
+    {
+        if (StringView::eq_str(w, TYPE_NAMES[i]))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether `b[lo..hi]` names a numeric type: `i` or `u` and `8`, `16`,
+// `32`, `64`, `128` or `size`; `f32`, `f64`. Read from the bytes, with no
+// slice of them taken.
+fn numeric_type_at(ref<Vec<u8>, shared> b, usize lo, usize hi) : bool
+{
+    if (hi <= lo + 1)
+    {
+        return false;
+    }
+    u8 c = b[lo];
+    usize n = hi - lo;
+    if (c == b'f')
+    {
+        return n == 3 && ((b[lo + 1] == b'3' && b[lo + 2] == b'2') || (b[lo + 1] == b'6' && b[lo + 2] == b'4'));
+    }
+    if (c != b'i' && c != b'u')
+    {
+        return false;
+    }
+    if (n == 5 && b[lo + 1] == b's' && b[lo + 2] == b'i' && b[lo + 3] == b'z' && b[lo + 4] == b'e')
+    {
+        return true;
+    }
+    if (n == 2)
+    {
+        return b[lo + 1] == b'8';
+    }
+    if (n == 3)
+    {
+        u8 x = b[lo + 1];
+        u8 y = b[lo + 2];
+        return (x == b'1' && y == b'6') || (x == b'3' && y == b'2') || (x == b'6' && y == b'4');
+    }
+    n == 4 && b[lo + 1] == b'1' && b[lo + 2] == b'2' && b[lo + 3] == b'8'
+}
+
+// `"…"` or `b"…"`, `q` at the opening quote; an error is reported at the
+// quote, as coby's lexer does.
+fn lex_quoted(ref<Vec<u8>, shared> b, usize q, bool bytes) : Result<Scanned, LexError>
+{
+    StringView what = if (bytes) { "byte literal" } else { "string literal" };
+    usize pos = q + 1;
+    usize n = 0;
+    while (true)
+    {
+        u8 c = b[pos];
+        if (c == 0 || c == b'\n')
+        {
+            return Err(lex_error(b, String::as_view(&sprintf("unterminated %v", what)), q));
+        }
+        if (c == b'"')
+        {
+            pos += 1;
+            break;
+        }
+        if (c == b'\\')
+        {
+            u8 e = b[pos + 1];
+            pos += 2;
+            if (e == b'x' && bytes)
+            {
+                if (!hex_digit(b[pos]) || !hex_digit(b[pos + 1]))
+                {
+                    return Err(lex_error(b, "invalid \\x escape in byte literal", q));
+                }
+                pos += 2;
+            }
+            else if (e == b'u' && !bytes)
+            {
+                if (b[pos] != b'{')
+                {
+                    return Err(lex_error(b, "invalid \\u escape in string literal: expected '{'", q));
+                }
+                pos += 1;
+                u32 cp = 0;
+                usize digits = 0;
+                while (true)
+                {
+                    u8 d = b[pos];
+                    pos += 1;
+                    if (d == b'}')
+                    {
+                        break;
+                    }
+                    if (!hex_digit(d) || digits >= 6)
+                    {
+                        return Err(lex_error(b, "invalid \\u escape in string literal", q));
+                    }
+                    cp = cp * 16 + widen<u32>(hex_val(d));
+                    digits += 1;
+                }
+                if (digits == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+                {
+                    return Err(lex_error(b, "invalid \\u escape in string literal: not a scalar value", q));
+                }
+            }
+            else if (!(e == b'n' || e == b'r' || e == b't' || e == b'0' || e == b'\\' || e == b'"'))
+            {
+                return Err(lex_error(b, String::as_view(&sprintf("invalid escape in %v", what)), q));
+            }
+            n += 1;
+            continue;
+        }
+        if (bytes && c >= 0x80)
+        {
+            return Err(lex_error(b, "non-ASCII character in byte literal", q));
+        }
+        pos += 1;
+        n += 1;
+    }
+    if (bytes)
+    {
+        if (n == 0)
+        {
+            return Err(lex_error(b, "empty byte literal", q));
+        }
+        return scanned(Tok::Bytes, pos);
+    }
+    scanned(Tok::Str, pos)
+}
+
+// The decoded text of the string literal whose quote is at `q` (a valid
+// one: `lex_quoted` has accepted it).
+fn decode_str(ref<Vec<u8>, shared> b, usize q) : String
+{
+    Vec<u8> out = Vec::new();
+    usize pos = q + 1;
+    while (b[pos] != b'"')
+    {
+        u8 c = b[pos];
+        if (c != b'\\')
+        {
+            Vec::push(&mut out, c);
+            pos += 1;
+            continue;
+        }
+        u8 e = b[pos + 1];
+        pos += 2;
+        if (e == b'u')
+        {
+            pos += 1;
+            u32 cp = 0;
+            while (b[pos] != b'}')
+            {
+                cp = cp * 16 + widen<u32>(hex_val(b[pos]));
+                pos += 1;
+            }
+            pos += 1;
+            String s = String::new();
+            String::push_code_point(&mut s, cp);
+            Vec::append(&mut out, String::into_bytes(s));
+        }
+        else
+        {
+            Vec::push(&mut out, escaped(e));
+        }
+    }
+    Result::expect(String::from_utf8(out), "a string literal is UTF-8")
+}
+
+fn escaped(u8 e) : u8
+{
+    match (e)
+    {
+        b'n' : b'\n',
+        b'r' : b'\r',
+        b't' : b'\t',
+        b'0' : 0,
+        _    : e,
+    }
+}
+
+// The bytes of the byte string whose quote is at `q` (a valid one).
+fn decode_bytes(ref<Vec<u8>, shared> b, usize q) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    usize pos = q + 1;
+    while (b[pos] != b'"')
+    {
+        u8 c = b[pos];
+        if (c != b'\\')
+        {
+            Vec::push(&mut out, c);
+            pos += 1;
+            continue;
+        }
+        u8 e = b[pos + 1];
+        pos += 2;
+        if (e == b'x')
+        {
+            Vec::push(&mut out, hex_val(b[pos]) * 16 + hex_val(b[pos + 1]));
+            pos += 2;
+        }
+        else
+        {
+            Vec::push(&mut out, escaped(e));
+        }
+    }
+    out
+}
+
+// `b'x'`, `q` at the opening quote: an integer literal, its value the byte.
+fn lex_byte(ref<Vec<u8>, shared> b, usize q) : Result<Scanned, LexError>
+{
+    u8 c = b[q + 1];
+    usize pos = q + 2;
+    u8 v = c;
+    if (c == 0 || c == b'\n' || c == b'\'')
+    {
+        return Err(lex_error(b, "empty or unterminated byte character", q));
+    }
+    if (c == b'\\')
+    {
+        u8 e = b[pos];
+        pos += 1;
+        if (e == b'x')
+        {
+            if (!hex_digit(b[pos]) || !hex_digit(b[pos + 1]))
+            {
+                return Err(lex_error(b, "invalid \\x escape in byte character", q));
+            }
+            v = hex_val(b[pos]) * 16 + hex_val(b[pos + 1]);
+            pos += 2;
+        }
+        else if (e == b'n' || e == b'r' || e == b't' || e == b'0' || e == b'\\' || e == b'\'' || e == b'"')
+        {
+            v = escaped(e);
+        }
+        else
+        {
+            return Err(lex_error(b, "invalid escape in byte character", q));
+        }
+    }
+    else if (c >= 0x80)
+    {
+        return Err(lex_error(b, "non-ASCII character in byte character", q));
+    }
+    if (b[pos] != b'\'')
+    {
+        return Err(lex_error(b, "a byte character holds exactly one byte", q));
+    }
+    Ok(Scanned { .tok = Tok::Int, .end = pos + 1, .value = widen<u128>(v), .sfx_lo = 0, .sfx_hi = 0 })
+}
+
+// After a number ending at `pos`, its `: type` suffix (`lo..hi`, empty for
+// none), taken when a numeric type's name follows the colon (an arm's
+// `3 : x` is not a suffix).
+struct Suffix
+{
+    usize lo;
+    usize hi;
+}
+
+fn lex_suffix(ref<Vec<u8>, shared> b, usize pos) : Suffix
+{
+    Suffix none = Suffix { .lo = pos, .hi = pos };
+    usize look = pos;
+    while (b[look] == b' ' || b[look] == b'\t')
+    {
+        look += 1;
+    }
+    if (b[look] != b':')
+    {
+        return none;
+    }
+    usize tstart = look + 1;
+    while (b[tstart] == b' ' || b[tstart] == b'\t')
+    {
+        tstart += 1;
+    }
+    usize tend = tstart;
+    while (is_word_byte(b[tend]))
+    {
+        tend += 1;
+    }
+    if (!numeric_type_at(b, tstart, tend))
+    {
+        return none;
+    }
+    Suffix { .lo = tstart, .hi = tend }
+}
+
+// The digits from `from` (`hex`: letters too), with a `_` only between
+// two of them: where they end, and the digits without the `_`s.
+struct Digits
+{
+    usize end;
+    Vec<u8> text;
+}
+
+fn digit_run(ref<Vec<u8>, shared> b, usize from, bool hex, usize start) : Result<Digits, LexError>
+{
+    usize pos = from;
+    Vec<u8> text = Vec::new();
+    while (true)
+    {
+        u8 c = b[pos];
+        bool digit = if (hex) { ascii_is_alnum(c) } else { ascii_is_digit(c) };
+        if (digit)
+        {
+            Vec::push(&mut text, c);
+            pos += 1;
+        }
+        else if (c == b'_')
+        {
+            u8 n = b[pos + 1];
+            bool next = if (hex) { ascii_is_alnum(n) } else { ascii_is_digit(n) };
+            if (Vec::len(&text) == 0 || !next)
+            {
+                return Err(sep_error(b, start));
+            }
+            pos += 1;
+        }
+        else
+        {
+            return Ok(Digits { .end = pos, .text = text });
+        }
+    }
+    Ok(Digits { .end = pos, .text = text })
+}
+
+fn sep_error(ref<Vec<u8>, shared> b, usize start) : LexError
+{
+    lex_error(b, "a `_` in a number goes between two digits (`1_000`, `0xFFFF_0000`)", start)
+}
+
+// The value of `digits` in `radix`; `None` for a digit out of the radix or
+// a value past `u128`.
+fn digits_value(ref<Vec<u8>, shared> digits, u128 radix) : Option<u128>
+{
+    u128 max = ~(0: u128);
+    u128 v = 0;
+    foreach (c in digits)
+    {
+        u128 d = widen<u128>(hex_val(*c));
+        if (!ascii_is_digit(*c) && !(ascii_is_alpha(*c) && d < 16))
+        {
+            return None;
+        }
+        if (d >= radix || v > (max - d) / radix)
+        {
+            return None;
+        }
+        v = v * radix + d;
+    }
+    Some(v)
+}
+
+fn lex_number(ref<Vec<u8>, shared> b, usize start) : Result<Scanned, LexError>
+{
+    u8 r = b[start + 1];
+    if (b[start] == b'0' && (r == b'x' || r == b'o' || r == b'b'))
+    {
+        u128 radix = if (r == b'x') { 16 } else if (r == b'o') { 8 } else { 2 };
+        if (b[start + 2] == b'_')
+        {
+            return Err(sep_error(b, start));
+        }
+        Digits d = digit_run(b, start + 2, true, start)?;
+        Option<u128> v = if (Vec::len(&d.text) == 0) { None } else { digits_value(&d.text, radix) };
+        u128 value = match (v)
+        {
+            Some(x) : x,
+            None : return Err(lex_error(
+                b,
+                String::as_view(&sprintf("invalid base-%v integer literal", radix)),
+                start,
+            )),
+        };
+        Suffix s = lex_suffix(b, d.end);
+        return Ok(Scanned { .tok = Tok::Int, .end = s.hi, .value = value, .sfx_lo = s.lo, .sfx_hi = s.hi });
+    }
+    Digits whole = digit_run(b, start, false, start)?;
+    usize pos = whole.end;
+    bool is_float = false;
+    if (b[pos] == b'.' && b[pos + 1] == b'_')
+    {
+        return Err(sep_error(b, start));
+    }
+    if (b[pos] == b'.' && ascii_is_digit(b[pos + 1]))
+    {
+        is_float = true;
+        pos = digit_run(b, pos + 1, false, start)?.end;
+    }
+    u8 e = b[pos];
+    if (e == b'e' || e == b'E')
+    {
+        u8 sign = b[pos + 1];
+        bool signed = sign == b'+' || sign == b'-';
+        u8 first = if (signed) { b[pos + 2] } else { sign };
+        if (first == b'_')
+        {
+            return Err(sep_error(b, start));
+        }
+        if (ascii_is_digit(first))
+        {
+            is_float = true;
+            pos = digit_run(b, if (signed) { pos + 2 } else { pos + 1 }, false, start)?.end;
+        }
+    }
+    Suffix s = lex_suffix(b, pos);
+    usize end = if (s.hi > s.lo) { s.hi } else { pos };
+    if (is_float)
+    {
+        return Ok(Scanned { .tok = Tok::Float, .end = end, .value = 0, .sfx_lo = s.lo, .sfx_hi = s.hi });
+    }
+    u128 value = match (digits_value(&whole.text, 10))
+    {
+        Some(x) : x,
+        None    : return Err(lex_error(b, "invalid int literal", start)),
+    };
+    Ok(Scanned { .tok = Tok::Int, .end = end, .value = value, .sfx_lo = s.lo, .sfx_hi = s.hi })
+}
+
+// A float literal's value: its digits, `_`s left out, read as `parse<f64>`
+// reads them (correctly rounded), from `start` to its end (`end` may
+// include a suffix).
+fn float_value(ref<Vec<u8>, shared> b, usize start, usize end) : f64
+{
+    String t = String::new();
+    usize pos = start;
+    while (pos < end)
+    {
+        u8 c = b[pos];
+        if (ascii_is_digit(c) || c == b'.' || c == b'e' || c == b'E' || c == b'-' || c == b'+')
+        {
+            String::push_ascii(&mut t, if (c == b'E') { b'e' } else { c });
+        }
+        else if (c != b'_')
+        {
+            break;
+        }
+        pos += 1;
+    }
+    Result::unwrap_or(String::parse<f64>(&t), 0.0)
+}
+
+// A token's text.
+export fn text(StringView src, Token t) : StringView
+{
+    StringView::sub(src, t.pos, t.pos + t.len)
+}
+
+// Whether a token is a name written `w` (`in` is a name, not a keyword).
+export fn is_name(StringView src, Token t, str w) : bool
+{
+    t.tok == Tok::Ident && StringView::eq_str(text(src, t), w)
+}
+
+// A token as a message shows it (`Tok`'s `Display`): `;`, `x`, `42`,
+// `1: u8`, `"text"`, `the end of the file`.
+export fn display(ref<PTok, shared> t) : String
+{
+    if (t.tok == Tok::Eof)
+    {
+        return String::from_str("the end of the file");
+    }
+    String s = String::from_str("`");
+    match (t.tok)
+    {
+        Tok::Int      :
+        {
+            String::append(&mut s, t.ival);
+            match (&t.sfx)
+            {
+                Some(x) : String::appendf(&mut s, ": %s", x),
+                None    : {},
+            }
+        },
+        Tok::Float    : String::append(&mut s, &float_display(t.fval)),
+        Tok::Str      :
+        {
+            String::push_ascii(&mut s, b'"');
+            String::append(&mut s, &t.text);
+            String::push_ascii(&mut s, b'"');
+        },
+        Tok::Bytes    : String::append(&mut s, "a byte string"),
+        Tok::Ident    : String::append(&mut s, &t.text),
+        Tok::TypeName : String::append(&mut s, &t.text),
+        _             : String::append(&mut s, spelling(t.tok)),
+    }
+    String::push_ascii(&mut s, b'`');
+    s
+}
+
+// A keyword's or a punctuation token's spelling.
+export fn spelling(Tok t) : str
+{
+    match (t)
+    {
+        Tok::True       : "true",
+        Tok::False      : "false",
+        Tok::Fn         : "fn",
+        Tok::Struct     : "struct",
+        Tok::Enum       : "enum",
+        Tok::Resource   : "resource",
+        Tok::Bitstruct  : "bitstruct",
+        Tok::Match      : "match",
+        Tok::If         : "if",
+        Tok::Else       : "else",
+        Tok::While      : "while",
+        Tok::For        : "for",
+        Tok::Foreach    : "foreach",
+        Tok::Unittest   : "unittest",
+        Tok::Const      : "const",
+        Tok::Static     : "static",
+        Tok::Return     : "return",
+        Tok::Auto       : "auto",
+        Tok::Module     : "module",
+        Tok::Import     : "import",
+        Tok::Export     : "export",
+        Tok::Unsafe     : "unsafe",
+        Tok::Extern     : "extern",
+        Tok::Break      : "break",
+        Tok::Continue   : "continue",
+        Tok::Move       : "move",
+        Tok::Mut        : "mut",
+        Tok::As         : "as",
+        Tok::Void       : "void",
+        Tok::LParen     : "(",
+        Tok::RParen     : ")",
+        Tok::LBrace     : "{",
+        Tok::RBrace     : "}",
+        Tok::LBracket   : "[",
+        Tok::RBracket   : "]",
+        Tok::Comma      : ",",
+        Tok::Semi       : ";",
+        Tok::Colon      : ":",
+        Tok::ColonColon : "::",
+        Tok::Dot        : ".",
+        Tok::DotDot     : "..",
+        Tok::Dollar     : "$",
+        Tok::Question   : "?",
+        Tok::Eq         : "=",
+        Tok::EqEq       : "==",
+        Tok::NotEq      : "!=",
+        Tok::Lt         : "<",
+        Tok::Le         : "<=",
+        Tok::Gt         : ">",
+        Tok::Ge         : ">=",
+        Tok::AndAnd     : "&&",
+        Tok::OrOr       : "||",
+        Tok::Not        : "!",
+        Tok::Tilde      : "~",
+        Tok::Amp        : "&",
+        Tok::Pipe       : "|",
+        Tok::Caret      : "^",
+        Tok::Shl        : "<<",
+        Tok::Shr        : ">>",
+        Tok::Plus       : "+",
+        Tok::Minus      : "-",
+        Tok::Star       : "*",
+        Tok::Slash      : "/",
+        Tok::Percent    : "%",
+        Tok::PlusEq     : "+=",
+        Tok::MinusEq    : "-=",
+        Tok::StarEq     : "*=",
+        Tok::SlashEq    : "/=",
+        Tok::PercentEq  : "%=",
+        Tok::AmpEq      : "&=",
+        Tok::PipeEq     : "|=",
+        Tok::CaretEq    : "^=",
+        Tok::ShlEq      : "<<=",
+        Tok::ShrEq      : ">>=",
+        _               : "",
+    }
+}
+
+// A float as Rust's `Display` writes it: the shortest digits that read
+// back, in plain decimal, with no `.0` for a whole number (`1`, `0.1`,
+// `100000000000000000000`, `0.0000001`), `inf`, `NaN`.
+export fn float_display(f64 v) : String
+{
+    String t = sprintf("%v", v);
+    if (t == "inf" || t == "-inf" || t == "NaN")
+    {
+        return t;
+    }
+    // The digits, and where the decimal point falls among them.
+    slice<u8, shared> b = &String::as_bytes(&t)[0..$];
+    String digits = String::new();
+    bool neg = false;
+    isize point = -1;
+    isize exp = 0;
+    usize i = 0;
+    usize n = slice_len(b);
+    while (i < n)
+    {
+        u8 c = b[i];
+        if (c == b'-')
+        {
+            neg = true;
+        }
+        else if (c == b'.')
+        {
+            point = narrow<isize>(String::len(&digits));
+        }
+        else if (c == b'e')
+        {
+            exp = Result::unwrap_or(StringView::parse<isize>(String::view(&t, i + 1, n)), 0);
+            break;
+        }
+        else
+        {
+            String::push_ascii(&mut digits, c);
+        }
+        i += 1;
+    }
+    if (point < 0)
+    {
+        point = narrow<isize>(String::len(&digits));
+    }
+    point += exp;
+    // Leading and trailing zeros do not change the value.
+    slice<u8, shared> d = &String::as_bytes(&digits)[0..$];
+    usize lo = 0;
+    usize hi = slice_len(d);
+    while (lo < hi && d[lo] == b'0')
+    {
+        lo += 1;
+        point -= 1;
+    }
+    while (hi > lo && d[hi - 1] == b'0')
+    {
+        hi -= 1;
+    }
+    String out = String::new();
+    if (neg)
+    {
+        String::push_ascii(&mut out, b'-');
+    }
+    if (lo == hi)
+    {
+        String::push_ascii(&mut out, b'0');
+        return out;
+    }
+    isize count = narrow<isize>(hi - lo);
+    if (point <= 0)
+    {
+        String::append(&mut out, "0.");
+        for (isize k = 0; k < -point; k += 1)
+        {
+            String::push_ascii(&mut out, b'0');
+        }
+        String::append(&mut out, String::view(&digits, lo, hi));
+    }
+    else if (point >= count)
+    {
+        String::append(&mut out, String::view(&digits, lo, hi));
+        for (isize k = count; k < point; k += 1)
+        {
+            String::push_ascii(&mut out, b'0');
+        }
+    }
+    else
+    {
+        usize p = narrow<usize>(point);
+        String::append(&mut out, String::view(&digits, lo, lo + p));
+        String::push_ascii(&mut out, b'.');
+        String::append(&mut out, String::view(&digits, lo + p, hi));
+    }
+    out
+}

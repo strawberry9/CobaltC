@@ -1,0 +1,266 @@
+// Type substitution, unification and literal helpers
+// (impl/cobc/src/lower/typeops.rs), as the lowering does them: `apply`
+// leaves `simd` and closure types alone, as the Rust one does.
+
+import std;
+import ast;
+
+export fn subst_of(ref<Vec<String>, shared> params, ref<Vec<Type>, shared> args) : HashMap<String, Type>
+{
+    HashMap<String, Type> m = HashMap::new();
+    for (usize k = 0; k < Vec::len(params) && k < Vec::len(args); k += 1)
+    {
+        HashMap::insert(&mut m, String::clone(&params[k]), clone(&args[k]));
+    }
+    m
+}
+
+fn moded(Type inner, Mode mode) : Box<ModedTy>
+{
+    Box::new(ModedTy { .inner = inner, .mode = mode })
+}
+
+export fn apply(ref<Type, shared> t, ref<HashMap<String, Type>, shared> s) : Type
+{
+    match (t)
+    {
+        Type::TNamed(n)  :
+        {
+            if (Vec::len(&Box::get(n).args) == 0)
+            {
+                match (HashMap::get(s, &Box::get(n).name))
+                {
+                    Some(r) : return clone(r),
+                    None    : {},
+                }
+            }
+            Vec<Type> args = Vec::new();
+            foreach (a in &Box::get(n).args)
+            {
+                Vec::push(&mut args, apply(a, s));
+            }
+            Type::TNamed(Box::new(NamedTy { .name = String::clone(&Box::get(n).name), .args = args }))
+        },
+        Type::TRef(m)    : Type::TRef(moded(apply(&Box::get(m).inner, s), Box::get(m).mode)),
+        Type::TSlice(m)  : Type::TSlice(moded(apply(&Box::get(m).inner, s), Box::get(m).mode)),
+        Type::TRawptr(i) : Type::TRawptr(Box::new(apply(Box::get(i), s))),
+        Type::TArray(a) : Type::TArray(Box::new(SizedTy { .inner = apply(
+            &Box::get(a).inner,
+            s,
+        ), .n = Box::get(a).n })),
+        Type::TFn(f)     :
+        {
+            Vec<Type> ps = Vec::new();
+            foreach (p in &Box::get(f).params)
+            {
+                Vec::push(&mut ps, apply(p, s));
+            }
+            Type::TFn(Box::new(FnTy { .params = ps, .ret = apply(&Box::get(f).ret, s) }))
+        },
+        Type::THandle(i) : Type::THandle(Box::new(apply(Box::get(i), s))),
+        Type::TMutex(i)  : Type::TMutex(Box::new(apply(Box::get(i), s))),
+        Type::TGuard(i)  : Type::TGuard(Box::new(apply(Box::get(i), s))),
+        _                : clone(t),
+    }
+}
+
+fn is_param(ref<Vec<String>, shared> params, ref<String, shared> n) : bool
+{
+    foreach (p in params)
+    {
+        if (*p == *n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether no type parameter of `params` is left in `t`.
+export fn resolved(ref<Type, shared> t, ref<Vec<String>, shared> params) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n)  :
+        {
+            if (Vec::len(&Box::get(n).args) == 0 && is_param(params, &Box::get(n).name))
+            {
+                return false;
+            }
+            foreach (a in &Box::get(n).args)
+            {
+                if (!resolved(a, params))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        Type::TRef(m)    : resolved(&Box::get(m).inner, params),
+        Type::TSlice(m)  : resolved(&Box::get(m).inner, params),
+        Type::TRawptr(i) : resolved(Box::get(i), params),
+        Type::TArray(a)  : resolved(&Box::get(a).inner, params),
+        Type::THandle(i) : resolved(Box::get(i), params),
+        Type::TMutex(i)  : resolved(Box::get(i), params),
+        Type::TGuard(i)  : resolved(Box::get(i), params),
+        Type::TFn(f)     :
+        {
+            foreach (p in &Box::get(f).params)
+            {
+                if (!resolved(p, params))
+                {
+                    return false;
+                }
+            }
+            resolved(&Box::get(f).ret, params)
+        },
+        _                : true,
+    }
+}
+
+// Each type parameter of `params` in `pattern` that `actual` fixes, unless
+// already fixed.
+export fn unify(
+    ref<Type, shared> pattern,
+    ref<Type, shared> actual,
+    ref<Vec<String>, shared> params,
+    ref<HashMap<String, Type>, exclusive> m,
+)
+{
+    match (pattern)
+    {
+        Type::TNamed(n)  :
+        {
+            if (Vec::len(&Box::get(n).args) == 0 && is_param(params, &Box::get(n).name))
+            {
+                if (!HashMap::contains(m, &Box::get(n).name))
+                {
+                    HashMap::insert(m, String::clone(&Box::get(n).name), clone(actual));
+                }
+                return;
+            }
+            match (actual)
+            {
+                Type::TNamed(a) :
+                {
+                    if (Box::get(n).name == Box::get(a).name && Vec::len(&Box::get(n).args) == Vec::len(&Box::get(a).args))
+                    {
+                        for (usize k = 0; k < Vec::len(&Box::get(n).args); k += 1)
+                        {
+                            unify(&Box::get(n).args[k], &Box::get(a).args[k], params, m);
+                        }
+                    }
+                },
+                _               : {},
+            }
+        },
+        Type::TRef(p)    :
+        {
+            match (actual)
+            {
+                Type::TRef(a) : unify(&Box::get(p).inner, &Box::get(a).inner, params, m),
+                _             : {},
+            }
+        },
+        Type::TSlice(p)  :
+        {
+            match (actual)
+            {
+                Type::TSlice(a) : unify(&Box::get(p).inner, &Box::get(a).inner, params, m),
+                _               : {},
+            }
+        },
+        Type::TRawptr(p) :
+        {
+            match (actual)
+            {
+                Type::TRawptr(a) : unify(Box::get(p), Box::get(a), params, m),
+                _                : {},
+            }
+        },
+        Type::TArray(p)  :
+        {
+            match (actual)
+            {
+                Type::TArray(a) : unify(&Box::get(p).inner, &Box::get(a).inner, params, m),
+                _               : {},
+            }
+        },
+        Type::THandle(p) :
+        {
+            match (actual)
+            {
+                Type::THandle(a) : unify(Box::get(p), Box::get(a), params, m),
+                _                : {},
+            }
+        },
+        Type::TMutex(p)  :
+        {
+            match (actual)
+            {
+                Type::TMutex(a) : unify(Box::get(p), Box::get(a), params, m),
+                _               : {},
+            }
+        },
+        Type::TGuard(p)  :
+        {
+            match (actual)
+            {
+                Type::TGuard(a) : unify(Box::get(p), Box::get(a), params, m),
+                _               : {},
+            }
+        },
+        Type::TFn(p)     :
+        {
+            match (actual)
+            {
+                Type::TFn(a) :
+                {
+                    if (Vec::len(&Box::get(p).params) == Vec::len(&Box::get(a).params))
+                    {
+                        for (usize k = 0; k < Vec::len(&Box::get(p).params); k += 1)
+                        {
+                            unify(&Box::get(p).params[k], &Box::get(a).params[k], params, m);
+                        }
+                        unify(&Box::get(p).ret, &Box::get(a).ret, params, m);
+                    }
+                },
+                _            : {},
+            }
+        },
+        _                : {},
+    }
+}
+
+// A literal that takes its type from its context: an unsuffixed number (or a
+// byte literal, D-0102), negated or in parentheses.
+export fn is_bare_literal(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(l)   :
+        {
+            match (&Box::get(l).sfx)
+            {
+                Some(s) : String::eq_str(s, "byte"),
+                None    : true,
+            }
+        },
+        ExprKind::EFloat(f) : Option::is_none(&Box::get(f).sfx),
+        ExprKind::EUnary(u) :
+        {
+            if (Box::get(u).op != UnOp::Neg)
+            {
+                return false;
+            }
+            match (&Box::get(u).e.kind)
+            {
+                ExprKind::EInt(l)   : Option::is_none(&Box::get(l).sfx),
+                ExprKind::EFloat(f) : Option::is_none(&Box::get(f).sfx),
+                _                   : false,
+            }
+        },
+        ExprKind::EParen(i) : is_bare_literal(Box::get(i)),
+        _                   : false,
+    }
+}

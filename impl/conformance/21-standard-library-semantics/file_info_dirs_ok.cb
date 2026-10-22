@@ -1,0 +1,92 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.fs [File-Info] [Copy-File] [Dir-All] [Set-Current-Dir] [Path-Canonical] [Temp-Dir] [Home-Dir] (D-0141); conf.file-info, conf.copy-file, conf.dir-all, conf.set-current-dir, conf.path-canonical, conf.temp-home-dir
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6d616b655f6469725f616c6c3a20747275652c20616761696e3a20747275650a66696c653a2046696c652c206c656e2031322c20726563656e7420747275652c20726561642d6f6e6c792066616c73650a6469726563746f72793a204469720a6d697373696e673a204e6f74466f756e640a636f706965643a2031320a636f70792072656164733a207477656c76652062797465730a63616e6f6e6963616c206973206162736f6c7574653a20747275650a63616e6f6e6963616c206f66206e6f7468696e673a204e6f74466f756e640a72656d6f76655f6469725f616c6c3a20747275652c20616761696e3a2066616c73650a61667465723a206e6f7468696e670a63757272656e745f646972206d6f7665643a20747275652c2072656c617469766520726561643a207477656c76652062797465730a74656d705f646972206e6f6e2d656d7074793a20747275650a
+// args: $TMP
+//
+// Argument 0 is a fresh, empty directory. `make_dir_all` makes three
+// levels and is `Ok` again when they exist; `file_info` of a file the
+// case wrote gives its length and a modification time within a minute of
+// now, of a directory its kind, of nothing `NotFound`; `copy_file` copies
+// every byte; `path_canonical` is absolute; `remove_dir_all` removes the
+// tree, and then finds nothing; `set_current_dir` changes what
+// `current_dir` gives.
+
+import std;
+
+fn main() : u8
+{
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String deep = path_join(&dir[0..$], "a/b/c");
+    printf(
+        "make_dir_all: %v, again: %v\n",
+        Result::is_ok(&make_dir_all(&deep[0..$])),
+        Result::is_ok(&make_dir_all(&deep[0..$])),
+    );
+    String f = path_join(&deep[0..$], "data.txt");
+    if (Err(_) = write_file(&f[0..$], "twelve bytes"))
+    {
+        return 1;
+    }
+    match (file_info(&f[0..$]))
+    {
+        Ok(i) : printf(
+            "file: %v, len %u, recent %v, read-only %v\n",
+            i.kind,
+            i.len,
+            unix_seconds() - i.modified_unix < 60 && i.modified_unix - unix_seconds() < 60,
+            i.readonly,
+        ),
+        Err(e) : printf("file_info: %s\n", FileError::text(&e)),
+    }
+    match (file_info(&deep[0..$]))
+    {
+        Ok(i)  : printf("directory: %v\n", i.kind),
+        Err(e) : printf("file_info: %s\n", FileError::text(&e)),
+    }
+    String none = path_join(&deep[0..$], "none");
+    match (file_info(&none[0..$]))
+    {
+        Err(NotFound) : printf("missing: NotFound\n"),
+        _             : printf("missing: ?\n"),
+    }
+    String g = path_join(&dir[0..$], "copy.txt");
+    printf("copied: %v\n", Result::unwrap_or(copy_file(&f[0..$], &g[0..$]), 0));
+    String back = Result::unwrap_or(read_file(&g[0..$]), String::new());
+    printf("copy reads: %s\n", &back);
+    String canon = Result::unwrap_or(path_canonical(&g[0..$]), String::new());
+    printf("canonical is absolute: %v\n", path_is_absolute(&canon[0..$]));
+    match (path_canonical(&none[0..$]))
+    {
+        Err(NotFound) : printf("canonical of nothing: NotFound\n"),
+        _             : printf("canonical: ?\n"),
+    }
+    String top = path_join(&dir[0..$], "a");
+    printf(
+        "remove_dir_all: %v, again: %v\n",
+        Result::is_ok(&remove_dir_all(&top[0..$])),
+        Result::is_ok(&remove_dir_all(&top[0..$])),
+    );
+    match (path_kind(&top[0..$]))
+    {
+        Err(NotFound) : printf("after: nothing\n"),
+        _             : printf("after: ?\n"),
+    }
+    if (Err(_) = set_current_dir(&dir[0..$]))
+    {
+        return 2;
+    }
+    // Both sides canonical: Windows keeps the directory as it was set
+    // (often an 8.3 short name under %TEMP%), while
+    // `path_canonical` gives the long name.
+    String set_to = Result::unwrap_or(current_dir(), String::new());
+    String cwd = Result::unwrap_or(path_canonical(&set_to[0..$]), String::new());
+    String want = Result::unwrap_or(path_canonical(&dir[0..$]), String::new());
+    String rel = Result::unwrap_or(read_file("copy.txt"), String::new());
+    printf("current_dir moved: %v, relative read: %s\n", String::eq(&cwd, &want), &rel);
+    String t = temp_dir();
+    printf("temp_dir non-empty: %v\n", String::len(&t) > 0);
+    0
+}
