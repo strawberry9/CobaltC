@@ -655,6 +655,24 @@ impl<'a> Gen<'a> {
             let e = self.elem_ref_lets(&f.body, &names);
             let q = self.quiet_locals(&f.body, &names, &e);
             dump_analyses(name, &f.body, &c, &o, &e, &q);
+            // The stage-1 analyses, past their `--all-checks` gate.
+            let mut cf: Vec<String> = confined_fields(&f.body, &names).into_iter().map(|(h, fl)| format!("{}.{}", h, fl)).collect();
+            cf.sort();
+            let mut rc: Vec<String> = read_confined_vecs(&f.body, &names).into_iter().collect();
+            rc.sort();
+            let pd: Vec<String> = (0..f.params.len()).filter(|&j| self.pure_direct_in(name, j, &std::cell::RefCell::new(Vec::new()))).map(|j| j.to_string()).collect();
+            let dual = match self.dual_direct_params(&f.params, &f.body, &subst) {
+                Ok(Some(d)) => d.join(" "),
+                Ok(None) => "-".to_string(),
+                Err(_) => "!".to_string(),
+            };
+            let mut dr: Vec<String> = self.direct_refs_core(&f.params, &f.body, &subst, true).map(|d| d.into_iter().collect()).unwrap_or_default();
+            dr.sort();
+            eprintln!("ANALYSES {} confined_fields [{}]", name, cf.join(" "));
+            eprintln!("ANALYSES {} read_confined [{}]", name, rc.join(" "));
+            eprintln!("ANALYSES {} pure_direct [{}]", name, pd.join(" "));
+            eprintln!("ANALYSES {} dual [{}]", name, dual);
+            eprintln!("ANALYSES {} direct [{}]", name, dr.join(" "));
         }
         let all_checks = self.all_checks;
         let mut fx = Fx { g: self, subst, scopes: vec![HashMap::new()], out: String::new(), ret: ret.clone(), cleanup: Vec::new(), loops: Vec::new(), loop_broken: Vec::new(), ind: 1, self_ref: None, assigned: assigned_names(&f.body), rebind_frames: HashMap::new(), holder_roots: HashMap::new(), no_overflow: HashSet::new(), proven_next: false, pinned, confined_names, confined_fields: if all_checks { HashSet::new() } else { confined_fields(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, read_confined: if all_checks { HashSet::new() } else { read_confined_vecs(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, objectless_names, cur_let: None, raw_ret: false, raw_tail: None, raw_sinks: HashSet::new(), raw_substring: None, raw_return_path: false, raw_call: None, objectless_c: HashSet::new(), moved_flag: HashMap::new(), bare_trims: HashSet::new(), elem_ref_ids, quiet_ids, quiet_roots: HashSet::new(), drop_lines: Vec::new(), confined: HashSet::new(), confined_params: HashMap::new(), probes: HashMap::new(), kept: Vec::new(), dollar: Vec::new(), place_write: false,
