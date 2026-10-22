@@ -676,6 +676,20 @@ fn end_ref_bindings(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Stmt, share
             None     : continue,
         };
         bool is_ref = ends_at_last_use(&g.prog.table, &b.ty);
+        if (HashSet::contains(&x.held_c, &b.c))
+        {
+            // A held local (`cb_frame_hold`): its frame lets go now.
+            match (HashMap::get(&x.unstored, &b.c))
+            {
+                Some(tk) :
+                {
+                    String t = String::clone(tk);
+                    emit(x, String::as_view(&sprintf("cb_frame_unhold(%s);", &t)));
+                },
+                None     : {},
+            }
+            continue;
+        }
         String root = if (String::len(&b.root) == 0)
         {
             match (HashMap::get(&x.holder_roots, &b.c))
@@ -856,6 +870,40 @@ fn lower_block_body(
         }
         pop_stmt(x);
         end_ref_bindings(g, x, st);
+        // A quiet local's root (`quiet_locals`), for `drop_quiet_checks`.
+        match (st)
+        {
+            Stmt::SLet(ql) :
+            {
+                match (&Box::get(ql).init)
+                {
+                    Some(qi) :
+                    {
+                        if (HashSet::contains(&x.quiet_ids, &qi.id))
+                        {
+                            match (lookup(x, String::as_view(&Box::get(ql).name)))
+                            {
+                                Some(bd) :
+                                {
+                                    bool local = match (&bd.kind)
+                                    {
+                                        BindKind::Local : true,
+                                        _               : false,
+                                    };
+                                    if (local && String::len(&bd.root) > 0)
+                                    {
+                                        HashSet::insert(&mut x.quiet_roots, String::clone(&bd.root));
+                                    }
+                                },
+                                None     : {},
+                            }
+                        }
+                    },
+                    None     : {},
+                }
+            },
+            _              : {},
+        }
         // `$c = &v` or `&mut v` of a `foreach` whose body only reads or
         // writes its elements in place: `$c` holds `v` for the whole loop
         // (`confine_holder`); and a held shared reference to a `Vec` only
@@ -905,7 +953,7 @@ fn lower_block_body(
                 {
                     match (&strip_parens(te).kind)
                     {
-                        ExprKind::EMatch(m) : x.raw_tail = Some(Box::get(m).scrut.id),
+                        ExprKind::EMatch(m) : x.raw_tail = arms_key(&Box::get(m).arms),
                         ExprKind::EPath(_)  : x.raw_return_path = true,
                         _                   : {},
                     }
@@ -1029,7 +1077,7 @@ fn compound_pair(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared>
             ref<Expr, shared> sc = strip_parens(c);
             x.map_acc = match (&sc.kind)
             {
-                ExprKind::ECall(cc) : if (Vec::len(&Box::get(cc).args) > 0) { Some(Box::get(cc).args[0].id) } else { None },
+                ExprKind::ECall(cc) : Some(args_key(&Box::get(cc).args)),
                 _                   : None,
             };
             x.map_acc_used = false;
@@ -1082,6 +1130,309 @@ fn compound_pair(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared>
     }
     pop_stmt(x);
     Some(false)
+}
+
+// D-0200: `*Option::unwrap(HashMap::get(&m, k))` for a native map of plain
+// values: the lookup's `_acc` variant, `unwrap`'s fault for NULL, and the
+// value read where it lies (cobc's `unwrapped_map_get`).
+fn unwrapped_map_get(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> inner, usize line) : Option<P>
+{
+    if (boot(g, 4))
+    {
+        return None;
+    }
+    ref<CallExpr, shared> uc = match (&strip_parens(inner).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> up = match (&uc.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&uc.args) != 1)
+    {
+        return None;
+    }
+    ref<Expr, shared> garg = &uc.args[0];
+    ref<CallExpr, shared> gc = match (&strip_parens(garg).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> gp = match (&gc.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&up.targs) > 0 || Vec::len(&gp.targs) > 0 || (Vec::len(&up.segs) == 1 && Option::is_some(&lookup(x, String::as_view(&up.segs[0])))) || (Vec::len(
+        &gp.segs,
+    ) == 1 && Option::is_some(&lookup(x, String::as_view(&gp.segs[0])))))
+    {
+        return None;
+    }
+    String uk0 = String::join(&up.segs[0..$], "::");
+    String uk = if (HashMap::contains(&g.prog.table.fns, &uk0)) { uk0 } else { sprintf("std::%s", &uk0) };
+    String gk0 = String::join(&gp.segs[0..$], "::");
+    String gk = if (HashMap::contains(&g.prog.table.fns, &gk0)) { gk0 } else { sprintf("std::%s", &gk0) };
+    if (!String::eq_str(&uk, "std::Option::unwrap") || !String::eq_str(&gk, "std::HashMap::get"))
+    {
+        return None;
+    }
+    FnDecl uf = match (get_fn(g, &uk))
+    {
+        Some(f) : f,
+        None    : return None,
+    };
+    FnDecl gf = match (get_fn(g, &gk))
+    {
+        Some(f) : f,
+        None    : return None,
+    };
+    if (!in_prelude(String::as_view(&uk), &uf) || !native_map_passthrough(g, x, String::as_view(&gk), &gf, &gc.args, 0))
+    {
+        return None;
+    }
+    Type ot = probe_type(g, x, garg, None);
+    Type vt = match (&ot)
+    {
+        Type::TNamed(n) :
+        {
+            if (Vec::len(&Box::get(n).args) != 1)
+            {
+                return None;
+            }
+            match (&Box::get(n).args[0])
+            {
+                Type::TRef(m) :
+                {
+                    if (Box::get(m).mode != Mode::Shared)
+                    {
+                        return None;
+                    }
+                    clone(&Box::get(m).inner)
+                },
+                _             : return None,
+            }
+        },
+        _               : return None,
+    };
+    if (!plain_data(g, &vt))
+    {
+        return None;
+    }
+    x.map_get_acc = Some(args_key(&gc.args));
+    x.map_get_acc_out = None;
+    V v = lower_expr(g, x, garg, None);
+    x.map_get_acc = None;
+    if (is_never(&v.ty))
+    {
+        return Some(P { .c = String::clone(&v.c), .ty = Type::TNever, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None });
+    }
+    String pv = match (replace(&mut x.map_get_acc_out, None))
+    {
+        Some(p) : p,
+        None    :
+        {
+            assert(false, "cobc: a native map lookup that was not made");
+            String::new()
+        },
+    };
+    StringView m = StringView::of("`Option::unwrap` found `None`");
+    at(g, x, line);
+    emit(x, String::as_view(&sprintf("if (!%s) cb_fault_msg(\"diag.unwrap-failed\", (const uint8_t *)\"%v\", %vu, CB_NOLOC, 0);", &pv, m, StringView::len(m))));
+    Some(P { .c = sprintf("(*%s)", &pv), .ty = vt, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None })
+}
+
+fn opt_eq(ref<Option<usize>, shared> a, ref<Option<usize>, shared> b) : bool
+{
+    match (a)
+    {
+        Some(x) : match (b)
+        {
+            Some(y) : *x == *y,
+            None    : false,
+        },
+        None    : Option::is_none(b),
+    }
+}
+
+// `Option<ref<T>>`: reference data whose one reference is the payload
+// (cobc's `one_ref_option`).
+fn one_ref_option(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) :
+        {
+            String::eq_str(&Box::get(n).name, "std::Option") && Vec::len(&Box::get(n).args) == 1 && is_ref_type(&Box::get(n).args[0])
+        },
+        _               : false,
+    }
+}
+
+// Whether argument `j` of a call to `name` goes to a native map body
+// (`native_map_op`) that only checks through its path (cobc's
+// `native_map_passthrough`).
+fn native_map_passthrough(ref<Gen, exclusive> g, ref<Fx, exclusive> x, StringView name, ref<FnDecl, shared> f, ref<Vec<Expr>, shared> args, usize j) : bool
+{
+    bool op = StringView::eq_str(name, "std::HashMap::get") || StringView::eq_str(name, "std::HashMap::get_mut") || StringView::eq_str(name, "std::HashMap::contains") || StringView::eq_str(
+        name,
+        "std::HashMap::entry",
+    ) || StringView::eq_str(name, "std::HashMap::insert");
+    bool entry_or_insert = StringView::eq_str(name, "std::HashMap::entry") || StringView::eq_str(name, "std::HashMap::insert");
+    if (!op || !in_prelude(name, f) || !(j == 0 || (j == 1 && !entry_or_insert)))
+    {
+        return false;
+    }
+    if (Vec::len(args) == 0)
+    {
+        return false;
+    }
+    Type t0 = probe_type(g, x, &args[0], None);
+    Type mt = match (&t0)
+    {
+        Type::TRef(m) : clone(&Box::get(m).inner),
+        _             : return false,
+    };
+    ref<NamedTy, shared> hn = match (&mt)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return false,
+    };
+    if (Vec::len(&hn.args) != 2)
+    {
+        return false;
+    }
+    ref<Type, shared> k = &hn.args[0];
+    ref<Type, shared> v = &hn.args[1];
+    bool text = is_string_ty(k);
+    bool scalar = match (k)
+    {
+        Type::TInt(_) : true,
+        Type::TBool   : true,
+        _             : false,
+    };
+    if (!String::eq_str(&hn.name, "std::HashMap") || !(text || scalar))
+    {
+        return false;
+    }
+    u64 vs = size_align(g, v).size;
+    if (vs == 0 || has_refs(g, v) || holds_fn(g, v))
+    {
+        return false;
+    }
+    !entry_or_insert || plain_data(g, v)
+}
+
+// A call's identity for the call state (`map_acc`, `map_get_acc`,
+// `datum_tok`): cobc compares its arguments' address; here its first
+// argument's id (every argument list cobc could tell apart by address has
+// one), and one value for every empty list, as cobc's dangling pointer is.
+export fn args_key(ref<Vec<Expr>, shared> args) : usize
+{
+    if (Vec::len(args) > 0) { args[0].id } else { 1 << 61 }
+}
+
+// A `match`'s identity for `raw_tail`: its first arm's body (cobc: the arms'
+// address).
+fn arms_key(ref<Vec<Arm>, shared> arms) : Option<usize>
+{
+    if (Vec::len(arms) > 0) { Some(Box::get(&arms[0].body).id) } else { None }
+}
+
+// `match (HashMap::get_mut(…)) { Some(c) : *c op= x, None : … }`, `x` a
+// literal or a local other than `c` (cobc's `get_mut_acc_arms`).
+fn get_mut_acc_arms(ref<Expr, shared> scrut, ref<Vec<Arm>, shared> arms) : bool
+{
+    match (&strip_parens(scrut).kind)
+    {
+        ExprKind::ECall(c) :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    String k = String::join(&Box::get(p).segs[0..$], "::");
+                    if ((!String::eq_str(&k, "HashMap::get_mut") && !String::eq_str(&k, "std::HashMap::get_mut")) || Vec::len(arms) != 2)
+                    {
+                        return false;
+                    }
+                },
+                _                  : return false,
+            }
+        },
+        _                  : return false,
+    }
+    usize some = 0;
+    bool other_ok = true;
+    foreach (a in arms)
+    {
+        bool is_some = match (&a.variant)
+        {
+            Some(v) : String::eq_str(v, "Some"),
+            None    : false,
+        };
+        bool is_none = match (&a.variant)
+        {
+            Some(v) : String::eq_str(v, "None"),
+            None    : true,
+        };
+        if (is_some)
+        {
+            some += 1;
+            other_ok = other_ok && match (&a.binder)
+            {
+                Some(cb) : acc_arm_body(Box::get(&a.body), cb),
+                None     : false,
+            };
+        }
+        else if (is_none)
+        {
+            other_ok = other_ok && Option::is_none(&a.binder) && Vec::len(&a.nested) == 0 && Option::is_none(&a.lit);
+        }
+        else
+        {
+            other_ok = false;
+        }
+    }
+    some == 1 && other_ok
+}
+
+// The `Some` arm's body is `*c op= x` alone (a block of that statement or
+// that tail, or the expression).
+fn acc_arm_body(ref<Expr, shared> body, ref<String, shared> c) : bool
+{
+    ref<Expr, shared> b = strip_parens(body);
+    Expr e = match (&b.kind)
+    {
+        ExprKind::EBlock(bl) :
+        {
+            if (Vec::len(&bl.stmts) == 1 && Option::is_none(&bl.tail))
+            {
+                match (&bl.stmts[0])
+                {
+                    Stmt::SExpr(x) : clone(Box::get(x)),
+                    _              : return false,
+                }
+            }
+            else if (Vec::len(&bl.stmts) == 0)
+            {
+                match (&bl.tail)
+                {
+                    Some(t) : clone(Box::get(t)),
+                    None    : return false,
+                }
+            }
+            else
+            {
+                return false;
+            }
+        },
+        _                    : clone(b),
+    };
+    compound_write_inert(&Stmt::SExpr(Box::new(e)), c)
 }
 
 // `*t = *t op e;` for the hidden `t`, with `e` a literal or a local (cobc's
@@ -1639,6 +1990,25 @@ fn lower_expr_inner(
             {
                 P pl = lower_place(g, x, e);
                 return read_place(g, x, pl, e.line);
+            }
+            // A `foreach` element aliased for a reader loop, used whole: the
+            // element's address with token 0.
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                match (HashMap::get(&x.elem_alias, &Box::get(p).segs[0]))
+                {
+                    Some(a0) :
+                    {
+                        Expr a = clone(a0);
+                        P ap = lower_place(g, x, &a);
+                        if (is_never(&ap.ty))
+                        {
+                            return never();
+                        }
+                        return V { .c = sprintf("((cb_ref){ (void *)&(%s), 0 })", &ap.c), .ty = ref_ty(clone(&ap.ty), Mode::Shared), .obj = None };
+                    },
+                    None     : {},
+                }
             }
             match (variant_of(g, &Box::get(p).segs))
             {
@@ -2476,6 +2846,11 @@ fn lower_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e)
                 },
                 _                   : {},
             }
+            match (unwrapped_map_get(g, x, Box::get(inner), e.line))
+            {
+                Some(up) : return up,
+                None     : {},
+            }
             Type it = probe_type(g, x, Box::get(inner), None);
             if (is_guard(&it))
             {
@@ -2815,6 +3190,17 @@ fn lower_place_value(
             }
         },
         _                   : {},
+    }
+    // `*x` for a `foreach` element aliased to `(*$c)[$i]` (`foreach_alias`).
+    match (alias_of_deref(x, e))
+    {
+        Some(a) : return lower_expr(g, x, &a, expected),
+        None    : {},
+    }
+    match (alias_field_chain(g, x, e))
+    {
+        Some(r) : return lower_expr(g, x, &r, expected),
+        None    : {},
     }
     match (vec_index_call(g, x, e, false))
     {
@@ -4318,6 +4704,102 @@ fn lower_elem_ref_let(
 // D-0219: the mark a call's callee name carries where its `__arrive` twin is
 // asked for (cobc's `ARRIVE_MARK`).
 const str ARRIVE_MARK = "__ARRIVE_MARK__";
+
+// `*x` (no parens inside) for an aliased `foreach` element `x`: its alias.
+fn alias_of_deref(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Expr>
+{
+    match (&e.kind)
+    {
+        ExprKind::EDeref(inner) :
+        {
+            match (&Box::get(inner).kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1)
+                    {
+                        return match (HashMap::get(&x.elem_alias, &Box::get(p).segs[0]))
+                        {
+                            Some(a) : Some(clone(a)),
+                            None    : None,
+                        };
+                    }
+                    None
+                },
+                _                  : None,
+            }
+        },
+        _                       : None,
+    }
+}
+
+// `x.f…` read as a value, `x` an aliased `foreach` element: the same fields
+// of that element (cobc's `alias_field_chain`), built anew each time.
+fn alias_field_chain(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Expr>
+{
+    if (HashMap::len(&x.elem_alias) == 0)
+    {
+        return None;
+    }
+    match (&e.kind)
+    {
+        ExprKind::EField(_) : rebuild_alias(g, x, e),
+        _                   : None,
+    }
+}
+
+fn rebuild_alias(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Expr>
+{
+    match (&e.kind)
+    {
+        ExprKind::EField(f) :
+        {
+            Expr a = match (rebuild_alias(g, x, &Box::get(f).e))
+            {
+                Some(a) : a,
+                None    : return None,
+            };
+            Some(synth(g, ExprKind::EField(Box::new(FieldExpr { .e = a, .name = String::clone(&Box::get(f).name) })), e.line, e.col))
+        },
+        ExprKind::EParen(a) : rebuild_alias(g, x, Box::get(a)),
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) != 1)
+            {
+                return None;
+            }
+            alias_copy(g, x, &Box::get(p).segs[0])
+        },
+        // `(*x).f…`: `*x` is the element itself.
+        ExprKind::EDeref(a) :
+        {
+            match (&strip_parens(Box::get(a)).kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) != 1)
+                    {
+                        return None;
+                    }
+                    alias_copy(g, x, &Box::get(p).segs[0])
+                },
+                _                  : None,
+            }
+        },
+        _                   : None,
+    }
+}
+
+// A copy of `n`'s alias with ids of its own (cobc clones it: new addresses).
+fn alias_copy(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<String, shared> n) : Option<Expr>
+{
+    Expr a = match (HashMap::get(&x.elem_alias, n))
+    {
+        Some(a) : clone(a),
+        None    : return None,
+    };
+    Some(renumbered(g, &a))
+}
 
 // A struct's field type, its type arguments applied (`None`: not a struct or
 // no such field).
@@ -6408,10 +6890,28 @@ fn lower_user_call_access(
             Type::TRef(_) : true,
             _             : false,
         };
+        bool is_slice = match (&pty)
+        {
+            Type::TSlice(_) : true,
+            _               : false,
+        };
         if (is_resource(g, &pty))
         {
             String o = Option::expect(clone(&argv[j].obj), "a resource argument without an object");
             emit(x, String::as_view(&sprintf("cb_send(%s);", &o)));
+        }
+        else if (is_slice && pure_direct(g, &String::from_view(name), j))
+        {
+        }
+        else if (pure_view(g, &String::from_view(name), j))
+        {
+            // Not sent (`pure_view`): a temporary view ends after the call,
+            // where the callee would have ended it.
+            match (&argv[j].obj)
+            {
+                Some(o) : Vec::push(&mut weakened, String::clone(o)),
+                None    : {},
+            }
         }
         else if (has_refs(g, &pty) && !is_ref)
         {
@@ -6425,8 +6925,93 @@ fn lower_user_call_access(
     {
         Vec::push(&mut cs, String::clone(&v.c));
     }
-    String call = sprintf("%s(%s)", &cname, &String::join(&cs[0..$], ", "));
-    V v = finish_call(g, x, call, ret, line);
+    String argl = String::join(&cs[0..$], ", ");
+    Option<usize> key = Some(args_key(args));
+    if (opt_eq(&x.map_acc, &key) && StringView::eq_str(name, "std::HashMap::entry") && native_map_passthrough(g, x, name, f, args, 0))
+    {
+        x.map_acc = None;
+        // The `_acc` variant: the value's address, its element access made
+        // (`lower_block_body`'s compound pair).
+        Type vt = match (&ret)
+        {
+            Type::TRef(m) : clone(&Box::get(m).inner),
+            _             :
+            {
+                assert(false, "cobc: entry's result");
+                Type::TVoid
+            },
+        };
+        String vc = ctype(g, &vt);
+        String pv = fresh(g, "pv");
+        emit(x, String::as_view(&sprintf("%s *%s = %s_acc(%s);", &vc, &pv, &cname, &argl)));
+        x.map_acc_used = true;
+        return V { .c = pv, .ty = ret, .obj = None };
+    }
+    String call = sprintf("%s(%s)", &cname, &argl);
+    // The `_acc` variant of `HashMap::get[_mut]` (`unwrapped_map_get`,
+    // `get_mut_acc_arms`): the value's address, its element access made;
+    // and the `Option<ref<T>>` whose token is received unheld (`datum_tok`).
+    Option<Type> acc_vt = None;
+    if (opt_eq(&x.map_get_acc, &key) && (StringView::eq_str(name, "std::HashMap::get_mut") || StringView::eq_str(name, "std::HashMap::get")) && one_ref_option(&ret) && native_map_passthrough(
+        g,
+        x,
+        name,
+        f,
+        args,
+        0,
+    ))
+    {
+        match (&ret)
+        {
+            Type::TNamed(n) :
+            {
+                match (&Box::get(n).args[0])
+                {
+                    Type::TRef(m) :
+                    {
+                        if (plain_data(g, &Box::get(m).inner))
+                        {
+                            acc_vt = Some(clone(&Box::get(m).inner));
+                        }
+                    },
+                    _             : {},
+                }
+            },
+            _               : {},
+        }
+    }
+    V v = match (acc_vt)
+    {
+        Some(vt) :
+        {
+            x.map_get_acc = None;
+            String vc = ctype(g, &vt);
+            String pv = fresh(g, "pv");
+            emit(x, String::as_view(&sprintf("%s *%s = %s_acc(%s);", &vc, &pv, &cname, &argl)));
+            String t = fresh(g, "t");
+            String oc = ctype(g, &ret);
+            emit(x, String::as_view(&sprintf("%s %s;", &oc, &t)));
+            emit(x, String::as_view(&sprintf("%s.tag = %s ? 0u : 1u;", &t, &pv)));
+            emit(x, String::as_view(&sprintf("%s.u.v0 = (void *)%s;", &t, &pv)));
+            x.map_get_acc_out = Some(pv);
+            V { .c = t, .ty = ret, .obj = None }
+        },
+        None     :
+        {
+            if (opt_eq(&x.datum_tok, &key) && one_ref_option(&ret))
+            {
+                x.datum_tok = None;
+                String t = fresh(g, "t");
+                String c = ctype(g, &ret);
+                emit(x, String::as_view(&sprintf("%s %s = %s;", &c, &t, &call)));
+                String tk = fresh(g, "tk");
+                emit(x, String::as_view(&sprintf("uint64_t %s = cb_recv_datum_tok();", &tk)));
+                x.datum_tok_out = Some(tk);
+                V { .c = t, .ty = ret, .obj = None }
+            }
+            else { finish_call(g, x, call, ret, line) }
+        },
+    };
     foreach (o in &weakened)
     {
         emit(x, String::as_view(&sprintf("cb_absorb(%s);", o)));
@@ -6847,6 +7432,36 @@ fn is_literal_branch(ref<Expr, shared> e) : bool
     }
 }
 
+// A `match`'s sink object holder, raw when the `match` (`id`, `arms_key`) is
+// a `__raw` form's last expression (`raw_tail`) and its value a resource
+// holding no reference (cobc's `match_sink_obj_var`).
+fn match_sink_obj_var(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Type, shared> ty, Option<usize> id) : Option<String>
+{
+    Option<String> ov = sink_obj_var(g, x, ty);
+    match (&ov)
+    {
+        Some(o) :
+        {
+            bool tail = match (x.raw_tail)
+            {
+                Some(t) : match (id)
+                {
+                    Some(i) : t == i,
+                    None    : false,
+                },
+                None    : false,
+            };
+            if (tail && is_resource(g, ty) && !has_refs(g, ty))
+            {
+                x.raw_tail = None;
+                HashSet::insert(&mut x.raw_sinks, String::clone(o));
+            }
+        },
+        None    : {},
+    }
+    ov
+}
+
 fn sink_obj_var(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Type, shared> ty) : Option<String>
 {
     match (ty)
@@ -6888,6 +7503,21 @@ fn assign_sink(
         _             : {},
     }
     store(g, x, dst, dty, &v);
+    // A raw sink (`match_sink_obj_var`): the value's record ends here.
+    bool raw = match (obj_var)
+    {
+        Some(ov) : HashSet::contains(&x.raw_sinks, ov),
+        None     : false,
+    };
+    if (raw)
+    {
+        match (&v.obj)
+        {
+            Some(vo) : emit(x, String::as_view(&sprintf("cb_forget_obj(%s);", vo))),
+            None     : {},
+        }
+        return None;
+    }
     String o = String::new();
     if (is_resource(g, dty))
     {
@@ -6993,7 +7623,18 @@ fn lower_branch(
             // An expression body gets its own statement scope, as a block
             // tail does.
             push_stmt(g, x);
-            V v = lower_expr(g, x, e, expected);
+            // A raw sink's `String` made with no object where it can be.
+            bool raw_sink = match (&sk.ov)
+            {
+                Some(o) : HashSet::contains(&x.raw_sinks, o),
+                None    : false,
+            };
+            Option<V> raw = if (raw_sink && is_string_ty(&sk.ty)) { lower_raw_string(g, x, e) } else { None };
+            V v = match (raw)
+            {
+                Some(rv) : rv,
+                None     : lower_expr(g, x, e, expected),
+            };
             if (is_never(&v.ty))
             {
                 end_diverged(x);
@@ -7258,6 +7899,19 @@ fn lower_assign(
     ref<Expr, shared> val,
 ) : V
 {
+    // `*x = e` for a `foreach (x in &mut v)` element aliased to `(*$c)[$i]`
+    // (`foreach_alias`): the write is to that element (a new node each time,
+    // as cobc builds one).
+    match (alias_of_deref(x, strip_parens(place)))
+    {
+        Some(a) :
+        {
+            Expr v = renumbered(g, val);
+            Expr w = synth(g, ExprKind::EAssign(Box::new(PairExpr { .a = a, .b = v })), e.line, e.col);
+            return lower_expr(g, x, &w, None);
+        },
+        None    : {},
+    }
     // D-0118: a write into a bit field: the whole backing integer is the
     // place written; the value must fit the width.
     match (&strip_parens(place).kind)
@@ -8289,6 +8943,27 @@ fn lower_borrow(
             &tok,
         ), .ty = ref_ty(clone(&v.ty), mode), .obj = None };
     }
+    // `&s` / `&mut s` of an objectless local (`objectless_strings`): its
+    // address with token 0 (every check proven).
+    match (path_name_raw(inner))
+    {
+        Some(n) :
+        {
+            match (lookup(x, String::as_view(&n)))
+            {
+                Some(b) :
+                {
+                    if (HashSet::contains(&x.objectless_c, &b.c))
+                    {
+                        objectless_use(g, x, &b.c, e.line);
+                        return V { .c = sprintf("((cb_ref){ (void *)&(%s), 0 })", &b.c), .ty = ref_ty(clone(&b.ty), mode), .obj = None };
+                    }
+                },
+                None    : {},
+            }
+        },
+        None    : {},
+    }
     // D-0258: `&NAME` of a static, `&K` of an addressed constant: a C
     // global's address with token 0.
     match (global_borrow(g, x, inner))
@@ -8303,6 +8978,14 @@ fn lower_borrow(
     P p = lower_place(g, x, inner);
     x.temp_root = false;
     x.place_write = false;
+    // The compound pair's `&mut v[i]` on a confined vector (`compound_elem`):
+    // the element's address, its bounds checked.
+    if (x.compound_elem && Option::is_none(&p.base) && Option::is_none(&p.raw) && !p.is_binding && !is_never(&p.ty))
+    {
+        String ad = fresh(g, "ad");
+        emit(x, String::as_view(&sprintf("void *%s = (void *)&(%s);", &ad, &p.c)));
+        return V { .c = sprintf("((cb_ref){ %s, 0 })", &ad), .ty = ref_ty(clone(&p.ty), mode), .obj = None };
+    }
     String base = match (&p.base)
     {
         Some(b) : String::clone(b),
@@ -8650,6 +9333,12 @@ fn lower_borrowed_operand(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr,
                 {
                     emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &tok)));
                 }
+                else if (Option::is_none(&p.raw) && p.is_binding && Vec::len(&p.projs) == 0 && HashSet::contains(&x.objectless_c, &p.c))
+                {
+                    // D-0200: an objectless local: its address, token 0.
+                    objectless_use(g, x, &p.c, line);
+                    emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &tok)));
+                }
                 else
                 {
                     assert(false, "cobc: a compared String with no access path");
@@ -8921,6 +9610,7 @@ fn call_std_values(ref<Gen, exclusive> g, ref<Fx, exclusive> x, str name, ref<Ve
 {
     FnDecl f = Option::expect(get_fn(g, &String::from_str(name)), "a std function");
     String cname = request_fn(g, StringView::of(name), Vec::new());
+    Vec<String> ended = Vec::new();
     for (usize j = 0; j < Vec::len(&f.params) && j < Vec::len(args); j += 1)
     {
         ref<Type, shared> pt = &f.params[j].ty;
@@ -8929,7 +9619,17 @@ fn call_std_values(ref<Gen, exclusive> g, ref<Fx, exclusive> x, str name, ref<Ve
             Type::TRef(_) : true,
             _             : false,
         };
-        if (is_resource(g, pt))
+        if (pure_view(g, &String::from_str(name), j))
+        {
+            // Kept by the caller for the call (`pure_view`), and a temporary
+            // one ended after it.
+            match (&args[j].obj)
+            {
+                Some(o) : Vec::push(&mut ended, String::clone(o)),
+                None    : {},
+            }
+        }
+        else if (is_resource(g, pt))
         {
             emit(
                 x,
@@ -8951,7 +9651,12 @@ fn call_std_values(ref<Gen, exclusive> g, ref<Fx, exclusive> x, str name, ref<Ve
         Vec::push(&mut cs, String::clone(&v.c));
     }
     String call = sprintf("%s(%s)", &cname, &String::join(&cs[0..$], ", "));
-    finish_call(g, x, call, clone(&f.ret), line)
+    V r = finish_call(g, x, call, clone(&f.ret), line);
+    foreach (o in &ended)
+    {
+        emit(x, String::as_view(&sprintf("cb_absorb(%s);", o)));
+    }
+    r
 }
 
 fn usize_ty() : Type
@@ -11258,8 +11963,15 @@ fn lower_fmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared>
         {
             Some(b) :
             {
-                String lc = loc(g, x.std_body, a0.line);
-                emit(x, String::as_view(&sprintf("cb_read(%s, NULL, 0, %s);", &b.root, &lc)));
+                if (!HashSet::contains(&x.objectless_c, &b.c))
+                {
+                    String lc = loc(g, x.std_body, a0.line);
+                    emit(x, String::as_view(&sprintf("cb_read(%s, NULL, 0, %s);", &b.root, &lc)));
+                }
+                else
+                {
+                    objectless_use(g, x, &b.c, a0.line);
+                }
                 Vec::push(&mut inits, sprintf("{ 3u, 0u, 0, 0, 0.0, (%s).bytes.ptr, (%s).bytes.len }", &b.c, &b.c));
                 continue;
             },
@@ -11548,7 +12260,14 @@ fn fmt_direct_string(
                 Type::TNamed(t) : Box::get(t).name == "std::String" && Vec::len(&Box::get(t).args) == 0,
                 _               : false,
             };
-            if (string && !HashMap::contains(&x.unstored, &b.c) && String::len(&b.root) > 0)
+            bool local = match (&b.kind)
+            {
+                BindKind::Local : true,
+                _               : false,
+            };
+            if (local && string && !HashSet::contains(&x.direct_refs, &b.c) && !HashMap::contains(&x.unstored, &b.c) && (HashSet::contains(&x.objectless_c, &b.c) || String::len(
+                &b.root,
+            ) > 0))
             {
                 return Some(b);
             }
@@ -12365,9 +13084,45 @@ fn lower_match(
         }
     }
     bool fused = Option::is_some(&fused_scrut);
+    Option<String> datum_tok = None;
+    Option<String> acc_ptr = None;
+    // A call returning `Option<ref<T>>`, matched with one-level patterns and
+    // no arm binding the whole value: the reference's path is received unheld
+    // into the statement's scope (`cb_recv_datum_tok`); `get_mut`'s `_acc`
+    // variant where the arms are a compound write (`get_mut_acc_arms`).
+    bool one_level = true;
+    foreach (a in arms)
+    {
+        one_level = one_level && Vec::len(&a.nested) == 0 && Option::is_none(&a.lit) && !(Option::is_none(&a.variant) && Option::is_some(&a.binder));
+    }
+    Option<usize> call_key = if (!fused && !res_place && !boot(g, 4) && one_level)
+    {
+        match (&strip_parens(scrut).kind)
+        {
+            ExprKind::ECall(c) : Some(args_key(&Box::get(c).args)),
+            _                  : None,
+        }
+    }
+    else { None };
     V sv = if (fused)
     {
         Option::expect(fused_scrut, "a fused scrutinee")
+    }
+    else if (Option::is_some(&call_key))
+    {
+        x.datum_tok = call_key;
+        x.datum_tok_out = None;
+        if (get_mut_acc_arms(scrut, arms))
+        {
+            x.map_get_acc = call_key;
+            x.map_get_acc_out = None;
+        }
+        V cv = lower_expr(g, x, scrut, None);
+        x.datum_tok = None;
+        x.map_get_acc = None;
+        datum_tok = replace(&mut x.datum_tok_out, None);
+        acc_ptr = replace(&mut x.map_get_acc_out, None);
+        cv
     }
     else if (res_place)
     {
@@ -12459,7 +13214,22 @@ fn lower_match(
     };
     HashMap<String, Type> sub = subst_of(&ed.type_params, &eargs);
     bool by_ref = Option::is_some(&by_ref_mode);
-    V s = if (by_ref || res_place) { sv2 } else { into_temp(g, x, sv2, line) };
+    V s = if (by_ref || res_place || Option::is_some(&datum_tok) || Option::is_some(&acc_ptr)) { sv2 } else { into_temp(g, x, sv2, line) };
+    match (&datum_tok)
+    {
+        Some(tk) :
+        {
+            // The payload slot's token is the received one (`slot_tok`).
+            for (usize vi = 0; vi < Vec::len(&ed.variants); vi += 1)
+            {
+                if (Option::is_some(&ed.variants[vi].payload))
+                {
+                    HashMap::insert(&mut x.unstored, sprintf("%s.u.v%v", &s.c, vi), String::clone(tk));
+                }
+            }
+        },
+        None     : {},
+    }
     bool scrut_res = !by_ref && !res_place && is_resource(g, &s.ty);
     // The first arm's type fixes the rest.
     Option<Type> arm_expected = match (expected)
@@ -12496,7 +13266,7 @@ fn lower_match(
         String r = fresh(g, "r");
         String rc = reg_ctype(g, &result_ty);
         emit(x, String::as_view(&sprintf("%s %s;", &rc, &r)));
-        Option<String> ov = sink_obj_var(g, x, &result_ty);
+        Option<String> ov = match_sink_obj_var(g, x, &result_ty, arms_key(arms));
         sink = Some(Sink { .dst = r, .ty = clone(&result_ty), .ov = ov });
     }
     for (usize i = 0; i < Vec::len(arms); i += 1)
@@ -12583,6 +13353,7 @@ fn lower_match(
             &by_ref_tok,
             &by_ref_prefix,
             &place_root,
+            &acc_ptr,
             line,
         );
         if (scrut_res && moved_out)
@@ -12626,7 +13397,20 @@ fn lower_match(
     }
     match (sink)
     {
-        Some(sk) : V { .c = String::clone(&sk.dst), .ty = result_ty, .obj = clone(&sk.ov) },
+        Some(sk) :
+        {
+            // A raw sink's value has no object (`inert_c`).
+            bool raw = match (&sk.ov)
+            {
+                Some(o) : HashSet::contains(&x.raw_sinks, o),
+                None    : false,
+            };
+            if (raw)
+            {
+                HashSet::insert(&mut x.inert_c, String::clone(&sk.dst));
+            }
+            V { .c = String::clone(&sk.dst), .ty = result_ty, .obj = if (raw) { None } else { clone(&sk.ov) } }
+        },
         None     : if (is_never(&result_ty)) { never() } else { unit() },
     }
 }
@@ -12680,6 +13464,7 @@ fn bind_match_arm(
     ref<String, shared> by_ref_tok,
     ref<Vec<String>, shared> by_ref_prefix,
     ref<Option<String>, shared> place_root,
+    ref<Option<String>, shared> acc_ptr,
     usize line
 ) : bool
 {
@@ -12869,6 +13654,17 @@ fn bind_match_arm(
             None    : {},
         }
         u32 tid = type_id(g, &pty);
+        // D-0200: an objectless binder (`objectless_strings`): the payload's
+        // bytes, no object.
+        usize arm_id = Box::get(&arm.body).id | ARM_BIT;
+        if (HashSet::contains(&x.objectless_names.ids, &arm_id) && objectless_type(g, &pty) && x.probing == 0)
+        {
+            Option<usize> saved = replace(&mut x.cur_let, Some(arm_id));
+            objectless_bound(g, x, &cname, tid, &pty);
+            x.cur_let = saved;
+            bind_in_scope(x, String::as_view(binder), Binding { .c = cname, .ty = pty, .root = String::new(), .kind = BindKind::Local });
+            return true;
+        }
         String lc = loc(g, x.std_body, line);
         String o = fresh(g, "o");
         emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &cname, tid, &lc)));
@@ -12881,6 +13677,15 @@ fn bind_match_arm(
             Binding { .c = cname, .ty = pty, .root = root, .kind = BindKind::Local },
         );
         moved_out = true;
+    }
+    else if (Option::is_some(acc_ptr) && is_ref)
+    {
+        // `get_mut`'s `_acc` variant: `*c op= x` alone, the element's access
+        // made (`get_mut_acc_arms`).
+        String pv = Option::expect(clone(acc_ptr), "a value pointer");
+        emit(x, String::as_view(&sprintf("%s = (void *)%s;", &cname, &pv)));
+        HashSet::insert(&mut x.direct_refs, String::clone(&cname));
+        bind_in_scope(x, String::as_view(binder), Binding { .c = cname, .ty = pty, .root = String::new(), .kind = BindKind::Local });
     }
     else if (!boot(g, 7) && is_ref && binder_used_once_first(Box::get(&arm.body), binder))
     {
@@ -12965,7 +13770,7 @@ fn lower_match_scalar(
         String r = fresh(g, "r");
         String rc = reg_ctype(g, &result_ty);
         emit(x, String::as_view(&sprintf("%s %s;", &rc, &r)));
-        Option<String> ov = sink_obj_var(g, x, &result_ty);
+        Option<String> ov = match_sink_obj_var(g, x, &result_ty, arms_key(arms));
         sink = Some(Sink { .dst = r, .ty = clone(&result_ty), .ov = ov });
     }
     for (usize i = 0; i < Vec::len(arms); i += 1)
@@ -13064,7 +13869,20 @@ fn lower_match_scalar(
     }
     match (sink)
     {
-        Some(sk) : V { .c = String::clone(&sk.dst), .ty = result_ty, .obj = clone(&sk.ov) },
+        Some(sk) :
+        {
+            // A raw sink's value has no object (`inert_c`).
+            bool raw = match (&sk.ov)
+            {
+                Some(o) : HashSet::contains(&x.raw_sinks, o),
+                None    : false,
+            };
+            if (raw)
+            {
+                HashSet::insert(&mut x.inert_c, String::clone(&sk.dst));
+            }
+            V { .c = String::clone(&sk.dst), .ty = result_ty, .obj = if (raw) { None } else { clone(&sk.ov) } }
+        },
         None     : if (is_never(&result_ty)) { never() } else { unit() },
     }
 }
