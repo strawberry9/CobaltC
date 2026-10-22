@@ -15,12 +15,12 @@ impl<'g, 'a> Fx<'g, 'a> {
         }
         // D-0274: in the bootstrap form every call takes the general path,
         // but `e[k]`, whose check is element k's (`lower_vec_index_pre`).
-        if self.g.bootstrap {
+        if self.g.boot(3) {
             if let Some(v) = self.lower_vec_index_pre(name, f, args, line, access)? {
                 return Ok(v);
             }
         }
-        if !self.g.bootstrap {
+        if !self.g.boot(3) {
             // `String::append(s, x)` with a `str`: the prelude's body is
             // `append_native(s, x)`, which hands both on to `append_str`. The
             // call goes to that helper directly: the body's frame and its
@@ -439,7 +439,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // operations' passthroughs). `None`: the general path lowers it.
     #[allow(clippy::too_many_arguments)]
     fn lower_user_arg_direct(&mut self, name: &str, f: &FnDecl, args: &[Expr], j: usize, a: &Expr, p: &Param, argv: &[V], m: &mut HashMap<String, Type>, map_excl_checked: &mut bool) -> R<Option<DirectArg>> {
-        if self.g.bootstrap {
+        if self.g.boot(3) {
             return Ok(None);
         }
         // D-0258: `&NAME` of a static, `&K` of an addressed constant, as an

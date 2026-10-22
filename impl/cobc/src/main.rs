@@ -188,6 +188,8 @@ Options:
                Emit the general checked form only: --all-checks, no object
                cache, no elisions (D-0274). The reference for the code
                generator written in CobaltC; much slower.
+               COBALTC_BOOTSTRAP_UPTO=N switches off D-0274's stages 1..N
+               only (0 the default form, 10 this one; CHG-0368).
   --warn-shadow
                Note, on standard error, each item of the program whose name
                hides an imported one (a `struct Vec` beside `import std;`):

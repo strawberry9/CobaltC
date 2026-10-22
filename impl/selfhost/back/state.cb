@@ -127,6 +127,30 @@ export struct Gen
     // The key hash and order functions made so far (`cb_kh_`, `cb_kc_`).
     export HashMap<String, String> khs;
     export HashMap<String, String> kcs;
+    // D-0274: the stages switched off, 1..=`bootstrap` (`bootstrap_level`,
+    // `boot`; cobc's `Gen::bootstrap`).
+    export u8 bootstrap;
+    // D-0200: the closure being lowered is a predicate (`lower_closure`):
+    // its reference parameters bare addresses; and one that only reads.
+    export bool pending_pred_closure;
+    export bool pending_reader_closure;
+    // D-0192: closures whose reference parameters are all direct and never
+    // handed on: a `fn` value holding one is pure (`cb_fn_mark_pure`).
+    export HashSet<u64> pure_closures;
+    // `reader_param`'s answers, by `key#pos` (cobc's `reader_memo`).
+    export HashMap<String, bool> reader_memo;
+    // The function a native body is being made for (cobc's `native_ctx`):
+    // `std_fallback` emits the prelude's own body beside it.
+    export Option<NativeCtx> native_ctx;
+}
+
+export struct NativeCtx
+{
+    export String name;
+    export FnDecl f;
+    export Vec<Type> targs;
+    export String ret_c;
+    export String sig;
 }
 
 // A name in scope: its C name, its type, and the root path of its runtime
@@ -255,6 +279,39 @@ export struct Fx
     export bool branch_scope;
     // The function being lowered, for internal errors.
     export String fn_name;
+    // The direct reference parameters (`direct_refs_of`), and the C names
+    // whose accesses need no check (cobc's `direct_refs`).
+    export HashSet<String> direct_params;
+    export HashSet<String> direct_refs;
+    // A direct slice's entry flag (`bind_direct_live`), by its C name.
+    export HashMap<String, String> direct_live;
+    // A predicate closure's body (`pending_pred_closure`).
+    export bool pred_body;
+    // The reference parameters no slot holds (`unstored_ref_params`).
+    export HashSet<String> unstored_params;
+    // The vectors an element access reaches with its bounds check alone: a
+    // confined holder or parameter, by name (cobc's `confined_params`), and
+    // the confined locals, by C name (`confined`).
+    export HashMap<String, ConfinedVec> confined_params;
+    export HashSet<String> confined;
+    // The binders whose path is not minted (`cb_borrow_unminted`), by C
+    // name: the base token and projections (`unminted_binders`).
+    export HashMap<String, Unminted> unminted_binders;
+}
+
+// A confined vector: the vector as a C lvalue, the path to hand on, and
+// the element type.
+export struct ConfinedVec
+{
+    export String c;
+    export String path;
+    export Type elem;
+}
+
+export struct Unminted
+{
+    export String tok;
+    export Vec<String> projs;
 }
 
 export struct Loop
@@ -301,7 +358,63 @@ export fn new_gen(Checked prog) : Gen
         .eqs = HashMap::new(),
         .khs = HashMap::new(),
         .kcs = HashMap::new(),
+        .bootstrap = bootstrap_level(),
+        .pending_pred_closure = false,
+        .pending_reader_closure = false,
+        .pure_closures = HashSet::new(),
+        .reader_memo = HashMap::new(),
+        .native_ctx = None,
     }
+}
+
+// The D-0274 stages cobc has: `COBALTC_BOOTSTRAP_UPTO=N` switches off
+// stages 1..=N (CHG-0368), `COBALTC_BOOTSTRAP_FORM` all of them.
+export const u8 BOOTSTRAP_STAGES = 10;
+
+// The lowest level this port writes (the stages above it are ported).
+export const u8 LOWEST_LEVEL = 5;
+
+fn env_set(str name) : Option<String>
+{
+    match (env_var(StringView::of(name)))
+    {
+        Ok(v)  : v,
+        Err(_) : None,
+    }
+}
+
+export fn bootstrap_level() : u8
+{
+    match (env_set("COBALTC_BOOTSTRAP_UPTO"))
+    {
+        Some(v) :
+        {
+            match (StringView::parse<u8>(StringView::trim(String::as_view(&v))))
+            {
+                Ok(n)  : return if (n > BOOTSTRAP_STAGES) { BOOTSTRAP_STAGES } else { n },
+                Err(_) : {},
+            }
+        },
+        None    : {},
+    }
+    match (env_set("COBALTC_BOOTSTRAP_FORM"))
+    {
+        Some(v) :
+        {
+            if (String::len(&v) > 0 && !String::eq_str(&v, "0"))
+            {
+                return BOOTSTRAP_STAGES;
+            }
+        },
+        None    : {},
+    }
+    LOWEST_LEVEL
+}
+
+// D-0274 stage `stage` is switched off (cobc's `Gen::boot`).
+export fn boot(ref<Gen, shared> g, u8 stage) : bool
+{
+    g.bootstrap >= stage
 }
 
 // ---- names, locations, requests ----

@@ -276,7 +276,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // from the same values laid out once as C static data, with the same
     // bounds check. Only a read comes this way: the data is never written.
     pub(super) fn const_array_read(&mut self, e: &Expr) -> R<Option<V>> {
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             return Ok(None);
         }
         let ExprKind::Index(base, idx) = &e.kind else { return Ok(None) };

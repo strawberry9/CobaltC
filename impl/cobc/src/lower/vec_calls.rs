@@ -124,7 +124,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         // cannot change the runtime's state keeps the two in agreement.
         // D-0274: in the bootstrap form only the sugar, which `[Index-Vec]`
         // needs; a stateless index is an optimisation.
-        let stateless = !self.g.bootstrap && self.stateless(a1);
+        let stateless = !self.g.boot(3) && self.stateless(a1);
         if !stateless && !sugar {
             return Ok(None);
         }
@@ -178,7 +178,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             return Ok(Some(V { c: e, ty: elem, obj: None }));
         }
         let r = self.g.fresh("r");
-        if self.g.bootstrap {
+        if self.g.boot(5) {
             // D-0274: no native bodies, so no `…_pre` variant: its body inline.
             let vec_c = self.g.ctype(&p.ty)?;
             let elem_c = self.g.ctype(&elem)?;

@@ -70,7 +70,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         // write nothing, and having no storage of its own it can keep
         // nothing it is given.
         let read_captures = captures.is_empty() || (!is_move && captures.iter().all(|c| !body_writes(body, c)));
-        if read_captures && !self.g.pending_pred_closure && !self.g.bootstrap {
+        if read_captures && !self.g.pending_pred_closure && !self.g.boot(10) {
             let bound = bound_names(body);
             let g = &*self.g;
             let sub = self.subst.clone();
@@ -118,7 +118,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             let saved_str_names = self.g.str_names.clone();
             // A closure's own parameters and its captures are its bindings.
             let bound: Vec<String> = params.iter().map(|p| p.name.clone()).chain(info.fields.iter().map(|(n, _)| n.clone())).collect();
-            let confined_names = if self.g.bootstrap { HashSet::new() } else { self.g.confined_vecs(body, &bound, &[]) };
+            let confined_names = if self.g.boot(4) { HashSet::new() } else { self.g.confined_vecs(body, &bound, &[]) };
             let cl_bound: HashSet<String> = bound_names(body).into_iter().chain(bound.iter().cloned()).collect();
             let pinned = pinned_names(body, &|segs: &[String], j: usize| self.g.pure_direct_ref_arg(segs, j, &cl_bound));
             let mut fx = Fx {
@@ -195,7 +195,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             // A closure that captures nothing never reaches `self`: it is
             // bound as a bare address (`bind_param`'s direct form), and its
             // own parameters may be direct as a function's are.
-            if fx.g.bootstrap {
+            if fx.g.boot(10) {
                 // D-0274: nothing direct in the bootstrap form.
             } else if !info.fields.is_empty() && !pred {
                 // D-0192: a capturing closure may reach storage outside it
@@ -217,7 +217,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                     fx.direct_params.insert("self".to_string());
                 }
             }
-            if !fx.g.bootstrap && (info.fields.is_empty() || pred) {
+            if !fx.g.boot(10) && (info.fields.is_empty() || pred) {
                 fx.direct_params = fx.g.direct_refs_of(params, body, &fx.subst)?;
                 fx.pred_body = pred;
                 if pred {
@@ -228,7 +228,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 }
                 fx.direct_params.insert("self".to_string());
             }
-            if !probing && !fx.g.bootstrap {
+            if !probing && !fx.g.boot(10) {
                 // Pure: every reference parameter direct and never handed on,
                 // none a slice (which travels in flight), the result plain.
                 let all_direct = params.iter().all(|p| match apply(&p.ty, &fx.subst) {
@@ -269,7 +269,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             }
             let prologue = fx.notes_finish();
             // D-0274: in the bootstrap form no text pass elides anything.
-            let out = if fx.g.bootstrap {
+            let out = if fx.g.boot(1) {
                 resolve_scopes(&fx.out)
             } else {
                 elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&fx.out)), self.g.line_directives))

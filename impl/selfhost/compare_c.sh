@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compares cbc (impl/selfhost/cbc, the code generator written in CobaltC)
 # with `cobc --bootstrap-form` (D-0274), byte for byte, on each FILE given
+# (LEVEL=N: both at COBALTC_BOOTSTRAP_UPTO=N, CHG-0368; default 10)
 # (default: every `.cb` file git tracks): the C each writes for it. A
 # program cobc rejects is skipped. Also checks that
 # impl/selfhost/back/header.cb is what gen_header.py makes of cbrt.h now.
@@ -47,12 +48,12 @@ one() {
     local f=$1 tag d
     tag=$(printf '%s' "$f" | tr '/' '_')
     d=$(mktemp -d "$OUT/run/c.XXXXXX")
-    if ! (cd "$root" && COBALTC_BOOTSTRAP_FORM=1 timeout -k 5 600 "$cobc" --cc /bin/true --keep-c -o "$d/a" "$f" > "$d/cobc.log" 2>&1); then
+    if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --cc /bin/true --keep-c -o "$d/a" "$f" > "$d/cobc.log" 2>&1); then
         rm -rf "$d"
         echo "skip $f"
         return
     fi
-    (cd "$root" && timeout -k 5 3600 "$cbc" --emit-c --c-name "$d/a.c" "$f" > "$d/b.c" 2> "$d/cbc.log")
+    (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 3600 "$cbc" --emit-c --c-name "$d/a.c" "$f" > "$d/b.c" 2> "$d/cbc.log")
     if cmp -s "$d/a.c" "$d/b.c"; then
         rm -rf "$d"
         echo "same $f"
@@ -64,7 +65,8 @@ one() {
     fi
 }
 export -f one
-export root cobc cbc OUT
+LEVEL=${LEVEL:-10}
+export root cobc cbc OUT LEVEL
 xargs -P "$jobs" -I{} bash -c 'one "$@"' _ {} < "$OUT/files" >> "$OUT/results"
 sort -o "$OUT/results" "$OUT/results"
 printf '%s same, %s DIFF, %s skip\n' "$(grep -c '^same' "$OUT/results")" "$(grep -c '^DIFF' "$OUT/results")" "$(grep -c '^skip' "$OUT/results")"

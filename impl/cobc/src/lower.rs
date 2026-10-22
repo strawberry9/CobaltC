@@ -275,8 +275,10 @@ pub struct Gen<'a> {
     // elided forms (`impl/battery.sh` stage 3); what a program proves of
     // its own locals is kept.
     all_checks: bool,
-    // D-0274: `--bootstrap-form`, the general checked form only.
-    pub(crate) bootstrap: bool,
+    // D-0274: `--bootstrap-form`, the general checked form only: the
+    // stages of D-0274 switched off, 1..=`bootstrap` (`bootstrap_level`;
+    // 0 is the default form, 10 every stage; `boot`).
+    pub(crate) bootstrap: u8,
     // WI-11: `#line` directives naming the program's `.cb` lines before
     // the C of its own statements (`line_directives`); off with
     // `--no-line-directives`.

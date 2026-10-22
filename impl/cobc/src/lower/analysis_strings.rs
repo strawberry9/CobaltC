@@ -444,7 +444,7 @@ impl<'a> Gen<'a> {
     // every result -- each `return x` and its last expression -- is a local
     // declared once that the analysis makes objectless.
     pub(super) fn raw_ret_ok(&self, key: &str) -> bool {
-        if self.bootstrap {
+        if self.boot(4) {
             return false;
         }
         let Some(f) = self.items.fns.get(key) else { return false };

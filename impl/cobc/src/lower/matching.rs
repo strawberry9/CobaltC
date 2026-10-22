@@ -254,7 +254,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         // unheld all its life, and no check counts an unheld path (D-0018),
         // as an ancestor or otherwise.
         let mut fused: Option<(Mode, String, Vec<String>)> = None;
-        if let (ExprKind::Borrow(bm, place), false) = (&strip_parens(scrut).kind, self.g.bootstrap) {
+        if let (ExprKind::Borrow(bm, place), false) = (&strip_parens(scrut).kind, self.g.boot(9)) {
             let pt = self.probe_place_type(place)?;
             if matches!(&pt, Type::Named(n, _) if self.g.items.enums.contains_key(n)) {
                 let p = self.lower_place(place)?;
@@ -292,7 +292,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 }
             }
             V { c: p.c, ty: p.ty, obj: None }
-        } else if let (ExprKind::Call(_, cargs), true) = (&strip_parens(scrut).kind, !self.g.bootstrap && arms.iter().all(|a| a.nested.is_empty() && a.lit.is_none() && !(a.variant.is_none() && a.binder.is_some()))) {
+        } else if let (ExprKind::Call(_, cargs), true) = (&strip_parens(scrut).kind, !self.g.boot(4) && arms.iter().all(|a| a.nested.is_empty() && a.lit.is_none() && !(a.variant.is_none() && a.binder.is_some()))) {
             // A call returning `Option<ref<T>>`, matched with one-level
             // patterns and no arm binding the whole value (that binder is
             // copied from the temporary's slot, which this leaves empty):
@@ -527,7 +527,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 // the box's pointer. The borrow is checked
                 // (`cb_borrow_unminted`) and none minted; the call is
                 // made inline through the base (`unminted_binders`).
-                let box_use = !self.g.bootstrap && binder_used_once_first(&arm.body, binder) && binder_box_call(&arm.body, binder).map_or(false, |g| g == "std::Box::get" || (g == "std::Box::get_mut" && *mode == Mode::Exclusive));
+                let box_use = !self.g.boot(7) && binder_used_once_first(&arm.body, binder) && binder_box_call(&arm.body, binder).map_or(false, |g| g == "std::Box::get" || (g == "std::Box::get_mut" && *mode == Mode::Exclusive));
                 if !box_use && tok.is_empty() {
                     return internal("a binder through a direct place used other than by `Box::get`");
                 }
@@ -542,7 +542,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                     let _ = &t;
                 } else {
                 self.emit(&format!("uint64_t {} = cb_borrow({}, {}, {}, {}, {});", t, tok, projs, all.len(), m, loc));
-                if !self.g.bootstrap && binder_used_once_first(&arm.body, binder) {
+                if !self.g.boot(7) && binder_used_once_first(&arm.body, binder) {
                     // Used once, by the first thing the arm evaluates:
                     // nothing runs between the binding and its use, so
                     // its path need not be held by a binding object
@@ -606,7 +606,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                     self.emit(&format!("{} = (void *){};", cname, pv));
                     self.direct_refs.insert(cname.clone());
                     self.scopes.last_mut().unwrap().insert(binder.clone(), Binding { c: cname, ty: pty, root: String::new(), kind: BindKind::Local });
-                } else if !self.g.bootstrap && matches!(pty, Type::Ref(..)) && binder_used_once_first(&arm.body, binder) {
+                } else if !self.g.boot(7) && matches!(pty, Type::Ref(..)) && binder_used_once_first(&arm.body, binder) {
                     // The reference stays in the scrutinee's slot, held
                     // there until the statement ends; a binder used once,
                     // by the first thing the arm evaluates, needs no
@@ -763,7 +763,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     }
 
     pub(super) fn foreach_alias(&mut self, s: &Stmt, next: Option<&Stmt>) -> R<Option<(String, std::rc::Rc<Expr>)>> {
-        if self.g.bootstrap {
+        if self.g.boot(4) {
             return Ok(None);
         }
         let Stmt::Let { ty: None, name, init: Some(init), .. } = s else { return Ok(None) };

@@ -485,7 +485,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // `Some(diverged)` when done here.
     pub(super) fn bind_fresh_objectless(&mut self, name: &str, cname: &str, declared: Option<&Type>, e: &Expr) -> R<Option<bool>> {
         // D-0274: no `_raw` variants in the bootstrap form (no native bodies).
-        if self.g.bootstrap {
+        if self.g.boot(5) {
             return Ok(None);
         }
         // D-0200: `String::new()` / `Vec::new()` into an objectless local:
@@ -788,7 +788,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // objects only where its entry test found one (`bind_direct_live`).
     pub(super) fn bind_reader_slice(&mut self, name: &str, c: &str, ty: &Type) -> R<()> {
         // D-0274: not in the bootstrap form.
-        if self.g.bootstrap {
+        if self.g.boot(7) {
             return Ok(());
         }
         // Not a hidden binding (`$…`, a `foreach`'s): its uses are expanded

@@ -364,7 +364,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // value is inert (`inert_c`). `None`: `e` is none of these.
     pub(super) fn lower_raw_string(&mut self, e: &Expr) -> R<Option<V>> {
         // D-0274: no `_raw` variants in the bootstrap form (no native bodies).
-        if self.g.bootstrap {
+        if self.g.boot(5) {
             return Ok(None);
         }
         let string = Type::Named("std::String".to_string(), vec![]);

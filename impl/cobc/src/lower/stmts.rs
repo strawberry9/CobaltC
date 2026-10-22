@@ -30,7 +30,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             // uses through the borrow's token, which that one statement
             // keeps until its end.
             if let (Stmt::Let { ty: None, name, init: Some(e), line, .. }, Some(next)) = (s, b.stmts.get(si + 1)) {
-                if !self.g.bootstrap && name.starts_with("__compound") && matches!(&e.kind, ExprKind::Borrow(Mode::Exclusive, _)) && compound_write_inert(next, name) {
+                if !self.g.boot(4) && name.starts_with("__compound") && matches!(&e.kind, ExprKind::Borrow(Mode::Exclusive, _)) && compound_write_inert(next, name) {
                     self.push_stmt();
                     // `*HashMap::entry(…) op= e`: the native `entry`'s
                     // `_acc` variant gives the value's address, the
@@ -150,7 +150,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                         self.quiet_roots.insert(bd.root.clone());
                     }
                 }
-                if self.g.bootstrap {
+                if self.g.boot(7) {
                     // D-0274: no holder is confined in the bootstrap form.
                 } else if foreach_reads_only(name, init, b) {
                     self.confine_holder(name)?;
@@ -232,7 +232,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // The reference to the mutex is checked as `lock` checks it. Returns
     // false, having emitted nothing, where the interior is not plain.
     pub(super) fn lower_bare_guard(&mut self, name: &str, marg: &Expr, line: usize, unlocks: &mut Vec<String>) -> R<bool> {
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             return Ok(false);
         }
         let inner = match self.probe_type(marg, None)? {

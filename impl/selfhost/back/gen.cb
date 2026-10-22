@@ -15,6 +15,8 @@ import header;
 import passes;
 import cnames;
 import uses;
+import direct;
+import natives;
 import each;
 import state;
 import typeops;
@@ -164,6 +166,11 @@ fn lower_fn(ref<Gen, exclusive> g, ref<FnRequest, shared> r)
     };
     String sig = sprintf("%s %s(%s)", &ret_c, &cname, &plist);
     String::append(&mut g.protos, &sprintf("%s;\n", &sig));
+    // A native body (D-0274 stage 5), where one exists.
+    if (lower_native(g, &r.name, &f, &r.targs, &cname, &ret_c, &sig))
+    {
+        return;
+    }
     emit_fn_body(g, String::as_view(&r.name), &f, &subst, &ret, &sig, &cname);
 }
 
@@ -218,10 +225,19 @@ fn emit_fn_body(
         .stmt_match = false,
         .branch_scope = false,
         .fn_name = String::from_view(name),
+        .direct_params = HashSet::new(),
+        .direct_refs = HashSet::new(),
+        .direct_live = HashMap::new(),
+        .pred_body = false,
+        .unstored_params = HashSet::new(),
+        .confined_params = HashMap::new(),
+        .confined = HashSet::new(),
+        .unminted_binders = HashMap::new(),
     };
     Vec::push(&mut x.scopes, HashMap::new());
     push_frame(g, &mut x);
     x.root_frame = g.nscope;
+    x.unstored_params = unstored_ref_params(g, f, subst, &x.direct_params);
     foreach (p in &f.params)
     {
         bind_param(g, &mut x, p, subst);
@@ -513,8 +529,9 @@ fn lower_block_body(
 {
     Vec::push(&mut x.scopes, HashMap::new());
     V result = unit();
-    foreach (st in &b.stmts)
+    for (usize si = 0; si < Vec::len(&b.stmts); si += 1)
     {
+        ref<Stmt, shared> st = &b.stmts[si];
         match (stmt_line(st))
         {
             Some(l) : at(g, x, l),
@@ -530,6 +547,36 @@ fn lower_block_body(
         }
         pop_stmt(x);
         end_ref_bindings(g, x, st);
+        // `$c = &v` or `&mut v` of a `foreach` whose body only reads or
+        // writes its elements in place: `$c` holds `v` for the whole loop
+        // (`confine_holder`); and a held shared reference to a `Vec` only
+        // read through (`held_vec_reader`).
+        match (st)
+        {
+            Stmt::SLet(l) :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(init) :
+                    {
+                        if (boot(g, 7))
+                        {
+                            // D-0274: no holder is confined in the bootstrap form.
+                        }
+                        else if (foreach_reads_only(&Box::get(l).name, init, b))
+                        {
+                            confine_holder(g, x, &Box::get(l).name);
+                        }
+                        else if (held_vec_reader(g, x, &Box::get(l).name, init, b, si))
+                        {
+                            confine_holder(g, x, &Box::get(l).name);
+                        }
+                    },
+                    None       : {},
+                }
+            },
+            _             : {},
+        }
     }
     if (!is_never(&result.ty))
     {
@@ -711,6 +758,38 @@ fn lower_expr_inner(
         ExprKind::EParen(i)       : lower_expr(g, x, Box::get(i), expected),
         ExprKind::EPath(p)        :
         {
+            // A direct reference parameter handed on whole: the reference
+            // the call was given, its path unchanged.
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                match (lookup(x, String::as_view(&Box::get(p).segs[0])))
+                {
+                    Some(b) :
+                    {
+                        if (HashSet::contains(&x.direct_refs, &b.c) && is_ref_type(&b.ty))
+                        {
+                            String pc = if (String::starts_with(
+                                &b.c,
+                                StringView::of("l_"),
+                            ))
+                            {
+                                String::from_view(StringView::sub(
+                                    String::as_view(&b.c),
+                                    2,
+                                    String::len(&b.c),
+                                ))
+                            }
+                            else { String::clone(&b.c) };
+                            return V { .c = sprintf(
+                                "((cb_ref){ %s, (%s).tok })",
+                                &b.c,
+                                &pc,
+                            ), .ty = clone(&b.ty), .obj = None };
+                        }
+                    },
+                    None    : {},
+                }
+            }
             if (Vec::len(&Box::get(p).segs) == 1 && Option::is_some(&lookup(x, String::as_view(&Box::get(p).segs[0]))))
             {
                 P pl = lower_place(g, x, e);
@@ -857,7 +936,9 @@ fn lower_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Stmt, shared> st)
                     };
                     String c = ctype(g, &ty);
                     emit(x, String::as_view(&sprintf("%s %s;", &c, &cname)));
+                    String bound_c = String::clone(&cname);
                     bind_value_let(g, x, String::as_view(&l.name), cname, &ty, &v2, e.line, true);
+                    bind_reader_slice(g, x, &l.name, &bound_c, &ty);
                 },
                 None    :
                 {
@@ -966,6 +1047,9 @@ fn bind_value_let(
     bool is_let,
 )
 {
+    // A new binding of the name: whatever `confined_params` recorded for an
+    // earlier one is not this one.
+    HashMap::remove(&mut x.confined_params, &String::from_view(name));
     bool is_ref = match (ty)
     {
         Type::TRef(_) : true,
@@ -1355,6 +1439,29 @@ fn lower_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e)
         },
         ExprKind::EDeref(inner) :
         {
+            // `*r` for a direct reference: its referent, unchecked.
+            match (&Box::get(inner).kind)
+            {
+                ExprKind::EPath(ip) :
+                {
+                    if (Vec::len(&Box::get(ip).segs) == 1 && Vec::len(&Box::get(ip).targs) == 0)
+                    {
+                        match (lookup(x, String::as_view(&Box::get(ip).segs[0])))
+                        {
+                            Some(b) :
+                            {
+                                if (HashSet::contains(&x.direct_refs, &b.c))
+                                {
+                                    P bp = P { .c = String::clone(&b.c), .ty = clone(&b.ty), .base = None, .projs = Vec::new(), .is_binding = true, .raw = None };
+                                    return auto_deref(g, x, bp);
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                },
+                _                   : {},
+            }
             Type it = probe_type(g, x, Box::get(inner), None);
             if (is_guard(&it))
             {
@@ -1482,6 +1589,24 @@ fn index_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e,
         Type::TSlice(m) :
         {
             Type elem = clone(&Box::get(&m).inner);
+            if (HashSet::contains(&x.direct_refs, &pb.c) && (pb.is_binding || Option::is_none(&pb.base)))
+            {
+                // A direct slice (`direct_refs_of`): bounds only.
+                String dlen = fresh(g, "len");
+                emit(x, String::as_view(&sprintf("uint64_t %s = (%s).len;", &dlen, &pb.c)));
+                Vec::push(&mut x.dollar, String::clone(&dlen));
+                V di = lower_expr(g, x, idx, Some(&us));
+                Vec::pop(&mut x.dollar);
+                V dit = into_temp(g, x, di, e.line);
+                String dlc = loc(g, x.std_body, e.line);
+                emit(x, String::as_view(&sprintf("cb_index_check((uint64_t)%s, %s, %s);", &dit.c, &dlen, &dlc)));
+                slice_elem_access(g, x, &pb.c, &dit.c, &elem, &dlc);
+                return P { .c = sprintf(
+                    "(%s).data[%s]",
+                    &pb.c,
+                    &dit.c,
+                ), .ty = elem, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None };
+            }
             String tok = fresh(g, "tok");
             emit(x, String::as_view(&sprintf("uint64_t %s = cb_load_ref(&(%s).src);", &tok, &pb.c)));
             String lenv = fresh(g, "len");
@@ -1548,6 +1673,30 @@ fn slice_elem_access(
     u32 tid = type_id(g, elem);
     str mode = if (x.place_write) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
     u32 w = if (x.place_write) { 1 } else { 0 };
+    // A direct slice meets element objects only where its entry test found
+    // one (`bind_direct_live`).
+    match (HashMap::get(&x.direct_live, sc))
+    {
+        Some(flag) :
+        {
+            String fl = String::clone(flag);
+            emit(
+                x,
+                String::as_view(&sprintf(
+                    "cb_elem_access_if(%s, (void *)&(%s).data[%s], %vu, %s, %vu, %s);",
+                    &fl,
+                    sc,
+                    idx,
+                    tid,
+                    mode,
+                    w,
+                    lc,
+                )),
+            );
+            return;
+        },
+        None       : {},
+    }
     u64 size = size_align(g, elem).size;
     emit(
         x,
@@ -1573,6 +1722,16 @@ fn auto_deref(ref<Gen, exclusive> g, ref<Fx, exclusive> x, P p) : P
         Type::TRef(m) :
         {
             Type pointee = clone(&Box::get(m).inner);
+            // A direct reference (`direct_refs`): its referent, unchecked.
+            if (p.is_binding && HashSet::contains(&x.direct_refs, &p.c))
+            {
+                String dc = ctype(g, &pointee);
+                return P { .c = sprintf(
+                    "(*(%s *)%s)",
+                    &dc,
+                    &p.c,
+                ), .ty = pointee, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None };
+            }
             String tk = fresh(g, "tk");
             String load = slot_tok(x, &p.c);
             emit(x, String::as_view(&sprintf("uint64_t %s = %s;", &tk, &load)));
@@ -1964,6 +2123,51 @@ fn elem_access_place(
         Some(fd) : fd,
         None     : return None,
     };
+    if (in_prelude(String::as_view(&name), &f) && Vec::len(&call.args) == 2)
+    {
+        ref<Expr, shared> a0 = &call.args[0];
+        ref<Expr, shared> a1 = &call.args[1];
+        // Confined (a holder, a confined local): the body's location and
+        // bounds fault, and the element's address; nothing else. (A read of
+        // a `read_confined_vec` comes with stage 4.)
+        match (confined_elem_vec(g, x, a0))
+        {
+            Some(cv) :
+            {
+                V i = lower_index_arg(g, x, sprintf("(%s).len", &cv.c), a1);
+                if (is_never(&i.ty))
+                {
+                    return Some(P { .c = String::new(), .ty = Type::TNever, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None });
+                }
+                V it = into_temp(g, x, i, a1.line);
+                Vec<Type> va = Vec::new();
+                Vec::push(&mut va, clone(&cv.elem));
+                String vec_c = ctype(
+                    g,
+                    &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = va })),
+                );
+                String elem_c = ctype(g, &cv.elem);
+                String v = fresh(g, "v");
+                String ev = fresh(g, "e");
+                at(g, x, line);
+                emit(x, String::as_view(&sprintf("%s *%s = &(%s);", &vec_c, &v, &cv.c)));
+                emit(
+                    x,
+                    String::as_view(&sprintf(
+                        "if (%s >= %s->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);",
+                        &it.c,
+                        &v,
+                    )),
+                );
+                emit(x, String::as_view(&sprintf("%s *%s = %s->ptr + (int64_t)%s;", &elem_c, &ev, &v, &it.c)));
+                return Some(P { .c = sprintf(
+                    "(*%s)",
+                    &ev,
+                ), .ty = clone(&cv.elem), .base = None, .projs = Vec::new(), .is_binding = false, .raw = None });
+            },
+            None     : {},
+        }
+    }
     V v = lower_user_call_access(g, x, String::as_view(&name), &f, &path.targs, &call.args, None, line, Some(write));
     match (&v.ty)
     {
@@ -2652,6 +2856,38 @@ fn bind_param(
     Type ty = apply(&p.ty, subst);
     String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
     StringView name = String::as_view(&p.name);
+    bool direct = HashSet::contains(&x.direct_params, &p.name);
+    bool is_slice = match (&ty)
+    {
+        Type::TSlice(_) : true,
+        _               : false,
+    };
+    if (direct && is_slice)
+    {
+        // A direct slice is received and bound as any slice, its path held
+        // for the call; only its element accesses go unchecked.
+        HashSet::insert(&mut x.direct_refs, String::clone(&pc));
+        bind_direct_live(g, x, &pc, &ty);
+    }
+    else if (direct)
+    {
+        // A direct reference: the address alone; no object, no stored path.
+        String dl = sprintf("l_%s", &pc);
+        emit(x, String::as_view(&sprintf("void *%s = %s.p;", &dl, &pc)));
+        HashSet::insert(&mut x.direct_refs, String::clone(&dl));
+        bind_in_scope(x, name, Binding { .c = dl, .ty = ty, .root = String::new(), .kind = BindKind::Local });
+        return;
+    }
+    if (HashSet::contains(&x.unstored_params, &p.name) && is_ref_type(&ty))
+    {
+        // Its accesses go through the token it came with; the binding itself
+        // is never written, borrowed or captured.
+        String ul = sprintf("l_%s", &pc);
+        emit(x, String::as_view(&sprintf("void *%s = %s.p;", &ul, &pc)));
+        HashMap::insert(&mut x.unstored, String::clone(&ul), sprintf("%s.tok", &pc));
+        bind_in_scope(x, name, Binding { .c = ul, .ty = ty, .root = String::new(), .kind = BindKind::Local });
+        return;
+    }
     if (unchecked(g, x, name, &ty))
     {
         bind_in_scope(x, name, Binding { .c = pc, .ty = ty, .root = String::new(), .kind = BindKind::Local });
@@ -2693,6 +2929,430 @@ fn bind_param(
     bind_in_scope(x, name, Binding { .c = cname, .ty = ty, .root = r, .kind = BindKind::Local });
     // A `Vec` taken by value is confined only outside the bootstrap form
     // (`bind_confined`: no confined names there).
+}
+
+// A value whose evaluation changes no runtime state (cobc's `stateless`):
+// literals, paths, fields, operators, and the width conversions of an
+// integer.
+fn stateless(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(_)    : true,
+        ExprKind::EFloat(_)  : true,
+        ExprKind::EBool(_)   : true,
+        ExprKind::EStr(_)    : true,
+        ExprKind::EUnit      : true,
+        ExprKind::EPath(_)   : true,
+        ExprKind::EParen(a)  : stateless(g, x, Box::get(a)),
+        ExprKind::EUnary(u)  : stateless(g, x, &Box::get(u).e),
+        ExprKind::EField(f)  : stateless(g, x, &Box::get(f).e),
+        ExprKind::EBinary(b) : stateless(g, x, &Box::get(b).a) && stateless(g, x, &Box::get(b).b),
+        ExprKind::ECall(c)   :
+        {
+            ref<Vec<Expr>, shared> args = &Box::get(c).args;
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 1 && Vec::len(args) == 1)
+                    {
+                        stateless(
+                            g,
+                            x,
+                            &args[0],
+                        ) && stateless_conv(g, x, &Box::get(p).segs[0], &Box::get(p).targs[0], &args[0])
+                    }
+                    else { false }
+                },
+                _                  : false,
+            }
+        },
+        _                    : false,
+    }
+}
+
+fn stateless_conv(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<Type, shared> dst0,
+    ref<Expr, shared> a,
+) : bool
+{
+    bool intrinsic = Option::is_none(&lookup(
+        x,
+        String::as_view(name),
+    )) && !HashMap::contains(&g.prog.table.fns, name) && !HashMap::contains(&g.prog.table.externs, name);
+    if (!intrinsic)
+    {
+        return false;
+    }
+    Type dst = apply(dst0, &x.subst);
+    IntTy d = match (&dst)
+    {
+        Type::TInt(t) : *t,
+        _             : return false,
+    };
+    if (String::eq_str(name, "widen") || String::eq_str(name, "narrow_wrapping") || String::eq_str(name, "reinterpret"))
+    {
+        return match (probe_type(g, x, a, None))
+        {
+            Type::TInt(_) : true,
+            _             : false,
+        };
+    }
+    if (String::eq_str(name, "narrow"))
+    {
+        return match (probe_type(g, x, a, None))
+        {
+            Type::TInt(s) : int_range_within(s, d),
+            _             : false,
+        };
+    }
+    false
+}
+
+fn int_signed(IntTy t) : bool
+{
+    match (t)
+    {
+        IntTy::I8    : true,
+        IntTy::I16   : true,
+        IntTy::I32   : true,
+        IntTy::I64   : true,
+        IntTy::I128  : true,
+        IntTy::Isize : true,
+        _            : false,
+    }
+}
+
+fn int_bitwidth(IntTy t) : u32
+{
+    match (t)
+    {
+        IntTy::I8   : 8,
+        IntTy::U8   : 8,
+        IntTy::I16  : 16,
+        IntTy::U16  : 16,
+        IntTy::I32  : 32,
+        IntTy::U32  : 32,
+        IntTy::I128 : 128,
+        IntTy::U128 : 128,
+        _           : 64,
+    }
+}
+
+// Every value of `s` is one of `d` (cobc's `int_range_within`).
+fn int_range_within(IntTy s, IntTy d) : bool
+{
+    u32 sb = int_bitwidth(s);
+    u32 db = int_bitwidth(d);
+    if (int_signed(s) == int_signed(d))
+    {
+        return sb <= db;
+    }
+    !int_signed(s) && sb < db
+}
+
+// D-0193: a local shared slice the body never assigns, borrows, captures or
+// drops: the path it holds stands until its scope ends, so its element reads
+// go unchecked, meeting element objects only where its entry test found one.
+fn bind_reader_slice(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<String, shared> c,
+    ref<Type, shared> ty,
+)
+{
+    // D-0274: not in the bootstrap form.
+    if (boot(g, 7))
+    {
+        return;
+    }
+    bool shared_slice = match (ty)
+    {
+        Type::TSlice(m) : Box::get(m).mode == Mode::Shared,
+        _               : false,
+    };
+    // Not a hidden binding (`$…`): its uses are expanded only as it is
+    // lowered, so `pinned` never saw them.
+    if (String::starts_with(
+        name,
+        StringView::of("$"),
+    ) || !shared_slice || HashSet::contains(&x.pinned, name) || HashSet::contains(
+        &x.assigned,
+        name,
+    ) || Option::is_some(&x.self_ref))
+    {
+        return;
+    }
+    match (lookup(x, String::as_view(name)))
+    {
+        Some(b) :
+        {
+            if (!String::eq(&b.c, c))
+            {
+                return;
+            }
+        },
+        None    : return,
+    }
+    bind_direct_live(g, x, c, ty);
+    HashSet::insert(&mut x.direct_refs, String::clone(c));
+}
+
+// D-0200: `ref<Vec<T>, shared> b = …;` (`T` plain), statement `at` of `blk`:
+// a held shared path to the `Vec` for `b`'s life, `b` only read and lent to
+// readers in the rest of its block, never declared again, its initializer
+// naming no guard: confined as a `foreach`'s holder is.
+fn held_vec_reader(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<Expr, shared> init,
+    ref<Block, shared> blk,
+    usize at,
+) : bool
+{
+    Binding b = match (lookup(x, String::as_view(name)))
+    {
+        Some(bd) : bd,
+        None     : return false,
+    };
+    bool local = match (&b.kind)
+    {
+        BindKind::Local : true,
+        _               : false,
+    };
+    bool vec_ok = match (&b.ty)
+    {
+        Type::TRef(m) :
+        {
+            Box::get(m).mode == Mode::Shared && match (&Box::get(m).inner)
+            {
+                Type::TNamed(n) : String::eq_str(
+                    &Box::get(n).name,
+                    "std::Vec",
+                ) && Vec::len(&Box::get(n).args) == 1 && plain_data(g, &Box::get(n).args[0]),
+                _ : false,
+            }
+        },
+        _             : false,
+    };
+    if (!local || !vec_ok || String::starts_with(name, StringView::of("$")))
+    {
+        return false;
+    }
+    HashSet<String> names = HashSet::new();
+    mentions_into(init, &mut names);
+    foreach (n in &names)
+    {
+        match (lookup(x, String::as_view(n)))
+        {
+            Some(nb) :
+            {
+                bool guarded = is_guard(&nb.ty) || match (&nb.ty)
+                {
+                    Type::TRef(m) : is_guard(&Box::get(m).inner),
+                    _             : false,
+                };
+                if (guarded)
+                {
+                    return false;
+                }
+            },
+            None     : {},
+        }
+    }
+    if (!held_names_ok(blk, at, name))
+    {
+        return false;
+    }
+    Block rest = rest_block(blk, at);
+    CalleeTest reads = CalleeTest::ClosureReads(bound_names(&rest));
+    reader_uses(g, &rest, name, false, &reads)
+}
+
+fn confine_holder(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<String, shared> name)
+{
+    Binding b = match (lookup(x, String::as_view(name)))
+    {
+        Some(bd) : bd,
+        None     : return,
+    };
+    Type inner = match (&b.ty)
+    {
+        Type::TRef(m) : clone(&Box::get(m).inner),
+        _             : return,
+    };
+    Type elem = match (&inner)
+    {
+        Type::TNamed(n) :
+        {
+            if (!String::eq_str(&Box::get(n).name, "std::Vec") || Vec::len(&Box::get(n).args) != 1)
+            {
+                return;
+            }
+            clone(&Box::get(n).args[0])
+        },
+        _               : return,
+    };
+    if (!plain_data(g, &elem) || size_align(g, &elem).size == 0)
+    {
+        return;
+    }
+    String vec_c = ctype(g, &inner);
+    HashMap::insert(
+        &mut x.confined_params,
+        String::clone(name),
+        ConfinedVec { .c = sprintf("(*(%s *)%s)", &vec_c, &b.c), .path = String::from_str("0"), .elem = elem },
+    );
+}
+
+// A confined vector passed as a `Vec` function's reference argument: `&x` /
+// `&mut x` for a confined local `x`, or `p` / `&*p` / `&mut *p` for a
+// confined parameter or holder `p` (cobc's `confined_local`).
+fn confined_local(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<ConfinedVec>
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(bb) :
+        {
+            ref<Expr, shared> inner = &Box::get(bb).e;
+            match (&inner.kind)
+            {
+                ExprKind::EDeref(p) :
+                {
+                    return match (plain_name(Box::get(p)))
+                    {
+                        Some(n) : confined_param(x, &n),
+                        None    : None,
+                    };
+                },
+                _                   : {},
+            }
+            String n = match (plain_name(inner))
+            {
+                Some(n) : n,
+                None    : return None,
+            };
+            Binding b = match (lookup(x, String::as_view(&n)))
+            {
+                Some(bd) : bd,
+                None     : return None,
+            };
+            if (!HashSet::contains(&x.confined, &b.c))
+            {
+                return None;
+            }
+            Type elem = match (&b.ty)
+            {
+                Type::TNamed(nt) :
+                {
+                    if (Vec::len(&Box::get(nt).args) == 0)
+                    {
+                        return None;
+                    }
+                    clone(&Box::get(nt).args[0])
+                },
+                _                : return None,
+            };
+            // D-0200: an objectless confined `Vec` has no root: token 0.
+            String root = if (String::len(&b.root) == 0) { String::from_str("0") } else { String::clone(&b.root) };
+            Some(ConfinedVec { .c = String::clone(&b.c), .path = root, .elem = elem })
+        },
+        ExprKind::EPath(_)    :
+        {
+            match (plain_name(e))
+            {
+                Some(n) : confined_param(x, &n),
+                None    : None,
+            }
+        },
+        _                     : None,
+    }
+}
+
+fn confined_param(ref<Fx, exclusive> x, ref<String, shared> n) : Option<ConfinedVec>
+{
+    match (HashMap::get(&x.confined_params, n))
+    {
+        Some(c) : Some(clone(c)),
+        None    : None,
+    }
+}
+
+// A one-segment path with no type arguments: its name (no parens).
+fn plain_name(ref<Expr, shared> e) : Option<String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 0)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+// An element access's vector: a confined local's or a confined field's
+// (cobc's `confined_elem_vec`; confined fields come with stage 4).
+fn confined_elem_vec(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<ConfinedVec>
+{
+    match (confined_local(x, e))
+    {
+        Some(c) : Some(c),
+        None    :
+        {
+            assert(boot(g, 4), "cbc: confined fields are not ported yet (D-0274 stage 4)");
+            None
+        },
+    }
+}
+
+// A place through fields of a direct reference (`box_rec_uses`).
+fn direct_place(ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::EField(f) : direct_place(x, &Box::get(f).e),
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) != 1)
+            {
+                return false;
+            }
+            match (lookup(x, String::as_view(&Box::get(p).segs[0])))
+            {
+                Some(b) : HashSet::contains(&x.direct_refs, &b.c) && is_ref_type(&b.ty),
+                None    : false,
+            }
+        },
+        _                   : false,
+    }
+}
+
+// A direct slice's entry test: whether any of its elements has an object.
+fn bind_direct_live(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<String, shared> pc, ref<Type, shared> ty)
+{
+    Type elem = match (ty)
+    {
+        Type::TSlice(m) : clone(&Box::get(m).inner),
+        _               : return,
+    };
+    u64 size = size_align(g, &elem).size;
+    String flag = sprintf("lv_%s", pc);
+    emit(
+        x,
+        String::as_view(&sprintf("uint8_t %s = cb_live_in((void *)(%s).data, (%s).len * %vu);", &flag, pc, pc, size)),
+    );
+    HashMap::insert(&mut x.direct_live, String::clone(pc), flag);
 }
 
 // ---- calls ----
@@ -2963,7 +3623,22 @@ fn box_closure(ref<Gen, exclusive> g, ref<Fx, exclusive> x, V v0, Type dst, usiz
         // D-0239: its calls write its own captures.
         emit(x, String::as_view(&sprintf("((cb_fnbox *)%s)->closure = 3u;", &h)));
     }
+    if (HashSet::contains(&g.pure_closures, &id) && plain_ret(g, &info.ret))
+    {
+        emit(x, String::as_view(&sprintf("cb_fn_mark_pure((void *)%s);", &info.cname)));
+    }
     V { .c = h, .ty = dst, .obj = None }
+}
+
+// A result that holds nothing of the arguments (cobc's `plain_ret`).
+fn plain_ret(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TVoid : return true,
+        _           : {},
+    }
+    plain_data(g, t) && !has_refs(g, t) && !holds_fn(g, t)
 }
 
 // A closure's id: unique in the program, the same in every pass.
@@ -3052,6 +3727,50 @@ fn lower_closure(
     String lc = loc(g, x.std_body, line);
     String o = fresh(g, "o");
     emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &t, tid, &lc)));
+    // D-0200: a closure capturing nothing whose reference parameters are
+    // all shared and only read through or lent to readers, the rest plain
+    // data: lowered as a predicate (`pending_pred_closure`), its parameters
+    // bare addresses. A closure capturing by reference only what it never
+    // writes qualifies too.
+    bool read_captures = Vec::len(captures) == 0;
+    if (!read_captures && !is_move)
+    {
+        read_captures = true;
+        foreach (c in captures)
+        {
+            read_captures = read_captures && !body_writes(body, c);
+        }
+    }
+    if (read_captures && !g.pending_pred_closure && !boot(g, 10))
+    {
+        CalleeTest reads = CalleeTest::ClosureReads(bound_names(body));
+        bool read_only = Vec::len(params) > 0;
+        foreach (pd in params)
+        {
+            if (!read_only)
+            {
+                break;
+            }
+            Type pt = apply(&pd.ty, &x.subst);
+            read_only = match (&pt)
+            {
+                Type::TRef(m) :
+                {
+                    if (Box::get(m).mode == Mode::Shared)
+                    {
+                        reader_uses(g, body, &pd.name, false, &reads)
+                    }
+                    else { plain_data(g, &pt) && !has_refs(g, &pt) && !holds_fn(g, &pt) }
+                },
+                _             : plain_data(g, &pt) && !has_refs(g, &pt) && !holds_fn(g, &pt),
+            };
+        }
+        if (read_only)
+        {
+            g.pending_pred_closure = true;
+            g.pending_reader_closure = true;
+        }
+    }
     Type ret = lower_closure_body(g, x, id, params, declared, body);
     match (HashMap::get_mut(&mut g.closures, &id))
     {
@@ -3074,6 +3793,8 @@ fn lower_closure_body(
 ) : Type
 {
     ClosureInfo info = clone(Option::expect(HashMap::get(&g.closures, &id), "a lowered closure"));
+    bool pred = replace(&mut g.pending_pred_closure, false);
+    bool reader_closure = replace(&mut g.pending_reader_closure, false);
     Type self_ty = ref_ty(Type::TClosure(id), Mode::Exclusive);
     Type ret = match (declared)
     {
@@ -3119,10 +3840,90 @@ fn lower_closure_body(
             .stmt_match = false,
             .branch_scope = false,
             .fn_name = String::clone(&outer.fn_name),
+            .direct_params = HashSet::new(),
+            .direct_refs = HashSet::new(),
+            .direct_live = HashMap::new(),
+            .pred_body = false,
+            .unstored_params = HashSet::new(),
+            .confined_params = HashMap::new(),
+            .confined = HashSet::new(),
+            .unminted_binders = HashMap::new(),
         };
         Vec::push(&mut fx.scopes, HashMap::new());
         push_frame(g, &mut fx);
         fx.root_frame = g.nscope;
+        // A closure that captures nothing never reaches `self`: it is bound
+        // as a bare address, and its own parameters may be direct as a
+        // function's are.
+        CalleeTest never = CalleeTest::Never;
+        if (boot(g, 10))
+        {
+            // D-0274: nothing direct in the bootstrap form.
+        }
+        else if (Vec::len(&info.fields) > 0 && !pred)
+        {
+            // D-0192: a capturing closure's parameter is direct only if never
+            // handed on at all; `self` is bound as its address unless the
+            // closure moves its captures in.
+            HashSet<String> d = direct_refs_of(g, params, body, &outer.subst);
+            foreach (n in &d)
+            {
+                if (direct_uses(g, body, n, &never))
+                {
+                    HashSet::insert(&mut fx.direct_params, String::clone(n));
+                }
+            }
+            if (!info.is_move)
+            {
+                HashSet::insert(&mut fx.direct_params, String::from_str("self"));
+            }
+        }
+        if (!boot(g, 10) && (Vec::len(&info.fields) == 0 || pred))
+        {
+            fx.direct_params = direct_refs_of(g, params, body, &outer.subst);
+            fx.pred_body = pred;
+            if (pred)
+            {
+                // A predicate: every reference parameter used only directly,
+                // or only read.
+                foreach (pd in params)
+                {
+                    if (is_ref_type(&apply(&pd.ty, &outer.subst)))
+                    {
+                        HashSet::insert(&mut fx.direct_params, String::clone(&pd.name));
+                    }
+                }
+            }
+            HashSet::insert(&mut fx.direct_params, String::from_str("self"));
+        }
+        if (!probing && !boot(g, 10))
+        {
+            // Pure: every reference parameter direct and never handed on,
+            // none a slice (which travels in flight), the result plain.
+            bool all_direct = true;
+            foreach (pd in params)
+            {
+                Type pt = apply(&pd.ty, &outer.subst);
+                bool ok = match (&pt)
+                {
+                    Type::TRef(_) : HashSet::contains(
+                        &fx.direct_params,
+                        &pd.name,
+                    ) && (reader_closure || direct_uses(g, body, &pd.name, &never)),
+                    Type::TSlice(_) : false,
+                    _               : plain_data(g, &pt) && !has_refs(g, &pt) && !holds_fn(g, &pt),
+                };
+                if (!ok)
+                {
+                    all_direct = false;
+                    break;
+                }
+            }
+            if (all_direct)
+            {
+                HashSet::insert(&mut g.pure_closures, id);
+            }
+        }
         bind_param(g, &mut fx, &ParamDecl { .ty = clone(&self_ty), .name = String::from_str("self") }, &outer.subst);
         foreach (pd in params)
         {
@@ -4722,9 +5523,47 @@ fn lower_assign(
         },
         _                    : {},
     }
-    x.place_write = true;
-    P p = lower_place(g, x, place);
-    x.place_write = false;
+    // `v[i] = x` on a `Vec` is `*Vec::index_exclusive(&mut v, i) = x`. A
+    // stateless value leaves nothing between the element's borrow and the
+    // write for `cb_elem_access` to skip: the element's place at once.
+    Option<P> fused = None;
+    if (!boot(g, 8))
+    {
+        Expr target = match (vec_index_call(g, x, place, true))
+        {
+            Some(sy) : sy,
+            None     : clone(place),
+        };
+        match (&target.kind)
+        {
+            ExprKind::EDeref(inner) :
+            {
+                if (stateless(g, x, val))
+                {
+                    fused = elem_access_place(g, x, Box::get(inner), true, e.line);
+                }
+            },
+            _                       : {},
+        }
+    }
+    P p = match (fused)
+    {
+        Some(fp) :
+        {
+            if (is_never(&fp.ty))
+            {
+                return never();
+            }
+            fp
+        },
+        None     :
+        {
+            x.place_write = true;
+            P lp = lower_place(g, x, place);
+            x.place_write = false;
+            lp
+        },
+    };
     V v0 = lower_expr(g, x, val, Some(&p.ty));
     if (is_never(&v0.ty))
     {
@@ -5998,7 +6837,19 @@ fn lower_borrowed_operand(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr,
                     &lc,
                 )),
             ),
-            None : assert(false, "cobc: a compared String with no access path"),
+            None :
+            {
+                // A place with no path (through a direct reference: D-0192's
+                // predicate parameters) is read as it stands.
+                if (Option::is_none(&p.raw) && x.pred_body)
+                {
+                    emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &tok)));
+                }
+                else
+                {
+                    assert(false, "cobc: a compared String with no access path");
+                }
+            },
         }
         V r0 = V { .c = sprintf(
             "((cb_ref){ (void *)&(%s), %s })",
@@ -9638,7 +10489,63 @@ fn lower_match(
         ExprKind::EDeref(_) : place_res_enum(g, x, scrut),
         _                   : false,
     };
-    V sv = if (res_place)
+    // `match (&mut p)` / `match (&p)` on an enum place with a checked base:
+    // the borrow's check (`cb_borrow_unminted`) and the tag's read through
+    // the base, with no path minted for the scrutinee; a binder's path is
+    // borrowed from the base, through the place's projection and the
+    // payload (D-0018: the scrutinee's own path would be unheld all its
+    // life).
+    Option<V> fused_scrut = None;
+    Option<Mode> fused_mode = None;
+    String fused_base = String::new();
+    Vec<String> fused_projs = Vec::new();
+    if (!boot(g, 9))
+    {
+        match (&strip_parens(scrut).kind)
+        {
+            ExprKind::EBorrow(bb) :
+            {
+                ref<Expr, shared> place = &Box::get(bb).e;
+                Type pt = probe_place_type(g, x, place);
+                if (is_enum_ty(g, &pt))
+                {
+                    P fp = lower_place(g, x, place);
+                    if (is_never(&fp.ty))
+                    {
+                        return never();
+                    }
+                    bool has_base = Option::is_some(&fp.base) && Option::is_none(&fp.raw);
+                    if (has_base)
+                    {
+                        String base = Option::expect(clone(&fp.base), "a base");
+                        String flc = loc(g, x.std_body, line);
+                        str fm = if (Box::get(bb).mode == Mode::Exclusive) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+                        String pa = projs_args(&fp.projs);
+                        emit(x, String::as_view(&sprintf("cb_borrow_unminted(%s, %s, %s, %s);", &base, &pa, fm, &flc)));
+                        emit(x, String::as_view(&sprintf("cb_read(%s, %s, %s);", &base, &pa, &flc)));
+                        fused_base = base;
+                    }
+                    else if (!(Option::is_none(&fp.raw) && direct_place(x, place)))
+                    {
+                        assert(false, "cobc: a fused match scrutinee was lowered without a base");
+                    }
+                    // A field of a direct parameter (`box_rec_uses`): no check
+                    // can fail, so none is made; the binder's base is "".
+                    fused_mode = Some(Box::get(bb).mode);
+                    fused_projs = clone(&fp.projs);
+                    P { c, ty, base, projs, is_binding, raw } = fp;
+                    fused_scrut = Some(V { .c = c, .ty = ty, .obj = None });
+                }
+            },
+            _                     : {},
+        }
+    }
+    bool fused = Option::is_some(&fused_scrut);
+    V sv = if (fused)
+    {
+        Option::expect(fused_scrut, "a fused scrutinee")
+    }
+    else if (res_place)
     {
         P p = lower_place(g, x, scrut);
         String lc = loc(g, x.std_body, line);
@@ -9667,9 +10574,9 @@ fn lower_match(
     }
     // `[Match-By-Ref]` (D-0046): a reference scrutinee is matched on its
     // referent, and a binder borrows from the scrutinee's token.
-    Option<Mode> by_ref_mode = None;
-    String by_ref_tok = String::new();
-    Vec<String> by_ref_prefix = Vec::new();
+    Option<Mode> by_ref_mode = fused_mode;
+    String by_ref_tok = fused_base;
+    Vec<String> by_ref_prefix = fused_projs;
     V sv2 = match (clone(&sv.ty))
     {
         Type::TRef(m) :
@@ -10026,7 +10933,54 @@ fn bind_match_arm(
                     &String::join(&all[0..$], ", "),
                 )
             };
-            assert(String::len(&ref_tok) > 0, "cobc: a binder through a direct place used other than by `Box::get`");
+            // `Some(b) : … Box::get_mut(b) …`, `b` used only there, first: the
+            // borrow is checked (`cb_borrow_unminted`) and none minted; the
+            // call is made inline through the base (`unminted_binders`).
+            ref<Expr, shared> abody = Box::get(&arm.body);
+            bool box_use = !boot(
+                g,
+                7,
+            ) && binder_used_once_first(abody, binder) && match (binder_box_call(abody, binder))
+            {
+                Some(k) : String::eq_str(
+                    &k,
+                    "std::Box::get",
+                ) || (String::eq_str(&k, "std::Box::get_mut") && mode == Mode::Exclusive),
+                None : false,
+            };
+            assert(
+                box_use || String::len(&ref_tok) > 0,
+                "cobc: a binder through a direct place used other than by `Box::get`",
+            );
+            if (box_use)
+            {
+                if (String::len(&ref_tok) > 0)
+                {
+                    emit(
+                        x,
+                        String::as_view(&sprintf(
+                            "cb_borrow_unminted(%s, %s, %v, %s, %s);",
+                            &ref_tok,
+                            &projs,
+                            Vec::len(&all),
+                            mode_c(mode),
+                            &lc,
+                        )),
+                    );
+                }
+                emit(x, String::as_view(&sprintf("%s = (void *)&(%s);", &cname, slot_path)));
+                HashMap::insert(
+                    &mut x.unminted_binders,
+                    String::clone(&cname),
+                    Unminted { .tok = String::clone(&ref_tok), .projs = clone(&all) },
+                );
+                bind_in_scope(
+                    x,
+                    String::as_view(binder),
+                    Binding { .c = cname, .ty = rty, .root = String::new(), .kind = BindKind::Local },
+                );
+                return false;
+            }
             emit(
                 x,
                 String::as_view(&sprintf(
@@ -10039,6 +10993,20 @@ fn bind_match_arm(
                     &lc,
                 )),
             );
+            if (!boot(g, 7) && binder_used_once_first(abody, binder))
+            {
+                // Used once, by the first thing the arm evaluates: its path
+                // need not be held by a binding object (D-0018); the use goes
+                // through the borrow's token (`unstored`).
+                emit(x, String::as_view(&sprintf("%s = (void *)&(%s);", &cname, slot_path)));
+                HashMap::insert(&mut x.unstored, String::clone(&cname), String::clone(&t));
+                bind_in_scope(
+                    x,
+                    String::as_view(binder),
+                    Binding { .c = cname, .ty = rty, .root = String::new(), .kind = BindKind::Local },
+                );
+                return false;
+            }
             V fv = V { .c = sprintf("((cb_ref){ (void *)&(%s), %s })", slot_path, &t), .ty = clone(&rty), .obj = None };
             bind_value(g, x, String::as_view(binder), cname, &rty, &fv, line);
             return false;
@@ -10089,6 +11057,22 @@ fn bind_match_arm(
             Binding { .c = cname, .ty = pty, .root = root, .kind = BindKind::Local },
         );
         moved_out = true;
+    }
+    else if (!boot(g, 7) && is_ref && binder_used_once_first(Box::get(&arm.body), binder))
+    {
+        // The reference stays in the scrutinee's slot, held there until the
+        // statement ends; a binder used once, by the first thing the arm
+        // evaluates, needs no binding of its own (D-0018).
+        String tk = fresh(g, "tk");
+        String load = slot_tok(x, slot_path);
+        emit(x, String::as_view(&sprintf("uint64_t %s = %s;", &tk, &load)));
+        emit(x, String::as_view(&sprintf("%s = %s;", &cname, slot_path)));
+        HashMap::insert(&mut x.unstored, String::clone(&cname), tk);
+        bind_in_scope(
+            x,
+            String::as_view(binder),
+            Binding { .c = cname, .ty = pty, .root = String::new(), .kind = BindKind::Local },
+        );
     }
     else
     {

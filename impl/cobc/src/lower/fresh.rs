@@ -11,7 +11,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // can reach it before the aggregate around it absorbs it.
     pub(super) fn inert_expr(&mut self, e: &Expr) -> R<bool> {
         // D-0274: not in the bootstrap form.
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             return Ok(false);
         }
         match &strip_parens(e).kind {
@@ -53,7 +53,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // is a `Box` of one (`inert_box_new`): destroying it runs no destructor.
     pub(super) fn inert_value(&mut self, e: &Expr) -> R<bool> {
         // D-0274: not in the bootstrap form.
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             return Ok(false);
         }
         if self.inert_expr(e)? {
@@ -75,7 +75,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // variant's payload, a `Box` that needs no object (`objectless`).
     pub(super) fn inert_box_new(&mut self, e: &Expr) -> R<bool> {
         // D-0274: `Box::new` takes the general call path (`lower_box_new` is off).
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             return Ok(false);
         }
         let ExprKind::Call(c, args) = &strip_parens(e).kind else { return Ok(false) };
@@ -331,7 +331,7 @@ impl<'g, 'a> Fx<'g, 'a> {
     // read at once: its path, the `Option`'s object and the datum's
     // transfers make nothing a check could find.
     pub(super) fn unwrapped_map_get(&mut self, inner: &Expr, line: usize) -> R<Option<P>> {
-        if self.g.bootstrap {
+        if self.g.boot(4) {
             return Ok(None);
         }
         let ExprKind::Call(uc, uargs) = &strip_parens(inner).kind else { return Ok(None) };

@@ -37,7 +37,7 @@ impl<'a> Gen<'a> {
             arrive_twins: HashSet::new(),
             pending_tested: false,
             all_checks: std::env::var("COBALTC_ALL_CHECKS").map_or(false, |v| !v.is_empty() && v != "0") || bootstrap_form(),
-            bootstrap: bootstrap_form(),
+            bootstrap: bootstrap_level(),
             line_directives: true,
             pure_closures: HashSet::new(),
             fn_names: HashMap::new(),
@@ -107,7 +107,7 @@ impl<'a> Gen<'a> {
             self.thunks_out = resolve_arrive(&self.thunks_out, &twins);
         }
         self.arrive_twins = twins;
-        if !self.bootstrap {
+        if !self.boot(1) {
             self.localize(&main_c);
         }
         // Last, when no pass reads the text line by line any more.
@@ -329,5 +329,31 @@ impl<'a> Gen<'a> {
 // optimisation off, the general checked form that the code generator
 // written in CobaltC reproduces.
 pub(crate) fn bootstrap_form() -> bool {
-    std::env::var("COBALTC_BOOTSTRAP_FORM").map_or(false, |v| !v.is_empty() && v != "0")
+    bootstrap_level() > 0
+}
+
+// The highest D-0274 stage switched off: `COBALTC_BOOTSTRAP_UPTO=N`
+// switches off stages 1..=N only (each a state the suites passed in
+// D-0274's order; the code generator written in CobaltC restores them from
+// the last, CHG-0368); `COBALTC_BOOTSTRAP_FORM` all ten.
+pub(crate) const BOOTSTRAP_STAGES: u8 = 10;
+
+pub(crate) fn bootstrap_level() -> u8 {
+    if let Ok(v) = std::env::var("COBALTC_BOOTSTRAP_UPTO") {
+        if let Ok(n) = v.trim().parse::<u8>() {
+            return n.min(BOOTSTRAP_STAGES);
+        }
+    }
+    if std::env::var("COBALTC_BOOTSTRAP_FORM").map_or(false, |v| !v.is_empty() && v != "0") {
+        BOOTSTRAP_STAGES
+    } else {
+        0
+    }
+}
+
+impl Gen<'_> {
+    // D-0274 stage `stage` is switched off (`bootstrap_level`).
+    pub(crate) fn boot(&self, stage: u8) -> bool {
+        self.bootstrap >= stage
+    }
 }

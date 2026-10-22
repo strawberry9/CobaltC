@@ -466,7 +466,7 @@ impl<'g, 'a> Fx<'g, 'a> {
 
     // A `while` loop (and the `for` loops desugared to one), with its step.
     fn lower_while(&mut self, c: &Expr, b: &Block, step: Option<&Expr>) -> R<V> {
-        if self.g.bootstrap {
+        if self.g.boot(2) {
             // D-0274: no proof that the step cannot overflow.
         } else if let Some(inc) = loop_increment(c, b, step.as_deref(), |x| self.lookup(x).map_or(false, |b| b.root.is_empty() && matches!(b.kind, BindKind::Local) && matches!(b.ty, Type::Int(_)))) {
             self.no_overflow.insert(inc);
@@ -665,7 +665,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             _ => false,
         };
         let fused = match &place.kind {
-            ExprKind::Deref(inner) if confined || (!self.g.bootstrap && self.stateless(val)) => self.elem_access_place(inner, true, e.line)?,
+            ExprKind::Deref(inner) if confined || (!self.g.boot(8) && self.stateless(val)) => self.elem_access_place(inner, true, e.line)?,
             _ => None,
         };
         let p = match fused {

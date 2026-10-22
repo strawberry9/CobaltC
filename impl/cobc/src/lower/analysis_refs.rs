@@ -128,7 +128,7 @@ impl<'a> Gen<'a> {
     pub(super) fn unstored_ref_params(&self, f: &FnDecl, subst: &HashMap<String, Type>, direct: &HashSet<String>) -> R<HashSet<String>> {
         let mut out = HashSet::new();
         // D-0274: not in the bootstrap form.
-        if self.bootstrap {
+        if self.boot(8) {
             return Ok(out);
         }
         let tys: Vec<Type> = f.params.iter().map(|p| apply(&p.ty, subst)).collect();
@@ -222,7 +222,7 @@ impl<'a> Gen<'a> {
     // through it is then the no-op the proof makes it. Recursion answers no.
     pub(super) fn reader_param(&self, key: &str, pos: usize) -> bool {
         // D-0274: no reader parameters in the bootstrap form.
-        if self.bootstrap {
+        if self.boot(7) {
             return false;
         }
         let visiting = std::cell::RefCell::new(Vec::new());
@@ -284,7 +284,7 @@ impl<'a> Gen<'a> {
     // its parts. `local`: whether a one-segment name is a binding where the
     // block is (a local of that name would be what the call calls).
     pub(super) fn fusion_plan<'b>(&self, b: &'b Block, local: &dyn Fn(&str) -> bool) -> Option<FusionPlan<'b>> {
-        if self.bootstrap {
+        if self.boot(4) {
             return None;
         }
         let [Stmt::Let { name: en, init: Some(coll), .. }, Stmt::Let { name: dn, init: Some(dr), .. }, Stmt::Let { name: inn, init: Some(_), .. }] = b.stmts.as_slice() else { return None };
@@ -681,7 +681,7 @@ impl<'a> Gen<'a> {
     // bounds-checked (`Fx::bind_param`, `lower_user_call`). Recursion
     // answers no (no fixed point; no is safe).
     pub(super) fn pure_view(&self, key: &str, pos: usize) -> bool {
-        if self.bootstrap {
+        if self.boot(4) {
             return false;
         }
         let visiting = std::cell::RefCell::new(Vec::new());

@@ -45,7 +45,7 @@ impl<'a> Gen<'a> {
         writeln!(self.protos, "{};", sig).unwrap();
 
         // D-0274: no native body in the bootstrap form.
-        if mask == 0 && !self.bootstrap {
+        if mask == 0 && !self.boot(5) {
             self.native_ctx = Some((name.to_string(), f.clone(), targs.to_vec(), ret_c.clone(), sig.clone()));
             let native = self.native_vec_index(name, &f, targs, &cname);
             self.native_ctx = None;
@@ -635,7 +635,7 @@ impl<'a> Gen<'a> {
         // D-0274: the bootstrap form keeps every local's object and check, so
         // these analyses are not made. `pinned_names` stays: the base
         // discharge of plain locals (`spec/14` §6).
-        let (confined_names, objectless_names, elem_ref_ids, quiet_ids) = if self.bootstrap {
+        let (confined_names, objectless_names, elem_ref_ids, quiet_ids) = if self.boot(4) {
             (HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new())
         } else {
             let names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
@@ -668,7 +668,7 @@ impl<'a> Gen<'a> {
         };
         fx.unstored_params = fx.g.unstored_ref_params(&f, &fx.subst, &fx.direct_params)?;
         fx.frozen_on = fx.g.frozen_mode;
-        fx.held_locals = if fx.g.bootstrap { HashSet::new() } else { held_locals(&f.body) };
+        fx.held_locals = if fx.g.boot(4) { HashSet::new() } else { held_locals(&f.body) };
         fx.pure_slices = f.params.iter().enumerate().filter(|(i, p)| matches!(p.ty, Type::Slice(..)) && fx.g.pure_direct(name, *i)).map(|(_, p)| p.name.clone()).collect();
         if bare {
             // ... and none of its slices is received: the caller holds each
@@ -703,7 +703,7 @@ impl<'a> Gen<'a> {
         }
         let prologue = fx.notes_finish();
         // D-0274: in the bootstrap form no text pass elides anything.
-        let body = if fx.g.bootstrap {
+        let body = if fx.g.boot(1) {
             resolve_scopes(&fx.out)
         } else {
             elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&drop_quiet_checks(&fx.out, &fx.quiet_roots))), self.line_directives))
@@ -711,7 +711,7 @@ impl<'a> Gen<'a> {
         // D-0077: a call too deep for the stack faults here, at the call.
         // A body that calls nothing (`calls_nothing`) cannot go deeper:
         // its caller's check, and the floor's margin, cover its frame.
-        let check = if !self.bootstrap && calls_nothing(&body) { "" } else { "    cb_stack_check();\n" };
+        let check = if !self.boot(1) && calls_nothing(&body) { "" } else { "    cb_stack_check();\n" };
         let (entry, exit) = self.overaligned_params(&param_tys)?;
         write!(self.fns, "{}\n{{\n{}{}{}{}{}}}\n\n", sig, entry, check, prologue, body, exit).unwrap();
         Ok(())
