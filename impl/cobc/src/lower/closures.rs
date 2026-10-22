@@ -272,7 +272,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             let out = if fx.g.boot(1) {
                 resolve_scopes(&fx.out)
             } else {
-                elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&fx.out)), self.g.line_directives))
+                super::functions::dumped_text_passes(&fx.out, self.g.line_directives)
             };
             if self.g.probing == 0 {
                 let ret_c = self.g.reg_ctype(&ret)?;

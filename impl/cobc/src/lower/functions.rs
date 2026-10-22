@@ -172,7 +172,7 @@ impl<'a> Gen<'a> {
         self.pending_raw_ret = raw;
         self.pending_tested = true;
         self.emit_fn_body(name, f, targs, 0, &dir_sig, None)?;
-        if code_lines(&self.fns[start..]) > FROZEN_LINES {
+        if counted_lines(&self.fns[start..]) > FROZEN_LINES {
             self.fns.truncate(start);
             self.uid = 0;
             self.pending_raw_ret = raw;
@@ -275,7 +275,7 @@ impl<'a> Gen<'a> {
         let r = self.emit_fn_body(name, f, targs, 0, &frz_sig, None);
         self.frozen_mode = false;
         r?;
-        if code_lines(&self.fns[start..]) > FROZEN_LINES {
+        if counted_lines(&self.fns[start..]) > FROZEN_LINES {
             self.fns.truncate(start);
             self.uid = 0;
             self.pending_raw_ret = raw;
@@ -423,7 +423,7 @@ impl<'a> Gen<'a> {
         // proves disjoint (`lower_dual_bare_call`): the fast half, its slices
         // pure direct (the caller holds their paths), its own element test.
         let bare_sig = format!("{} {}__bare{}", ret_c, cname, tail);
-        if code_lines(&self.fns[start..]) > DUAL_LINES {
+        if counted_lines(&self.fns[start..]) > DUAL_LINES {
             self.fns.truncate(start);
             self.uid = 0;
             self.emit_fn_body(name, f, targs, 0, sig, None)?;
@@ -582,7 +582,7 @@ impl<'a> Gen<'a> {
         self.pending_tested = true; // D-0219: entered only through its dispatcher's test
         self.emit_fn_body(name, f, targs, 0, &fast_sig, if direct_b { Some(&direct) } else { None })?;
         self.pending_field_confined = None;
-        if code_lines(&self.fns[start..]) > DUAL_LINES {
+        if counted_lines(&self.fns[start..]) > DUAL_LINES {
             self.fns.truncate(start);
             self.uid = 0;
             return self.emit_fn_body(name, f, targs, 0, sig, None);
@@ -735,12 +735,25 @@ impl<'a> Gen<'a> {
         let body = if fx.g.boot(1) {
             resolve_scopes(&fx.out)
         } else {
-            elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&drop_quiet_checks(&fx.out, &fx.quiet_roots))), self.line_directives))
+            let mut roots: Vec<&String> = fx.quiet_roots.iter().collect();
+            roots.sort();
+            let roots_text: String = roots.iter().map(|r| format!("{}\n", r)).collect();
+            let q = drop_quiet_checks(&fx.out, &fx.quiet_roots);
+            dump_pass("drop_quiet_checks", &[("in", &fx.out), ("arg", &roots_text), ("out", &q)]);
+            dumped_text_passes(&q, self.line_directives)
         };
         // D-0077: a call too deep for the stack faults here, at the call.
         // A body that calls nothing (`calls_nothing`) cannot go deeper:
         // its caller's check, and the floor's margin, cover its frame.
-        let check = if !self.boot(1) && calls_nothing(&body) { "" } else { "    cb_stack_check();\n" };
+        let check = if !self.boot(1) && {
+            let nothing = calls_nothing(&body);
+            dump_pass("calls_nothing", &[("in", &body), ("out", if nothing { "true\n" } else { "false\n" })]);
+            nothing
+        } {
+            ""
+        } else {
+            "    cb_stack_check();\n"
+        };
         let (entry, exit) = self.overaligned_params(&param_tys)?;
         write!(self.fns, "{}\n{{\n{}{}{}{}{}}}\n\n", sig, entry, check, prologue, body, exit).unwrap();
         Ok(())
@@ -813,4 +826,44 @@ fn dump_analyses(name: &str, body: &Block, confined: &HashSet<String>, objectles
     eprintln!("ANALYSES {} elem_refs [{}]", name, nodes(elem_refs));
     eprintln!("ANALYSES {} quiet [{}]", name, nodes(quiet));
     eprintln!("ANALYSES {} held [{}]", name, held);
+}
+
+// D-0274 tool: `COBC_DUMP_PASSES=DIR` writes, for every call of a text
+// pass, its input, its other argument and its result, as the files
+// `DIR/<pid>-<n>-<pass>.<part>` (`in`, `arg`, `out`, ...), for checking a
+// port of the passes (cbc's `back/passes.cb`) byte for byte.
+pub(super) fn dump_pass(pass: &str, parts: &[(&str, &str)]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("COBC_DUMP_PASSES").map(std::path::PathBuf::from)) else {
+        return;
+    };
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    for (part, text) in parts {
+        let path = dir.join(format!("{}-{:06}-{}.{}", std::process::id(), n, pass, part));
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("cobc: COBC_DUMP_PASSES: {}: {}", path.display(), e));
+    }
+}
+
+// The text passes after `drop_quiet_checks`, each call dumped
+// (`dump_pass`).
+pub(super) fn dumped_text_passes(text: &str, marks: bool) -> String {
+    let z = fold_zero_tokens(text);
+    dump_pass("fold_zero_tokens", &[("in", text), ("out", &z)]);
+    let s = resolve_scopes(&z);
+    dump_pass("resolve_scopes", &[("in", &z), ("out", &s)]);
+    let d = drop_dead_locations(&s, marks);
+    dump_pass("drop_dead_locations", &[("in", &s), ("arg", if marks { "true\n" } else { "false\n" }), ("out", &d)]);
+    let e = elide_implied_checks(&d);
+    dump_pass("elide_implied_checks", &[("in", &d), ("out", &e)]);
+    e
+}
+
+// `code_lines`, dumped.
+fn counted_lines(text: &str) -> usize {
+    let n = code_lines(text);
+    dump_pass("code_lines", &[("in", text), ("out", &format!("{}\n", n))]);
+    n
 }

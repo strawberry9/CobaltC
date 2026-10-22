@@ -1,6 +1,7 @@
 // The generator's entry: Gen::new, generate, and its request queues.
 
 use super::*;
+use super::functions::dump_pass;
 
 impl<'a> Gen<'a> {
     pub fn new(items: &'a Items, map: &'a SourceMap) -> Self {
@@ -98,17 +99,24 @@ impl<'a> Gen<'a> {
         // D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive`
         // twin where it has one, and the callee itself where it has none.
         let twins = std::mem::take(&mut self.arrive_twins);
+        let mut twin_list: Vec<&String> = twins.iter().collect();
+        twin_list.sort();
+        let twins_text: String = twin_list.iter().map(|t| format!("{}\n", t)).collect();
         for u in self.units.iter_mut() {
             if u.text.contains(ARRIVE_MARK) {
-                u.text = resolve_arrive(&u.text, &twins);
+                let r = resolve_arrive(&u.text, &twins);
+                dump_pass("resolve_arrive", &[("in", &u.text), ("arg", &twins_text), ("out", &r)]);
+                u.text = r;
             }
         }
         if self.thunks_out.contains(ARRIVE_MARK) {
-            self.thunks_out = resolve_arrive(&self.thunks_out, &twins);
+            let r = resolve_arrive(&self.thunks_out, &twins);
+            dump_pass("resolve_arrive", &[("in", &self.thunks_out), ("arg", &twins_text), ("out", &r)]);
+            self.thunks_out = r;
         }
         self.arrive_twins = twins;
         if !self.boot(1) {
-            self.localize(&main_c);
+            self.dumped_localize(&main_c);
         }
         // Last, when no pass reads the text line by line any more.
         if self.line_directives {
@@ -224,6 +232,29 @@ impl<'a> Gen<'a> {
     // `cb_program`, which only C's `main` calls, GCC would compile the
     // whole program as code run once, for size (a `div` for a `%` by a
     // constant, say).
+    // `localize`, dumped (`dump_pass`): the units' flags (`1` cacheable)
+    // and texts, the prototypes, the inlined signatures and `main`'s name,
+    // before and after.
+    fn dumped_localize(&mut self, main_c: &str) {
+        if std::env::var_os("COBC_DUMP_PASSES").is_none() {
+            return self.localize(main_c);
+        }
+        let mut sigs: Vec<&String> = self.inline_sigs.iter().collect();
+        sigs.sort();
+        let sigs: String = sigs.iter().map(|t| format!("{}\n", t)).collect();
+        let flags: String = self.units.iter().map(|u| if u.cacheable { "1\n" } else { "0\n" }).collect();
+        let before: Vec<String> = self.units.iter().map(|u| u.text.clone()).collect();
+        let protos_in = self.protos.clone();
+        self.localize(main_c);
+        let mut parts: Vec<(String, &str)> = vec![("main".to_string(), main_c), ("sigs".to_string(), &sigs), ("flags".to_string(), &flags), ("protos_in".to_string(), &protos_in), ("protos_out".to_string(), &self.protos)];
+        for (k, b) in before.iter().enumerate() {
+            parts.push((format!("unit{}_in", k), b));
+            parts.push((format!("unit{}_out", k), &self.units[k].text));
+        }
+        let parts: Vec<(&str, &str)> = parts.iter().map(|(a, b)| (a.as_str(), *b)).collect();
+        dump_pass("localize", &parts);
+    }
+
     pub(super) fn localize(&mut self, main_c: &str) {
         let mut cached: HashSet<String> = HashSet::new();
         for u in self.units.iter().filter(|u| u.cacheable) {
