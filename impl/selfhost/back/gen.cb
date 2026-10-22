@@ -3305,8 +3305,7 @@ fn probe_place_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, share
     u64 saved_nstr = g.nstr;
     usize saved_cleanup = Vec::len(&x.cleanup);
     usize saved_scopes = Vec::len(&x.scopes);
-    HashSet<String> saved_obj_temps = HashSet::clone(&x.obj_temps);
-    HashMap<String, String> saved_unstored = HashMap::clone(&x.unstored);
+    NameSnap saved_names = snapshot_names(x);
     Vec<Loop> saved_loops = clone(&x.loops);
     bool saved_write = replace(&mut x.place_write, false);
     x.probing += 1;
@@ -3319,8 +3318,7 @@ fn probe_place_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, share
     g.nstr = saved_nstr;
     Vec::truncate(&mut x.cleanup, saved_cleanup);
     Vec::truncate(&mut x.scopes, saved_scopes);
-    x.obj_temps = saved_obj_temps;
-    x.unstored = saved_unstored;
+    restore_names(x, saved_names);
     x.loops = saved_loops;
     P { c, ty, base, projs, is_binding, raw } = p;
     ty
@@ -3941,8 +3939,7 @@ fn probe_raw(
     u64 saved_nstr = g.nstr;
     usize saved_cleanup = Vec::len(&x.cleanup);
     usize saved_scopes = Vec::len(&x.scopes);
-    HashSet<String> saved_obj_temps = HashSet::clone(&x.obj_temps);
-    HashMap<String, String> saved_unstored = HashMap::clone(&x.unstored);
+    NameSnap saved_names = snapshot_names(x);
     Vec<Loop> saved_loops = clone(&x.loops);
     x.probing += 1;
     V v = lower_expr(g, x, e, expected);
@@ -3953,8 +3950,7 @@ fn probe_raw(
     g.nstr = saved_nstr;
     Vec::truncate(&mut x.cleanup, saved_cleanup);
     Vec::truncate(&mut x.scopes, saved_scopes);
-    x.obj_temps = saved_obj_temps;
-    x.unstored = saved_unstored;
+    restore_names(x, saved_names);
     x.loops = saved_loops;
     V { c, ty, obj } = v;
     ty
@@ -6312,6 +6308,7 @@ fn lower_closure_body(
     {
         bool probing = pass == 0;
         u64 saved_uid = g.uid;
+        NameSnap saved_names = snapshot_names(outer);
         u64 saved_nstr = g.nstr;
         StrMark saved_strs = str_mark(g);
         Fx fx = Fx {
@@ -6488,6 +6485,7 @@ fn lower_closure_body(
         {
             ret = if (is_never(&v.ty)) { Type::TVoid } else { clone(&v.ty) };
             g.uid = saved_uid;
+            restore_names(outer, saved_names);
             g.nstr = saved_nstr;
             str_restore(g, saved_strs);
             continue;
@@ -8001,8 +7999,7 @@ fn probe_block_type(
     u64 saved_nstr = g.nstr;
     usize saved_cleanup = Vec::len(&x.cleanup);
     usize saved_scopes = Vec::len(&x.scopes);
-    HashSet<String> saved_obj_temps = HashSet::clone(&x.obj_temps);
-    HashMap<String, String> saved_unstored = HashMap::clone(&x.unstored);
+    NameSnap saved_names = snapshot_names(x);
     x.probing += 1;
     V v = lower_block(g, x, b, expected);
     x.probing -= 1;
@@ -8012,8 +8009,7 @@ fn probe_block_type(
     g.nstr = saved_nstr;
     Vec::truncate(&mut x.cleanup, saved_cleanup);
     Vec::truncate(&mut x.scopes, saved_scopes);
-    x.obj_temps = saved_obj_temps;
-    x.unstored = saved_unstored;
+    restore_names(x, saved_names);
     V { c, ty, obj } = v;
     HashMap::insert(&mut x.probes, key, clone(&ty));
     ty
@@ -8079,8 +8075,7 @@ fn lower_block(
             u64 saved_nstr = g.nstr;
             usize saved_cleanup = Vec::len(&x.cleanup);
             usize saved_scopes = Vec::len(&x.scopes);
-            HashSet<String> saved_obj_temps = HashSet::clone(&x.obj_temps);
-            HashMap<String, String> saved_unstored = HashMap::clone(&x.unstored);
+            NameSnap saved_names = snapshot_names(x);
             usize probe_ind = x.ind;
             x.ind += 1;
             push_frame_at(g, x, fl);
@@ -8089,8 +8084,7 @@ fn lower_block(
             x.probing -= 1;
             Vec::truncate(&mut x.cleanup, saved_cleanup);
             Vec::truncate(&mut x.scopes, saved_scopes);
-            x.obj_temps = saved_obj_temps;
-            x.unstored = saved_unstored;
+            restore_names(x, saved_names);
             x.ind = probe_ind;
             x.out = saved_out;
             g.uid = saved_uid;
@@ -8746,9 +8740,6 @@ fn lower_vec_index_pre(
     String pre_cname = request_fn(g, name, ta);
     bool exclusive = StringView::eq_str(name, "std::Vec::index_exclusive");
     str rm = if (exclusive) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
-    String vec_c = ctype(g, &p.ty);
-    String elem_c = ctype(g, &elem);
-    u32 tid = type_id(g, &elem);
     match (access)
     {
         Some(write) :
@@ -8756,6 +8747,9 @@ fn lower_vec_index_pre(
             if (is_plain_elem(g, &elem))
             {
                 // The `…_pre` body inline, then the access's checks in one call.
+                String vec_c = ctype(g, &p.ty);
+                String elem_c = ctype(g, &elem);
+                u32 tid = type_id(g, &elem);
                 String v = fresh(g, "v");
                 String e = fresh(g, "e");
                 at(g, x, line);
@@ -8804,6 +8798,9 @@ fn lower_vec_index_pre(
         return Some(V { .c = r, .ty = Type::TRef(Box::new(ModedTy { .inner = elem, .mode = rmode })), .obj = None });
     }
     // D-0274: no native bodies, so no `…_pre` variant: its body inline.
+    String vec_c = ctype(g, &p.ty);
+    String elem_c = ctype(g, &elem);
+    u32 tid = type_id(g, &elem);
     String v = fresh(g, "v");
     String e = fresh(g, "e");
     at(g, x, line);
