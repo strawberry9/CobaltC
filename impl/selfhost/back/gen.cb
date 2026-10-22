@@ -11621,26 +11621,34 @@ export fn lower_assign(
     }
     // `v[i] = x` on a `Vec` is `*Vec::index_exclusive(&mut v, i) = x`. A
     // stateless value leaves nothing between the element's borrow and the
-    // write for `cb_elem_access` to skip: the element's place at once.
-    Option<P> fused = None;
-    if (!boot(g, 8))
+    // write for `cb_elem_access` to skip: the element's place at once. A
+    // confined vector's element (`bind_confined`) has nothing to check at
+    // all; the analysis saw that `val` pushes nothing onto it.
+    Expr target = match (vec_index_call(g, x, place, true))
     {
-        Expr target = match (vec_index_call(g, x, place, true))
+        Some(sy) : sy,
+        None     : clone(place),
+    };
+    Option<P> fused = None;
+    match (&target.kind)
+    {
+        ExprKind::EDeref(inner) :
         {
-            Some(sy) : sy,
-            None     : clone(place),
-        };
-        match (&target.kind)
-        {
-            ExprKind::EDeref(inner) :
+            bool confined = match (&Box::get(inner).kind)
             {
-                if (stateless(g, x, val))
-                {
-                    fused = elem_access_place(g, x, Box::get(inner), true, e.line);
-                }
-            },
-            _                       : {},
-        }
+                ExprKind::ECall(c) : Vec::len(&Box::get(c).args) > 0 && Option::is_some(&confined_elem_vec(
+                    g,
+                    x,
+                    &Box::get(c).args[0],
+                )),
+                _ : false,
+            };
+            if (confined || (!boot(g, 8) && stateless(g, x, val)))
+            {
+                fused = elem_access_place(g, x, Box::get(inner), true, e.line);
+            }
+        },
+        _                       : {},
     }
     P p = match (fused)
     {
@@ -11655,7 +11663,7 @@ export fn lower_assign(
         None     :
         {
             x.place_write = true;
-            P lp = lower_place(g, x, place);
+            P lp = lower_place(g, x, &target);
             x.place_write = false;
             lp
         },
@@ -11963,7 +11971,19 @@ export fn lower_return(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Option<B
     Type ret = clone(&x.ret);
     V v = match (r)
     {
-        Some(e) : lower_expr(g, x, Box::get(e), Some(&ret)),
+        Some(e) :
+        {
+            // D-0200: a `__raw` form returning a local named alone
+            // (`raw_return_path`).
+            x.raw_return_path = x.raw_ret && match (&strip_parens(Box::get(e)).kind)
+            {
+                ExprKind::EPath(_) : true,
+                _                  : false,
+            };
+            V rv = lower_expr(g, x, Box::get(e), Some(&ret));
+            x.raw_return_path = false;
+            rv
+        },
         None    : unit(),
     };
     if (is_never(&v.ty))
