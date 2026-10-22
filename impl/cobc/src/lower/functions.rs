@@ -755,12 +755,16 @@ impl<'a> Gen<'a> {
 // answers sorted: names as they are, nodes as `e:LINE:COL` (an expression) or
 // `a:LINE:COL` (a match arm, by its body).
 fn dump_analyses(name: &str, body: &Block, confined: &HashSet<String>, objectless: &HashSet<usize>, elem_refs: &HashSet<usize>, quiet: &HashSet<usize>) {
+    // A program line as the code generator written in CobaltC numbers it
+    // (its own file's, not after the prelude's).
+    let n = prelude::line_count();
+    let ln = |l: usize| if l > n { l - n } else { l };
     let mut pos: HashMap<usize, String> = HashMap::new();
     visit_exprs(body, &mut |e| {
-        pos.insert(e as *const Expr as usize, format!("e:{}:{}", e.line, e.col));
+        pos.insert(e as *const Expr as usize, format!("e:{}:{}", ln(e.line), e.col));
         if let ExprKind::Match(_, arms) = &e.kind {
             for a in arms {
-                pos.insert(a as *const Arm as usize, format!("a:{}:{}", a.body.line, a.body.col));
+                pos.insert(a as *const Arm as usize, format!("a:{}:{}", ln(a.body.line), a.body.col));
             }
         }
     });
