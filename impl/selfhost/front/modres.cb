@@ -1934,3 +1934,214 @@ export fn resolve_more(ref<Resolver, shared> r, ref<Vec<Item>, exclusive> items,
     Vec<String> path = if (StringView::len(home) == 0) { Vec::new() } else { segments(home) };
     resolve_items(items, &mut path, r)
 }
+
+// ---- `--warn-shadow` (CHG-0333) ----
+
+// A note `--warn-shadow` prints, at the line of the item it names (0 for
+// none).
+export struct ShadowNote
+{
+    export usize line;
+    export String text;
+}
+
+// The declaration line of each item of `items` (impl/src/modres.rs's
+// `lines`, which `build` fills as it enters them).
+fn item_lines(
+    ref<Vec<Item>, shared> items,
+    ref<Vec<String>, exclusive> path,
+    ref<HashMap<String, usize>, exclusive> lines,
+)
+{
+    foreach (it in items)
+    {
+        match (it)
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                String simple = match (&f.assoc_type)
+                {
+                    Some(t) : sprintf("%s::%s", t, &f.name),
+                    None    : String::clone(&f.name),
+                };
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&simple)), f.line);
+            },
+            Item::IStatic(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IExtern(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IStruct(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IEnum(b)   :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IModule(b) :
+            {
+                Vec::push(path, String::clone(&Box::get(b).name));
+                item_lines(&Box::get(b).items, path, lines);
+                _ = Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+fn home_is(ref<Resolver, shared> r, ref<String, shared> key, ref<String, shared> m) : bool
+{
+    match (HashMap::get(&r.all_items, key))
+    {
+        Some(info) : info.home == *m,
+        None       : false,
+    }
+}
+
+// impl/src/modres.rs's `note_shadowing`: a note for each item of the program
+// whose name an imported module also exports, or an `import p::name`
+// targets. `[Resolve-Unqualified]`'s clause (1) makes the program's own item
+// the one used, and nothing else says so. Sorted by line, then text.
+export fn shadow_notes(ref<Resolver, shared> r, ref<Program, shared> p) : Vec<ShadowNote>
+{
+    HashMap<String, usize> lines = HashMap::new();
+    Vec<String> path = Vec::new();
+    item_lines(&p.items, &mut path, &mut lines);
+    Vec<ShadowNote> notes = Vec::new();
+    for (usize mi = 0; mi < HashMap::len(&r.modules); mi += 1)
+    {
+        ref<String, shared> m = HashMap::key_at(&r.modules, mi);
+        if (*m == "std" || String::starts_with(m, "std::"))
+        {
+            continue;
+        }
+        ref<ModuleNode, shared> node = HashMap::value_at(&r.modules, mi);
+        for (usize ii = 0; ii < HashMap::len(&node.items); ii += 1)
+        {
+            ref<String, shared> simple = HashMap::key_at(&node.items, ii);
+            ref<Entry, shared> e = HashMap::value_at(&node.items, ii);
+            // The module's own items (a re-export's alias keys another
+            // module's), not its submodules; an associated function of the
+            // module's own type is covered by the type's note.
+            if (!home_is(r, &e.key, m) || e.kind == Kind::KModule)
+            {
+                continue;
+            }
+            match (String::find(simple, "::"))
+            {
+                Some(k) :
+                {
+                    String t = String::from_view(String::view(simple, 0, k));
+                    bool own_type = match (HashMap::get(&node.items, &t))
+                    {
+                        Some(te) : (te.kind == Kind::KStruct || te.kind == Kind::KEnum) && home_is(r, &te.key, m),
+                        None     : false,
+                    };
+                    if (own_type)
+                    {
+                        continue;
+                    }
+                },
+                None    : {},
+            }
+            Vec<String> hidden = Vec::new();
+            match (HashMap::get(&r.import_targets, m))
+            {
+                Some(ts) :
+                {
+                    foreach (t in ts)
+                    {
+                        if (StringView::eq(
+                            last_seg(&t.imp),
+                            String::as_view(simple),
+                        ) && t.key != e.key && !Vec::contains(&hidden, &t.key))
+                        {
+                            Vec::push(&mut hidden, String::clone(&t.key));
+                        }
+                    }
+                },
+                None     : {},
+            }
+            Vec<String> mods = imported(r, m, Kind::KModule);
+            foreach (im in &mods)
+            {
+                match (HashMap::get(&r.modules, im))
+                {
+                    Some(n) :
+                    {
+                        match (HashMap::get(&n.items, simple))
+                        {
+                            Some(te) :
+                            {
+                                if (te.export_ && te.kind != Kind::KModule && te.key != e.key && !Vec::contains(
+                                    &hidden,
+                                    &te.key,
+                                ))
+                                {
+                                    Vec::push(&mut hidden, String::clone(&te.key));
+                                }
+                            },
+                            None     : {},
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            if (Vec::len(&hidden) > 0)
+            {
+                str what = match (e.kind)
+                {
+                    Kind::KFn     : "fn",
+                    Kind::KStruct : "struct",
+                    Kind::KEnum   : "enum",
+                    Kind::KStatic : "static",
+                    Kind::KExtern : "extern fn",
+                    Kind::KModule : "module",
+                };
+                String whose = if (String::len(m) == 0) { String::from_str("this program") } else
+                {
+                    sprintf(
+                        "module `%s`",
+                        m,
+                    )
+                };
+                usize line = match (HashMap::get(&lines, &e.key))
+                {
+                    Some(l) : *l,
+                    None    : 0,
+                };
+                Vec::push(&mut notes, ShadowNote {
+                    .line = line,
+                    .text = sprintf(
+                        "note: %v `%s` of %s hides `%s`; the program's own is used",
+                        what,
+                        simple,
+                        &whose,
+                        &String::join(&hidden[0..$], "` and `"),
+                    ),
+                });
+            }
+        }
+    }
+    // Sorted by `(line, text)`.
+    for (usize i = 1; i < Vec::len(&notes); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && note_less(&notes[j], &notes[j - 1]))
+        {
+            Vec::swap(&mut notes, j - 1, j);
+            j -= 1;
+        }
+    }
+    notes
+}
+
+fn note_less(ref<ShadowNote, shared> a, ref<ShadowNote, shared> b) : bool
+{
+    a.line < b.line || (a.line == b.line && String::less(&a.text, &b.text))
+}

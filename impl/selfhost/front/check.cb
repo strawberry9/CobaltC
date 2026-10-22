@@ -303,17 +303,74 @@ export fn checked_text(StringView src, StringView origin) : Result<String, Strin
 // as `coby` gives it.
 export fn check_text(StringView src, StringView origin) : Result<Checked, String>
 {
-    Expansion ex = expand(strip_bom(src), origin);
-    match (&ex.error)
-    {
-        Some(e) : return Err(describe_diagnostic(e, &ex, true)),
-        None    : {},
-    }
-    Program user = match (parse_text(&ex.text))
+    Parsed p = match (parse_user(src, origin))
     {
         Ok(p)  : p,
-        Err(e) : return Err(failure(&e, &ex)),
+        Err(r) : return Err(shown(&r)),
     };
+    match (check_parsed(p, false))
+    {
+        Ok(c)  : Ok(c),
+        Err(r) : Err(shown(&r)),
+    }
+}
+
+// A rejection, raw (`diag.x\u{1}detail@N`, `parse error at L:C: …`, its
+// lines the expansion's), with the expansion that places it: what cobc's
+// driver renders as `coby` does (`render_located`). `loading` for the
+// loader's own.
+export struct Rejected
+{
+    export String raw;
+    export Expansion ex;
+    export bool loading;
+}
+
+// The program's own text expanded and parsed (after the prelude's tokens),
+// before the rest of the static pass (`check_parsed`): cobc's `--unittest`
+// adds its runner here.
+export struct Parsed
+{
+    export Program user;
+    export Expansion ex;
+}
+
+fn shown(ref<Rejected, shared> r) : String
+{
+    if (r.loading)
+    {
+        return describe_diagnostic(&r.raw, &r.ex, true);
+    }
+    failure(&r.raw, &r.ex)
+}
+
+fn rejected(String raw, Expansion ex) : Rejected
+{
+    Rejected { .raw = raw, .ex = ex, .loading = false }
+}
+
+export fn parse_user(StringView src, StringView origin) : Result<Parsed, Rejected>
+{
+    Expansion ex = expand(strip_bom(src), origin);
+    Option<String> error = clone(&ex.error);
+    match (error)
+    {
+        Some(raw) : return Err(Rejected { .raw = raw, .ex = ex, .loading = true }),
+        None      : {},
+    }
+    match (parse_text(&ex.text))
+    {
+        Ok(p)  : Ok(Parsed { .user = p, .ex = ex }),
+        Err(e) : Err(rejected(e, ex)),
+    }
+}
+
+// The rest of the static pass over a parsed program. `warn_shadow`
+// (`--warn-shadow`, CHG-0333): once its names are resolved, a note on
+// standard error for each item of the program that hides an imported one.
+export fn check_parsed(Parsed parsed, bool warn_shadow) : Result<Checked, Rejected>
+{
+    Parsed { user, ex } = parsed;
     Program program = parse_prelude();
     Program { items, tests } = user;
     Vec::append(&mut program.items, items);
@@ -321,18 +378,30 @@ export fn check_text(StringView src, StringView origin) : Result<Checked, String
     match (check_duplicates(&program))
     {
         Ok(_)  : {},
-        Err(e) : return Err(failure(&e, &ex)),
+        Err(e) : return Err(rejected(e, ex)),
     }
     add_derived(&mut program);
     Resolver resolver = match (resolve_program(&mut program))
     {
         Ok(r)  : r,
-        Err(e) : return Err(failure(&e, &ex)),
+        Err(e) : return Err(rejected(e, ex)),
     };
+    if (warn_shadow)
+    {
+        Vec<ShadowNote> notes = shadow_notes(&resolver, &program);
+        foreach (n in &notes)
+        {
+            match (resolve_line(&ex, n.line))
+            {
+                Some(o) : eprintf("%s\n  --> %s:%v\n", &n.text, &o.file, o.line),
+                None    : eprintf("%s\n", &n.text),
+            }
+        }
+    }
     HashMap<String, Expr> lits = match (consts::process(&mut program))
     {
         Ok(l)  : l,
-        Err(e) : return Err(failure(&e, &ex)),
+        Err(e) : return Err(rejected(e, ex)),
     };
     Sigs sigs = views::process(&mut program);
     Front front = Front { .resolver = resolver, .lits = lits, .sigs = sigs, .std_base = std_base() };
@@ -342,7 +411,7 @@ export fn check_text(StringView src, StringView origin) : Result<Checked, String
     Vec<StaticAssert> asserts = match (check_program(&mut table, &front, &mut facts))
     {
         Ok(a)  : a,
-        Err(e) : return Err(failure(&e, &ex)),
+        Err(e) : return Err(rejected(e, ex)),
     };
     // D-0162: the literals typed `String` through a generic, and the other
     // rewrites, applied; the program is then checked again.
@@ -353,19 +422,19 @@ export fn check_text(StringView src, StringView origin) : Result<Checked, String
         asserts = match (check_program(&mut table, &front, &mut again))
         {
             Ok(a)  : a,
-            Err(e) : return Err(failure(&e, &ex)),
+            Err(e) : return Err(rejected(e, ex)),
         };
         if (literal_still_string(&again))
         {
             String m = String::from_str("diag.type-mismatch\u{1}a text literal here is a `String` in one instantiation of the generic function around it and another type in another; write `String::from_str(\"…\")` where a `String` is meant");
-            return Err(failure(&m, &ex));
+            return Err(rejected(m, ex));
         }
         facts = again;
     }
     match (check_static_asserts(&table, &asserts))
     {
         Ok(_)  : Ok(Checked { .table = table, .facts = facts, .ex = ex, .front = front }),
-        Err(e) : Err(failure(&e, &ex)),
+        Err(e) : Err(rejected(e, ex)),
     }
 }
 

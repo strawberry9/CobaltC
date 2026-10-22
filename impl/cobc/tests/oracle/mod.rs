@@ -21,6 +21,10 @@ pub use common::{case_args_os, case_dir};
 #[allow(unused_imports)]
 pub use common::{in_shard, shard_count, slow_skipped, Slowest};
 
+// The compiler under test (`COBC`, else this build's cobc).
+mod exe;
+pub use exe::cobc_exe;
+
 // D-0143: whether a case's `platform:` header names another platform.
 pub fn platform_skipped(src: &str) -> bool {
     common::platform_skipped(src)
@@ -59,7 +63,7 @@ pub const CPU_LIMIT_SECS: u64 = 300;
 // `cobc --cc CC`, ready for its remaining arguments.
 pub fn cobc(cc: &str) -> Command {
     coby();                                   // and, with it, a runtime built from these sources
-    let mut c = Command::new(env!("CARGO_BIN_EXE_cobc"));
+    let mut c = Command::new(cobc_exe());
     c.arg("--cc").arg(cc).env("COBALTC_CPU_LIMIT", CPU_LIMIT_SECS.to_string());
     limited(&mut c);
     c

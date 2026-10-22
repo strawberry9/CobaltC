@@ -14,6 +14,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "oracle/exe.rs"]
+mod exe;
+use exe::cobc_exe;
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("cobc-identity-{}-{}", tag, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -28,7 +32,7 @@ fn build(root: &Path, name: &str, src: &str, cache: &Path) -> (usize, usize) {
     fs::create_dir_all(&dir).unwrap();
     let file = format!("{}.cb", name);
     fs::write(dir.join(&file), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc"))
+    let out = Command::new(cobc_exe())
         .args(["-v", "-o", "prog_out", &file])
         .env("COBC_CACHE", cache)
         .current_dir(&dir)

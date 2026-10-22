@@ -32,19 +32,23 @@ import each;
 import state;
 import typeops;
 import layout;
+import libheader;
 
 // ---- the program ----
 
-// The program's C, the C file's name `c_name` (for the `#line` that returns
-// to the C's own lines).
-export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
+// The program's C in parts (cobc's `Gen::generate`): the driver compiles
+// pure-`std` units apart (`cache.cb`). D-0257: a library (`lib`) has no
+// `main`; its entry points (`extern fn` with a body) are requested instead,
+// each with a C-callable stub in the tail (`lib_tail`).
+export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
 {
-    String main_c = request_fn(g, StringView::of("main"), Vec::new());
+    String main_c = if (lib) { String::new() } else { request_fn(g, StringView::of("main"), Vec::new()) };
     bool main_u8 = match (HashMap::get(&g.prog.table.fns, &String::from_str("main")))
     {
         Some(m) : !is_void(&m.ret),
         None    : false,
     };
+    Vec<Entry> entry_c = request_entries(g, lib);
     while (g.queue_head < Vec::len(&g.queue))
     {
         FnRequest r = clone(&g.queue[g.queue_head]);
@@ -135,6 +139,11 @@ export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
         String::append(&mut tail, &sprintf("\"%s\", ", &c_escape(String::as_view(f))));
     }
     String::append(&mut tail, "0};\n");
+    if (lib)
+    {
+        String header_text = lib_tail(g, &mut tail, &entry_c);
+        return parts(g, descs, tail, header_text);
+    }
     String call = if (main_u8) { sprintf("uint8_t cb_status = %s();", &main_c) } else { sprintf("%s();", &main_c) };
     String::append(
         &mut tail,
@@ -146,24 +155,7 @@ export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
             if (main_u8) { "cb_status" } else { "0" }
         )
     );
-    String out = String::from_str(HEADER);
-    String::append(&mut out, "\n/* ---- types ---- */\n");
-    String::append(&mut out, &g.fwd);
-    String::append(&mut out, &g.types);
-    String::append(&mut out, "\n/* ---- string literals ---- */\n");
-    String::append(&mut out, &g.strings);
-    String::append(&mut out, "\n/* ---- functions ---- */\n");
-    String::append(&mut out, &g.protos);
-    String::append(&mut out, "\n/* ---- call thunks for fn values ---- */\n");
-    String::append(&mut out, &g.thunks_out);
-    String::append(&mut out, "\n/* ---- type descriptors ---- */\n");
-    String::append(&mut out, &descs);
-    foreach (u in &g.units)
-    {
-        String::append(&mut out, &u.text);
-    }
-    String::append(&mut out, &tail);
-    settle_lines(&out, c_name)
+    parts(g, descs, tail, String::new())
 }
 
 // ---- one function ----
@@ -393,7 +385,7 @@ export fn emit_fn_body(
     x.objectless_names = objectless_names;
     x.elem_ref_ids = elem_ref_ids;
     x.quiet_ids = quiet_ids;
-    if (!boot(g, 1))
+    if (!all_checks(g))
     {
         x.confined_fields = confined_fields(&f.body, &pnames);
         x.read_confined = read_confined_vecs(&f.body, &pnames);
@@ -19461,4 +19453,200 @@ export fn lower_call_expr(
         _                  : {},
     }
     lower_call(g, x, &c.callee, &c.args, expected, e.line)
+}
+
+// ---- the program's C in parts (lower.rs's `Generated`) ----
+
+// The generated C in parts (`generate_parts`); `combined` is the single
+// file `--keep-c` writes and the no-cache path compiles.
+export struct Generated
+{
+    export String fwd;
+    export String types;
+    export String strings;
+    export String protos;
+    export String thunks;
+    export String descs;
+    export Vec<Unit> units;
+    export String tail;
+    // D-0257: the C header of a library's entry points (`--lib`).
+    export String header_text;
+}
+
+// The program's C, the C file's name `c_name` (for the `#line` that returns
+// to the C's own lines).
+export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
+{
+    combined(&generate_parts(g, false), c_name)
+}
+
+// `Generated::header`: the runtime's C interface every C file begins with.
+export fn generated_header() : str
+{
+    HEADER
+}
+
+// The single C file, `c_name` the name it is written under (for the `#line`
+// that returns to the C's own lines, `settle_lines`).
+export fn combined(ref<Generated, shared> gen, StringView c_name) : String
+{
+    settle_lines(&combined_text(gen), c_name)
+}
+
+fn combined_text(ref<Generated, shared> gen) : String
+{
+    String out = String::from_str(HEADER);
+    String::append(&mut out, "\n/* ---- types ---- */\n");
+    String::append(&mut out, &gen.fwd);
+    String::append(&mut out, &gen.types);
+    String::append(&mut out, "\n/* ---- string literals ---- */\n");
+    String::append(&mut out, &gen.strings);
+    String::append(&mut out, "\n/* ---- functions ---- */\n");
+    String::append(&mut out, &gen.protos);
+    String::append(&mut out, "\n/* ---- call thunks for fn values ---- */\n");
+    String::append(&mut out, &gen.thunks);
+    String::append(&mut out, "\n/* ---- type descriptors ---- */\n");
+    String::append(&mut out, &gen.descs);
+    foreach (u in &gen.units)
+    {
+        String::append(&mut out, &u.text);
+    }
+    String::append(&mut out, &gen.tail);
+    out
+}
+
+// The parts, taken out of `g` (cobc's `generate` consumes its `Gen`).
+fn parts(ref<Gen, exclusive> g, String descs, String tail, String header_text) : Generated
+{
+    Generated {
+        .fwd = replace(&mut g.fwd, String::new()),
+        .types = replace(&mut g.types, String::new()),
+        .strings = replace(&mut g.strings, String::new()),
+        .protos = replace(&mut g.protos, String::new()),
+        .thunks = replace(&mut g.thunks_out, String::new()),
+        .descs = descs,
+        .units = replace(&mut g.units, Vec::new()),
+        .tail = tail,
+        .header_text = header_text,
+    }
+}
+
+// A library's entry point: its C name and its declaration.
+export struct Entry
+{
+    export String c;
+    export FnDecl f;
+}
+
+// D-0257: the entry points (`extern fn` with a body), in the order of the
+// program's text, each requested when building a library.
+fn request_entries(ref<Gen, exclusive> g, bool lib) : Vec<Entry>
+{
+    Vec<String> keys = Vec::new();
+    Vec<usize> lines = Vec::new();
+    for (usize i = 0; i < HashMap::len(&g.prog.table.fns); i += 1)
+    {
+        ref<FnDecl, shared> f = HashMap::value_at(&g.prog.table.fns, i);
+        if (f.c_entry)
+        {
+            // Sorted by line (stable, as cobc's `sort_by_key`).
+            usize at = Vec::len(&keys);
+            while (at > 0 && lines[at - 1] > f.line)
+            {
+                at -= 1;
+            }
+            Vec::insert(&mut keys, at, String::clone(HashMap::key_at(&g.prog.table.fns, i)));
+            Vec::insert(&mut lines, at, f.line);
+        }
+    }
+    Vec<Entry> out = Vec::new();
+    if (lib)
+    {
+        foreach (k in &keys)
+        {
+            String c = request_fn(g, String::as_view(k), Vec::new());
+            FnDecl f = clone(Option::expect(HashMap::get(&g.prog.table.fns, k), "an entry point"));
+            Vec::push(&mut out, Entry { .c = c, .f = f });
+        }
+    }
+    out
+}
+
+// D-0257: a library's tail, no `main`. `cb_lib_init` is the runtime's start,
+// run once by the first entry; each entry point is a stub that enters, calls
+// the function, leaves; its `_try` twin contains a fault (`cb_lib_jmp`) and
+// gives C a status and the result through a pointer. `cobalt_init`,
+// `cobalt_shutdown` and `cobalt_last_fault` are the library's own API. The
+// header's text (`header_text`).
+fn lib_tail(ref<Gen, exclusive> g, ref<String, exclusive> out, ref<Vec<Entry>, shared> entry_c) : String
+{
+    String::appendf(
+        out,
+        "static void cb_lib_init(void)\n{\n    cb_init(cb_files, %v, cb_types, %v, cb_type_ids);\n}\n",
+        Vec::len(&g.files),
+        Vec::len(&g.descs),
+    );
+    String::append(out, "void cobalt_init(void)\n{\n    cb_lib_enter(cb_lib_init);\n    cb_lib_leave();\n}\n");
+    String::append(out, "void cobalt_shutdown(void)\n{\n    cb_lib_shutdown();\n}\n");
+    String::append(out, "int cobalt_last_fault(char *buf, size_t n)\n{\n    return cb_lib_last_fault(buf, n);\n}\n");
+    foreach (e in entry_c)
+    {
+        Vec<String> params = Vec::new();
+        Vec<String> args = Vec::new();
+        for (usize i = 0; i < Vec::len(&e.f.params); i += 1)
+        {
+            String pc = ctype(g, &e.f.params[i].ty);
+            Vec::push(&mut params, sprintf("%s a%v", &pc, i));
+            Vec::push(&mut args, sprintf("a%v", i));
+        }
+        String plist = if (Vec::len(&params) == 0) { String::from_str("void") } else
+        {
+            String::join(
+                &params[0..$],
+                ", ",
+            )
+        };
+        String call = sprintf("%s(%s)", &e.c, &String::join(&args[0..$], ", "));
+        if (is_void(&e.f.ret))
+        {
+            String::appendf(
+                out,
+                "void %s(%s)\n{\n    cb_lib_enter(cb_lib_init);\n    %s;\n    cb_lib_leave();\n}\n",
+                &e.f.name,
+                &plist,
+                &call,
+            );
+            String::appendf(
+                out,
+                "int %s_try(%s)\n{\n    cb_lib_enter(cb_lib_init);\n    jmp_buf cb_jb;\n    if (setjmp(cb_jb) == 0) {\n        cb_lib_jmp((void *)cb_jb);\n        %s;\n        cb_lib_jmp(0);\n        cb_lib_leave();\n        return 0;\n    }\n    cb_lib_leave();\n    return cb_lib_fault_code();\n}\n",
+                &e.f.name,
+                &plist,
+                &call,
+            );
+        }
+        else
+        {
+            String rc = ctype(g, &e.f.ret);
+            String::appendf(
+                out,
+                "%s %s(%s)\n{\n    cb_lib_enter(cb_lib_init);\n    %s cb_r = %s;\n    cb_lib_leave();\n    return cb_r;\n}\n",
+                &rc,
+                &e.f.name,
+                &plist,
+                &rc,
+                &call,
+            );
+            Vec<String> tparams = Vec::clone(&params);
+            Vec::push(&mut tparams, sprintf("%s *cb_out", &rc));
+            String::appendf(
+                out,
+                "int %s_try(%s)\n{\n    cb_lib_enter(cb_lib_init);\n    jmp_buf cb_jb;\n    if (setjmp(cb_jb) == 0) {\n        cb_lib_jmp((void *)cb_jb);\n        %s cb_r = %s;\n        cb_lib_jmp(0);\n        cb_lib_leave();\n        *cb_out = cb_r;\n        return 0;\n    }\n    cb_lib_leave();\n    return cb_lib_fault_code();\n}\n",
+                &e.f.name,
+                &String::join(&tparams[0..$], ", "),
+                &rc,
+                &call,
+            );
+        }
+    }
+    header_text(g, entry_c)
 }

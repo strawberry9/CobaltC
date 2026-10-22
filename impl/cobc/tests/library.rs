@@ -230,19 +230,19 @@ fn a_library_and_a_program_are_told_apart() {
     let dir = scratch("gcc", "kinds");
     fs::write(dir.join("lib.cb"), "import std;\n\nextern fn one() : u32\n{\n    1\n}\n").unwrap();
     fs::write(dir.join("prog.cb"), "import std;\n\nfn main()\n{\n    printf(\"1\\n\");\n}\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).arg("lib.cb").current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).arg("lib.cb").current_dir(&dir).output().expect("run cobc");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{}", err);
     assert!(err.contains("is a library") && err.contains("cobc --lib -o liblib.a lib.cb"), "{}", err);
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--lib", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--lib", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{}", err);
     assert!(err.contains("has no `main`"), "{}", err);
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--lib", "--run", "lib.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--lib", "--run", "lib.cb"]).current_dir(&dir).output().expect("run cobc");
     assert_eq!(out.status.code(), Some(2));
     // The default output name: `lib<stem>.a` beside the source, and its
     // header and the runtime with it.
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--lib", "lib.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--lib", "lib.cb"]).current_dir(&dir).output().expect("run cobc");
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(dir.join("liblib.a").is_file() && dir.join("lib.h").is_file() && dir.join("libcbrt.a").is_file());
     let _ = fs::remove_dir_all(&dir);

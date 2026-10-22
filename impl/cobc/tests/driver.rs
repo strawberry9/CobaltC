@@ -3,6 +3,10 @@
 use std::fs;
 use std::process::Command;
 
+#[path = "oracle/exe.rs"]
+mod exe;
+use exe::cobc_exe;
+
 // `cobc foo.cb` writes `foo`; when `foo` is a directory (one holding the
 // program's module files, say), it must say so and write nothing, not
 // leave the linker to fail with "cannot open output file".
@@ -12,7 +16,7 @@ fn default_output_that_is_a_directory_is_reported() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("prog")).unwrap();
     fs::write(dir.join("prog.cb"), "import std;\n\nfn main()\n{\n    printf(\"hi\\n\");\n}\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).arg("prog.cb").current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(cobc_exe()).arg("prog.cb").current_dir(&dir).output().expect("run cobc");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", err);
     assert!(err.contains("that is a directory") && err.contains("-o"), "stderr: {}", err);
@@ -22,7 +26,7 @@ fn default_output_that_is_a_directory_is_reported() {
 
 #[test]
 fn about_shows_the_banner_and_explains_cobc() {
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).arg("--about").output().expect("run cobc");
+    let out = Command::new(cobc_exe()).arg("--about").output().expect("run cobc");
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("                            C O B A L T C\n"), "{}", text);
@@ -36,7 +40,7 @@ fn check_builds_nothing_and_checks_extern_files() {
     let dir = std::env::temp_dir().join(format!("cobc-check-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let cobc = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_cobc")).args(args).current_dir(&dir).output().expect("run cobc");
+    let cobc = |args: &[&str]| Command::new(cobc_exe()).args(args).current_dir(&dir).output().expect("run cobc");
     fs::write(dir.join("ok.cb"), "import std;\n\nfn main()\n{\n    printf(\"hi\\n\");\n}\n").unwrap();
     let out = cobc(&["--check", "ok.cb"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -81,7 +85,7 @@ fn report_tracking_lists_tracked_lines_and_compiles_nothing() {
     fs::create_dir_all(&dir).unwrap();
     let src = "import std;\n\nfn main()\n{\n    Vec<i64> v = Vec::new();\n    Vec::push(&mut v, 1);\n    Vec::push(&mut v, 2);\n    i64 first = 7;\n    i64 t = 0;\n    foreach (i in 0..Vec::len(&v))\n    {\n        t += v[i];\n    }\n    Vec<i64> w = Vec::new();\n    Vec::push(&mut w, 3);\n    foreach (i in 0..Vec::len(&w))\n    {\n        t += w[i];\n    }\n    Vec<i64> keep = v;\n    printf(\"%v %v %v\\n\", t, first, Vec::len(&keep));\n}\n";
     fs::write(dir.join("prog.cb"), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--report-tracking", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(cobc_exe()).args(["--report-tracking", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let first = text.lines().nth(2).unwrap_or("");
@@ -103,7 +107,7 @@ fn program_functions_are_static_and_cached_helpers_link() {
     fs::create_dir_all(&dir).unwrap();
     let src = "import std;\n\nfn step(ref<i64, exclusive> x)\n{\n    *x += 1;\n}\n\nfn main()\n{\n    Vec<i64> v = Vec::new();\n    foreach (i in 0..10)\n    {\n        Vec::push(&mut v, narrow<i64>(i));\n    }\n    i64 t = 0;\n    foreach (i in 0..Vec::len(&v))\n    {\n        step(&mut t);\n        t += v[i];\n    }\n    printf(\"%v\\n\", t);\n}\n";
     fs::write(dir.join("prog.cb"), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(cobc_exe()).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let c = fs::read_to_string(dir.join("prog.c")).unwrap();
     assert!(c.lines().any(|l| l.starts_with("static void f_step(")), "`step` is not static");
@@ -128,7 +132,7 @@ fn line_directives_name_the_program_lines() {
             let mut args = vec!["--keep-c", "--cc", cc, "-o", out];
             args.extend_from_slice(extra);
             args.push("prog.cb");
-            let o = Command::new(env!("CARGO_BIN_EXE_cobc")).args(&args).env("COBC_CACHE", "off").current_dir(&dir).output().expect("run cobc");
+            let o = Command::new(cobc_exe()).args(&args).env("COBC_CACHE", "off").current_dir(&dir).output().expect("run cobc");
             assert!(o.status.success(), "{}: {}", cc, String::from_utf8_lossy(&o.stderr));
             let run = Command::new(dir.join(out)).output().expect("run prog");
             assert_eq!(String::from_utf8_lossy(&run.stdout), "3\n", "{}", cc);
@@ -171,7 +175,7 @@ fn sanitizer_reports_the_program_line() {
     let wrapper = concat!(env!("CARGO_MANIFEST_DIR"), "/../fuzz/clang-asan");
     let src = "import std;\n\nstruct P\n{\n    i64 x;\n    i64 y;\n}\n\nfn main()\n{\n    match (allocate(sizeof<i64>(), alignof<i64>()))\n    {\n        Ok(b)  :\n        {\n            rawptr<P> p = reinterpret_ptr<P>(b);\n            unsafe\n            {\n                (*p).y = 40;\n            }\n        },\n        Err(_) :\n        {\n        },\n    }\n}\n";
     fs::write(dir.join("over.cb"), src).unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["-O0", "-g", "--cc", wrapper, "-o", "over", "over.cb"]).current_dir(&dir).output().expect("run cobc");
+    let o = Command::new(cobc_exe()).args(["-O0", "-g", "--cc", wrapper, "-o", "over", "over.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     // `setarch -R`: clang 14's sanitized binaries can fail at start under ASLR.
     let run = Command::new("setarch").args(["-R", "./over"]).current_dir(&dir).output().expect("run over");
@@ -196,14 +200,14 @@ fn unittest_build_reports_as_coby_does() {
     assert_eq!(want.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&want.stdout).ends_with("3 tests: 2 passed, 1 failed\n"), "{}", String::from_utf8_lossy(&want.stdout));
     for cc in ["gcc", "clang"] {
-        let built = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--unittest", "--cc", cc, "-o", "tests", "t.cb"]).current_dir(&dir).output().expect("run cobc");
+        let built = Command::new(cobc_exe()).args(["--unittest", "--cc", cc, "-o", "tests", "t.cb"]).current_dir(&dir).output().expect("run cobc");
         assert!(built.status.success(), "{}: {}", cc, String::from_utf8_lossy(&built.stderr));
         let got = Command::new(dir.join("tests")).current_dir(&dir).env("NO_COLOR", "1").output().expect("run the tests");
         assert_eq!((got.status.code(), String::from_utf8_lossy(&got.stdout)), (want.status.code(), String::from_utf8_lossy(&want.stdout)), "{}", cc);
-        let run = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--unittest", "--unittest-filter", "zero", "--cc", cc, "--run", "t.cb"]).current_dir(&dir).output().expect("run cobc");
+        let run = Command::new(cobc_exe()).args(["--unittest", "--unittest-filter", "zero", "--cc", cc, "--run", "t.cb"]).current_dir(&dir).output().expect("run cobc");
         assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "test t.cb:18 twice: zero ... ok\n1 test: 1 passed, 0 failed, 2 filtered out\n".to_string()), "{}", cc);
         // Without --unittest, the program: `main`, and no test.
-        let plain = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--cc", cc, "--run", "t.cb"]).current_dir(&dir).output().expect("run cobc");
+        let plain = Command::new(cobc_exe()).args(["--cc", cc, "--run", "t.cb"]).current_dir(&dir).output().expect("run cobc");
         assert_eq!(String::from_utf8_lossy(&plain.stdout), "main\n", "{}", cc);
     }
     let _ = fs::remove_dir_all(&dir);
@@ -220,7 +224,8 @@ fn internal_error_is_one_line() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("p.cb"), "fn main()\n{\n}\n").unwrap();
     let coby = std::path::Path::new(env!("CARGO_BIN_EXE_cobc")).with_file_name(if cfg!(windows) { "coby.exe" } else { "coby" });
-    for (tool, exe) in [("coby", coby.as_path()), ("cobc", std::path::Path::new(env!("CARGO_BIN_EXE_cobc")))] {
+    let under_test = cobc_exe();
+    for (tool, exe) in [("coby", coby.as_path()), ("cobc", under_test.as_path())] {
         let o = Command::new(exe).arg("p.cb").env("COBALTC_TEST_INTERNAL_ERROR", "1").env_remove("RUST_BACKTRACE").current_dir(&dir).output().expect("run the tool");
         let err = String::from_utf8_lossy(&o.stderr);
         assert_eq!(o.status.code(), Some(4), "{}: {}", tool, err);
@@ -244,7 +249,7 @@ fn closed_output_pipe_is_not_an_internal_error() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("p.cb"), "import std;\n\nfn main()\n{\n    printf(\"x\\n\");\n}\n").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cobc"))
+    let mut child = Command::new(cobc_exe())
         .args(["--explore", "3", "p.cb"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -268,7 +273,7 @@ fn explore_does_not_wait_for_an_open_input() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("p.cb"), "import std;\n\nfn main()\n{\n    printf(\"x\\n\");\n}\n").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cobc"))
+    let mut child = Command::new(cobc_exe())
         .args(["--explore", "3", "p.cb"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -305,7 +310,7 @@ fn unknown_target_is_a_usage_error() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("p.cb"), "import std;\n\nfn main()\n{\n}\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--target", "aarch64-unknown-linux-gnu", "p.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(cobc_exe()).args(["--target", "aarch64-unknown-linux-gnu", "p.cb"]).current_dir(&dir).output().expect("run cobc");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", err);
     assert!(err.contains("x86_64-unknown-linux-gnu") && err.contains("x86_64-pc-windows-gnu"), "stderr: {}", err);
@@ -319,8 +324,8 @@ fn unknown_target_is_a_usage_error() {
 #[test]
 fn windows_target_builds_an_exe_that_wine_runs() {
     let have = |p: &str| Command::new(p).arg("--version").output().map_or(false, |o| o.status.success());
-    let cobc = std::path::PathBuf::from(env!("CARGO_BIN_EXE_cobc"));
-    let runtime = cobc.parent().and_then(|d| d.parent()).map(|t| t.join("x86_64-pc-windows-gnu/release/libcbrt.a"));
+    let cobc = cobc_exe();
+    let runtime = std::path::Path::new(env!("CARGO_BIN_EXE_cobc")).parent().and_then(|d| d.parent()).map(|t| t.join("x86_64-pc-windows-gnu/release/libcbrt.a"));
     if !have("x86_64-w64-mingw32-gcc") || !have("wine64") || !runtime.as_ref().map_or(false, |r| r.exists()) {
         eprintln!("skipped: needs x86_64-w64-mingw32-gcc, wine64 and target/x86_64-pc-windows-gnu/release/libcbrt.a (cargo +1.77.2 build --release -p cbrt --target x86_64-pc-windows-gnu)");
         return;
@@ -355,7 +360,7 @@ fn warn_shadow_notes_hidden_imports() {
     let dir = std::env::temp_dir().join(format!("cobc-warn-shadow-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let cobc = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_cobc")).args(args).current_dir(&dir).output().expect("run cobc");
+    let cobc = |args: &[&str]| Command::new(cobc_exe()).args(args).current_dir(&dir).output().expect("run cobc");
     let src = "import std;\n\nstruct Option\n{\n    bool some;\n}\n\nfn main()\n{\n    Option o = Option { .some = true };\n    printf(\"%v\\n\", o.some);\n}\n";
     fs::write(dir.join("shadow.cb"), src).unwrap();
     let out = cobc(&["--warn-shadow", "--run", "shadow.cb"]);
@@ -399,7 +404,7 @@ fn contained_fault_frees_objectless_locals() {
     let coby = std::path::Path::new(env!("CARGO_BIN_EXE_cobc")).with_file_name(if cfg!(windows) { "coby.exe" } else { "coby" });
     let want = Command::new(&coby).arg("pool.cb").current_dir(&dir).output().expect("run coby");
     assert!(want.status.success(), "{}", String::from_utf8_lossy(&want.stderr));
-    let o = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["-O0", "-g", "--cc", wrapper, "-o", "pool", "pool.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
+    let o = Command::new(cobc_exe()).args(["-O0", "-g", "--cc", wrapper, "-o", "pool", "pool.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     // `setarch -R`: clang 14's sanitized binaries can fail at start under ASLR.
     let run = Command::new("setarch").args(["-R", "./pool"]).current_dir(&dir).output().expect("run pool");

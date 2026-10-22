@@ -39,9 +39,10 @@ else
     echo "fixpoint.sh: stage 1 differs from cobc (level $level)"; cmp "$cname" "$OUT/stage1.c" | head -2; exit 1
 fi
 rm -f "$cname" "$OUT/stage"
+# cbc's own C code (`extern "./host.c";`, cbc/host.cb) is linked with it.
 echo "== $cc $(date +%T)"
 libs=$(printf ' -l%s' pthread dl m)
-timeout -k 10 14000 "$cc" -std=gnu11 -ffp-contract=off -fno-optimize-sibling-calls -w -O2 -o "$OUT/cbc2" "$OUT/stage1.c" \
+timeout -k 10 14000 "$cc" -std=gnu11 -ffp-contract=off -fno-optimize-sibling-calls -w -O2 -o "$OUT/cbc2" "$OUT/stage1.c" "$here/cbc/host.c" \
     -L "$root/impl/target/release" -lcbrt $libs > "$OUT/cc.log" 2>&1 || { echo "fixpoint.sh: $cc failed"; tail "$OUT/cc.log"; exit 1; }
 echo "== stage 2 $(date +%T)"
 timeout -k 10 30000 "$OUT/cbc2" --emit-c --c-name "$cname" "$main" > "$OUT/stage2.c" 2> "$OUT/stage2.err" \

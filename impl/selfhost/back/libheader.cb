@@ -1,0 +1,270 @@
+// D-0257: the C header of a library's entry points (`--lib`), as
+// impl/cobc/src/lower/header.rs writes it: each ffi-struct they use as C
+// declares it, with its D-0250 layout asserted, the library's own API, and
+// each entry point's prototype with its `_try` form. The driver adds the
+// file's guard and the link line.
+
+import std;
+import ast;
+import cnames;
+import layout;
+import state;
+import gen;
+
+struct Header
+{
+    String defs;
+    HashSet<String> done;
+    HashSet<String> fwd;
+}
+
+// A type's C spelling for the header: the base type and, for an array, the
+// dimensions that follow the name (`uint8_t f[2][4]`).
+struct Spelled
+{
+    String base;
+    String dims;
+}
+
+export fn header_text(ref<Gen, exclusive> g, ref<Vec<Entry>, shared> entries) : String
+{
+    Header h = Header { .defs = String::new(), .done = HashSet::new(), .fwd = HashSet::new() };
+    String protos = String::new();
+    foreach (e in entries)
+    {
+        ref<FnDecl, shared> f = &e.f;
+        Vec<String> params = Vec::new();
+        foreach (p in &f.params)
+        {
+            Spelled s = hspell(g, &p.ty, &mut h);
+            Vec::push(
+                &mut params,
+                sprintf(
+                    "%s%v%s%s",
+                    &s.base,
+                    if (String::ends_with(&s.base, "*")) { "" } else { " " },
+                    &hsan(&p.name),
+                    &s.dims,
+                ),
+            );
+        }
+        String plist = if (Vec::len(&params) == 0) { String::from_str("void") } else
+        {
+            String::join(
+                &params[0..$],
+                ", ",
+            )
+        };
+        if (is_void(&f.ret))
+        {
+            String::appendf(&mut protos, "void %s(%s);\n", &f.name, &plist);
+            String::appendf(&mut protos, "int %s_try(%s);\n", &f.name, &plist);
+        }
+        else
+        {
+            Spelled r = hspell(g, &f.ret, &mut h);
+            String::appendf(&mut protos, "%s %s(%s);\n", &r.base, &f.name, &plist);
+            // The result parameter's name must not be one of the entry's own.
+            String rn = String::from_str("result");
+            while (true)
+            {
+                bool clash = false;
+                foreach (p in &f.params)
+                {
+                    if (hsan(&p.name) == rn)
+                    {
+                        clash = true;
+                    }
+                }
+                if (!clash)
+                {
+                    break;
+                }
+                String::push_ascii(&mut rn, b'_');
+            }
+            Vec<String> t = Vec::clone(&params);
+            Vec::push(&mut t, sprintf("%s *%s", &r.base, &rn));
+            String::appendf(&mut protos, "int %s_try(%s);\n", &f.name, &String::join(&t[0..$], ", "));
+        }
+    }
+    String out = String::new();
+    String::append(&mut out, "#include <stdint.h>\n#include <stddef.h>\n\n");
+    if (String::len(&h.defs) > 0)
+    {
+        String::append(
+            &mut out,
+            "/* The structs that cross by value, laid out as CobaltC lays them out (D-0250). */\n",
+        );
+        String::append(&mut out, &h.defs);
+        String::append(&mut out, "\n");
+    }
+    String::append(
+        &mut out,
+        "/* The library: started by its first call, or here; its buffered output written out; the last fault a _try call contained (its report into buf, at most n - 1 bytes; the report's length, or 0 for none). */\n",
+    );
+    String::append(
+        &mut out,
+        "void cobalt_init(void);\nvoid cobalt_shutdown(void);\nint cobalt_last_fault(char *buf, size_t n);\n\n",
+    );
+    String::append(
+        &mut out,
+        "/* The entry points. A fault inside name(...) reports and ends the process; name_try(...) contains it: 0 and the result through its last argument, or 1 with the result untouched. */\n",
+    );
+    String::append(&mut out, &protos);
+    out
+}
+
+fn spelled(String base, String dims) : Spelled
+{
+    Spelled { .base = base, .dims = dims }
+}
+
+// A struct is defined on first sight, after the structs its fields need.
+fn hspell(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Header, exclusive> h) : Spelled
+{
+    match (t)
+    {
+        Type::TInt(it)   : spelled(String::from_str(c_int_type(*it)), String::new()),
+        Type::TF32       : spelled(String::from_str("float"), String::new()),
+        Type::TF64       : spelled(String::from_str("double"), String::new()),
+        Type::TBool      : spelled(String::from_str("uint8_t"), String::new()),
+        Type::TVoid      : spelled(String::from_str("void"), String::new()),
+        Type::TRawptr(i) :
+        {
+            ref<Type, shared> inner = Box::get(i);
+            match (inner)
+            {
+                Type::TVoid     : spelled(String::from_str("void *"), String::new()),
+                Type::TNamed(_) :
+                {
+                    String n = hname(inner);
+                    if (!HashSet::contains(&h.done, &n) && HashSet::insert(&mut h.fwd, String::clone(&n)))
+                    {
+                        String::appendf(&mut h.defs, "struct %s;\n", &n);
+                    }
+                    spelled(sprintf("struct %s *", &n), String::new())
+                },
+                _               :
+                {
+                    Spelled s = hspell(g, inner, h);
+                    if (String::len(&s.dims) > 0)
+                    {
+                        assert(false, "cobc: a raw pointer to an array in a C-callable signature");
+                    }
+                    spelled(sprintf("%s *", &s.base), String::new())
+                },
+            }
+        },
+        Type::TArray(a)  :
+        {
+            Spelled { base, dims } = hspell(g, &Box::get(a).inner, h);
+            spelled(base, sprintf("[%v]%s", Box::get(a).n, &dims))
+        },
+        Type::TNamed(nt) :
+        {
+            String hn = hname(t);
+            if (!HashSet::contains(&h.done, &hn))
+            {
+                StructDecl decl = match (struct_decl(g, &Box::get(nt).name))
+                {
+                    Some(d) : d,
+                    None    :
+                    {
+                        assert(false, "cobc: a C-callable signature's type is no struct");
+                        return spelled(String::new(), String::new());
+                    },
+                };
+                HashMap<String, Type> subst = HashMap::new();
+                for (usize i = 0; i < Vec::len(&decl.type_params) && i < Vec::len(&Box::get(nt).args); i += 1)
+                {
+                    HashMap::insert(&mut subst, String::clone(&decl.type_params[i]), clone(&Box::get(nt).args[i]));
+                }
+                String body = String::new();
+                foreach (fd in &decl.fields)
+                {
+                    Type ft = hsubst(&fd.ty, &subst);
+                    Spelled s = hspell(g, &ft, h);
+                    String::appendf(
+                        &mut body,
+                        "    %s%v%s%s;\n",
+                        &s.base,
+                        if (String::ends_with(&s.base, "*")) { "" } else { " " },
+                        &hsan(&fd.name),
+                        &s.dims,
+                    );
+                }
+                SizeAlign sa = size_align(g, t);
+                String attr = match (decl.align)
+                {
+                    Some(a) : sprintf(" __attribute__((aligned(%v)))", a),
+                    None    : String::new(),
+                };
+                String::appendf(&mut h.defs, "struct %s {\n%s}%s;\n", &hn, &body, &attr);
+                String::appendf(
+                    &mut h.defs,
+                    "_Static_assert(sizeof(struct %s) == %v && _Alignof(struct %s) == %v, \"layout of %s\");\n",
+                    &hn,
+                    sa.size,
+                    &hn,
+                    sa.align,
+                    &hn,
+                );
+                HashSet::insert(&mut h.done, String::clone(&hn));
+            }
+            spelled(sprintf("struct %s", &hn), String::new())
+        },
+        _                :
+        {
+            assert(false, "cobc: a type in a C-callable signature");
+            spelled(String::new(), String::new())
+        },
+    }
+}
+
+// A struct's name in the header: its qualified name with `::` as `__`
+// (`Point`, `geo__Point`), and its type arguments as cobc mangles them.
+fn hname(ref<Type, shared> t) : String
+{
+    mangle(t)
+}
+
+// A field or parameter name C accepts.
+fn hsan(ref<String, shared> s) : String
+{
+    san(String::as_view(s))
+}
+
+fn hsubst(ref<Type, shared> t, ref<HashMap<String, Type>, shared> subst) : Type
+{
+    match (t)
+    {
+        Type::TNamed(n)  :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            if (Vec::len(&nt.args) == 0)
+            {
+                return match (HashMap::get(subst, &nt.name))
+                {
+                    Some(r) : clone(r),
+                    None    : clone(t),
+                };
+            }
+            Vec<Type> args = Vec::new();
+            foreach (a in &nt.args)
+            {
+                Vec::push(&mut args, hsubst(a, subst));
+            }
+            Type::TNamed(Box::new(NamedTy { .name = String::clone(&nt.name), .args = args }))
+        },
+        Type::TArray(a) : Type::TArray(Box::new(SizedTy { .inner = hsubst(
+            &Box::get(a).inner,
+            subst,
+        ), .n = Box::get(a).n })),
+        Type::TRawptr(e) : Type::TRawptr(Box::new(hsubst(Box::get(e), subst))),
+        Type::TSimd(a) : Type::TSimd(Box::new(SizedTy { .inner = hsubst(
+            &Box::get(a).inner,
+            subst,
+        ), .n = Box::get(a).n })),
+        _                : clone(t),
+    }
+}
