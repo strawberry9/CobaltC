@@ -3881,6 +3881,10 @@ impl<'a> Body<'a> {
                 let else_first = expected.is_none()
                     && is_literal_block(t)
                     && f.as_ref().map_or(false, |fe| !is_literal_branch(fe));
+                // A branch checked against the other's type (the hint) that
+                // comes out untyped (a generic variant such as `None`) has
+                // that type: the hint, kept in `hinted`.
+                let hinted: Option<Type>;
                 let (tt, ft, after_t) = if else_first {
                     let ft = self.check_expr(f.as_ref().unwrap(), None)?;
                     let after_f = std::mem::replace(&mut self.flow, before);
@@ -3890,6 +3894,7 @@ impl<'a> Body<'a> {
                     }
                     let tt = self.check_nested_block(t, hint.as_ref())?;
                     let after_t = std::mem::replace(&mut self.flow, after_f);
+                    hinted = hint;
                     (tt, ft, after_t)
                 } else {
                     let tt = self.check_nested_block(t, expected)?;
@@ -3908,9 +3913,15 @@ impl<'a> Body<'a> {
                         Some(fe) => self.check_expr(fe, expected.or(hint.as_ref()))?,
                         None => Some(Type::Void),
                     };
+                    hinted = hint;
                     (tt, ft, after_t)
                 };
                 self.flow = after_t.join(&self.flow);
+                let (tt, ft) = match (tt, ft, hinted) {
+                    (None, b, Some(h)) if else_first => (Some(h), b),
+                    (a, None, Some(h)) if !else_first && f.is_some() => (a, Some(h)),
+                    (a, b, _) => (a, b),
+                };
                 match (tt, ft) {
                     (Some(a), Some(b)) if !has_unresolved_marker(&a) && !has_unresolved_marker(&b) => {
                         if f.is_none() {

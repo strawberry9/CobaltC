@@ -1,7 +1,7 @@
 # CobaltC Conformance Cases
 
 Status: normative artifact
-Version: 3.268.0
+Version: 3.269.0
 Conforms to: `spec/02-schema.md` (Kind: Conformance case, `conf.<name>`)
 Governed by: `CobaltC_Master_Instructions.md` §1, §19, §20
 
@@ -833,6 +833,7 @@ Rows added for case files that had none (CHG-0265):
 | `conf.generic-variant-argument-typed-by-context` | `impl/conformance/12-type-system/generic_variant_argument_typed_by_context_ok.cb` | ok | rule.type.expected, D-0012 §3c (type arguments from the context), D-0079: A variant of a generic enum passed where the parameter is a type parameter -- `None`, `Ok(5)`, `Some(None)` -- has its full type from the call's expected type, as a literal does: |
 | `conf.if-condition-not-bool` | `impl/conformance/12-type-system/if_condition_not_bool_rejected.cb` | ✗ `diag.type-mismatch` (static) | rule.type.typing [T-If]: An `if` condition is a `bool`. |
 | `conf.if-variant-branch-takes-sibling-type` | `impl/conformance/12-type-system/if_variant_branch_takes_sibling_type_ok.cb` | ok | rule.type.expected; D-0049: with no expected type, an `if` whose `then` branch is a payloadless variant of a generic enum (`{ None }`) has the `else` branch's type: as a `match` scrutinee, an `auto` value and a generic call's argument. |
+| `conf.if-variant-else-branch-takes-sibling-type` | `impl/conformance/12-type-system/if_variant_else_branch_takes_sibling_type_ok.cb` | ok | rule.type.expected; D-0049: with no expected type, an `if` whose `else` branch is a payloadless variant of a generic enum (`{ None }`) has the `then` branch's type: as a `match` scrutinee whose binder holds a resource compared as text, an `auto` value and a generic call's argument. |
 | `conf.12-limits-generic-not-integer` | `impl/conformance/12-type-system/limits_generic_not_integer_rejected.cb` | ✗ `diag.type-mismatch` (static) | rule.type.kind; [Limits-Not-Number] (conf.limits-generic-not-integer): A generic body may pass its `T` to `min_value`, which is then typed at each instantiation. |
 | `conf.literal-expression-operand-takes-other-operand-type` | `impl/conformance/12-type-system/literal_expression_operand_takes_other_operand_type_ok.cb` | ok | rule.type.expected (the other operand's type) with D-0037 (literal expressions): `k & ((1 << 40) - 1)` where nothing outside gives a type (an argument of `printf`, of `reinterpret`): |
 | `conf.neg-unsigned` | `impl/conformance/12-type-system/neg_unsigned_rejected.cb` | ✗ `diag.type-mismatch` (static) | [T-Neg] (conf.neg-unsigned-rejected): Unary minus needs a signed or float operand. |
@@ -1980,6 +1981,7 @@ Rows added for case files that had none (CHG-0265):
 
 ## Change Log
 
+- 3.269.0 — `CHG-0369`: `conf.if-variant-else-branch-takes-sibling-type`.
 - 3.268.0 — `CHG-0365` (D-0275): `conf.ref-binding-end-not-deferred-by-plain-reference`, `conf.ref-binding-end-deferred-by-rebound-reference`; `conf.ref-holding-binding-end-deferred` now defers through a struct holding a reference; `conf.box-destroyed-while-contents-referenced` defers through a `ref<Vec<StringView>, exclusive>`. `CHG-0366`: `conf.text-compare-element-through-reference-result`.
 - 3.267.0 — `CHG-0364`: `conf.box-destroyed-while-contents-referenced`.
 - 3.266.0 — `CHG-0363`: `conf.text-compare-through-reference-result`.

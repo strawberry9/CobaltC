@@ -8022,3 +8022,11 @@ crossing to C by value.
   1 GB, every check on. `selfhost/build.sh` builds `cbc` too.
 - The port's string table was copied before each type probe, most of a self-compilation's time; a probe
   now records what it adds and undoes it.
+
+
+## Step 4: the code generator in CobaltC replaces cobc (2026-10-23)
+
+- An `if` whose `else` branch is `{ None }` had no type where none was expected, though its `then` branch
+  had one: a `match` on it bound an untyped payload, and `a == "x"` on a `String` binder faulted
+  `diag.read-of-resource` at run time, under `coby` and `cobc`. It has the `then` branch's type now, in the
+  static pass and in the one written in CobaltC. `CHG-0369`, `conf.if-variant-else-branch-takes-sibling-type`.
