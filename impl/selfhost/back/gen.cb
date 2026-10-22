@@ -428,6 +428,24 @@ export fn emit_fn_body(
             HashSet::insert(&mut x.pure_slices, String::clone(&f.params[pi].name));
         }
     }
+    if (bare)
+    {
+        // ... and none of its slices is received: the caller holds each one's
+        // path (`lower_dual_bare_call`).
+        foreach (p in &f.params)
+        {
+            Type pt = apply(&p.ty, subst);
+            bool sl = match (&pt)
+            {
+                Type::TSlice(_) : true,
+                _               : false,
+            };
+            if (sl)
+            {
+                HashSet::insert(&mut x.pure_slices, String::clone(&p.name));
+            }
+        }
+    }
     for (usize pi = 0; pi < Vec::len(&f.params); pi += 1)
     {
         if (pure_view(g, &key, pi))
@@ -2034,9 +2052,11 @@ export fn lower_user_arg_direct(
                 Type::TSlice(pm) : Box::get(pm).mode == Box::get(sl).mode,
                 _                : false,
             };
-            if (mode_ok && pure_direct(g, &key, j))
+            bool temp = HashSet::contains(&g.prog.facts.temp_borrows, &sa.id);
+            if (mode_ok && !HashMap::contains(&g.prog.facts.view_ops, &sa.id) && !temp && pure_direct(g, &key, j))
             {
-                assert(false, "cbc: pure direct slices are not ported yet (D-0274 stage 1)");
+                V v = lower_slice_of_as(g, x, Box::get(sl), false, sa.line, false);
+                return Some(DirectArg::Arg(v));
             }
         },
         _                      : {},
@@ -2071,6 +2091,18 @@ export fn lower_user_arg_direct(
     {
         Some(vx) :
         {
+            // CHG-0237: the text of a frozen parameter's field (`&p.f…`): no
+            // path can clash with it while the call runs.
+            bool frozen = match (&strip_parens(vx).kind)
+            {
+                ExprKind::EBorrow(vb) : Box::get(vb).mode == Mode::Shared && frozen_root(g, x, &Box::get(vb).e),
+                _                     : false,
+            };
+            if (frozen && pure_view(g, &key, j))
+            {
+                V v = lower_as_view_unminted(g, x, vx, a.line);
+                return Some(DirectArg::Arg(v));
+            }
             if (pure_view(g, &key, j) && view_safe_params(g, f) && view_args_inert(args, j))
             {
                 V v = lower_as_view_unminted(g, x, vx, a.line);
@@ -2109,7 +2141,28 @@ export fn lower_user_arg_direct(
     };
     if (p_slice && is_place_expr(a) && root_bound(x, a) && pure_direct(g, &key, j))
     {
-        assert(false, "cbc: pure direct slices are not ported yet (D-0274 stage 1)");
+        P pl = lower_place(g, x, a);
+        bool pl_slice = match (&pl.ty)
+        {
+            Type::TSlice(_) : true,
+            _               : false,
+        };
+        if (Option::is_none(&pl.raw) && pl_slice)
+        {
+            match (&pl.base)
+            {
+                Some(base) :
+                {
+                    String lc = loc(g, x.std_body, a.line);
+                    emit(x, String::as_view(&sprintf("cb_read(%s, %s, %s);", base, &projs_args(&pl.projs), &lc)));
+                },
+                None       : {},
+            }
+            String t = fresh(g, "t");
+            String c = ctype(g, &pl.ty);
+            emit(x, String::as_view(&sprintf("%s %s = %s;", &c, &t, &pl.c)));
+            return Some(DirectArg::Arg(V { .c = t, .ty = clone(&pl.ty), .obj = None }));
+        }
     }
     // A native map operation's map (or key) reference, `append`'s text, or a
     // reader's referent: `&x` / `&mut x` of a local is checked as the borrow
@@ -2222,15 +2275,46 @@ export fn lower_user_arg_direct(
                 g,
                 &key,
                 j,
-            ))
+            ) && !sibling_names_root(args, j, &Box::get(gc).args[0]))
             {
-                assert(false, "cbc: pure direct box arguments are not ported yet (D-0274 stage 1)");
+                match (lower_box_arg_unminted(g, x, &gname, &Box::get(gc).args[0], f, p, m, a.line))
+                {
+                    Some(v) : return Some(DirectArg::Arg(v)),
+                    None    : {},
+                }
             }
         },
         _                   : {},
     }
-    // CHG-0237: `&x.f…` of a frozen parameter for a reader parameter (frozen
-    // parameters come with stage 1: `frozen_root` is false before).
+    // CHG-0237: `&x.f…` -- fields only, down to a shared reference parameter
+    // that is never rebound (`frozen_root`) -- for a reader parameter: the
+    // field's address, no path.
+    match (&a.kind)
+    {
+        ExprKind::EBorrow(bb) :
+        {
+            ref<Expr, shared> place = &Box::get(bb).e;
+            bool p_shared = match (&p.ty)
+            {
+                Type::TRef(pm) : Box::get(pm).mode == Mode::Shared,
+                _              : false,
+            };
+            if (Box::get(bb).mode == Mode::Shared && p_shared && frozen_root(g, x, place) && reader_param(g, &key, j))
+            {
+                Type pt = probe_type(g, x, place, None);
+                if (flat_value(g, &pt))
+                {
+                    P pl = lower_place(g, x, place);
+                    String ad = fresh(g, "ad");
+                    emit(x, String::as_view(&sprintf("void *%s = (void *)&(%s);", &ad, &pl.c)));
+                    Type ty = ref_ty(clone(&pl.ty), Mode::Shared);
+                    unify(&p.ty, &ty, &f.type_params, m);
+                    return Some(DirectArg::Arg(V { .c = sprintf("((cb_ref){ %s, 0 })", &ad), .ty = ty, .obj = None }));
+                }
+            }
+        },
+        _                     : {},
+    }
     // `&v[i]`/`&mut v[i]`: a plain element for a pure direct parameter, or a
     // resource element holding no reference for a reader: the index call's
     // checks, the element checked in the borrow's mode, and its address.
@@ -2764,6 +2848,30 @@ export fn shared_refish(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
 // parameters' fields come with stage 1).
 export fn lower_as_view_unminted(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> vx, usize line) : V
 {
+    // CHG-0237: `&x.f…` of a frozen parameter (`frozen_root`): the view of
+    // the field's text, no check.
+    match (&strip_parens(vx).kind)
+    {
+        ExprKind::EBorrow(fb) :
+        {
+            if (Box::get(fb).mode == Mode::Shared && frozen_root(g, x, &Box::get(fb).e))
+            {
+                P pl = lower_place(g, x, &Box::get(fb).e);
+                if (is_string_ty(&pl.ty))
+                {
+                    Type vty = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::StringView"), .args = Vec::new() }));
+                    String vc = ctype(g, &vty);
+                    String t = fresh(g, "t");
+                    emit(x, String::as_view(&sprintf("%s %s;", &vc, &t)));
+                    emit(x, String::as_view(&sprintf("%s.bytes.src = (void *)&((%s).bytes);", &t, &pl.c)));
+                    emit(x, String::as_view(&sprintf("%s.bytes.data = (%s).bytes.ptr;", &t, &pl.c)));
+                    emit(x, String::as_view(&sprintf("%s.bytes.len = (%s).bytes.len;", &t, &pl.c)));
+                    return V { .c = t, .ty = vty, .obj = None };
+                }
+            }
+        },
+        _                     : {},
+    }
     Type st = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::String"), .args = Vec::new() }));
     Type sref = ref_ty(clone(&st), Mode::Shared);
     // `&s` of a local: its root; the checks below are the borrow's.
@@ -5738,6 +5846,22 @@ export fn lower_place_value(
     Option<ref<Type, shared>> expected,
 ) : V
 {
+    // CHG-0237: plain data in a field of a frozen parameter (`frozen_root`):
+    // read with no check.
+    bool field = match (&e.kind)
+    {
+        ExprKind::EField(_) : true,
+        _                   : false,
+    };
+    if (field && frozen_root(g, x, e))
+    {
+        P p = lower_place(g, x, e);
+        if (plain_data(g, &p.ty))
+        {
+            V v = V { .c = String::clone(&p.c), .ty = clone(&p.ty), .obj = None };
+            return into_temp(g, x, v, e.line);
+        }
+    }
     match (&e.kind)
     {
         // D-0103: a field moved out of a temporary.
@@ -5992,16 +6116,28 @@ export fn vec_index_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, 
         ExprKind::EDeref(_) : true,
         _                   : false,
     };
+    // A confined parameter's `(*v)[k]` is lowered as its `v[k]`: the place
+    // indexed is that dereference.
+    Option<Expr> deref_place = None;
     Option<Type> local_ty = match (&sb.kind)
     {
-        ExprKind::EPath(p) :
+        ExprKind::EPath(p)  :
         {
             if (Vec::len(&Box::get(p).segs) == 1)
             {
                 match (lookup(x, String::as_view(&Box::get(p).segs[0])))
                 {
                     Some(b) : Some(binding_place_ty(&b)),
-                    None    : None,
+                    // A confined parameter (a variant's mask) has no binding:
+                    // it is a reference to a `Vec` of the element type.
+                    None : match (HashMap::get(&x.confined_params, &Box::get(p).segs[0]))
+                    {
+                        Some(cv) : Some(ref_ty(
+                            Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = one_type(clone(&cv.elem)) })),
+                            Mode::Shared,
+                        )),
+                        None : None,
+                    },
                 }
             }
             else
@@ -6009,7 +6145,39 @@ export fn vec_index_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, 
                 None
             }
         },
-        _                  : None,
+        ExprKind::EDeref(d) :
+        {
+            ref<Expr, shared> di = strip_parens(Box::get(d));
+            match (&di.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1 && Option::is_none(&lookup(
+                        x,
+                        String::as_view(&Box::get(p).segs[0]),
+                    )))
+                    {
+                        match (HashMap::get(&x.confined_params, &Box::get(p).segs[0]))
+                        {
+                            Some(cv) :
+                            {
+                                Type el = clone(&cv.elem);
+                                Expr dc = renumbered(g, di);
+                                deref_place = Some(synth(g, ExprKind::EDeref(Box::new(dc)), e.line, e.col));
+                                Some(Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = one_type(el) })))
+                            },
+                            None     : None,
+                        }
+                    }
+                    else
+                    {
+                        None
+                    }
+                },
+                _                  : None,
+            }
+        },
+        _                   : None,
     };
     Type bt = match (local_ty)
     {
@@ -6037,8 +6205,15 @@ export fn vec_index_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, 
     }
     usize line = e.line;
     usize col = e.col;
-    Expr base_c = renumbered(g, &ix.a);
-    Expr place = if (through_ref) { synth(g, ExprKind::EDeref(Box::new(base_c)), line, col) } else { base_c };
+    Expr place = match (deref_place)
+    {
+        Some(dp) : dp,
+        None     :
+        {
+            Expr base_c = renumbered(g, &ix.a);
+            if (through_ref) { synth(g, ExprKind::EDeref(Box::new(base_c)), line, col) } else { base_c }
+        },
+    };
     str fname = if (write) { "index_exclusive" } else { "index_shared" };
     Mode mode = if (write) { Mode::Exclusive } else { Mode::Shared };
     Vec<String> segs = Vec::new();
@@ -6096,45 +6271,36 @@ export fn elem_access_place(
     {
         ref<Expr, shared> a0 = &call.args[0];
         ref<Expr, shared> a1 = &call.args[1];
-        // Confined (a holder, a confined local): the body's location and
-        // bounds fault, and the element's address; nothing else. (A read of
-        // a `read_confined_vec` comes with stage 4.)
-        match (confined_elem_vec(g, x, a0))
+        // Confined (`bind_confined`, `confined_field`, a read of a
+        // `read_confined_vec`): the body's location and bounds fault, and the
+        // element's address; nothing else.
+        bool read_ok = !write && String::eq_str(&name, "std::Vec::index_shared");
+        Option<ConfinedVec> cvo = match (confined_elem_vec(g, x, a0))
         {
-            Some(cv) :
-            {
-                V i = lower_index_arg(g, x, sprintf("(%s).len", &cv.c), a1);
-                if (is_never(&i.ty))
-                {
-                    return Some(P { .c = String::new(), .ty = Type::TNever, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None });
-                }
-                V it = into_temp(g, x, i, a1.line);
-                Vec<Type> va = Vec::new();
-                Vec::push(&mut va, clone(&cv.elem));
-                String vec_c = ctype(
-                    g,
-                    &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = va })),
-                );
-                String elem_c = ctype(g, &cv.elem);
-                String v = fresh(g, "v");
-                String ev = fresh(g, "e");
-                at(g, x, line);
-                emit(x, String::as_view(&sprintf("%s *%s = &(%s);", &vec_c, &v, &cv.c)));
-                emit(
-                    x,
-                    String::as_view(&sprintf(
-                        "if (%s >= %s->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);",
-                        &it.c,
-                        &v,
-                    )),
-                );
-                emit(x, String::as_view(&sprintf("%s *%s = %s->ptr + (int64_t)%s;", &elem_c, &ev, &v, &it.c)));
-                return Some(P { .c = sprintf(
-                    "(*%s)",
-                    &ev,
-                ), .ty = clone(&cv.elem), .base = None, .projs = Vec::new(), .is_binding = false, .raw = None });
-            },
+            Some(cv) : Some(cv),
+            None     : if (read_ok) { read_confined_vec(g, x, a0) } else { None },
+        };
+        match (cvo)
+        {
+            Some(cv) : return Some(confined_elem_place(g, x, &cv, a1, line)),
             None     : {},
+        }
+        // CHG-0237: an element of a vector reached through a shared reference
+        // parameter (`frozen_vec`), read as plain data or handed to a reader
+        // parameter: its bounds fault and its address, nothing else.
+        if (read_ok)
+        {
+            match (frozen_vec(g, x, a0))
+            {
+                Some(cv) :
+                {
+                    if ((x.elem_reader && flat_value(g, &cv.elem)) || plain_data(g, &cv.elem))
+                    {
+                        return Some(confined_elem_place(g, x, &cv, a1, line));
+                    }
+                },
+                None     : {},
+            }
         }
     }
     V v = lower_user_call_access(g, x, String::as_view(&name), &f, &path.targs, &call.args, None, line, Some(write));
@@ -6892,6 +7058,15 @@ export fn bind_param(
         // Not received: the caller's copy holds the view's path for the call
         // (`pure_view`); only its bytes and length are read.
         HashSet::insert(&mut x.direct_refs, sprintf("%s.bytes", &pc));
+        bind_in_scope(x, name, Binding { .c = pc, .ty = ty, .root = String::new(), .kind = BindKind::Local });
+        return;
+    }
+    if (HashSet::contains(&x.pure_slices, &p.name))
+    {
+        // Not received: the caller holds the slice's path for the call
+        // (`pure_direct`); only its elements and length are used.
+        HashSet::insert(&mut x.direct_refs, String::clone(&pc));
+        bind_direct_live(g, x, &pc, &ty);
         bind_in_scope(x, name, Binding { .c = pc, .ty = ty, .root = String::new(), .kind = BindKind::Local });
         return;
     }
@@ -7942,7 +8117,9 @@ export fn bind_reader_slice(
         },
         None    : return,
     }
+    bool was = replace(&mut x.fast_half, false);
     bind_direct_live(g, x, c, ty);
+    x.fast_half = was;
     HashSet::insert(&mut x.direct_refs, String::clone(c));
 }
 
@@ -8064,6 +8241,34 @@ export fn confined_local(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Con
         ExprKind::EBorrow(bb) :
         {
             ref<Expr, shared> inner = &Box::get(bb).e;
+            // D-0189: `&b.f` / `&(*b).f` of a field a field dual body's fast
+            // half confines.
+            if (HashMap::len(&x.field_confined) > 0)
+            {
+                match (&strip_parens(inner).kind)
+                {
+                    ExprKind::EField(fe) :
+                    {
+                        ref<Expr, shared> base = strip_parens(&Box::get(fe).e);
+                        Option<String> bn = match (&base.kind)
+                        {
+                            ExprKind::EDeref(d) : plain_name(strip_parens(Box::get(d))),
+                            _                   : plain_name(base),
+                        };
+                        String b = match (bn)
+                        {
+                            Some(n) : n,
+                            None    : return None,
+                        };
+                        return match (HashMap::get(&x.field_confined, &sprintf("%s.%s", &b, &Box::get(fe).name)))
+                        {
+                            Some(fc) : Some(ConfinedVec { .c = String::clone(&fc.c), .path = String::from_str("0"), .elem = clone(&fc.elem) }),
+                            None     : None,
+                        };
+                    },
+                    _                    : {},
+                }
+            }
             match (&inner.kind)
             {
                 ExprKind::EDeref(p) :
@@ -8151,12 +8356,144 @@ export fn confined_elem_vec(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Exp
     match (confined_local(x, e))
     {
         Some(c) : Some(c),
-        None    :
+        None    : confined_field(g, x, e),
+    }
+}
+
+// `&h.f` for a local struct `h` whose `Vec` field `f` of plain, non-zero-sized
+// elements `confined_fields` found reached only as `h.f[i]` and
+// `Vec::len(&h.f)` (cobc's `confined_field`).
+export fn confined_field(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<ConfinedVec>
+{
+    ref<Expr, shared> inner = match (&strip_parens(e).kind)
+    {
+        ExprKind::EBorrow(bb) : &Box::get(bb).e,
+        _                     : return None,
+    };
+    ref<FieldExpr, shared> fe = match (&strip_parens(inner).kind)
+    {
+        ExprKind::EField(f) : Box::get(f),
+        _                   : return None,
+    };
+    String h = match (path_name_raw(&fe.e))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    if (!HashSet::contains(&x.confined_fields, &sprintf("%s.%s", &h, &fe.name)))
+    {
+        return None;
+    }
+    Binding b = match (lookup(x, String::as_view(&h)))
+    {
+        Some(bd) : bd,
+        None     : return None,
+    };
+    bool local = match (&b.kind)
+    {
+        BindKind::Local : true,
+        _               : false,
+    };
+    if (!local || String::len(&b.root) == 0)
+    {
+        return None;
+    }
+    ref<NamedTy, shared> st = match (&b.ty)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return None,
+    };
+    StructDecl sd = match (struct_decl(g, &st.name))
+    {
+        Some(d) : d,
+        None    : return None,
+    };
+    HashMap<String, Type> sub = subst_of(&sd.type_params, &st.args);
+    Option<Type> fty = None;
+    foreach (fd in &sd.fields)
+    {
+        if (String::eq(&fd.name, &fe.name) && Option::is_none(&fty))
         {
-            // `confined_fields` is empty under `--all-checks` (stage 1).
-            assert(boot(g, 1), "cbc: confined fields are not ported yet (D-0274 stage 1)");
-            None
+            fty = Some(apply(&fd.ty, &sub));
+        }
+    }
+    Type vt = match (fty)
+    {
+        Some(t) : t,
+        None    : return None,
+    };
+    Type elem = match (vec_plain_elem(g, &vt))
+    {
+        Some(el) : el,
+        None     : return None,
+    };
+    Some(ConfinedVec { .c = sprintf(
+        "%s.%s",
+        &b.c,
+        &san(String::as_view(&fe.name)),
+    ), .path = String::new(), .elem = elem })
+}
+
+// `Vec<T>`'s `T` where it is plain data and sized.
+fn vec_plain_elem(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<Type>
+{
+    match (t)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            if (!String::eq_str(&nt.name, "std::Vec") || Vec::len(&nt.args) != 1)
+            {
+                return None;
+            }
+            if (!plain_data(g, &nt.args[0]) || size_align(g, &nt.args[0]).size == 0)
+            {
+                return None;
+            }
+            Some(clone(&nt.args[0]))
         },
+        _               : None,
+    }
+}
+
+// `&x` / `&mut x` for a local `x` that `read_confined_vecs` found no exclusive
+// path can ever be held to (a `Vec` of plain, non-zero-sized elements): a read
+// of an element, or of the length, needs its bounds check alone (cobc's
+// `read_confined_vec`). `.path` is empty.
+export fn read_confined_vec(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<ConfinedVec>
+{
+    ref<Expr, shared> inner = match (&strip_parens(e).kind)
+    {
+        ExprKind::EBorrow(bb) : &Box::get(bb).e,
+        _                     : return None,
+    };
+    String n = match (path_name_raw(inner))
+    {
+        Some(s) : s,
+        None    : return None,
+    };
+    if (!HashSet::contains(&x.read_confined, &n))
+    {
+        return None;
+    }
+    Binding b = match (lookup(x, String::as_view(&n)))
+    {
+        Some(bd) : bd,
+        None     : return None,
+    };
+    bool local = match (&b.kind)
+    {
+        BindKind::Local : true,
+        _               : false,
+    };
+    if (!local || String::len(&b.root) == 0)
+    {
+        return None;
+    }
+    match (vec_plain_elem(g, &b.ty))
+    {
+        Some(el) : Some(ConfinedVec { .c = String::clone(&b.c), .path = String::new(), .elem = el }),
+        None     : None,
     }
 }
 
@@ -8246,6 +8583,325 @@ export fn lower_raw_string(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr
     None
 }
 
+// `Box::get[_mut](b)` of an unminted arm binder `b` for a pure direct
+// parameter: the read of the box's pointer through the binder's base, the
+// contents' element access in the borrow's mode, then the address alone.
+fn lower_box_arg_unminted(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> gname,
+    ref<Expr, shared> ba,
+    ref<FnDecl, shared> f,
+    ref<ParamDecl, shared> p,
+    ref<HashMap<String, Type>, exclusive> m,
+    usize line,
+) : Option<V>
+{
+    String bn = match (path_name_raw(ba))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    Binding bind = match (lookup(x, String::as_view(&bn)))
+    {
+        Some(b) : b,
+        None    : return None,
+    };
+    Unminted um = match (HashMap::get(&x.unminted_binders, &bind.c))
+    {
+        Some(u) : clone(u),
+        None    : return None,
+    };
+    Type bt = match (&bind.ty)
+    {
+        Type::TRef(r) : clone(&Box::get(r).inner),
+        _             : return None,
+    };
+    Type elem = match (&bt)
+    {
+        Type::TNamed(n) :
+        {
+            if (Vec::len(&Box::get(n).args) != 1)
+            {
+                return None;
+            }
+            clone(&Box::get(n).args[0])
+        },
+        _               : return None,
+    };
+    String bc = ctype(g, &bt);
+    u32 tid = type_id(g, &elem);
+    bool shared = String::eq_str(gname, "std::Box::get");
+    str md = if (shared) { "CB_SHARED" } else { "CB_EXCLUSIVE" };
+    if (String::len(&um.tok) > 0)
+    {
+        Vec<String> all = clone(&um.projs);
+        Vec::push(&mut all, String::from_str("{ CB_FIELD, 0u }"));
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "cb_read(%s, (cb_proj[]){ %s }, %v, CB_NOLOC, 0);",
+                &um.tok,
+                &String::join(&all[0..$], ", "),
+                Vec::len(&all),
+            )),
+        );
+    }
+    String ad = fresh(g, "ad");
+    String lc = loc(g, x.std_body, line);
+    // The call's location, as a `std` call sets it: where its element borrow
+    // would fault.
+    at(g, x, line);
+    emit(x, String::as_view(&sprintf("void *%s = (void *)((%s *)%s)->ptr;", &ad, &bc, &bind.c)));
+    u64 esz = size_align(g, &elem).size;
+    emit(x, String::as_view(&sprintf("cb_elem_access(%s, %vu, %vu, %s, 0, %s);", &ad, esz, tid, md, &lc)));
+    Mode mode = if (shared) { Mode::Shared } else { Mode::Exclusive };
+    Type ty = ref_ty(elem, mode);
+    unify(&p.ty, &ty, &f.type_params, m);
+    Some(V { .c = sprintf("((cb_ref){ %s, 0 })", &ad), .ty = ty, .obj = None })
+}
+
+// A value made only of plain data and `String`s, through structs and enums
+// (cobc's `flat_value`).
+export fn flat_value(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
+{
+    flat_value_in(g, t, 0)
+}
+
+fn flat_value_in(ref<Gen, exclusive> g, ref<Type, shared> t, usize depth) : bool
+{
+    if (depth > 8)
+    {
+        return false;
+    }
+    if (plain_data(g, t))
+    {
+        return true;
+    }
+    match (t)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            if (String::eq_str(&nt.name, "std::String") && Vec::len(&nt.args) == 0)
+            {
+                return true;
+            }
+            match (struct_decl(g, &nt.name))
+            {
+                Some(sd) :
+                {
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+                    foreach (fd in &sd.fields)
+                    {
+                        if (!flat_value_in(g, &apply(&fd.ty, &sub), depth + 1))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                None     : {},
+            }
+            match (enum_decl(g, &nt.name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &nt.args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(pt) :
+                            {
+                                if (!flat_value_in(g, &apply(pt, &sub), depth + 1))
+                                {
+                                    return false;
+                                }
+                            },
+                            None     : {},
+                        }
+                    }
+                    true
+                },
+                None     : false,
+            }
+        },
+        _               : false,
+    }
+}
+
+// CHG-0237: `x.f…` (or `(*x).f…`), one field or more, for `x` a shared
+// reference parameter that is never written, borrowed or captured
+// (`unstored`), in a frozen body (cobc's `frozen_root`).
+export fn frozen_root(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    if (!x.frozen_on)
+    {
+        return false;
+    }
+    ref<Expr, shared> at_e = strip_parens(e);
+    usize fields = 0;
+    while (true)
+    {
+        match (&at_e.kind)
+        {
+            ExprKind::EField(fe) :
+            {
+                fields += 1;
+                at_e = strip_parens(&Box::get(fe).e);
+            },
+            ExprKind::EDeref(d)  :
+            {
+                // Only the parameter itself is dereferenced (`(*x).f`).
+                bool path = match (&strip_parens(Box::get(d)).kind)
+                {
+                    ExprKind::EPath(_) : true,
+                    _                  : false,
+                };
+                if (fields > 0 && path)
+                {
+                    at_e = strip_parens(Box::get(d));
+                }
+                else
+                {
+                    return false;
+                }
+            },
+            ExprKind::EPath(pe)  :
+            {
+                if (Vec::len(&Box::get(pe).segs) != 1 || Vec::len(&Box::get(pe).targs) != 0 || fields == 0)
+                {
+                    return false;
+                }
+                return match (lookup(x, String::as_view(&Box::get(pe).segs[0])))
+                {
+                    Some(b) : HashMap::contains(&x.unstored, &b.c) && match (&b.ty)
+                    {
+                        Type::TRef(r) : Box::get(r).mode == Mode::Shared,
+                        _             : false,
+                    },
+                    None : false,
+                };
+            },
+            _                    : return false,
+        }
+    }
+    false
+}
+
+// CHG-0237: `x` (or `&*x`) for a parameter `x : ref<Vec<T>, shared>` that is
+// never written, borrowed or captured (`unstored`), `T` sized: the vector (a C
+// lvalue) and `T` (cobc's `frozen_vec`).
+export fn frozen_vec(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<ConfinedVec>
+{
+    if (!x.frozen_on)
+    {
+        return None;
+    }
+    ref<Expr, shared> se = strip_parens(e);
+    String name = match (&se.kind)
+    {
+        ExprKind::EPath(_) : match (plain_name(se))
+        {
+            Some(n) : n,
+            None    : return None,
+        },
+        ExprKind::EBorrow(bb) :
+        {
+            if (Box::get(bb).mode != Mode::Shared)
+            {
+                return None;
+            }
+            match (&strip_parens(&Box::get(bb).e).kind)
+            {
+                ExprKind::EDeref(d) : match (plain_name(strip_parens(Box::get(d))))
+                {
+                    Some(n) : n,
+                    None    : return None,
+                },
+                _ : return None,
+            }
+        },
+        _                     : return None,
+    };
+    Binding b = match (lookup(x, String::as_view(&name)))
+    {
+        Some(bd) : bd,
+        None     : return None,
+    };
+    if (!HashMap::contains(&x.unstored, &b.c))
+    {
+        return None;
+    }
+    Type inner = match (&b.ty)
+    {
+        Type::TRef(r) :
+        {
+            if (Box::get(r).mode != Mode::Shared)
+            {
+                return None;
+            }
+            clone(&Box::get(r).inner)
+        },
+        _             : return None,
+    };
+    Type elem = match (&inner)
+    {
+        Type::TNamed(n) :
+        {
+            if (!String::eq_str(&Box::get(n).name, "std::Vec") || Vec::len(&Box::get(n).args) != 1)
+            {
+                return None;
+            }
+            clone(&Box::get(n).args[0])
+        },
+        _               : return None,
+    };
+    if (size_align(g, &elem).size == 0)
+    {
+        return None;
+    }
+    String vc = ctype(g, &inner);
+    Some(ConfinedVec { .c = sprintf("(*(%s *)%s)", &vc, &b.c), .path = String::new(), .elem = elem })
+}
+
+// The element `a1` of the confined vector `cv`: the body's location and
+// bounds fault, and the element's address.
+fn confined_elem_place(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<ConfinedVec, shared> cv,
+    ref<Expr, shared> a1,
+    usize line,
+) : P
+{
+    V i = lower_index_arg(g, x, sprintf("(%s).len", &cv.c), a1);
+    if (is_never(&i.ty))
+    {
+        return P { .c = String::new(), .ty = Type::TNever, .base = None, .projs = Vec::new(), .is_binding = false, .raw = None };
+    }
+    V it = into_temp(g, x, i, a1.line);
+    String vec_c = ctype(
+        g,
+        &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = one_type(clone(&cv.elem)) })),
+    );
+    String elem_c = ctype(g, &cv.elem);
+    String v = fresh(g, "v");
+    String ev = fresh(g, "e");
+    at(g, x, line);
+    emit(x, String::as_view(&sprintf("%s *%s = &(%s);", &vec_c, &v, &cv.c)));
+    emit(
+        x,
+        String::as_view(&sprintf("if (%s >= %s->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);", &it.c, &v)),
+    );
+    emit(x, String::as_view(&sprintf("%s *%s = %s->ptr + (int64_t)%s;", &elem_c, &ev, &v, &it.c)));
+    P { .c = sprintf(
+        "(*%s)",
+        &ev,
+    ), .ty = clone(&cv.elem), .base = None, .projs = Vec::new(), .is_binding = false, .raw = None }
+}
+
 // A place through fields of a direct reference (`box_rec_uses`).
 export fn direct_place(ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
 {
@@ -8278,10 +8934,25 @@ export fn bind_direct_live(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Stri
     };
     u64 size = size_align(g, &elem).size;
     String flag = sprintf("lv_%s", pc);
-    emit(
-        x,
-        String::as_view(&sprintf("uint8_t %s = cb_live_in((void *)(%s).data, (%s).len * %vu);", &flag, pc, pc, size)),
-    );
+    if (x.fast_half)
+    {
+        // A dual body's fast half: its dispatcher's test found no element
+        // object.
+        emit(x, String::as_view(&sprintf("const uint8_t %s = 0;", &flag)));
+    }
+    else
+    {
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "uint8_t %s = cb_live_in((void *)(%s).data, (%s).len * %vu);",
+                &flag,
+                pc,
+                pc,
+                size,
+            )),
+        );
+    }
     HashMap::insert(&mut x.direct_live, String::clone(pc), flag);
 }
 
@@ -8301,6 +8972,22 @@ export fn binding_place_ty(ref<Binding, shared> b) : Type
             _             : clone(&b.ty),
         },
         _ : clone(&b.ty),
+    }
+}
+
+export fn one_type(Type t) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, t);
+    v
+}
+
+export fn is_shared_ref(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(m) : Box::get(m).mode == Mode::Shared,
+        _             : false,
     }
 }
 
@@ -9437,6 +10124,26 @@ export fn lower_user_call_access(
             None    : {},
         }
     }
+    // Confined vectors passed to confining parameters (`confining_table`):
+    // the call goes to the variant compiled for them, and each is passed as
+    // its address and path, with no borrow formed.
+    Vec<bool> conf = confining_row(g, name);
+    u64 mask = 0;
+    u64 fresh_m = 0;
+    u64 one = 1;
+    for (usize j = 0; j < Vec::len(args) && j < 64; j += 1)
+    {
+        bool cj = j < Vec::len(&conf) && conf[j];
+        if (cj && Option::is_some(&confined_local(x, &args[j])))
+        {
+            mask = mask | (one << narrow<u32>(j));
+        }
+        else if (cj && is_shared_ref(&f.params[j].ty) && fresh_shared_vec_arg(g, x, &args[j], j, args))
+        {
+            mask = mask | (one << narrow<u32>(j));
+            fresh_m = fresh_m | (one << narrow<u32>(j));
+        }
+    }
     HashMap<String, Type> m = HashMap::new();
     for (usize k = 0; k < Vec::len(&f.type_params) && k < Vec::len(targs); k += 1)
     {
@@ -9469,7 +10176,11 @@ export fn lower_user_call_access(
         k += 1;
         ref<ParamDecl, shared> p = &f.params[j];
         ref<Expr, shared> a = &args[j];
-        if (!Vec::contains(&deferred, &j) && is_bare_num_literal(a) && !resolved(&apply(&p.ty, &m), &f.type_params))
+        bool in_mask = ((mask >> narrow<u32>(j)) & 1) != 0;
+        if (!Vec::contains(
+            &deferred,
+            &j,
+        ) && is_bare_num_literal(a) && !resolved(&apply(&p.ty, &m), &f.type_params) && !in_mask)
         {
             Vec::push(&mut deferred, j);
             Vec::push(&mut order, j);
@@ -9478,7 +10189,11 @@ export fn lower_user_call_access(
         }
         // A payload-less variant (`None`) fixes no type parameter either:
         // it waits for the other arguments, deferred literals included.
-        if (is_bare_variant(g, x, a) && !resolved(&apply(&p.ty, &m), &f.type_params) && count_of(&deferred, j) < 2)
+        if (is_bare_variant(
+            g,
+            x,
+            a,
+        ) && !resolved(&apply(&p.ty, &m), &f.type_params) && !in_mask && count_of(&deferred, j) < 2)
         {
             bool first = !Vec::contains(&deferred, &j);
             Vec::push(&mut deferred, j);
@@ -9489,6 +10204,41 @@ export fn lower_user_call_access(
             }
             continue;
         }
+        // A shared borrow formed here (`fresh_shared_vec_arg`): its path,
+        // checked as it is formed, is the parameter's.
+        if (((fresh_m >> narrow<u32>(j)) & 1) != 0)
+        {
+            V fv = lower_expr(g, x, a, None);
+            if (is_never(&fv.ty))
+            {
+                return never();
+            }
+            unify(&p.ty, &fv.ty, &f.type_params, &mut m);
+            put_arg(&mut argv, j, fv);
+            continue;
+        }
+        if (in_mask)
+        {
+            ConfinedVec cv = Option::expect(confined_local(x, a), "confined argument");
+            Mode cm = match (&p.ty)
+            {
+                Type::TRef(r) : Box::get(r).mode,
+                _             :
+                {
+                    assert(false, "cobc: confining parameter of a non-reference type");
+                    Mode::Shared
+                },
+            };
+            Type vt = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = one_type(clone(&cv.elem)) }));
+            Type cty = ref_ty(vt, cm);
+            unify(&p.ty, &cty, &f.type_params, &mut m);
+            put_arg(
+                &mut argv,
+                j,
+                V { .c = sprintf("((cb_ref){ (void *)&(%s), %s })", &cv.c, &cv.path), .ty = cty, .obj = None },
+            );
+            continue;
+        }
         Type hint = apply(&p.ty, &m);
         // A type parameter this argument cannot fix by itself: the later
         // arguments' types fix it first. They are probed, not lowered.
@@ -9496,7 +10246,7 @@ export fn lower_user_call_access(
         {
             for (usize l = j + 1; l < np; l += 1)
             {
-                if (!probe_safe(&args[l]))
+                if (!probe_safe(&args[l]) || ((mask >> narrow<u32>(l)) & 1) != 0)
                 {
                     continue;
                 }
@@ -9672,7 +10422,24 @@ export fn lower_user_call_access(
         },
         None        : {},
     }
-    String cname = request_fn(g, name, clone(&inst));
+    String cname0 = request_variant(g, name, clone(&inst), mask);
+    // D-0209: the direct twin itself where every direct argument is the
+    // caller's own local (`direct_local_call`).
+    String cname1 = if (direct_local_call(
+        g,
+        x,
+        name,
+        f,
+        &inst,
+        mask,
+        args,
+    )) { sprintf("%s__dir", &cname0) } else { cname0 };
+    // D-0219: a call whose reference arguments the dispatcher's cheap test
+    // cannot vouch for asks its `__arrive` twin.
+    String cname = if (!StringView::ends_with(
+        String::as_view(&cname1),
+        StringView::of("__dir"),
+    ) && !vouched_args(g, x, f, &inst, args)) { sprintf("%s%s", &cname1, ARRIVE_MARK) } else { cname1 };
     HashMap<String, Type> fsub = subst_of(&f.type_params, &inst);
     // Resources and reference data go in flight in argument order.
     for (usize j = 0; j < Vec::len(&f.params) && j < Vec::len(&argv); j += 1)
@@ -9744,6 +10511,46 @@ export fn lower_user_call_access(
         return V { .c = pv, .ty = ret, .obj = None };
     }
     String call = sprintf("%s%s(%s)", &cname, if (map_excl_checked) { "_x" } else { "" }, &argl);
+    // CHG-0237: a vector passed fresh (`fresh_shared_vec_arg`) is read
+    // unchecked by the confined variant only where no object lies over its
+    // elements; where one does, the ordinary variant runs and checks.
+    if (fresh_m != 0)
+    {
+        String slow = request_variant(g, name, clone(&inst), mask & ~fresh_m);
+        Vec<String> tests = Vec::new();
+        for (usize j = 0; j < Vec::len(&f.params) && j < Vec::len(&argv); j += 1)
+        {
+            if (((fresh_m >> narrow<u32>(j)) & 1) == 0)
+            {
+                continue;
+            }
+            Type pty = apply(&f.params[j].ty, &fsub);
+            Type inner = match (&pty)
+            {
+                Type::TRef(r) : clone(&Box::get(r).inner),
+                _             : continue,
+            };
+            Type e0 = match (&inner)
+            {
+                Type::TNamed(n) : clone(&Box::get(n).args[0]),
+                _               : continue,
+            };
+            u64 size = size_align(g, &e0).size;
+            String vc = ctype(g, &inner);
+            Vec::push(
+                &mut tests,
+                sprintf(
+                    "cb_live_in((void *)((%s *)(%s).p)->ptr, ((%s *)(%s).p)->len * %vu)",
+                    &vc,
+                    &argv[j].c,
+                    &vc,
+                    &argv[j].c,
+                    size,
+                ),
+            );
+        }
+        call = sprintf("((%s) ? %s(%s) : %s(%s))", &String::join(&tests[0..$], " || "), &slow, &argl, &cname, &argl);
+    }
     // The `_acc` variant of `HashMap::get[_mut]` (`unwrapped_map_get`,
     // `get_mut_acc_arms`): the value's address, its element access made;
     // and the `Option<ref<T>>` whose token is received unheld (`datum_tok`).
@@ -12276,6 +13083,21 @@ export fn lower_slice_expr(
         None     : {},
     }
     // D-0103: a temporary sliced as a call's argument.
+    lower_slice_of_as(g, x, sl, temp, line, true)
+}
+
+// `&base[lo .. hi]` / `&mut base[lo .. hi]` (D-0047). `minted` false: for a
+// pure direct slice parameter (`pure_direct`), the borrow's checks only, and a
+// bare `{ data, len }`: no path, no tracked slot, no temporary object.
+export fn lower_slice_of_as(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<SliceExpr, shared> sl,
+    bool temp,
+    usize line,
+    bool minted,
+) : V
+{
     x.temp_root = temp;
     P pb0 = lower_place(g, x, &sl.base);
     x.temp_root = false;
@@ -12338,6 +13160,47 @@ export fn lower_slice_expr(
             &lc,
         )),
     );
+    if (!minted)
+    {
+        match (&parent)
+        {
+            Some(t0) : emit(
+                x,
+                String::as_view(&sprintf(
+                    "cb_borrow_range_unminted(%s, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                    t0,
+                    &at.c,
+                    &bt.c,
+                    m,
+                    &lc,
+                )),
+            ),
+            None :
+            {
+                String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
+                emit(
+                    x,
+                    String::as_view(&sprintf(
+                        "cb_borrow_range_unminted(%s, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                        &base,
+                        &projs_args(&pb.projs),
+                        &at.c,
+                        &bt.c,
+                        m,
+                        &lc,
+                    )),
+                );
+            },
+        }
+        Type sty = Type::TSlice(Box::new(ModedTy { .inner = elem, .mode = sl.mode }));
+        String c = ctype(g, &sty);
+        String t = fresh(g, "sl");
+        emit(x, String::as_view(&sprintf("%s %s;", &c, &t)));
+        emit(x, String::as_view(&sprintf("%s.src = (void *)&(%s);", &t, &pb.c)));
+        emit(x, String::as_view(&sprintf("%s.data = %s + %s;", &t, &data, &at.c)));
+        emit(x, String::as_view(&sprintf("%s.len = (uint64_t)%s - (uint64_t)%s;", &t, &bt.c, &at.c)));
+        return V { .c = t, .ty = sty, .obj = None };
+    }
     // D-0070: the slice borrows its range (made absolute by the runtime when
     // the source is itself a slice), not the whole source.
     String tok = fresh(g, "tok");
