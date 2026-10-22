@@ -9129,10 +9129,10 @@ export fn probe_safe(ref<Expr, shared> e) : bool
 }
 
 // The enum and variant index a path names, as `Fx::variant_of` finds them.
-struct VariantRef
+export struct VariantRef
 {
-    String ename;
-    usize vi;
+    export String ename;
+    export usize vi;
 }
 
 export fn variant_of(ref<Gen, shared> g, ref<Vec<String>, shared> segs) : Option<VariantRef>
@@ -10674,7 +10674,11 @@ export fn lower_assign(
             lp
         },
     };
+    // A value built in place that owns nothing observable (`inert_value`):
+    // it needs no object. Not into raw memory.
+    x.objectless = Option::is_none(&p.raw) && is_resource(g, &p.ty) && inert_value(g, x, val);
     V v0 = lower_expr(g, x, val, Some(&p.ty));
+    x.objectless = false;
     if (is_never(&v0.ty))
     {
         return never();
@@ -15247,6 +15251,7 @@ export fn construct_variant(
     usize line,
 ) : V
 {
+    bool objectless = replace(&mut x.objectless, false);
     EnumDecl ed = Option::expect(enum_decl(g, ename), "an enum");
     HashMap<String, Type> m = HashMap::new();
     for (usize k = 0; k < Vec::len(&ed.type_params) && k < Vec::len(targs); k += 1)
@@ -15285,7 +15290,11 @@ export fn construct_variant(
             ref<Expr, shared> pe = Option::expect(payload, "cobc: variant payload arity");
             Type hint = apply(pty, &m);
             bool known = resolved(&hint, &ed.type_params);
+            // The payload is the last thing evaluated before the variant is:
+            // an inert literal, or a `Box` of one, needs no object of its own.
+            x.objectless = inert_expr(g, x, pe) || inert_box_new(g, x, pe);
             V v = if (known) { lower_expr(g, x, pe, Some(&hint)) } else { lower_expr(g, x, pe, None) };
+            x.objectless = false;
             if (is_never(&v.ty))
             {
                 return never();
@@ -15338,6 +15347,11 @@ export fn construct_variant(
         },
         None    : {},
     }
+    if (objectless && is_resource(g, &ty) && !has_refs(g, &ty))
+    {
+        HashSet::insert(&mut x.inert_c, String::clone(&t));
+        return V { .c = t, .ty = ty, .obj = None };
+    }
     register_temp(g, x, t, ty, line)
 }
 
@@ -15351,6 +15365,7 @@ export fn lower_struct_lit(
     usize line,
 ) : V
 {
+    bool objectless = replace(&mut x.objectless, false);
     String name = join_segs(segs);
     StructDecl sd = Option::expect(struct_decl(g, &name), "cobc: unknown struct");
     HashMap<String, Type> m = HashMap::new();
@@ -15412,7 +15427,11 @@ export fn lower_struct_lit(
                 None     : {},
             }
         }
+        // An inert field owns nothing: a fault in a later field leaves
+        // nothing of it to destroy (`inert_expr`).
+        x.objectless = inert_expr(g, x, &fi.value);
         V v = if (known) { lower_expr(g, x, &fi.value, Some(&hint)) } else { lower_expr(g, x, &fi.value, None) };
+        x.objectless = false;
         if (is_never(&v.ty))
         {
             return never();
@@ -15491,6 +15510,11 @@ export fn lower_struct_lit(
                 )),
             );
         }
+    }
+    if (objectless && is_resource(g, &ty) && !has_refs(g, &ty))
+    {
+        HashSet::insert(&mut x.inert_c, String::clone(&t));
+        return V { .c = t, .ty = ty, .obj = None };
     }
     register_temp(g, x, t, ty, line)
 }
