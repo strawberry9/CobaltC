@@ -20,6 +20,8 @@ import natives;
 import fresh3;
 import literals;
 import vec3;
+import bodies;
+import stage1a;
 import native_misc;
 import native_text;
 import analyses;
@@ -182,10 +184,15 @@ export fn lower_fn(ref<Gen, exclusive> g, ref<FnRequest, shared> r)
     FnDecl f = Option::expect(get_fn(g, &r.name), "a requested function");
     // Temporaries are numbered per function.
     g.uid = 0;
-    String cname = String::clone(Option::expect(
-        HashMap::get(&g.fn_names, &request_key(String::as_view(&r.name), &r.targs)),
-        "its C name",
-    ));
+    String rkey = request_key(String::as_view(&r.name), &r.targs);
+    String cname = if (r.mask == 0)
+    {
+        String::clone(Option::expect(HashMap::get(&g.fn_names, &rkey), "its C name"))
+    }
+    else
+    {
+        String::clone(Option::expect(HashMap::get(&g.variants, &sprintf("%s#%v", &rkey, r.mask)), "its C name"))
+    };
     HashMap<String, Type> subst = subst_of(&f.type_params, &r.targs);
     Type ret = apply(&f.ret, &subst);
     String ret_c = reg_ctype(g, &ret);
@@ -206,14 +213,21 @@ export fn lower_fn(ref<Gen, exclusive> g, ref<FnRequest, shared> r)
     String sig = sprintf("%s %s(%s)", &ret_c, &cname, &plist);
     String::append(&mut g.protos, &sprintf("%s;\n", &sig));
     // A native body (D-0274 stage 5), where one exists.
-    if (lower_native(g, &r.name, &f, &r.targs, &cname, &ret_c, &sig))
+    if (r.mask == 0 && lower_native(g, &r.name, &f, &r.targs, &cname, &ret_c, &sig))
     {
         return;
     }
-    emit_fn_body(g, String::as_view(&r.name), &f, &subst, &ret, &sig, &cname);
+    if (r.mask == 0 && !String::eq_str(&r.name, "main"))
+    {
+        if (lower_fn_bodies(g, &r.name, &f, &r.targs, &subst, &ret, &cname, &sig, &ret_c))
+        {
+            return;
+        }
+    }
+    emit_fn_body(g, String::as_view(&r.name), &f, &subst, &ret, &sig, &cname, r.mask, None);
     // D-0196: the `__raw` form beside it, for callers that bind its result
     // objectless.
-    if (Vec::len(&r.targs) == 0 && !String::eq_str(&r.name, "main") && raw_ret_ok(g, &r.name))
+    if (r.mask == 0 && Vec::len(&r.targs) == 0 && !String::eq_str(&r.name, "main") && raw_ret_ok(g, &r.name))
     {
         usize open = Option::expect(StringView::find(String::as_view(&sig), StringView::of("(")), "a signature");
         String raw_cname = sprintf("%s__raw", &cname);
@@ -226,10 +240,13 @@ export fn lower_fn(ref<Gen, exclusive> g, ref<FnRequest, shared> r)
         String::appendf(&mut g.protos, "%s;\n", &raw_sig);
         g.uid = 0;
         g.pending_raw_ret = true;
-        emit_fn_body(g, String::as_view(&r.name), &f, &subst, &ret, &raw_sig, &raw_cname);
+        emit_fn_body(g, String::as_view(&r.name), &f, &subst, &ret, &raw_sig, &raw_cname, 0, None);
     }
 }
 
+// The body of `name` under the signature `sig` (C name `cname`); `mask`: the
+// parameters given confined vectors (a variant); `direct` overrides which
+// reference parameters are direct (a dual body's fast half).
 export fn emit_fn_body(
     ref<Gen, exclusive> g,
     StringView name,
@@ -238,6 +255,8 @@ export fn emit_fn_body(
     ref<Type, shared> ret,
     ref<String, shared> sig,
     ref<String, shared> cname,
+    u64 mask,
+    Option<ref<HashSet<String>, shared>> direct,
 )
 {
     u32 h = 2166136261;
@@ -354,27 +373,110 @@ export fn emit_fn_body(
         .elem_reader = false,
         .no_overflow = HashSet::new(),
         .proven_next = false,
+        .fast_half = false,
+        .entry_tested = false,
+        .frozen_on = false,
+        .field_confined = HashMap::new(),
+        .pure_slices = HashSet::new(),
+        .confined_fields = HashSet::new(),
+        .read_confined = HashSet::new(),
     };
     Vec::push(&mut x.scopes, HashMap::new());
     push_frame(g, &mut x);
     x.root_frame = g.nscope;
-    x.raw_ret = replace(&mut g.pending_raw_ret, false);
     x.confined_names = confined_names;
     x.objectless_names = objectless_names;
     x.elem_ref_ids = elem_ref_ids;
     x.quiet_ids = quiet_ids;
+    if (!boot(g, 1))
+    {
+        x.confined_fields = confined_fields(&f.body, &pnames);
+        x.read_confined = read_confined_vecs(&f.body, &pnames);
+    }
+    x.fast_half = Option::is_some(&direct);
+    x.entry_tested = replace(&mut g.pending_tested, false);
+    bool bare = replace(&mut g.pending_bare, false);
+    x.raw_ret = replace(&mut g.pending_raw_ret, false);
+    if (bare)
+    {
+        // The bare form: no dispatcher has tested its slices.
+        x.fast_half = false;
+    }
+    match (replace(&mut g.pending_field_confined, None))
+    {
+        Some(fc) : x.field_confined = fc,
+        None     : {},
+    }
+    x.direct_params = match (direct)
+    {
+        Some(d) : HashSet::clone(d),
+        None    : direct_ref_params(g, f, subst),
+    };
     x.unstored_params = unstored_ref_params(g, f, subst, &x.direct_params);
+    x.frozen_on = g.frozen_mode;
     x.held_locals = if (boot(g, 4)) { HashSet::new() } else { held_locals(&f.body) };
+    String key = String::from_view(name);
     for (usize pi = 0; pi < Vec::len(&f.params); pi += 1)
     {
-        if (pure_view(g, &String::from_view(name), pi))
+        bool slice_p = match (&f.params[pi].ty)
+        {
+            Type::TSlice(_) : true,
+            _               : false,
+        };
+        if (slice_p && pure_direct(g, &key, pi))
+        {
+            HashSet::insert(&mut x.pure_slices, String::clone(&f.params[pi].name));
+        }
+    }
+    for (usize pi = 0; pi < Vec::len(&f.params); pi += 1)
+    {
+        if (pure_view(g, &key, pi))
         {
             HashSet::insert(&mut x.pure_views, String::clone(&f.params[pi].name));
         }
     }
-    foreach (p in &f.params)
+    for (usize pj = 0; pj < Vec::len(&f.params); pj += 1)
     {
-        bind_param(g, &mut x, p, subst);
+        ref<ParamDecl, shared> p = &f.params[pj];
+        if (pj < 64 && ((mask >> narrow<u32>(pj)) & 1) != 0)
+        {
+            // A confined argument: no binding object; its uses reach the
+            // vector through `p.p`.
+            Type pty = apply(&p.ty, subst);
+            Type inner = match (&pty)
+            {
+                Type::TRef(m) : clone(&Box::get(m).inner),
+                _             :
+                {
+                    assert(false, "cobc: confined parameter of a non-reference type");
+                    Type::TVoid
+                },
+            };
+            Type elem = match (&inner)
+            {
+                Type::TNamed(n) : clone(&Box::get(n).args[0]),
+                _               :
+                {
+                    assert(false, "cobc: confined parameter of a non-Vec type");
+                    Type::TVoid
+                },
+            };
+            String vec_c = ctype(g, &inner);
+            String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
+            HashMap::insert(
+                &mut x.confined_params,
+                String::clone(&p.name),
+                ConfinedVec { .c = sprintf(
+                    "(*(%s *)%s.p)",
+                    &vec_c,
+                    &pc,
+                ), .path = sprintf("%s.tok", &pc), .elem = elem },
+            );
+        }
+        else
+        {
+            bind_param(g, &mut x, p, subst);
+        }
     }
     V v = lower_block_body(g, &mut x, &f.body, Some(ret), None);
     if (is_never(&v.ty))
@@ -8710,6 +8812,13 @@ export fn lower_closure_body(
             .elem_reader = false,
             .no_overflow = HashSet::new(),
             .proven_next = false,
+            .fast_half = false,
+            .entry_tested = false,
+            .frozen_on = false,
+            .field_confined = HashMap::new(),
+            .pure_slices = HashSet::new(),
+            .confined_fields = HashSet::new(),
+            .read_confined = HashSet::new(),
         };
         Vec::push(&mut fx.scopes, HashMap::new());
         push_frame(g, &mut fx);

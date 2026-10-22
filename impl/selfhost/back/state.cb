@@ -149,6 +149,17 @@ export struct Gen
     // and the dispatchers `localize` inlines at their calls.
     export HashSet<String> arrive_twins;
     export HashSet<String> inline_sigs;
+    // D-0274 stage 1 (dual, frozen and direct bodies; confined variants):
+    // the variants' C names (`request_variant`, by `request_key` and mask);
+    // the next body is entered only through its dispatcher's test
+    // (`pending_tested`), is a dual body's bare form (`pending_bare`), a
+    // frozen body (`frozen_mode`), or a field dual body's fast half with these
+    // fields confined (`pending_field_confined`, by `b.f`).
+    export HashMap<String, String> variants;
+    export bool pending_tested;
+    export bool pending_bare;
+    export bool frozen_mode;
+    export Option<HashMap<String, FieldConf>> pending_field_confined;
     // The substring helpers emitted so far (cobc's `substring_fn`,
     // `append_substring_fn`).
     export bool substring_fn;
@@ -378,6 +389,19 @@ export struct Fx
     // expression's id) and whether the next binary operation is one.
     export HashSet<usize> no_overflow;
     export bool proven_next;
+    // D-0274 stage 1: a dual body's fast half (`fast_half`), a body entered
+    // only through its dispatcher's test (`entry_tested`), a frozen body
+    // (`frozen_on`); the fields a field dual body confines (`field_confined`,
+    // by `b.f`); the pure direct slice parameters (`pure_slices`); the
+    // confined fields and read-confined vectors of the body
+    // (`confined_fields` as `h.f`, `read_confined`).
+    export bool fast_half;
+    export bool entry_tested;
+    export bool frozen_on;
+    export HashMap<String, FieldConf> field_confined;
+    export HashSet<String> pure_slices;
+    export HashSet<String> confined_fields;
+    export HashSet<String> read_confined;
 }
 
 // A confined vector: the vector as a C lvalue, the path to hand on, and
@@ -386,6 +410,14 @@ export struct ConfinedVec
 {
     export String c;
     export String path;
+    export Type elem;
+}
+
+// A field a field dual body confines: the vector as a C lvalue and its
+// element type.
+export struct FieldConf
+{
+    export String c;
     export Type elem;
 }
 
@@ -451,6 +483,11 @@ export fn new_gen(Checked prog) : Gen
         .pending_raw_ret = false,
         .arrive_twins = HashSet::new(),
         .inline_sigs = HashSet::new(),
+        .variants = HashMap::new(),
+        .pending_tested = false,
+        .pending_bare = false,
+        .frozen_mode = false,
+        .pending_field_confined = None,
         .substring_fn = false,
         .append_substring_fn = false,
     }
@@ -560,6 +597,26 @@ export fn request_fn(ref<Gen, exclusive> g, StringView name, Vec<Type> targs) : 
     String c = fn_cname(name, &targs);
     HashMap::insert(&mut g.fn_names, key, String::clone(&c));
     Vec::push(&mut g.queue, FnRequest { .name = String::from_view(name), .targs = targs, .mask = 0 });
+    c
+}
+
+// The variant of a function compiled for confined arguments in the
+// parameters `mask` names (cobc's `request_variant`).
+export fn request_variant(ref<Gen, exclusive> g, StringView name, Vec<Type> targs, u64 mask) : String
+{
+    if (mask == 0)
+    {
+        return request_fn(g, name, targs);
+    }
+    String key = sprintf("%s#%v", &request_key(name, &targs), mask);
+    match (HashMap::get(&g.variants, &key))
+    {
+        Some(c) : return String::clone(c),
+        None    : {},
+    }
+    String c = sprintf("%s_c%v", &fn_cname(name, &targs), mask);
+    HashMap::insert(&mut g.variants, key, String::clone(&c));
+    Vec::push(&mut g.queue, FnRequest { .name = String::from_view(name), .targs = targs, .mask = mask });
     c
 }
 
