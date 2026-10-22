@@ -54,6 +54,36 @@ export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
         pure = pure && !String::contains(&text, "struct cb_env_");
         Vec::push(&mut g.units, Unit { .text = text, .cacheable = pure });
     }
+    // D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive` twin
+    // where it has one, and the callee itself where it has none.
+    for (usize k = 0; k < Vec::len(&g.units); k += 1)
+    {
+        if (String::contains(&g.units[k].text, ARRIVE_MARK))
+        {
+            g.units[k].text = resolve_arrive(&g.units[k].text, &g.arrive_twins);
+        }
+    }
+    if (String::contains(&g.thunks_out, ARRIVE_MARK))
+    {
+        g.thunks_out = resolve_arrive(&g.thunks_out, &g.arrive_twins);
+    }
+    if (!boot(g, 1))
+    {
+        // A program function's dispatcher inlined at its calls (`localize`).
+        Vec<String> texts = Vec::new();
+        Vec<bool> cacheable = Vec::new();
+        foreach (u in &g.units)
+        {
+            Vec::push(&mut texts, String::clone(&u.text));
+            Vec::push(&mut cacheable, u.cacheable);
+        }
+        HashSet<String> sigs = replace(&mut g.inline_sigs, HashSet::new());
+        localize(&mut texts, &cacheable, &mut g.protos, &sigs, String::as_view(&main_c));
+        for (usize k = 0; k < Vec::len(&g.units); k += 1)
+        {
+            g.units[k].text = String::clone(&texts[k]);
+        }
+    }
     // Last, when no pass reads the text line by line any more.
     if (g.line_directives)
     {
@@ -360,7 +390,21 @@ export fn emit_fn_body(
         end_diverged(&mut x);
     }
     String prologue = notes_finish(&mut x);
-    String body = resolve_scopes(&x.out);
+    // D-0274: in the bootstrap form no text pass elides anything.
+    String body = if (boot(g, 1))
+    {
+        resolve_scopes(&x.out)
+    }
+    else
+    {
+        elide_implied_checks(&drop_dead_locations(
+            &resolve_scopes(&fold_zero_tokens(&drop_quiet_checks(&x.out, &x.quiet_roots))),
+            g.line_directives,
+        ))
+    };
+    // D-0077: a call too deep for the stack faults here, at the call. A body
+    // that calls nothing cannot go deeper: its caller's check covers it.
+    str check = if (!boot(g, 1) && calls_nothing(&body)) { "" } else { "    cb_stack_check();\n" };
     // D-0255: a parameter aligned beyond 16 bytes is copied at entry into an
     // aligned local, which the body uses under the parameter's name.
     String entry = String::new();
@@ -380,7 +424,7 @@ export fn emit_fn_body(
     // D-0077: a call too deep for the stack faults here, at the call.
     String::append(
         &mut g.fns,
-        &sprintf("%s\n{\n%s    cb_stack_check();\n%s%s%s}\n\n", sig, &entry, &prologue, &body, &exit),
+        &sprintf("%s\n{\n%s%s%s%s%s}\n\n", sig, &entry, check, &prologue, &body, &exit),
     );
 }
 
@@ -8788,8 +8832,16 @@ export fn lower_closure_body(
         {
             end_diverged(&mut fx);
         }
+        String prologue = notes_finish(&mut fx);
         // D-0274: in the bootstrap form no text pass elides anything.
-        String out = resolve_scopes(&fx.out);
+        String out = if (boot(g, 1))
+        {
+            resolve_scopes(&fx.out)
+        }
+        else
+        {
+            elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&fx.out)), g.line_directives))
+        };
         if (outer.probing == 0)
         {
             String ret_c = reg_ctype(g, &ret);
@@ -8813,7 +8865,15 @@ export fn lower_closure_body(
             }
             String sig = sprintf("%s %s(%s)", &ret_c, &info.cname, &String::join(&params_c[0..$], ", "));
             String::appendf(&mut g.protos, "%s;\n", &sig);
-            String::appendf(&mut g.fns, "%s\n{\n%s    cb_stack_check();\n%s%s}\n\n", &sig, &entry, &out, &exit);
+            String::appendf(
+                &mut g.fns,
+                "%s\n{\n%s    cb_stack_check();\n%s%s%s}\n\n",
+                &sig,
+                &entry,
+                &prologue,
+                &out,
+                &exit,
+            );
         }
     }
     ret
