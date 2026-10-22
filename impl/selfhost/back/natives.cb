@@ -11,6 +11,7 @@ import cnames;
 import direct;
 import native_vec;
 import native_misc;
+import native_text;
 
 // D-0192: the `Vec` calls whose unchecked form a confined vector uses
 // (`nc_variant`), and those `lower_vec_checked_once` serves (`once_variant`).
@@ -179,15 +180,35 @@ export fn pure_direct(ref<Gen, exclusive> g, ref<String, shared> key, usize pos)
     false
 }
 
-// D-0196: whether `key` gets a `__raw` form (cobc's `raw_ret_ok`).
+// D-0196: whether `key` gets a `__raw` form (cobc's `raw_ret_ok`): a
+// non-generic function returning a value an objectless local may hold, not a
+// dual body; its `__raw` form ends its result's record where it returns, and
+// the caller binds the value objectless.
 export fn raw_ret_ok(ref<Gen, exclusive> g, ref<String, shared> key) : bool
 {
     if (boot(g, 4))
     {
         return false;
     }
-    assert(false, "cbc: `__raw` forms are not ported yet (D-0274 stage 4)");
-    false
+    Type ret = match (HashMap::get(&g.prog.table.fns, key))
+    {
+        Some(f) :
+        {
+            if (Vec::len(&f.type_params) > 0)
+            {
+                return false;
+            }
+            clone(&f.ret)
+        },
+        None    : return false,
+    };
+    if (String::eq_str(key, "main") || !objectless_type(g, &ret))
+    {
+        return false;
+    }
+    // Dual bodies come with stage 1 (`--all-checks` has none).
+    assert(boot(g, 1), "cbc: dual bodies are not ported yet (D-0274 stage 1)");
+    true
 }
 
 // cobc's `lower_fn` native branch: when `name` has a native body, writes it
@@ -222,7 +243,23 @@ export fn lower_native(
     // D-0200: the `__raw` form a caller binding the result objectless calls.
     if (Vec::len(targs) == 0 && !String::eq_str(name, "main") && raw_ret_ok(g, name))
     {
-        assert(false, "cbc: `__raw` forms of native bodies are not ported yet (D-0274 stage 4)");
+        String raw_sig = sprintf("%s %s__raw%v", ret_c, cname, rest);
+        String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+        String raw = match (native_raw_body(g, name, &body))
+        {
+            Some(b) : b,
+            None    :
+            {
+                // The native called and its result's record ended at once.
+                Vec<String> args = Vec::new();
+                foreach (p in &f.params)
+                {
+                    Vec::push(&mut args, sprintf("p_%s", &san(String::as_view(&p.name))));
+                }
+                sprintf("    %s r = %s(%s);\n    cb_forget_obj(cb_recv(&r));\n    return r;\n", ret_c, cname, &String::join(&args[0..$], ", "))
+            },
+        };
+        String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &raw_sig, &raw);
     }
     // `sort`'s unchecked form only for its integer and `bool` body.
     bool nc_shape = !String::eq_str(name, "std::Vec::sort") || (Vec::len(targs) == 1 && match (&targs[0])

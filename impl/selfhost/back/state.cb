@@ -10,6 +10,7 @@ import items;
 import typecheck;
 import check;
 import cnames;
+import strings4;
 
 // A location no fault reports (a line inside `std`).
 export const str NOLOC = "CB_NOLOC, 0";
@@ -139,6 +140,8 @@ export struct Gen
     export HashSet<u64> pure_closures;
     // `reader_param`'s answers, by `key#pos` (cobc's `reader_memo`).
     export HashMap<String, bool> reader_memo;
+    // D-0196: the body being emitted is a `__raw` form (`pending_raw_ret`).
+    export bool pending_raw_ret;
     // The function a native body is being made for (cobc's `native_ctx`):
     // `std_fallback` emits the prelude's own body beside it.
     export Option<NativeCtx> native_ctx;
@@ -304,6 +307,54 @@ export struct Fx
     export HashSet<String> inert_c;
     export Option<usize> raw_substring;
     export Option<String> raw_call;
+    // D-0200/D-0269 (stage 4): each objectless local's drop line, by its
+    // `CDrop` index; the analyses' answers for the body (`confined_vecs`,
+    // `objectless_strings`, `elem_ref_lets`, `quiet_locals`, `held_locals`,
+    // the pure view parameters); the objectless locals bound (`objectless_c`)
+    // and the moved flag of each that may be moved away; the `let` being
+    // bound (its initializer's id, `cur_let`); the held reference locals
+    // (`held_c`); the roots of quiet locals (`quiet_roots`).
+    export Vec<String> drop_lines;
+    export HashSet<String> confined_names;
+    export Objectless objectless_names;
+    export HashSet<usize> elem_ref_ids;
+    export HashSet<usize> quiet_ids;
+    export HashSet<String> held_locals;
+    export HashSet<String> pure_views;
+    export HashSet<String> objectless_c;
+    export HashMap<String, String> moved_flag;
+    export Option<usize> cur_let;
+    export HashSet<String> held_c;
+    export HashSet<String> quiet_roots;
+    // D-0196: a `__raw` form's body (`raw_ret`): its result leaves with no
+    // object; the sinks of its last `match` (`raw_sinks`), that `match`
+    // (`raw_tail`, by its scrutinee's id), and a local returned alone
+    // (`raw_return_path`).
+    export bool raw_ret;
+    export HashSet<String> raw_sinks;
+    export Option<usize> raw_tail;
+    export bool raw_return_path;
+    // An inert value is being lowered (`inert_expr`): no object for it.
+    export bool objectless;
+    // D-0200: the names a fused text loop's bare piece is trimmed into
+    // (`bare_trims`).
+    export HashSet<String> bare_trims;
+    // D-0200 call state (stage 4): the `HashMap::entry` call of a compound
+    // pair (`map_acc`, by its first argument's id) and whether its `_acc`
+    // variant was used; a compound pair's element borrow (`compound_elem`);
+    // the `foreach` elements aliased to `(*$c)[$i]` (`elem_alias`); the
+    // `HashMap::get[_mut]` call whose `_acc` variant is asked for
+    // (`map_get_acc`) and the value pointer it gave; the call whose
+    // `Option<ref<T>>` result's token is received unheld (`datum_tok`) and
+    // that token.
+    export Option<usize> map_acc;
+    export bool map_acc_used;
+    export bool compound_elem;
+    export HashMap<String, Expr> elem_alias;
+    export Option<usize> map_get_acc;
+    export Option<String> map_get_acc_out;
+    export Option<usize> datum_tok;
+    export Option<String> datum_tok_out;
 }
 
 // A confined vector: the vector as a C lvalue, the path to hand on, and
@@ -371,6 +422,7 @@ export fn new_gen(Checked prog) : Gen
         .pure_closures = HashSet::new(),
         .reader_memo = HashMap::new(),
         .native_ctx = None,
+        .pending_raw_ret = false,
     }
 }
 
@@ -568,11 +620,48 @@ export fn push_frame_at(ref<Gen, exclusive> g, ref<Fx, exclusive> x, Option<usiz
 
 export fn pop_frame(ref<Fx, exclusive> x)
 {
+    // The frame's objectless locals end first (`push_drop`).
+    while (Vec::len(&x.cleanup) > 0)
+    {
+        u32 k = match (x.cleanup[Vec::len(&x.cleanup) - 1])
+        {
+            Cleanup::CDrop(k) : k,
+            _                 : break,
+        };
+        Vec::pop(&mut x.cleanup);
+        String line = String::clone(&x.drop_lines[widen<usize>(k)]);
+        emit(x, String::as_view(&line));
+    }
     match (Vec::pop(&mut x.cleanup))
     {
         Some(Cleanup::CFrame(id)) : scope_marker(x, b'f', id),
         _                         : assert(false, "cobc: frame pop closes a statement scope"),
     }
+}
+
+// An objectless local bound in the innermost frame: its drop runs where that
+// frame ends or a jump leaves it. Placed just above the frame, below any
+// statement scope open now, so those pop first.
+export fn push_drop(ref<Fx, exclusive> x, String line)
+{
+    u32 k = narrow<u32>(Vec::len(&x.drop_lines));
+    Vec::push(&mut x.drop_lines, line);
+    usize at = 0;
+    usize i = Vec::len(&x.cleanup);
+    while (i > 0)
+    {
+        i -= 1;
+        match (x.cleanup[i])
+        {
+            Cleanup::CFrame(_) :
+            {
+                at = i + 1;
+                break;
+            },
+            _                  : {},
+        }
+    }
+    Vec::insert(&mut x.cleanup, at, Cleanup::CDrop(k));
 }
 
 export fn push_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x)
@@ -650,7 +739,11 @@ export fn emit_unwind_to(ref<Fx, exclusive> x, usize depth)
         {
             Cleanup::CFrame(id) : scope_marker(x, b'g', id),
             Cleanup::CStmt(id)  : scope_marker(x, b't', id),
-            Cleanup::CDrop(_)   : assert(false, "cbc: objectless drops are not in the bootstrap form"),
+            Cleanup::CDrop(d)   :
+            {
+                String line = String::clone(&x.drop_lines[widen<usize>(d)]);
+                emit(x, String::as_view(&line));
+            },
         }
     }
 }

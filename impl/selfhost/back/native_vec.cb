@@ -1,4 +1,5 @@
-// cobc's lower/native_vec.rs, written in CobaltC (D-0274 stage 5): to be ported.
+// cobc's lower/native_vec.rs, written in CobaltC (D-0274 stage 5): the
+// native C bodies for std's Vec operations.
 
 import std;
 import ast;
@@ -8,10 +9,1768 @@ import typeops;
 import cnames;
 import direct;
 import natives;
+import native_misc;
+import gen;
 
-// cobc's `native_vec_index`: the native body of `name`, if it has one.
-export fn native_vec_index(ref<Gen, exclusive> g, ref<String, shared> name, ref<FnDecl, shared> f, ref<Vec<Type>, shared> targs, ref<String, shared> cname) : Option<String>
+// ---- types the bodies name ----
+
+fn named1(str name, ref<Type, shared> t) : Type
 {
-    // Not ported yet: every body is the prelude's own.
-    None
+    Vec<Type> a = Vec::new();
+    Vec::push(&mut a, clone(t));
+    Type::TNamed(Box::new(NamedTy { .name = String::from_str(name), .args = a }))
+}
+
+fn ref_of(ref<Type, shared> t, Mode m) : Type
+{
+    Type::TRef(Box::new(ModedTy { .inner = clone(t), .mode = m }))
+}
+
+fn slice_of(ref<Type, shared> t, Mode m) : Type
+{
+    Type::TSlice(Box::new(ModedTy { .inner = clone(t), .mode = m }))
+}
+
+fn usize_ty() : Type
+{
+    Type::TInt(IntTy::Usize)
+}
+
+// `std::String`, with no type arguments.
+fn is_string_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::String") && Vec::len(&Box::get(n).args) == 0,
+        _               : false,
+    }
+}
+
+fn is_named(ref<Type, shared> t, str name) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, name),
+        _               : false,
+    }
+}
+
+fn is_ref_type(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(_) : true,
+        _             : false,
+    }
+}
+
+fn int_is_signed(IntTy t) : bool
+{
+    match (t)
+    {
+        IntTy::I8    : true,
+        IntTy::I16   : true,
+        IntTy::I32   : true,
+        IntTy::I64   : true,
+        IntTy::I128  : true,
+        IntTy::Isize : true,
+        _            : false,
+    }
+}
+
+fn is_vec_native(StringView n) : bool
+{
+    match (n)
+    {
+        "std::Vec::drop"          : true,
+        "std::Vec::push"          : true,
+        "std::Vec::pop"           : true,
+        "std::Vec::len"           : true,
+        "std::Vec::clear"         : true,
+        "std::Vec::sort"          : true,
+        "std::Vec::grow"          : true,
+        "std::Vec::reserve"       : true,
+        "std::Vec::remove"        : true,
+        "std::Vec::index_of"      : true,
+        "std::Vec::extend_from"   : true,
+        "std::Vec::from_slice"    : true,
+        "std::Vec::filled"        : true,
+        "std::Vec::swap"          : true,
+        "std::Vec::reverse"       : true,
+        "std::Vec::insert"        : true,
+        "std::Vec::truncate"      : true,
+        "std::Vec::clone"         : true,
+        "std::Vec::append"        : true,
+        "std::Vec::binary_search" : true,
+        "std::Vec::contains"      : true,
+        "std::Vec::dedup"         : true,
+        _                         : false,
+    }
+}
+
+// `Vec::index_shared`/`Vec::index_exclusive` realized natively, as `spec/21`
+// §0 permits (D-0023): the body's checked read of `v.len`, its bounds fault,
+// then one runtime call for `[Reclaim]` + `[Borrow]` + the return
+// (`cb_elem_borrow`). Only the prelude's own declaration qualifies — a
+// program may declare a function of the same name, and that one is lowered
+// as written.
+export fn native_vec_index(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<String, shared> cname,
+) : Option<String>
+{
+    // The natives of the other std types first (`native_std_body`).
+    match (native_std_body(g, name, f, targs, cname))
+    {
+        Some(b) : return Some(b),
+        None    : {},
+    }
+    str mode = if (String::eq_str(
+        name,
+        "std::Vec::index_shared",
+    )) { "CB_SHARED" } else if (String::eq_str(name, "std::Vec::index_exclusive"))
+    {
+        "CB_EXCLUSIVE"
+    }
+    else if (is_vec_native(String::as_view(name)))
+    {
+        ""
+    }
+    else
+    {
+        return None;
+    };
+    if (Vec::len(targs) != 1)
+    {
+        return None;
+    }
+    ref<Type, shared> elem = &targs[0];
+    if (!in_prelude(String::as_view(name), f))
+    {
+        return None;
+    }
+    String vec_c = ctype(g, &named1("std::Vec", elem));
+    if (String::eq_str(name, "std::Vec::len"))
+    {
+        // The body is one checked read of `v.len`. Its frame and the
+        // parameter binding holding the reference are unobservable: nothing
+        // else runs while the path is held.
+        String b = String::new();
+        String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    return ((%s *)p_v.p)->len;\n", &vec_c);
+        return Some(b);
+    }
+    if (String::eq_str(name, "std::Vec::drop"))
+    {
+        return native_vec_drop(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::clear"))
+    {
+        return native_vec_clear(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::sort"))
+    {
+        return native_vec_sort(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::grow"))
+    {
+        return native_vec_grow(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::reserve"))
+    {
+        return native_vec_reserve(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::remove"))
+    {
+        return native_vec_remove(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::index_of"))
+    {
+        return native_vec_index_of(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::extend_from"))
+    {
+        return native_vec_extend_from(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::from_slice"))
+    {
+        return native_vec_from_slice(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::filled"))
+    {
+        return native_vec_filled(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::swap"))
+    {
+        return native_vec_swap(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::reverse"))
+    {
+        return native_vec_reverse(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::insert"))
+    {
+        return native_vec_insert(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::truncate"))
+    {
+        return native_vec_truncate(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::clone"))
+    {
+        return native_vec_clone(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::append"))
+    {
+        return native_vec_append(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::binary_search"))
+    {
+        return native_vec_binary_search(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::contains"))
+    {
+        return native_vec_contains(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::dedup"))
+    {
+        return native_vec_dedup(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::pop") && !plain_data(g, elem))
+    {
+        return native_vec_pop_res(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::clear") && !plain_data(g, elem))
+    {
+        return native_vec_clear_res(g, elem, &vec_c);
+    }
+    if (String::eq_str(name, "std::Vec::pop"))
+    {
+        Option<String> b = native_vec_pop(g, elem, &vec_c, true);
+        if (Option::is_some(&b))
+        {
+            // For a confined vector (`Fx::bind_confined`): no checks.
+            String nc = Option::expect(native_vec_pop(g, elem, &vec_c, false), "the same element type");
+            String opt_c = ctype(g, &named1("std::Option", elem));
+            String sig = sprintf("%s %s_nc(cb_ref p_v)", &opt_c, cname);
+            String::appendf(&mut g.protos, "%s;\n", &sig);
+            String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &sig, &nc);
+        }
+        return b;
+    }
+    if (String::eq_str(name, "std::Vec::push"))
+    {
+        Option<String> b = native_vec_push(g, elem, &vec_c);
+        // `Vec<String>::push` of a fresh `String` (`lower_push_fresh`): the
+        // `_raw` variant, which neither receives nor moves an object.
+        // D-0200: and any resource holding no reference and no `fn`.
+        bool raw_ok = is_resource(g, elem) && !has_refs(g, elem) && !holds_fn(g, elem);
+        match (&b)
+        {
+            Some(body) :
+            {
+                if (raw_ok)
+                {
+                    String raw = String::new();
+                    foreach (l in StringView::lines(String::as_view(body)))
+                    {
+                        if (!StringView::contains(
+                            l,
+                            StringView::of("cb_recv(&p_x)"),
+                        ) && !StringView::contains(l, StringView::of("cb_raw_move_in(o,")))
+                        {
+                            String::appendf(&mut raw, "%v\n", l);
+                        }
+                    }
+                    String elem_c = reg_ctype(g, elem);
+                    String sig = sprintf("void %s_raw(cb_ref p_v, %s p_x)", cname, &elem_c);
+                    String::appendf(&mut g.protos, "%s;\n", &sig);
+                    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &sig, &raw);
+                }
+            },
+            None       : {},
+        }
+        if (Option::is_some(&b) && plain_data(g, elem))
+        {
+            // For a confined vector (`Fx::bind_confined`): no checks.
+            String grow = request_fn(g, StringView::of("std::Vec::grow"), clone(targs));
+            String elem_c = reg_ctype(g, elem);
+            String sig = sprintf("void %s_nc(cb_ref p_v, %s p_x)", cname, &elem_c);
+            String::appendf(&mut g.protos, "%s;\n", &sig);
+            String nc = String::new();
+            String::appendf(&mut nc, "    %s *v = (%s *)p_v.p;\n", &vec_c, &vec_c);
+            String::appendf(&mut nc, "    if (v->len == v->cap) { %s(p_v); }\n", &grow);
+            String::append(&mut nc, "    v->ptr[v->len] = p_x;\n");
+            // `v.len + 1` cannot overflow: here `len < cap`, and a capacity
+            // is bounded by the storage `allocate` gave.
+            String::append(&mut nc, "    uint64_t n = v->len + 1;\n");
+            String::append(&mut nc, "    v->len = n;\n");
+            String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &sig, &nc);
+        }
+        return b;
+    }
+    String elem_c = ctype(g, elem);
+    u32 ty = type_id(g, elem);
+    // The `…_pre` variant, for a call whose argument is `&place` or `&mut
+    // place` (`Fx::lower_vec_index_pre`): the call site has made the
+    // borrow's check and the read's (`cb_borrow_check`).
+    String pre = String::new();
+    String::appendf(&mut pre, "    %s *v = (%s *)p_v.p;\n", &vec_c, &vec_c);
+    String::append(&mut pre, "    if (p_i >= v->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::appendf(&mut pre, "    %s *e = v->ptr + (int64_t)p_i;\n", &elem_c);
+    String::appendf(&mut pre, "    return (cb_ref){ (void *)e, cb_elem_borrow_here(e, %vu, %v) };\n", ty, mode);
+    String pre_sig = sprintf("cb_ref %s_pre(cb_ref p_v, uint64_t p_i)", cname);
+    String::appendf(&mut g.protos, "%s;\n", &pre_sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &pre_sig, &pre);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", &vec_c, &vec_c);
+    String::append(&mut b, "    if (p_i >= v->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    if (StringView::eq_str(StringView::of(mode), "CB_EXCLUSIVE"))
+    {
+        // D-0222: the exclusive access to element i of `*v` that
+        // `[Index-Vec]` checks, through `v` itself: a live shared path to
+        // the vector (or a slice holding i) meets it; a slice of other
+        // elements does not.
+        String::append(
+            &mut b,
+            "    cb_borrow_range_unminted(p_v.tok, NULL, 0, p_i, p_i + 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+    }
+    String::appendf(&mut b, "    %s *e = v->ptr + (int64_t)p_i;\n", &elem_c);
+    String::appendf(&mut b, "    return (cb_ref){ (void *)e, cb_elem_borrow(e, %vu, %v) };\n", ty, mode);
+    Some(b)
+}
+
+// `Vec<String>::drop`: the body's loop `drop(reclaim<String>(…))` over the
+// elements, then the buffer's `deallocate`. An element with a live object
+// over its cells (`cb_live_at`) takes the body's own steps: `[Reclaim]`, the
+// move out, and its destruction. For any other, what is observable is the
+// destruction itself, the `String`'s `Vec<u8>` field dropped as its native
+// body does (`cb_vec_drop_plain` over the bytes, then their `deallocate`).
+// The reads of `self` go through one path that nothing in the loop writes,
+// so the first of each field stands for all.
+export fn native_vec_drop_strings(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+    bool opt,
+) : String
+{
+    String sc = ctype(g, elem);
+    u32 ty = type_id(g, elem);
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_self.p;\n", vec_c, vec_c);
+    String::append(
+        &mut b,
+        "    if (v->len > 0) cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    for (uint64_t i = 0; i < v->len; i++) {\n");
+    String::appendf(&mut b, "        %s *e = v->ptr + i;\n", &sc);
+    String::append(&mut b, "        if (cb_live_at(e)) {\n");
+    String::appendf(&mut b, "            uint64_t root = cb_reclaim(e, %vu);\n", ty);
+    String::append(&mut b, "            uint64_t o = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "            %s t = *e;\n", &sc);
+    String::append(&mut b, "            cb_move_to(o, &t);\n");
+    String::append(&mut b, "            cb_consume(o, CB_NOLOC, 0);\n");
+    String::append(&mut b, "        } else {\n");
+    // `Option<String>`: only `Some` (variant 0) holds bytes.
+    str gd = if (opt) { "if (e->tag == 0u) " } else { "" };
+    str sb = if (opt) { "e->u.v0.bytes" } else { "e->bytes" };
+    String::appendf(&mut b, "            %v{ if (%v.len > 0) cb_vec_drop_plain(%v.ptr, %v.len, 1u);\n", gd, sb, sb, sb);
+    // A `String`'s bytes, and a buffer of `String`s, never hold a reference
+    // (`cb_deallocate_plain`).
+    String::appendf(
+        &mut b,
+        "            if (%v.cap > 0) cb_deallocate_plain((uint8_t *)%v.ptr, %v.cap); }\n",
+        sb,
+        sb,
+        sb,
+    );
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 2u } }, 1, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    if (v->cap > 0) {\n");
+    String::append(&mut b, "        cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(
+        &mut b,
+        "        uint64_t n = ({ uint64_t _r; if (__builtin_mul_overflow(v->cap, (uint64_t)%vu, &_r)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); _r; });\n",
+        size
+    );
+    String::append(&mut b, "        cb_deallocate_plain((uint8_t *)v->ptr, n);\n");
+    String::append(&mut b, "    }\n");
+    b
+}
+
+// `Vec::drop` for a plain element type (`cb_vec_drop_plain`): the body's
+// checked read of `self.len`, the element loop, then the buffer's
+// `deallocate`. Its other reads of `self` are through the same path with no
+// write in between and cannot fail where the first passed. A resource,
+// reference-holding, fn-valued or zero-sized element type keeps the
+// prelude body.
+export fn native_vec_drop(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    if (is_string_ty(elem))
+    {
+        return Some(native_vec_drop_strings(g, elem, vec_c, false));
+    }
+    // `Vec<Option<String>>` (a database row's cells): the same, an element's
+    // bytes dropped only when it is `Some`.
+    bool opt_string = match (elem)
+    {
+        Type::TNamed(n) : String::eq_str(
+            &Box::get(n).name,
+            "std::Option",
+        ) && Vec::len(&Box::get(n).args) == 1 && is_string_ty(&Box::get(n).args[0]),
+        _ : false,
+    };
+    if (opt_string)
+    {
+        return Some(native_vec_drop_strings(g, elem, vec_c, true));
+    }
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *s = (%s *)p_self.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    if (s->len > 0) cb_vec_drop_plain(s->ptr, s->len, %vu);\n", size);
+    String::append(&mut b, "    if (s->cap > 0) {\n");
+    String::appendf(
+        &mut b,
+        "        uint64_t n = ({ uint64_t _r; if (__builtin_mul_overflow(s->cap, (uint64_t)%vu, &_r)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); _r; });\n",
+        size
+    );
+    // Plain elements: no reference in the cells (`cb_deallocate_plain`).
+    String::append(&mut b, "        cb_deallocate_plain((uint8_t *)s->ptr, n);\n");
+    String::append(&mut b, "    }\n");
+    Some(b)
+}
+
+// `Vec::clear` for a plain element type (its loop of `take_raw`s, each a
+// `[Reclaim]`, a read and a `[Release]` of one element, with nothing to
+// destroy): the elements that already have an object are checked as
+// `Vec::drop`'s are (`cb_vec_drop_plain`), the whole range released at once,
+// and `len` written through the same path.
+export fn native_vec_clear(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size > 0 && !plain_data(g, elem))
+    {
+        return native_vec_clear_res(g, elem, vec_c);
+    }
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    if (v->len > 0) {\n");
+    String::appendf(&mut b, "        cb_vec_drop_plain(v->ptr, v->len, %vu);\n", size);
+    String::appendf(&mut b, "        cb_release_plain((uint8_t *)v->ptr, v->len * %vu);\n", size);
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    v->len = 0;\n");
+    Some(b)
+}
+
+// `Vec::sort` (D-0062) for an integer or `bool` element type: the same read
+// and write checks on `v` as the prelude's form, the elements' objects ended
+// as their release would, and the values sorted in place, stably.
+export fn native_vec_sort(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u32 kind = match (elem)
+    {
+        Type::TBool   : 0,
+        Type::TInt(t) :
+        {
+            u32 bytes = int_ty_bits(*t, 64) / 8;
+            bytes + if (int_is_signed(*t)) { 256 } else { 0 }
+        },
+        _             : return native_vec_sort_keys(g, elem, vec_c),
+    };
+    u64 size = size_align(g, elem).size;
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    if (v->len < 2) return;\n");
+    String::appendf(&mut b, "    cb_vec_drop_plain(v->ptr, v->len, %vu);\n", size);
+    String::appendf(&mut b, "    cb_release((uint8_t *)v->ptr, v->len * %vu);\n", size);
+    String::append(&mut b, "    cb_write(p_v.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    cb_sort_plain(v->ptr, v->len, %vu);\n", kind);
+    Some(b)
+}
+
+// `Vec::sort` for the other key types (`String`, `str`, and struct or enum
+// keys, D-0110) holding no reference: the prelude's merge sort over
+// positions (`sorted_order_keys`), natively, comparing with what
+// `key_less_at` compares. Then `apply_order`'s moves as native `sort` makes
+// them: the elements that have objects read in order, their cells
+// released, the vector written.
+export fn native_vec_sort_keys(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || has_refs(g, elem) || holds_fn(g, elem))
+    {
+        return None;
+    }
+    // Text: the elements themselves, merged stably (the same order as the
+    // merge over positions below), each comparison an inline `memcmp`.
+    bool text = true;
+    str pf = "";
+    str nf = "";
+    if (is_string_ty(elem))
+    {
+        pf = "bytes.ptr";
+        nf = "bytes.len";
+    }
+    else
+    {
+        match (elem)
+        {
+            Type::TStr :
+            {
+                pf = "p";
+                nf = "n";
+            },
+            _          : text = false,
+        }
+    }
+    if (text)
+    {
+        String elem_c = reg_ctype(g, elem);
+        String b = String::new();
+        String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+        String::append(&mut b, "    uint64_t n = v->len;\n");
+        String::append(&mut b, "    if (n < 2) return;\n");
+        String::appendf(&mut b, "    %s *x = (%s *)malloc(n * sizeof(%s));\n", &elem_c, &elem_c, &elem_c);
+        String::appendf(&mut b, "    %s *y = (%s *)malloc(n * sizeof(%s));\n", &elem_c, &elem_c, &elem_c);
+        String::append(&mut b, "    if (!x || !y) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    memcpy(x, v->ptr, n * sizeof(%s));\n", &elem_c);
+        String::append(&mut b, "    for (uint64_t width = 1; width < n; width = width > n / 2 ? n : width * 2) {\n");
+        String::append(&mut b, "        for (uint64_t lo = 0; lo < n; ) {\n");
+        String::append(&mut b, "            uint64_t mid = n - lo > width ? lo + width : n;\n");
+        String::append(&mut b, "            uint64_t hi = n - mid > width ? mid + width : n;\n");
+        String::append(&mut b, "            uint64_t l = lo, r = mid, k = lo;\n");
+        String::append(&mut b, "            while (l < mid && r < hi) {\n");
+        String::appendf(
+            &mut b,
+            "                if (cb_bytes_lt((const void *)x[r].%v, x[r].%v, (const void *)x[l].%v, x[l].%v)) y[k++] = x[r++]; else y[k++] = x[l++];\n",
+            pf,
+            nf,
+            pf,
+            nf
+        );
+        String::append(&mut b, "            }\n");
+        String::append(&mut b, "            while (l < mid) y[k++] = x[l++];\n");
+        String::append(&mut b, "            while (r < hi) y[k++] = x[r++];\n");
+        String::append(&mut b, "            lo = hi;\n");
+        String::append(&mut b, "        }\n");
+        String::appendf(&mut b, "        %s *t = x; x = y; y = t;\n", &elem_c);
+        String::append(&mut b, "    }\n");
+        String::appendf(&mut b, "    cb_vec_drop_plain(v->ptr, n, %vu);\n", size);
+        String::appendf(&mut b, "    cb_release((uint8_t *)v->ptr, n * %vu);\n", size);
+        String::appendf(&mut b, "    memcpy(v->ptr, x, n * sizeof(%s));\n", &elem_c);
+        String::append(&mut b, "    free(x);\n");
+        String::append(&mut b, "    free(y);\n");
+        String::append(&mut b, "    cb_write(p_v.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+        return Some(b);
+    }
+    String cmp = match (elem)
+    {
+        Type::TNamed(n) :
+        {
+            if (String::eq_str(&Box::get(n).name, "std::String"))
+            {
+                String::from_str(
+                    "cb_bytes_less((const void *)v->ptr[@1].bytes.ptr, v->ptr[@1].bytes.len, (const void *)v->ptr[@2].bytes.ptr, v->ptr[@2].bytes.len)",
+                )
+            }
+            else
+            {
+                // A struct or enum key (`composite_key` of `&elem`).
+                String kf = key_cmp_fn(g, elem);
+                sprintf("((uint8_t)(%s(&v->ptr[@1], &v->ptr[@2]) < 0))", &kf)
+            }
+        },
+        Type::TStr      : String::from_str("cb_bytes_less((const void *)v->ptr[@1].p, v->ptr[@1].n, (const void *)v->ptr[@2].p, v->ptr[@2].n)"),
+        _               : return None,
+    };
+    String elem_c = reg_ctype(g, elem);
+    String lt_ra = String::replace(&String::replace(&cmp, "@1", "a[r]"), "@2", "a[l]");
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::append(&mut b, "    if (n < 2) return;\n");
+    String::append(&mut b, "    uint64_t *a = (uint64_t *)malloc(n * 2 * sizeof(uint64_t));\n");
+    String::appendf(&mut b, "    %s *out = (%s *)malloc(n * sizeof(%s));\n", &elem_c, &elem_c, &elem_c);
+    String::append(&mut b, "    if (!a || !out) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "    uint64_t *bb = a + n;\n");
+    String::append(&mut b, "    for (uint64_t i = 0; i < n; i++) { a[i] = i; bb[i] = 0; }\n");
+    String::append(&mut b, "    uint64_t width = 1;\n");
+    String::append(&mut b, "    while (width < n) {\n");
+    String::append(&mut b, "        uint64_t lo = 0;\n");
+    String::append(&mut b, "        while (lo < n) {\n");
+    String::append(&mut b, "            uint64_t mid = n - lo > width ? lo + width : n;\n");
+    String::append(&mut b, "            uint64_t hi = n - mid > width ? mid + width : n;\n");
+    String::append(&mut b, "            uint64_t l = lo, r = mid, k = lo;\n");
+    String::append(&mut b, "            while (k < hi) {\n");
+    String::appendf(&mut b, "                int take_left = l < mid && (r >= hi || !%s);\n", &lt_ra);
+    String::append(&mut b, "                if (take_left) bb[k] = a[l++]; else bb[k] = a[r++];\n");
+    String::append(&mut b, "                k++;\n");
+    String::append(&mut b, "            }\n");
+    String::append(&mut b, "            lo = hi;\n");
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "        uint64_t *t = a; a = bb; bb = t;\n");
+    String::append(&mut b, "        width = width > n ? n : width * 2;\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    for (uint64_t i = 0; i < n; i++) out[i] = v->ptr[a[i]];\n");
+    String::appendf(&mut b, "    cb_vec_drop_plain(v->ptr, n, %vu);\n", size);
+    String::appendf(&mut b, "    cb_release((uint8_t *)v->ptr, n * %vu);\n", size);
+    String::appendf(&mut b, "    memcpy(v->ptr, out, n * sizeof(%s));\n", &elem_c);
+    String::append(&mut b, "    free(a < bb ? a : bb);\n");
+    String::append(&mut b, "    free(out);\n");
+    String::append(&mut b, "    cb_write(p_v.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+    Some(b)
+}
+
+// D-0193: `Drain::take` (each step of `foreach` over a `Vec` it consumes)
+// natively, for plain elements and `StringView`s: the body borrows `d.v`
+// exclusively and reads `d.next` (both checked), then `take_raw` copies the
+// element out (a view's path with it, `cb_copy_datum`) and releases its
+// cells, then `d.next` is written (checked, its `+ 1` with the overflow
+// fault) and the element is returned (a view sent as reference data). An
+// element with an object over it takes the prelude's body.
+export fn native_drain_take(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<String>
+{
+    bool view = match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::StringView") && Vec::len(&Box::get(n).args) == 0,
+        _               : false,
+    };
+    if (!(plain_data(g, t) || view))
+    {
+        return None;
+    }
+    u64 size = size_align(g, t).size;
+    if (size == 0)
+    {
+        return None;
+    }
+    String dc = ctype(g, &named1("std::Drain", t));
+    String tc = ctype(g, t);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_d.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    cb_read(p_d.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *d = (%s *)p_d.p;\n", &dc, &dc);
+    String::append(&mut b, "    uint64_t i = d->next;\n");
+    String::appendf(&mut b, "    %s *p = d->v.ptr + i;\n", &tc);
+    String::appendf(&mut b, "    if (cb_live_in(p, %vu)) return %s(p_d);\n", size, &fb);
+    String::appendf(&mut b, "    %s x = *p;\n", &tc);
+    if (view)
+    {
+        u32 tid = type_id(g, t);
+        String::appendf(&mut b, "    cb_copy_datum(&x, p, %vu);\n", tid);
+        String::appendf(&mut b, "    cb_release((uint8_t *)p, %vu);\n", size);
+    }
+    else
+    {
+        String::appendf(&mut b, "    cb_release_plain((uint8_t *)p, %vu);\n", size);
+    }
+    String::append(&mut b, "    uint64_t ni;\n");
+    String::append(
+        &mut b,
+        "    if (__builtin_add_overflow(i, (uint64_t)1, &ni)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    cb_write(p_d.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    d->next = ni;\n");
+    if (view)
+    {
+        u32 tid = type_id(g, t);
+        String::appendf(&mut b, "    cb_send_datum(&x, %vu);\n", tid);
+    }
+    String::append(&mut b, "    return x;\n");
+    Some(b)
+}
+
+// D-0200: `Vec::sorted_order(v, less)` natively, for elements holding no
+// reference and no `fn`, when `less` keeps nothing it is given
+// (`cb_fn_pure`) and no object lies over an element (`cb_live_in`): the
+// body's merge over positions, the same comparisons in the same order, each
+// called with the elements' bare addresses. Its result, a `Vec<usize>` of
+// the positions, given an object and sent as the body's is. Anything else
+// takes the prelude's body.
+export fn native_sorted_order(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<String>
+{
+    u64 size = size_align(g, t).size;
+    if (size == 0 || has_refs(g, t) || holds_fn(g, t))
+    {
+        return None;
+    }
+    String vec_c = ctype(g, &named1("std::Vec", t));
+    Type u = usize_ty();
+    Type ut = named1("std::Vec", &u);
+    String uc = ctype(g, &ut);
+    u32 utid = type_id(g, &ut);
+    Vec<Type> fps = Vec::new();
+    Vec::push(&mut fps, ref_of(t, Mode::Shared));
+    Vec::push(&mut fps, ref_of(t, Mode::Shared));
+    Type ft = Type::TFn(Box::new(FnTy { .params = fps, .ret = Type::TBool }));
+    String th = thunk(g, &ft);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", &vec_c, &vec_c);
+    String::appendf(
+        &mut b,
+        "    if (!cb_fn_pure(p_less) || cb_live_in(v->ptr, v->len * %vu)) return %s(p_v, p_less);\n",
+        size,
+        &fb,
+    );
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::appendf(&mut b, "    %s res;\n", &uc);
+    String::append(&mut b, "    res.ptr = (uint64_t *)8; res.len = 0; res.cap = 0;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(
+        &mut b,
+        "        uint64_t nb; if (__builtin_mul_overflow(n, (uint64_t)8, &nb)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "        uint64_t *a = (uint64_t *)cb_allocate(nb, 8u);\n");
+    String::append(&mut b, "        uint64_t *bb = (uint64_t *)cb_allocate(nb, 8u);\n");
+    String::append(&mut b, "        if (!a || !bb) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "        for (uint64_t i = 0; i < n; i++) { a[i] = i; bb[i] = 0; }\n");
+    String::append(&mut b, "        uint64_t width = 1;\n");
+    String::append(&mut b, "        while (width < n) {\n");
+    String::append(&mut b, "            uint64_t lo = 0;\n");
+    String::append(&mut b, "            while (lo < n) {\n");
+    String::append(&mut b, "                uint64_t mid = n - lo > width ? lo + width : n;\n");
+    String::append(&mut b, "                uint64_t hi = n - mid > width ? mid + width : n;\n");
+    String::append(&mut b, "                uint64_t l = lo, r = mid, k = lo;\n");
+    String::append(&mut b, "                while (k < hi) {\n");
+    String::appendf(
+        &mut b,
+        "                    int take_left = l < mid && (r >= hi || !%s(p_less, ((cb_ref){ (void *)&v->ptr[a[r]], 0 }), ((cb_ref){ (void *)&v->ptr[a[l]], 0 })));\n",
+        &th
+    );
+    String::append(&mut b, "                    if (take_left) bb[k] = a[l++]; else bb[k] = a[r++];\n");
+    String::append(&mut b, "                    k++;\n");
+    String::append(&mut b, "                }\n");
+    String::append(&mut b, "                lo = hi;\n");
+    String::append(&mut b, "            }\n");
+    String::append(&mut b, "            uint64_t *tt = a; a = bb; bb = tt;\n");
+    String::append(&mut b, "            width = width > n ? n : width * 2;\n");
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "        cb_deallocate(bb, nb, 8u);\n");
+    String::append(&mut b, "        res.ptr = a; res.len = n; res.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    // `less` was given by value: its box (and the paths its captures hold)
+    // ends with the call, as the body's binding of it does.
+    String::append(&mut b, "    cb_drop_fn(p_less);\n");
+    String::appendf(&mut b, "    uint64_t o = cb_new(&res, %vu, CB_NOLOC, 0);\n", utid);
+    String::append(&mut b, "    cb_send(o);\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}
+
+// `Vec::grow`: the body's first checked read (of `v.cap`), its arithmetic
+// and faults, its two checked writes' checks, `allocate`, `copy_raw` of the
+// elements, `deallocate` of the old cells, then the two stores (the body's
+// order, CHG-0332: the writes before the old cells go).
+export fn native_vec_grow(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    u64 align = sa.align;
+    if (size == 0)
+    {
+        return None;
+    }
+    str ovf = "cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0)";
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 2u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t nc = 4;\n");
+    String::appendf(&mut b, "    if (v->cap != 0 && __builtin_mul_overflow(v->cap, (uint64_t)2, &nc)) %v;\n", ovf);
+    String::append(&mut b, "    uint64_t bytes;\n");
+    String::appendf(&mut b, "    if (__builtin_mul_overflow(nc, (uint64_t)%vu, &bytes)) %v;\n", size, ovf);
+    // The two checked writes' checks (`v.ptr`, `v.cap`) before the old cells
+    // go: a check that faults must leave the `Vec` as it was, or the
+    // unwind's `Vec::drop` frees the old cells a second time (CHG-0332).
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 2u } }, 1, 0u, CB_NOLOC, 0);\n");
+    move_cells(g, elem, &mut b, size, align, ovf);
+    String ec = ctype(g, elem);
+    String::appendf(&mut b, "    v->ptr = (%s *)p;\n", &ec);
+    String::append(&mut b, "    v->cap = nc;\n");
+    Some(b)
+}
+
+// The cells moved to a new buffer of `bytes`, as `grow` and `reserve` move
+// them (written out in both in cobc).
+fn move_cells(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, exclusive> b, u64 size, u64 align, str ovf)
+{
+    if (plain_data(g, elem))
+    {
+        // Plain elements: allocate, copy and deallocate as one
+        // `cb_reallocate_plain` (no cell holds a reference to move).
+        String::appendf(
+            b,
+            "    uint8_t *p = cb_reallocate_plain((uint8_t *)v->ptr, v->cap * %vu, bytes, %vu);\n",
+            size,
+            align,
+        );
+        String::append(b, "    if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    }
+    else
+    {
+        String::appendf(b, "    uint8_t *p = cb_allocate(bytes, %vu);\n", align);
+        String::append(b, "    if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+        String::append(b, "    uint64_t lb;\n");
+        String::appendf(b, "    if (__builtin_mul_overflow(v->len, (uint64_t)%vu, &lb)) %v;\n", size, ovf);
+        String::append(b, "    cb_copy_raw(p, (uint8_t *)v->ptr, lb);\n");
+        String::append(b, "    if (v->cap > 0) {\n");
+        String::append(b, "        uint64_t ob;\n");
+        String::appendf(b, "        if (__builtin_mul_overflow(v->cap, (uint64_t)%vu, &ob)) %v;\n", size, ovf);
+        String::appendf(b, "        cb_deallocate((uint8_t *)v->ptr, ob, %vu);\n", align);
+        String::append(b, "    }\n");
+    }
+}
+
+// `Vec::reserve` (D-0129): the body's first checked read (of `v.len`), its
+// checked `len + n`, then nothing when the room is there, or the cells moved
+// as `native_vec_grow` moves them, to the body's capacity, with its two
+// checked writes.
+export fn native_vec_reserve(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    u64 align = sa.align;
+    if (size == 0)
+    {
+        return None;
+    }
+    str ovf = "cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0)";
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t need;\n");
+    String::appendf(&mut b, "    if (__builtin_add_overflow(v->len, p_n, &need)) %v;\n", ovf);
+    String::append(&mut b, "    if (need <= v->cap) return;\n");
+    String::append(&mut b, "    uint64_t nc = need;\n");
+    String::appendf(
+        &mut b,
+        "    if (v->cap > need - v->cap && __builtin_mul_overflow(v->cap, (uint64_t)2, &nc)) %v;\n",
+        ovf,
+    );
+    String::append(&mut b, "    uint64_t bytes;\n");
+    String::appendf(&mut b, "    if (__builtin_mul_overflow(nc, (uint64_t)%vu, &bytes)) %v;\n", size, ovf);
+    // The two checked writes' checks before the old cells go (CHG-0332).
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 2u } }, 1, 0u, CB_NOLOC, 0);\n");
+    move_cells(g, elem, &mut b, size, align, ovf);
+    String ec = ctype(g, elem);
+    String::appendf(&mut b, "    v->ptr = (%s *)p;\n", &ec);
+    String::append(&mut b, "    v->cap = nc;\n");
+    Some(b)
+}
+
+// `Vec::extend_from(a, s)` for a plain element type: the body's bindings of
+// `a` and `s`, the first iteration's checks in its order -- `s[0]`'s read,
+// `a.len`'s read, the growth, `a.len`'s write -- then every later element's
+// read at once (`cb_borrow_range_unminted` over `1 .. n`). `a` grows by the
+// pushes' own doublings, then the elements are copied.
+export fn native_vec_extend_from(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    Vec<Type> ea = Vec::new();
+    Vec::push(&mut ea, clone(elem));
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+    Type vt = named1("std::Vec", elem);
+    u32 rtid = type_id(g, &ref_of(&vt, Mode::Exclusive));
+    u32 stid = type_id(g, &slice_of(elem, Mode::Shared));
+    String fb = std_fallback(g);
+    String b = String::new();
+    // A source element with a live object: the body's element reads.
+    String::appendf(&mut b, "    if (cb_live_in(p_s.data, p_s.len * %vu)) { %s(p_a, p_s); return; }\n", size, &fb);
+    // The body's bindings of `a` and `s`, which hold their paths for the
+    // call: a slice of the very vector being extended clashes with `a` at
+    // its first element's read, as in the body.
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::append(&mut b, "    void *l_a = p_a.p;\n");
+    String::appendf(&mut b, "    uint64_t oa = cb_new(&l_a, %vu, CB_NOLOC, 0);\n", rtid);
+    String::append(&mut b, "    cb_store_ref(&l_a, p_a.tok);\n");
+    String::append(&mut b, "    (void)cb_bind(oa);\n");
+    String::appendf(&mut b, "    cb_recv_datum(&p_s, %vu);\n", stid);
+    String::appendf(&mut b, "    uint64_t os = cb_new(&p_s, %vu, CB_NOLOC, 0);\n", stid);
+    String::append(&mut b, "    (void)cb_bind(os);\n");
+    String::append(&mut b, "    uint64_t n = p_s.len;\n");
+    String::append(&mut b, "    if (n == 0) { cb_frame_pop(); return; }\n");
+    String::append(&mut b, "    uint64_t st = cb_load_ref(&p_s.src);\n");
+    String::append(&mut b, "    cb_read(st, (cb_proj[]){ { CB_INDEX, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    uint64_t at = cb_load_ref(&l_a);\n");
+    String::append(&mut b, "    cb_read(at, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_a.p;\n", vec_c, vec_c);
+    // `len + n` cannot overflow: `n` elements are in memory already.
+    String::appendf(&mut b, "    while (v->cap - v->len < n) { %s(((cb_ref){ p_a.p, at })); }\n", &grow);
+    String::append(&mut b, "    cb_write(at, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    if (n > 1) cb_borrow_range_unminted(st, NULL, 0, 1u, n, CB_SHARED, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    memcpy(v->ptr + v->len, p_s.data, n * sizeof(*v->ptr));\n");
+    String::append(&mut b, "    v->len += n;\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    Some(b)
+}
+
+// The prelude's own body of the function a native body is being made for,
+// emitted as `NAME__std` beside it: the native body calls it where its
+// shortcut does not hold (an element with a live object, `cb_live_in`), so
+// that there every check and fault is the body's.
+export fn std_fallback(ref<Gen, exclusive> g) : String
+{
+    NativeCtx c = Option::expect(clone(&g.native_ctx), "a native body is being made");
+    usize open = Option::expect(String::find(&c.sig, StringView::of("(")), "a signature");
+    Vec<StringView> words = StringView::split(String::view(&c.sig, 0, open), " ");
+    String cname = String::from_view(words[Vec::len(&words) - 1]);
+    String fb = sprintf("%s__std", &cname);
+    String fsig = sprintf("%s %s%v", &c.ret_c, &fb, String::view(&c.sig, open, String::len(&c.sig)));
+    String::appendf(&mut g.protos, "%s;\n", &fsig);
+    g.uid = 0;
+    // cobc's `emit_fn_body(name, f, targs, 0, fsig, None)`: closure ids are
+    // hashed from the C name in `fsig`, `fb`.
+    HashMap<String, Type> subst = subst_of(&c.f.type_params, &c.targs);
+    Type ret = apply(&c.f.ret, &subst);
+    emit_fn_body(g, String::as_view(&c.name), &c.f, &subst, &ret, &fsig, &fb);
+    fb
+}
+
+// `Vec::swap` for a plain element type: the body's checked read of `v.len`,
+// its bounds fault, and, for two positions, the exclusive borrow of `v` its
+// element borrows are formed from (`cb_borrow_check`), then the values
+// exchanged in place.
+export fn native_vec_swap(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    String ec = ctype(g, elem);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(
+        &mut b,
+        "    if (p_i >= v->len || p_j >= v->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    if (p_i != p_j) {\n");
+    String::appendf(
+        &mut b,
+        "        if (cb_live_in2(&v->ptr[p_i], &v->ptr[p_j], %vu)) { %s(p_v, p_i, p_j); return; }\n",
+        size,
+        &fb,
+    );
+    String::append(&mut b, "        cb_borrow_check(p_v.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s t = v->ptr[p_i];\n", &ec);
+    String::append(&mut b, "        v->ptr[p_i] = v->ptr[p_j];\n");
+    String::append(&mut b, "        v->ptr[p_j] = t;\n");
+    String::append(&mut b, "    }\n");
+    Some(b)
+}
+
+// `Vec::reverse` for a plain element type: the body's checked read of
+// `v.len`, then its `n / 2` swaps, each making `swap`'s exclusive borrow
+// check and nothing else that can fail: the check once, the elements
+// reversed in place.
+export fn native_vec_reverse(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    String ec = ctype(g, elem);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::appendf(&mut b, "    if (n >= 2 && cb_live_in(v->ptr, n * %vu)) { %s(p_v); return; }\n", size, &fb);
+    String::append(&mut b, "    if (n >= 2) {\n");
+    String::append(&mut b, "        cb_borrow_check(p_v.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+    String::appendf(
+        &mut b,
+        "        for (uint64_t i = 0, j = n - 1; i < j; i++, j--) { %s t = v->ptr[i]; v->ptr[i] = v->ptr[j]; v->ptr[j] = t; }\n",
+        &ec,
+    );
+    String::append(&mut b, "    }\n");
+    Some(b)
+}
+
+// `Vec::insert` for a plain element type: the body's checked read of
+// `v.len` and its bounds fault, then `Vec::push(v, x)`, then the swaps that
+// carry `x` down to `i`, each making `swap`'s exclusive borrow check: once,
+// and the elements moved up by one in a single `memmove`.
+export fn native_vec_insert(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    // A resource `x` is received first, as the body's binding of it is, and
+    // moved into its cell (`cb_raw_move_in`) once placed; where the body
+    // runs instead, it is sent back for the body to receive.
+    bool res = !plain_data(g, elem);
+    String ec = ctype(g, elem);
+    Vec<Type> ea = Vec::new();
+    Vec::push(&mut ea, clone(elem));
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+    String fb = std_fallback(g);
+    String b = String::new();
+    if (res)
+    {
+        String::append(&mut b, "    uint64_t ox = cb_recv(&p_x);\n");
+    }
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    if (p_i > v->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    str resend = if (res) { "cb_send(ox); " } else { "" };
+    String::appendf(
+        &mut b,
+        "    if (p_i < v->len && cb_live_in(&v->ptr[p_i], (v->len - p_i) * %vu)) { %v%s(p_v, p_i, p_x); return; }\n",
+        size,
+        resend,
+        &fb,
+    );
+    String::appendf(&mut b, "    if (v->len == v->cap) { %s(p_v); }\n", &grow);
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    if (n > p_i) {\n");
+    String::append(&mut b, "        cb_borrow_check(p_v.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        memmove(v->ptr + p_i + 1, v->ptr + p_i, (size_t)(n - p_i) * sizeof(%s));\n", &ec);
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    v->ptr[p_i] = p_x;\n");
+    if (res)
+    {
+        String::append(&mut b, "    cb_raw_move_in(ox, &v->ptr[p_i]);\n");
+    }
+    String::append(&mut b, "    v->len = n + 1;\n");
+    Some(b)
+}
+
+// `Vec::truncate` for a plain element type: the body pops from the end
+// while `v.len > n`. Natively the first read and write, and one release of
+// all the cells: their objects end, as the pops' releases end them.
+export fn native_vec_truncate(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    // A resource's dropped elements are destroyed as the body's pops drop
+    // them, last first (`cb_drop_local`: no object over them); the
+    // prelude's body where one has an object.
+    bool res = !plain_data(g, elem);
+    u32 tid = type_id(g, elem);
+    Option<String> fb = if (res) { Some(std_fallback(g)) } else { None };
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    match (&fb)
+    {
+        Some(f) : String::appendf(
+            &mut b,
+            "    if (v->len > p_n && cb_live_in(v->ptr + p_n, (v->len - p_n) * %vu)) { %s(p_v, p_n); return; }\n",
+            size,
+            f,
+        ),
+        None : {},
+    }
+    String::append(&mut b, "    if (v->len > p_n) {\n");
+    String::append(&mut b, "        cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "        uint64_t old = v->len;\n");
+    if (res)
+    {
+        String::appendf(
+            &mut b,
+            "        for (uint64_t k = old; k > p_n; k--) { v->len = k - 1; cb_drop_local((uint8_t *)&v->ptr[k - 1], %vu); }\n",
+            tid,
+        );
+    }
+    String::appendf(&mut b, "        cb_release_plain((uint8_t *)(v->ptr + p_n), (old - p_n) * %vu);\n", size);
+    String::append(&mut b, "        v->len = p_n;\n");
+    String::append(&mut b, "    }\n");
+    Some(b)
+}
+
+// D-0192: `Vec::pop` for a movable resource element type (`movable_elem`):
+// the body's checked read and write of `v.len`, the last element moved out
+// (`[Rawptr-Move-Out]`) and its cells released, and the `Option` returned as
+// the body returns a resource value, `None` included: an object, bound,
+// taken and sent. The prelude's body where the last element has an object.
+export fn native_vec_pop_res(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    Type opt = named1("std::Option", elem);
+    String opt_c = ctype(g, &opt);
+    u32 otid = type_id(g, &opt);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    %s r;\n", &opt_c);
+    String::append(&mut b, "    if (v->len == 0) {\n");
+    String::append(&mut b, "        r.tag = 1u;\n");
+    String::append(&mut b, "    } else {\n");
+    String::append(&mut b, "        uint64_t n = v->len - 1;\n");
+    String::appendf(&mut b, "        if (cb_live_in(&v->ptr[n], %vu)) return %s(p_v);\n", size, &fb);
+    String::append(&mut b, "        cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "        v->len = n;\n");
+    String::append(&mut b, "        r.tag = 0u;\n");
+    String::append(&mut b, "        r.u.v0 = v->ptr[n];\n");
+    String::appendf(&mut b, "        cb_release_plain((uint8_t *)(v->ptr + n), %vu);\n", size);
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&r, %vu, CB_NOLOC, 0);\n", otid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = r;\n", &opt_c);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}
+
+// D-0192: `Vec::clear` for a movable resource element type: the body
+// destroys each element in order, first to last (`cb_drop_local`, no object
+// lying over them), then writes `v.len` (checked). The prelude's body where
+// an element has an object.
+export fn native_vec_clear_res(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    u32 tid = type_id(g, elem);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::appendf(&mut b, "    if (cb_live_in(v->ptr, n * %vu)) { %s(p_v); return; }\n", size, &fb);
+    String::appendf(&mut b, "    for (uint64_t k = 0; k < n; k++) cb_drop_local((uint8_t *)&v->ptr[k], %vu);\n", tid);
+    String::appendf(&mut b, "    cb_release_plain((uint8_t *)v->ptr, n * %vu);\n", size);
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    v->len = 0;\n");
+    Some(b)
+}
+
+// The `out` vector bound, moved out and sent as the bodies' is.
+fn send_out(ref<String, exclusive> b, u32 vtid, ref<String, shared> vec_c)
+{
+    String::appendf(b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", vtid);
+    String::append(b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(b, "    %s res = out;\n", vec_c);
+    String::append(b, "    cb_move_to(ot, &res);\n");
+    String::append(b, "    cb_send(ot);\n");
+    String::append(b, "    cb_frame_pop();\n");
+    String::append(b, "    return res;\n");
+}
+
+// `Vec::clone` for a plain element type (a plain value's clone is its
+// copy): the body's checked read of `v.len`, then each element pushed onto a
+// confined `out`. Natively one allocation and one copy; `out` bound, moved
+// out and sent as the body's is (as `native_vec_from_slice`).
+export fn native_vec_clone(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    u64 align = sa.align;
+    bool string = is_string_ty(elem);
+    if (size == 0 || !(plain_data(g, elem) || string))
+    {
+        return None;
+    }
+    String ec = ctype(g, elem);
+    u32 vtid = type_id(g, &named1("std::Vec", elem));
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    if (cb_live_in(v->ptr, v->len * %vu)) return %s(p_v);\n", size, &fb);
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", vec_c);
+    String::appendf(&mut b, "    out.ptr = (%s *)%v;\n", &ec, align);
+    String::append(&mut b, "    out.len = 0;\n");
+    String::append(&mut b, "    out.cap = 0;\n");
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::appendf(&mut b, "        %s *p = (%s *)cb_allocate(n * %vu, %vu);\n", &ec, &ec, size, align);
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    if (string)
+    {
+        // D-0192: each `String` cloned as `String::clone` makes it: a buffer
+        // of its bytes, its own (capacity unobservable).
+        String::append(&mut b, "        for (uint64_t k = 0; k < n; k++) {\n");
+        String::append(&mut b, "            uint64_t bl = v->ptr[k].bytes.len;\n");
+        String::append(&mut b, "            uint8_t *bp = (uint8_t *)1;\n");
+        String::append(
+            &mut b,
+            "            if (bl > 0) { bp = cb_allocate(bl, 1u); if (!bp) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0); memcpy(bp, v->ptr[k].bytes.ptr, bl); }\n",
+        );
+        String::append(&mut b, "            p[k].bytes.ptr = bp; p[k].bytes.len = bl; p[k].bytes.cap = bl;\n");
+        String::append(&mut b, "        }\n");
+    }
+    else
+    {
+        String::appendf(&mut b, "        memcpy(p, v->ptr, (size_t)n * %vu);\n", size);
+    }
+    String::append(&mut b, "        out.ptr = p;\n");
+    String::append(&mut b, "        out.len = n;\n");
+    String::append(&mut b, "        out.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    send_out(&mut b, vtid, vec_c);
+    Some(b)
+}
+
+// `Vec::append(a, b)` for a plain element type: `b` received and bound, `a`
+// grown as the pushes would grow it, the elements copied at once, their
+// cells in `b` released as the moves out release them, and `b` left empty
+// for its destructor at the frame's end.
+export fn native_vec_append(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    Vec<Type> ea = Vec::new();
+    Vec::push(&mut ea, clone(elem));
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+    String b = String::new();
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::append(&mut b, "    uint64_t ob = cb_recv(&p_b);\n");
+    String::append(&mut b, "    (void)cb_bind(ob);\n");
+    String::append(&mut b, "    uint64_t n = p_b.len;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        cb_read(p_a.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s *a = (%s *)p_a.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "        while (a->cap - a->len < n) { %s(p_a); }\n", &grow);
+    String::appendf(&mut b, "        memcpy(a->ptr + a->len, p_b.ptr, (size_t)n * %vu);\n", size);
+    String::append(&mut b, "        cb_write(p_a.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "        a->len += n;\n");
+    String::appendf(&mut b, "        cb_release_plain((uint8_t *)p_b.ptr, n * %vu);\n", size);
+    String::append(&mut b, "        p_b.len = 0;\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    Some(b)
+}
+
+// `Vec::dedup` for an integer or `bool` element type, whose `==` is the C
+// one: the same as the body, in place; the prelude's body where an element
+// has a live object.
+export fn native_vec_dedup(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    bool ok = match (elem)
+    {
+        Type::TInt(_) : true,
+        Type::TBool   : true,
+        _             : false,
+    };
+    if (!ok)
+    {
+        return None;
+    }
+    u64 size = size_align(g, elem).size;
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t n = v->len;\n");
+    String::append(&mut b, "    if (n < 2) return;\n");
+    String::appendf(&mut b, "    if (cb_live_in(v->ptr, n * %vu)) { %s(p_v); return; }\n", size, &fb);
+    String::append(&mut b, "    uint64_t w = 1;\n");
+    String::append(&mut b, "    uint8_t swapped = 0;\n");
+    String::append(&mut b, "    for (uint64_t i = 1; i < n; i++) {\n");
+    String::append(&mut b, "        if (v->ptr[i] != v->ptr[w - 1]) {\n");
+    String::append(&mut b, "            if (w != i) {\n");
+    String::append(
+        &mut b,
+        "                if (!swapped) { cb_borrow_check(p_v.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0); swapped = 1; }\n",
+    );
+    String::append(&mut b, "                v->ptr[w] = v->ptr[i];\n");
+    String::append(&mut b, "            }\n");
+    String::append(&mut b, "            w++;\n");
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    if (w < n) {\n");
+    String::append(&mut b, "        cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        cb_release_plain((uint8_t *)(v->ptr + w), (n - w) * %vu);\n", size);
+    String::append(&mut b, "        v->len = w;\n");
+    String::append(&mut b, "    }\n");
+    Some(b)
+}
+
+// D-0192: `==` and `<` for the element types the native searches take: C's
+// own for integers and `bool`, the bytes for `String` (its `==` and its
+// order, `cb_bytes_less` as `Vec::sort` compares). cobc's `search_ops`
+// returns the two as closures; here the kind, and `search_eq`/`search_lt`
+// write the text.
+export enum SearchOps
+{
+    SoPlain,
+    SoText,
+}
+
+export fn search_ops(ref<Gen, shared> g, ref<Type, shared> elem) : Option<SearchOps>
+{
+    match (elem)
+    {
+        Type::TInt(_) : Some(SearchOps::SoPlain),
+        Type::TBool   : Some(SearchOps::SoPlain),
+        _             : if (is_string_ty(elem)) { Some(SearchOps::SoText) } else { None },
+    }
+}
+
+export fn search_eq(ref<SearchOps, shared> k, StringView a, StringView b) : String
+{
+    match (k)
+    {
+        SearchOps::SoPlain : sprintf("(%v == %v)", a, b),
+        SearchOps::SoText : sprintf(
+            "cb_bytes_eq((const void *)(%v).bytes.ptr, (%v).bytes.len, (const void *)(%v).bytes.ptr, (%v).bytes.len)",
+            a,
+            a,
+            b,
+            b,
+        ),
+    }
+}
+
+export fn search_lt(ref<SearchOps, shared> k, StringView a, StringView b) : String
+{
+    match (k)
+    {
+        SearchOps::SoPlain : sprintf("(%v < %v)", a, b),
+        SearchOps::SoText : sprintf(
+            "cb_bytes_less((const void *)(%v).bytes.ptr, (%v).bytes.len, (const void *)(%v).bytes.ptr, (%v).bytes.len)",
+            a,
+            a,
+            b,
+            b,
+        ),
+    }
+}
+
+// `Vec::contains` for an integer or `bool` element type: the body is
+// `index_of` (native, `native_vec_index_of`) and a test of its result; the
+// same checks, the same fallback where an element has an object.
+export fn native_vec_contains(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SearchOps ops = match (search_ops(g, elem))
+    {
+        Some(o) : o,
+        None    : return None,
+    };
+    String elem_c = ctype(g, elem);
+    u64 size = size_align(g, elem).size;
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    if (cb_live_in(v->ptr, v->len * %vu)) return %s(p_v, p_x);\n", size, &fb);
+    String::append(&mut b, "    if (v->len > 0) {\n");
+    String::append(&mut b, "        cb_read(p_x.tok, NULL, 0, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s xv = *(%s *)p_x.p;\n", &elem_c, &elem_c);
+    String::appendf(
+        &mut b,
+        "        for (uint64_t k = 0; k < v->len; k++) if (%s) return 1;\n",
+        &search_eq(&ops, "v->ptr[k]", "xv"),
+    );
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    return 0;\n");
+    Some(b)
+}
+
+// `Vec::binary_search` for an integer or `bool` element type, whose `<`
+// (`key_before`) is the C one: the body reads `v.len` checked; for a
+// non-empty vector it reads the key (checked) and the elements through the
+// vector the call holds shared. The same lower bound, compared in place.
+export fn native_vec_binary_search(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+) : Option<String>
+{
+    SearchOps ops = match (search_ops(g, elem))
+    {
+        Some(o) : o,
+        None    : return None,
+    };
+    String ec = ctype(g, elem);
+    Vec<Type> ra = Vec::new();
+    Vec::push(&mut ra, usize_ty());
+    Vec::push(&mut ra, usize_ty());
+    String res_c = ctype(g, &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Result"), .args = ra })));
+    String fb = std_fallback(g);
+    u64 size = size_align(g, elem).size;
+    String b = String::new();
+    String::appendf(&mut b, "    %s r;\n", &res_c);
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    uint64_t lo = 0, hi = v->len;\n");
+    String::appendf(&mut b, "    if (hi > 0 && cb_live_in(v->ptr, hi * %vu)) return %s(p_v, p_key);\n", size, &fb);
+    String::append(&mut b, "    if (hi > 0) {\n");
+    String::append(&mut b, "        cb_read(p_key.tok, NULL, 0, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s k = *(%s *)p_key.p;\n", &ec, &ec);
+    String::appendf(
+        &mut b,
+        "        while (lo < hi) { uint64_t mid = lo + (hi - lo) / 2; if (%s) lo = mid + 1; else hi = mid; }\n",
+        &search_lt(&ops, "v->ptr[mid]", "k"),
+    );
+    String::appendf(
+        &mut b,
+        "        if (lo < v->len && !(%s)) { r.tag = 0u; r.u.v0 = lo; return r; }\n",
+        &search_lt(&ops, "k", "v->ptr[lo]"),
+    );
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    r.tag = 1u;\n");
+    String::append(&mut b, "    r.u.v1 = lo;\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `Vec::filled(n, x)` for a plain element type, as `from_slice`: one
+// allocation of exactly `n` elements, filled at once; `out` bound, moved out
+// and sent as the body's is. A size that overflows is the allocation the
+// body's growth could never have made: `diag.alloc-failure`, as there.
+export fn native_vec_filled(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    u64 align = sa.align;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    String ec = ctype(g, elem);
+    u32 vtid = type_id(g, &named1("std::Vec", elem));
+    str fail = "cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0)";
+    String b = String::new();
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", vec_c);
+    String::appendf(&mut b, "    out.ptr = (%s *)%v;\n", &ec, align);
+    String::append(&mut b, "    out.len = 0;\n");
+    String::append(&mut b, "    out.cap = 0;\n");
+    String::append(&mut b, "    uint64_t n = p_n;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        uint64_t bytes;\n");
+    String::appendf(&mut b, "        if (__builtin_mul_overflow(n, (uint64_t)%vu, &bytes)) %v;\n", size, fail);
+    String::appendf(&mut b, "        %s *p = (%s *)cb_allocate(bytes, %vu);\n", &ec, &ec, align);
+    String::appendf(&mut b, "        if (!p) %v;\n", fail);
+    if (size == 1)
+    {
+        String::append(&mut b, "        memset(p, *(uint8_t *)&p_x, n);\n");
+    }
+    else
+    {
+        String::append(&mut b, "        for (uint64_t i = 0; i < n; i++) p[i] = p_x;\n");
+    }
+    String::append(&mut b, "        out.ptr = p;\n");
+    String::append(&mut b, "        out.len = n;\n");
+    String::append(&mut b, "        out.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    send_out(&mut b, vtid, vec_c);
+    Some(b)
+}
+
+// `Vec::from_slice(s)` for a plain element type: the body binds `out`,
+// reserves `s`'s length, then pushes each element, unchecked. Here the
+// elements are copied at once; `out` is a binding as in the body (its
+// object, bound in a frame, then moved out and sent), and the slice is
+// received as `split` receives its view.
+export fn native_vec_from_slice(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+) : Option<String>
+{
+    SizeAlign sa = size_align(g, elem);
+    u64 size = sa.size;
+    u64 align = sa.align;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    String ec = ctype(g, elem);
+    u32 vtid = type_id(g, &named1("std::Vec", elem));
+    str ovf = "cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0)";
+    String fb = std_fallback(g);
+    String b = String::new();
+    // An element with a live object: the body's element reads, each checked
+    // against the paths that may hold it.
+    String::appendf(&mut b, "    if (cb_live_in(p_s.data, p_s.len * %vu)) return %s(p_s);\n", size, &fb);
+    String::append(&mut b, "    (void)cb_recv_datum_tok();\n");
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", vec_c);
+    String::appendf(&mut b, "    out.ptr = (%s *)%v;\n", &ec, align);
+    String::append(&mut b, "    out.len = 0;\n");
+    String::append(&mut b, "    out.cap = 0;\n");
+    String::append(&mut b, "    uint64_t n = p_s.len;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        uint64_t bytes;\n");
+    String::appendf(&mut b, "        if (__builtin_mul_overflow(n, (uint64_t)%vu, &bytes)) %v;\n", size, ovf);
+    String::appendf(&mut b, "        uint8_t *p = cb_allocate(bytes, %vu);\n", align);
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "        memcpy(p, p_s.data, bytes);\n");
+    String::appendf(&mut b, "        out.ptr = (%s *)p;\n", &ec);
+    String::append(&mut b, "        out.len = n;\n");
+    String::append(&mut b, "        out.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    send_out(&mut b, vtid, vec_c);
+    Some(b)
+}
+
+// `Vec::pop` for a plain element type: the body's checked read of `v.len`,
+// `None` when it is 0, the checked write of `len - 1`, then the element's
+// `[Rawptr-Read]` and the `[Release]` of its cells. `checked` false: the
+// confined form (`_nc`), without the two checks.
+export fn native_vec_pop(
+    ref<Gen, exclusive> g,
+    ref<Type, shared> elem,
+    ref<String, shared> vec_c,
+    bool checked,
+) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !plain_data(g, elem))
+    {
+        return None;
+    }
+    String opt_c = ctype(g, &named1("std::Option", elem));
+    String b = String::new();
+    if (checked)
+    {
+        String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    }
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    %s r;\n", &opt_c);
+    String::append(&mut b, "    if (v->len == 0) { r.tag = 1u; return r; }\n");
+    String::append(&mut b, "    uint64_t n = v->len - 1;\n");
+    if (checked)
+    {
+        String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    }
+    String::append(&mut b, "    v->len = n;\n");
+    String::append(&mut b, "    r.tag = 0u;\n");
+    String::append(&mut b, "    r.u.v0 = v->ptr[n];\n");
+    String::appendf(&mut b, "    cb_release_plain((uint8_t *)(v->ptr + n), %vu);\n", size);
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `Vec::remove` for a plain element type: the same bytes the body's swaps
+// move, at once: the checked read of `v.len`, the bounds fault, the element
+// out, the move, then `pop`'s checked write of `len - 1` and the
+// `[Release]` of the last cells.
+export fn native_vec_remove(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0 || !movable_elem(g, elem))
+    {
+        return None;
+    }
+    bool res = !plain_data(g, elem);
+    String elem_c = ctype(g, elem);
+    String fb = std_fallback(g);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::append(&mut b, "    if (p_i >= v->len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    // An element the body's swaps would borrow, with a live object.
+    String::appendf(
+        &mut b,
+        "    if (cb_live_in(&v->ptr[p_i], (v->len - p_i) * %vu)) return %s(p_v, p_i);\n",
+        size,
+        &fb,
+    );
+    String::appendf(&mut b, "    %s x = v->ptr[p_i];\n", &elem_c);
+    String::appendf(
+        &mut b,
+        "    memmove(v->ptr + p_i, v->ptr + p_i + 1, (size_t)(v->len - p_i - 1) * sizeof(%s));\n",
+        &elem_c,
+    );
+    String::append(&mut b, "    uint64_t n = v->len - 1;\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    v->len = n;\n");
+    String::appendf(&mut b, "    cb_release_plain((uint8_t *)(v->ptr + n), %vu);\n", size);
+    if (res)
+    {
+        // The value moved out (`[Rawptr-Move-Out]`) and returned as the body
+        // returns it: an object, bound, taken and sent.
+        u32 tid = type_id(g, elem);
+        String::append(&mut b, "    cb_frame_push();\n");
+        String::appendf(&mut b, "    uint64_t oo = cb_new(&x, %vu, CB_NOLOC, 0);\n", tid);
+        String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+        String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s res = x;\n", &elem_c);
+        String::append(&mut b, "    cb_move_to(ot, &res);\n");
+        String::append(&mut b, "    cb_send(ot);\n");
+        String::append(&mut b, "    cb_frame_pop();\n");
+        String::append(&mut b, "    return res;\n");
+    }
+    else
+    {
+        String::append(&mut b, "    return x;\n");
+    }
+    Some(b)
+}
+
+// `Vec::index_of` for an integer or `bool` element type, whose `==` is the C
+// one: the body's checked reads of `v.len` and of `*x`, then the elements
+// compared in place.
+export fn native_vec_index_of(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    SearchOps ops = match (search_ops(g, elem))
+    {
+        Some(o) : o,
+        None    : return None,
+    };
+    String elem_c = ctype(g, elem);
+    u64 size = size_align(g, elem).size;
+    String fb = std_fallback(g);
+    String opt_c = ctype(g, &named1("std::Option", &usize_ty()));
+    String b = String::new();
+    String::appendf(&mut b, "    %s r;\n", &opt_c);
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    if (cb_live_in(v->ptr, v->len * %vu)) return %s(p_v, p_x);\n", size, &fb);
+    String::append(&mut b, "    if (v->len > 0) {\n");
+    String::append(&mut b, "        cb_read(p_x.tok, NULL, 0, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s xv = *(%s *)p_x.p;\n", &elem_c, &elem_c);
+    String::append(&mut b, "        for (uint64_t k = 0; k < v->len; k++) {\n");
+    String::appendf(
+        &mut b,
+        "            if (%s) { r.tag = 0u; r.u.v0 = k; return r; }\n",
+        &search_eq(&ops, "v->ptr[k]", "xv"),
+    );
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    r.tag = 1u;\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `Vec::push` for a plain element type: the body's checked read of `v.len`,
+// `grow` as written in the prelude when full, the element's `[Rawptr-Write]`
+// (no reference in the value, so no holder object: CHG-0031), and the
+// checked write of `v.len`.
+export fn native_vec_push(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
+{
+    u64 size = size_align(g, elem).size;
+    if (size == 0)
+    {
+        return None;
+    }
+    if (is_resource(g, elem) && !has_refs(g, elem) && !holds_fn(g, elem) && !is_ref_type(elem))
+    {
+        // A resource holding no reference (`String`, D-0129's bench): the
+        // body's receipt of `x` (`[Param]`), its checked reads of `v`, `grow`
+        // when full, the move into the buffer (`[Rawptr-Move-In]`,
+        // `cb_raw_move_in`), then the checked write of `v.len`. The body's
+        // bind and take of `x` are not made: `x`'s object was received just
+        // now, no path into it exists.
+        Vec<Type> ea = Vec::new();
+        Vec::push(&mut ea, clone(elem));
+        String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+        String b = String::new();
+        String::append(&mut b, "    uint64_t o = cb_recv(&p_x);\n");
+        String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+        String::appendf(&mut b, "    if (v->len == v->cap) { %s(p_v); }\n", &grow);
+        String::append(&mut b, "    v->ptr[v->len] = p_x;\n");
+        String::append(&mut b, "    cb_raw_move_in(o, &v->ptr[v->len]);\n");
+        String::append(&mut b, "    uint64_t n = v->len + 1;\n");
+        String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+        String::append(&mut b, "    v->len = n;\n");
+        return Some(b);
+    }
+    if (!plain_data(g, elem))
+    {
+        // Reference data with no resource and no `fn` value: the body's
+        // receipt of `x`, then its write into the buffer -- here one step:
+        // the in-flight paths are received straight into the element's
+        // slots (`cb_recv_datum`). Its checks and their order as for a plain
+        // element. A bare reference travels as a `cb_ref`, not in flight.
+        if (is_resource(g, elem) || holds_fn(g, elem) || !has_refs(g, elem) || is_ref_type(elem))
+        {
+            return None;
+        }
+        u32 tid = type_id(g, elem);
+        Vec<Type> ea = Vec::new();
+        Vec::push(&mut ea, clone(elem));
+        String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+        String b = String::new();
+        String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+        String::appendf(&mut b, "    if (v->len == v->cap) { %s(p_v); }\n", &grow);
+        String::append(&mut b, "    v->ptr[v->len] = p_x;\n");
+        String::appendf(&mut b, "    cb_recv_datum(&v->ptr[v->len], %vu);\n", tid);
+        String::append(&mut b, "    uint64_t n = v->len + 1;\n");
+        String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+        String::append(&mut b, "    v->len = n;\n");
+        return Some(b);
+    }
+    Vec<Type> ea = Vec::new();
+    Vec::push(&mut ea, clone(elem));
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ea);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
+    String::appendf(&mut b, "    if (v->len == v->cap) { %s(p_v); }\n", &grow);
+    String::append(&mut b, "    v->ptr[v->len] = p_x;\n");
+    // As in the `_nc` body: `len < cap` here, so `len + 1` cannot overflow.
+    String::append(&mut b, "    uint64_t n = v->len + 1;\n");
+    String::append(&mut b, "    cb_write(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, 0u, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    v->len = n;\n");
+    Some(b)
 }
