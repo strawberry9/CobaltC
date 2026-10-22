@@ -4676,6 +4676,17 @@ export fn lower_expr_inner(
                 ),
                 None : {},
             }
+            // In a probe, cobc's internal error: the probe fails.
+            if (x.probing > 0)
+            {
+                x.probe_failed = true;
+                return unit();
+            }
+            eprintf(
+                "cbc: unresolved path `%s` (line %v)\n",
+                &String::join(&Box::get(p).segs[0..$], "::"),
+                e.line,
+            );
             assert(false, "cbc: a path not ported yet");
             unit()
         },
@@ -6483,7 +6494,15 @@ export fn probe_type(
         Some(t) : return clone(t),
         None    : {},
     }
+    // cobc's probe fails with its error, which is not kept: only a type
+    // found is, and `probe_failed` says whether this probe failed.
+    bool outer = replace(&mut x.probe_failed, false);
     Type ty = probe_raw(g, x, e, expected);
+    if (x.probe_failed)
+    {
+        return ty;
+    }
+    x.probe_failed = outer;
     HashMap::insert(&mut x.probes, key, clone(&ty));
     ty
 }
@@ -11624,13 +11643,13 @@ export fn lower_assign(
     // write for `cb_elem_access` to skip: the element's place at once. A
     // confined vector's element (`bind_confined`) has nothing to check at
     // all; the analysis saw that `val` pushes nothing onto it.
-    Expr target = match (vec_index_call(g, x, place, true))
+    Expr tplace = match (vec_index_call(g, x, place, true))
     {
         Some(sy) : sy,
         None     : clone(place),
     };
     Option<P> fused = None;
-    match (&target.kind)
+    match (&tplace.kind)
     {
         ExprKind::EDeref(inner) :
         {
@@ -11663,7 +11682,7 @@ export fn lower_assign(
         None     :
         {
             x.place_write = true;
-            P lp = lower_place(g, x, &target);
+            P lp = lower_place(g, x, &tplace);
             x.place_write = false;
             lp
         },
@@ -11752,7 +11771,52 @@ export fn lower_assign(
             };
             emit(x, String::as_view(&sprintf("cb_write(%s, %s, %s, %s);", base, &projs_args(&p.projs), &target, &lc)));
         },
-        None       : {},
+        None       :
+        {
+            if (res && Option::is_none(&p.raw) && direct_place(x, &tplace))
+            {
+                if (quiet_ty(&g.prog.table, &p.ty))
+                {
+                    // D-0194: the same through a direct parameter: no path,
+                    // and the place always holds its value.
+                    u32 tid = type_id(g, &p.ty);
+                    emit(
+                        x,
+                        String::as_view(&sprintf(
+                            "cb_write_quiet(0, NULL, 0, (void *)&(%s), %vu, %s);",
+                            &p.c,
+                            tid,
+                            &lc,
+                        )),
+                    );
+                }
+                else
+                {
+                    // A resource field through a direct parameter
+                    // (`box_rec_uses`): no path to check, but the value's
+                    // check stays -- overwriting a live resource faults
+                    // (`[Write-Resource-Overwrite-Rejected]`), as `cb_write`
+                    // would for the target's value.
+                    String live = if (always_owns(&g.prog.table, &p.ty))
+                    {
+                        String::from_str("1")
+                    }
+                    else
+                    {
+                        u32 tid = type_id(g, &p.ty);
+                        sprintf("cb_owns(&(%s), %vu)", &p.c, tid)
+                    };
+                    emit(
+                        x,
+                        String::as_view(&sprintf(
+                            "if (%s) cb_fault(\"diag.overwrite-of-live-resource\", %s);",
+                            &live,
+                            &lc,
+                        )),
+                    );
+                }
+            }
+        },
     }
     store(g, x, String::as_view(&p.c), &p.ty, &v);
     if (res && !HashSet::contains(&x.inert_c, &v.c))
@@ -12698,6 +12762,13 @@ export fn lower_borrow(
         Some(b) : String::clone(b),
         None    :
         {
+            // In a probe, cobc's internal error: the probe fails.
+            if (x.probing > 0)
+            {
+                x.probe_failed = true;
+                return unit();
+            }
+            eprintf("cbc: borrow of a temporary (line %v, `%s`)\n", e.line, &p.c);
             assert(false, "cobc: borrow of a temporary");
             return unit();
         },

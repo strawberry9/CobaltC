@@ -2,13 +2,13 @@
 
 This is the official home of the CobaltC programming language specification (CobaltC), the interpreter (coby), the native compiler (cobc), and the code formatter (cobfmt).
 
-CobaltC is a human-directed, AI-assisted, statically typed systems programming language built around memory safety, predictable resource management, and explicit control. It provides explicit ownership, deterministic destruction, compiler-checked borrowing, inferred lifetimes, explicit nullability, bounds-safe operations, structured error handling, safe concurrency, explicitly delineated unsafe operations, and explicit foreign-function interfaces.
-
-The language emerged from an exploration of C's memory-safety flaws, informed by [The Wrong Memory](https://strawberry9.github.io/the-wrong-memory/cover.html), an open-source online book and collection of essays examining the problems and consequences of unsafe memory management.
+CobaltC is a human-directed, AI-assisted, statically typed C-family systems programming language that emerged from an exploration of C's memory-safety flaws, informed by [The Wrong Memory](https://strawberry9.github.io/the-wrong-memory/cover.html), an open-source online book and collection of essays examining the problems and consequences of unsafe memory management.
 
 CobaltC's design is guided by two central commitments: making safety-relevant facts explicit in the language, and grounding implementation behavior in stable, normative rules.
 
-CobaltC differentiates between safety guarantees that can be verified at compile time and those that require runtime enforcement. Unlike Rust, which rejects code that fails to satisfy its static ownership and borrowing rules, CobaltC seeks to permit a broader range of operations when their safety can be enforced through runtime checks. If a runtime check fails, the operation must be prevented from proceeding, and a well-defined diagnostic must be produced.
+It combines affine resource ownership, explicit shared and exclusive references, deterministic destruction, and a hybrid static/dynamic enforcement model. Rather than requiring programmers to express lifetime relationships through explicit lifetime annotations, it uses compile-time analysis where sufficient and runtime checks where necessary. Its design prioritizes a small, composable language, predictable low-level control, and defined failure over maximal static verification.
+
+The central design principle: prove what you can, check what you can't. The language allow different mechanisms to discharge that obligation.
 
 CobaltC is already well formed, but currently still in experimental stage.
 
@@ -16,11 +16,11 @@ This project began on 19 September 2026, based on the instructions provided (to 
 
 Commit Update 130, 2026-10-22 03:29 UTC. Specification edition 2026.102201. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
-The language specification (which is already well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
+The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 
-NOTE: The language specification is intentionally designed by AI for AI consumption rather than human consumption.
+NOTE: The language specification is intentionally designed by AI for AI consumption rather than human consumption. For human consumption, a plain prose overview of the specification is available in [spec/OVERVIEW.md](spec/OVERVIEW.md).
 
-For human consumption, a plain prose overview of the specification is available in [spec/OVERVIEW.md](spec/OVERVIEW.md), and a language guide and reference is available [here](https://strawberry9.github.io/the-wrong-memory/Appendix_06.html); its source is primarily from `htmlguide/index.html` in this repository, regenerated from `htmlguide/generator/` (every example in it is checked against both the interpreter and the compiler).
+In most cases, the best place to begin is the language guide and reference, which is available [here](https://strawberry9.github.io/the-wrong-memory/Appendix_06.html); its source is primarily from `htmlguide/index.html` in this repository, regenerated from `htmlguide/generator/` (every example in it is checked against both the interpreter and the compiler).
 
 The language guide is dynamically updated as soon as new language clarifications and/or capabilities arrive.
 
