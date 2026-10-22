@@ -10223,8 +10223,14 @@ export fn lower_vec_index_pre(
         ExprKind::EBorrow(b) : Box::get(b),
         _                    : return None,
     };
-    // In the bootstrap form only the sugar, which `[Index-Vec]` needs.
-    if (!HashSet::contains(&x.index_sugar, &a0.id))
+    // `e[k]` (`vec_index_call`): `[Index-Vec]` checks the borrow as an
+    // access to element `k`, after `k` is evaluated. Otherwise the index is
+    // evaluated after the borrow's check here, where the ordinary call makes
+    // the read check after it: only an index that cannot change the
+    // runtime's state keeps the two in agreement (stage 3).
+    bool sugar = HashSet::contains(&x.index_sugar, &a0.id);
+    bool stateless_i = !boot(g, 3) && stateless(g, x, a1);
+    if (!stateless_i && !sugar)
     {
         return None;
     }
@@ -10251,17 +10257,27 @@ export fn lower_vec_index_pre(
     };
     String lc0 = loc(g, x.std_body, a0.line);
     str m = if (bw.mode == Mode::Exclusive) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
-    // The index may read `$` or run code: the place is valid first.
-    emit(x, String::as_view(&sprintf("cb_valid(%s, %s);", &base, &lc0)));
+    if (!sugar)
+    {
+        emit(x, String::as_view(&sprintf("cb_borrow_check(%s, %s, %s, %s);", &base, &projs_args(&p.projs), m, &lc0)));
+    }
+    else if (!stateless_i)
+    {
+        // The index may read `$` or run code: the place is valid first.
+        emit(x, String::as_view(&sprintf("cb_valid(%s, %s);", &base, &lc0)));
+    }
     V i = lower_index_arg(g, x, sprintf("(%s).len", &p.c), a1);
     if (is_never(&i.ty))
     {
         return Some(never());
     }
     V it = into_temp(g, x, i, a1.line);
-    Vec<String> projs = clone(&p.projs);
-    Vec::push(&mut projs, sprintf("{ CB_INDEX, %s }", &it.c));
-    emit(x, String::as_view(&sprintf("cb_borrow_check(%s, %s, %s, %s);", &base, &projs_args(&projs), m, &lc0)));
+    if (sugar)
+    {
+        Vec<String> projs = clone(&p.projs);
+        Vec::push(&mut projs, sprintf("{ CB_INDEX, %s }", &it.c));
+        emit(x, String::as_view(&sprintf("cb_borrow_check(%s, %s, %s, %s);", &base, &projs_args(&projs), m, &lc0)));
+    }
     Vec<Type> ta = Vec::new();
     Vec::push(&mut ta, clone(&elem));
     String pre_cname = request_fn(g, name, ta);
@@ -10271,7 +10287,12 @@ export fn lower_vec_index_pre(
     {
         Some(write) :
         {
-            if (is_plain_elem(g, &elem))
+            // A reader's shared element read (`elem_reader`): the same.
+            bool reader_read = x.elem_reader && !write && !exclusive && !has_refs(
+                g,
+                &elem,
+            ) && !holds_fn(g, &elem) && !is_closure(&elem) && !is_ref_type(&elem);
+            if (is_plain_elem(g, &elem) || reader_read)
             {
                 // The `…_pre` body inline, then the access's checks in one call.
                 String rms = elem_rm(x, rm);
