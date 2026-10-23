@@ -21,7 +21,22 @@ cc=()
 "$cobc" "${cc[@]}" -O 2 -o "$out/cobfmt-cb" "$here/cobfmt/main.cb"
 "$cobc" "${cc[@]}" -O 2 -o "$out/cbparse" "$here/cbparse/main.cb"
 cbrt_dir=$(cd "$(dirname "$cobc")" && pwd)
+# Under MSYS2 `pwd` gives /e/..., which a native cbc cannot open: take the
+# E:/... form.
+if command -v cygpath > /dev/null 2>&1; then
+    cbrt_dir=$(cygpath -m "$cbrt_dir")
+fi
 stamp=$(LC_ALL=C grep -aoE 'CBRT-STAMP:[0-9a-f]{16}' "$cbrt_dir/libcbrt.a" | head -n 1 | cut -d: -f2 || true)
-python3 "$here/cbc/gen_build_info.py" --stamp "$stamp" --cbrt-dir "$cbrt_dir"
-trap 'python3 "$here/cbc/gen_build_info.py"' EXIT
+# The two constants are written with sed rather than gen_build_info.py, so
+# the build needs no Python; the committed file is put back on exit.
+info=$here/cbc/build_info.cb
+cp "$info" "$out/build_info.cb.orig"
+trap 'mv -f "$out/build_info.cb.orig" "$info"' EXIT
+# A CobaltC literal escapes \ and "; the sed replacement then \, & and |.
+escaped_dir=$(printf '%s' "$cbrt_dir" | sed -e 's/[\\"]/\\&/g' | sed -e 's/[\\&|]/\\&/g')
+sed -e "s|^export const str CBRT_STAMP = \"\";|export const str CBRT_STAMP = \"$stamp\";|" \
+    -e "s|^export const str CBRT_DIR = \"\";|export const str CBRT_DIR = \"$escaped_dir\";|" \
+    "$out/build_info.cb.orig" > "$info"
+grep -q "^export const str CBRT_DIR = \"$(printf '%s' "$cbrt_dir" | head -c 1)" "$info" ||
+    { echo "build.sh: could not write CBRT_DIR into $info" >&2; exit 1; }
 "$cobc" "${cc[@]}" -O 2 -o "$out/cbc" "$here/cbc/main.cb"
