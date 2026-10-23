@@ -5,6 +5,9 @@
 // each element read left an orphaned object. The counts are what cbrt
 // reports at `[Terminate-Ok]` when `COBALTC_RT_STATS` is set.
 
+#[path = "oracle/exe.rs"]
+mod exe;
+
 use std::fs;
 use std::process::Command;
 
@@ -53,7 +56,7 @@ fn main()
 
 fn live_at_exit(cc: &str, dir: &std::path::Path) -> (u64, u64) {
     let exe = dir.join(format!("walk_{}", cc));
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc"))
+    let out = Command::new(exe::cobc_exe())
         .args(["--cc", cc, "-o"])
         .arg(&exe)
         .arg(dir.join("walk.cb"))

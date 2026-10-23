@@ -1,7 +1,7 @@
 # CobaltC Specification Schema
 
 Status: normative artifact
-Version: 1.0.138
+Version: 1.0.139
 Governed by: `CobaltC_Master_Instructions.md` §13, §14, §15, §18, §21, §22
 
 ## Purpose
@@ -220,11 +220,11 @@ Non-numbered, growing directories, created on first actual use rather
 than pre-created speculatively:
 
     spec/decisions/D-XXXX-<slug>.md   -- one file per Decision (in use:
-                                          D-0001 through D-0275)
+                                          D-0001 through D-0276)
     spec/registry/features.md         -- Feature entities (in use)
     spec/registry/diagnostics.md      -- Diagnostic entities (in use)
     spec/changes/CHG-XXXX-<slug>.md   -- one file per Change record (in use:
-                                          CHG-0001 through CHG-0367)
+                                          CHG-0001 through CHG-0369)
 
 A directory or file is created at the point a real entity needs it, not
 in advance (Master Instructions §24).
@@ -255,6 +255,7 @@ in advance (Master Instructions §24).
 
 ## Change Log
 
+- 1.0.139 — Non-normative (D-0276): ranges up to D-0276 and CHG-0369.
 - 1.0.138 — Non-normative (`CHG-0367`): ranges up to D-0275 and CHG-0367.
 - 1.0.137 — Non-normative (`CHG-0365`, `CHG-0366`): ranges up to D-0275 and CHG-0366.
 - 1.0.136 — Non-normative (`CHG-0364`): ranges up to D-0274 and CHG-0364.

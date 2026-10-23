@@ -8,7 +8,7 @@ CobaltC's design is guided by two central commitments: making safety-relevant fa
 
 It combines affine resource ownership, explicit shared and exclusive references, deterministic destruction, and a hybrid static/dynamic enforcement model. Rather than requiring programmers to express lifetime relationships through explicit lifetime annotations, it uses compile-time analysis where sufficient and runtime checks where necessary. Its design prioritizes a small, composable language, predictable low-level control, and defined failure over maximal static verification.
 
-The central design principle: prove what you can, check what you can't. The language allow different mechanisms to discharge that obligation.
+The central design principle: prove what you can, check what you can't. The language allows different mechanisms to discharge that obligation.
 
 CobaltC is already well formed, but currently still in experimental stage.
 
@@ -20,11 +20,11 @@ The language specification (which is also well developed, but not yet final) is 
 
 NOTE: The language specification is intentionally designed by AI for AI consumption rather than human consumption. For human consumption, a plain prose overview of the specification is available in [spec/OVERVIEW.md](spec/OVERVIEW.md).
 
-In most cases, the best place to begin is the language guide and reference, which is available [here](https://strawberry9.github.io/the-wrong-memory/Appendix_06.html); its source is primarily from `htmlguide/index.html` in this repository, regenerated from `htmlguide/generator/` (every example in it is checked against both the interpreter and the compiler).
+In most cases, the best place to begin learning is the language guide and reference, which is available [here](https://strawberry9.github.io/the-wrong-memory/Appendix_06.html); its source is primarily from `htmlguide/index.html` in this repository, regenerated from `htmlguide/generator/` (every example in it is checked against both the interpreter and the compiler).
 
 The language guide is dynamically updated as soon as new language clarifications and/or capabilities arrive.
 
-The showcase examples (see further below) are also updated as soon as new language features arrive.
+Another good place to begin learning is viewing the many showcase examples (see further below - `showcase/README.md` describes them all).
 
 ## What is in the repository
 
@@ -46,7 +46,9 @@ The showcase examples (see further below) are also updated as soon as new langua
 
 Everything is a standard Rust Cargo workspace with no dependencies outside the Rust standard library; the compiler additionally needs a C compiler (`cc`) on the path.
 
-Developed and verified on:
+NOTE: CobaltC is self-hosting - see impl/selfhost: `cbc`, the compiler written in CobaltC, takes the same options as `cobc`, writes the same C byte for byte, and compiles itself (`impl/STATUS.md` says how it is built and checked).
+
+The Rust Cargo workspace has been developed and verified on:
 
 - Ubuntu 22.04 LTS on x86_64 (Linux 6.8), with `cc` = GCC 11
 - Rust 1.98.1 with Cargo 1.98.1, installed from https://rustup.rs

@@ -12,6 +12,8 @@ import loader;
 import build_info;
 import driverbase;
 import host;
+import prelude;
+import typecheck;
 
 export struct DiagInfo
 {
@@ -807,12 +809,54 @@ export fn resolve_user_location_col(StringView raw, ref<Expansion, shared> ex) :
                 Origin { file, line } = o;
                 Some(At { .file = file, .line = line, .col = l.col })
             },
-            None    : None,
+            // A diagnostic inside `std` itself: its file and line there,
+            // marked as `std`'s (`prelude::std_location`).
+            None : match (std_location(if (n >= STD_LINE) { n - STD_LINE } else { n }))
+            {
+                Some(o) :
+                {
+                    Origin { file, line } = o;
+                    Some(At { .file = sprintf("<std>/%s", &file), .line = line, .col = l.col })
+                },
+                None    : None,
+            },
         },
         None : None,
     };
     Located { id, .. } = l;
     Resolved { .id = id, .at = at }
+}
+
+// The `std` file and line a prelude line came from (`PRELUDE_STD_ORIGINS`).
+export fn std_location(usize line) : Option<Origin>
+{
+    StringView rest = StringView::of(PRELUDE_STD_ORIGINS);
+    while (StringView::len(rest) > 0)
+    {
+        StringView rec = rest;
+        match (StringView::find(rest, "\n"))
+        {
+            Some(i) :
+            {
+                rec = StringView::sub(rest, 0, i);
+                rest = StringView::sub(rest, i + 1, StringView::len(rest));
+            },
+            None    : rest = StringView::sub(rest, 0, 0),
+        }
+        Vec<StringView> f = StringView::split(rec, " ");
+        if (Vec::len(&f) != 4)
+        {
+            continue;
+        }
+        usize first = Result::unwrap_or(StringView::parse<usize>(f[0]), 0);
+        usize at = Result::unwrap_or(StringView::parse<usize>(f[2]), 0);
+        usize count = Result::unwrap_or(StringView::parse<usize>(f[3]), 0);
+        if (line >= first && line < first + count)
+        {
+            return Some(Origin { .file = String::from_view(f[1]), .line = at + (line - first) });
+        }
+    }
+    None
 }
 
 export struct Place

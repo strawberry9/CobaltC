@@ -56,6 +56,12 @@ intro_body += p("""The two are kept honest against each other: the test suites r
 executables to match `coby`'s output and diagnostics byte for byte on every program, under both
 GCC and Clang — including every complete example in this guide. Use `coby` to run a program at
 once; use `cobc` to build an executable, or to see how fast the program can be.""")
+intro_body += p("""A third program, <strong>`cbc`</strong>, is `cobc` written in CobaltC itself
+(the repository's `impl/selfhost/`, over a front end that is likewise `coby`'s written in CobaltC). It
+takes the same options and writes the same C, byte for byte, for every program; built by `cobc`, it
+compiles its own source to that same C again, so CobaltC's compiler can rebuild itself without the Rust
+one (D-0276). Its programs are `cobc`'s programs, but it compiles them many times more slowly, so the
+examples in this guide say `cobc`.""")
 intro_body += p("""On Linux the two work side by side, and everything in this guide runs under
 either. On Windows, `coby` runs programs, the formatter `cobfmt` (below) runs there too, and
 `cobc` builds Windows programs with a MinGW-w64 GCC, there or from Linux with

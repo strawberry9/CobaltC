@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Compares cbc (impl/selfhost/cbc, the code generator written in CobaltC)
-# with `cobc --bootstrap-form` (D-0274), byte for byte, on each FILE given
-# (LEVEL=N: both at COBALTC_BOOTSTRAP_UPTO=N, CHG-0368; default 10)
-# (default: every `.cb` file git tracks): the C each writes for it. A
-# program cobc rejects is skipped. Also checks that
-# impl/selfhost/back/header.cb is what gen_header.py makes of cbrt.h now.
+# Compares cbc (impl/selfhost/cbc, the compiler written in CobaltC) with
+# cobc, byte for byte, on each FILE given (default: every `.cb` file git
+# tracks): the C each writes for it. LEVEL=N runs both at
+# COBALTC_BOOTSTRAP_UPTO=N (CHG-0368; default 0, the default form; 10 the
+# bootstrap form, D-0274). FLAGS (e.g. `--all-checks`, `-g`,
+# `--no-line-directives`, `--lib`) runs both drivers with those options and
+# `--keep-c`, the C compiler replaced by /bin/true, and compares the C each
+# keeps under the same name. A program cobc rejects is skipped. Also checks
+# that impl/selfhost/back/header.cb is what gen_header.py makes of cbrt.h now.
 #
 #   impl/selfhost/compare_c.sh [-j JOBS] [FILE...]
 #
@@ -48,12 +51,24 @@ one() {
     local f=$1 tag d
     tag=$(printf '%s' "$f" | tr '/' '_')
     d=$(mktemp -d "$OUT/run/c.XXXXXX")
-    if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --cc /bin/true --keep-c -o "$d/a" "$f" > "$d/cobc.log" 2>&1); then
-        rm -rf "$d"
-        echo "skip $f"
-        return
+    if [ -n "$FLAGS" ]; then
+        # Both drivers keep their C as $d/p.c (the name the `#line` directives give).
+        if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --cc /bin/true --keep-c $FLAGS -o "$d/p" "$f" > "$d/cobc.log" 2>&1); then
+            rm -rf "$d"
+            echo "skip $f"
+            return
+        fi
+        mv "$d/p.c" "$d/a.c"
+        (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 3600 "$cbc" --cc /bin/true --keep-c $FLAGS -o "$d/p" "$f" > "$d/cbc.log" 2>&1)
+        mv "$d/p.c" "$d/b.c" 2> /dev/null
+    else
+        if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --cc /bin/true --keep-c -o "$d/a" "$f" > "$d/cobc.log" 2>&1); then
+            rm -rf "$d"
+            echo "skip $f"
+            return
+        fi
+        (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 3600 "$cbc" --emit-c --c-name "$d/a.c" "$f" > "$d/b.c" 2> "$d/cbc.log")
     fi
-    (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 3600 "$cbc" --emit-c --c-name "$d/a.c" "$f" > "$d/b.c" 2> "$d/cbc.log")
     if cmp -s "$d/a.c" "$d/b.c"; then
         rm -rf "$d"
         echo "same $f"
@@ -65,8 +80,9 @@ one() {
     fi
 }
 export -f one
-LEVEL=${LEVEL:-10}
-export root cobc cbc OUT LEVEL
+LEVEL=${LEVEL:-0}
+FLAGS=${FLAGS:-}
+export root cobc cbc OUT LEVEL FLAGS
 xargs -P "$jobs" -I{} bash -c 'one "$@"' _ {} < "$OUT/files" >> "$OUT/results"
 sort -o "$OUT/results" "$OUT/results"
 printf '%s same, %s DIFF, %s skip\n' "$(grep -c '^same' "$OUT/results")" "$(grep -c '^DIFF' "$OUT/results")" "$(grep -c '^skip' "$OUT/results")"

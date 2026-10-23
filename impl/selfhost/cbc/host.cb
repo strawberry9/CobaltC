@@ -17,6 +17,8 @@ unsafe extern fn cbc_host_input_wait(u64 have, u64 ms) : u64;
 unsafe extern fn cbc_host_input_byte(u64 i) : i64;
 unsafe extern fn cbc_host_guard(u64 pid, i64 secs) : u64;
 unsafe extern fn cbc_host_unguard(u64 h);
+unsafe extern fn cbc_host_run_path_byte(i64 b);
+unsafe extern fn cbc_host_run(u64 first, i64 secs, i64 seed) : i64;
 
 // Whether the stream `fd` (0, 1 or 2) is a terminal.
 // trusted: [Extern-Call] cbc_host_isatty reads no memory of the program.
@@ -122,5 +124,37 @@ export fn unguard_child(u64 h)
     unsafe
     {
         cbc_host_unguard(h);
+    }
+}
+
+// `--run` on Unix: the program at `exe`, with cbc's own arguments from
+// `first` on (`arg` numbering) as its arguments byte for byte, so that one
+// that is not UTF-8 reaches it as it came (std's commands take text), and
+// cobc's `child_guard` (ended when cbc ends, `secs` of CPU time when set,
+// `COBALTC_SCHEDULE_SEED` when `seed` is set). Its exit status, minus its
+// signal when a signal ended it; None when it could not be started.
+// trusted: [Extern-Call] cbc_host_run_path_byte and cbc_host_run read no memory of the program.
+export fn run_raw(StringView exe, usize first, Option<i64> secs, Option<u64> seed) : Option<i32>
+{
+    slice<u8, shared> b = StringView::as_bytes(exe);
+    i64 s = match (secs)
+    {
+        Some(v) : v,
+        None    : -1,
+    };
+    i64 sd = match (seed)
+    {
+        Some(v) : reinterpret<i64>(v),
+        None    : -1,
+    };
+    unsafe
+    {
+        cbc_host_run_path_byte(-1);
+        for (usize i = 0; i < slice_len(b); i += 1)
+        {
+            cbc_host_run_path_byte(widen<i64>(b[i]));
+        }
+        i64 st = cbc_host_run(widen<u64>(first), s, sd);
+        if (st == -1000) { None } else { Some(narrow<i32>(st)) }
     }
 }

@@ -16,7 +16,7 @@ later; `Cargo.lock` stays at version 3 so that older Cargo reads it.
 | `cobc` | `cobc/` | The native compiler: `coby`'s front end, then a lowering to C compiled by a C compiler |
 | `cbrt` | `cbrt/` | The runtime every compiled program links (`libcbrt.a`): the checks the specification discharges at run time, over real addresses |
 | `cobfmt` | `cobfmt/` | The formatter: changes layout only, never a token |
-| `selfhost` | `selfhost/` | Parts of the toolchain written in CobaltC, built by `cobc`: coby's whole front end, the type checker included (`front/`, `cbparse`), `cobfmt` (`cobfmt-cb`) and `cobc`'s code generator in its bootstrap form (`back/`, `cbc`, which compiles itself to a fixed point), each compared byte for byte with the Rust original |
+| `selfhost` | `selfhost/` | Parts of the toolchain written in CobaltC, built by `cobc`: coby's whole front end, the type checker included (`front/`, `cbparse`), `cobfmt` (`cobfmt-cb`) and `cobc` itself (`back/` and `cbc/`: `cbc`, the same command line and the same C, which compiles itself to a fixed point), each compared byte for byte with the Rust original |
 | `cobmodel` | `model/` | An executable model of the alias and thread rules, written from the specification alone (D-0219) |
 | `std` | `std/` | The standard library's CobaltC source, embedded in both tools |
 | Conformance | `conformance/` | The file-based conformance suite, and `run.py`, a standalone runner for any implementation |
@@ -102,14 +102,19 @@ CobaltC (`front/typecheck.cb` with `items.cb`, `each.cb`, `fmtcheck.cb` and `con
 about 20 times slower than coby's on large inputs (the runtime's object tracking, spread over every
 operation).
 
-`cbc` (`selfhost/cbc/`, with `selfhost/back/`) is `cobc`'s code generator written in CobaltC, over that
-front end: `cbc --emit-c [--c-name NAME] FILE` prints the C that `cobc --bootstrap-form` (D-0274, every
-optimisation off) writes for the program, byte for byte, or the diagnostic `coby` gives. It neither runs the
-C compiler nor links. `selfhost/compare_c.sh` compares the two on any set of files: every conformance case
-`cobc` accepts gives the same C. `selfhost/fixpoint.sh` checks the fixed point: `cbc` built by `cobc` writes
-its own C, which is `cobc --bootstrap-form`'s; the C compiler builds a second `cbc` from it, which writes the
-same C again (about two hours, 1 GB). The code `cbc` writes is the checked general form, slower than `cobc
--O 2`'s; `cobc` stays the compiler in use.
+`cbc` (`selfhost/cbc/`, with `selfhost/back/`) is `cobc` written in CobaltC, over that front end
+(D-0276): the same command line (`cbc [options] FILE.cb`, every option `cobc` takes, the object cache, the
+stale-runtime check, `--lib`, `--unittest`, `--run`, `--target`), the same C compiler invocation and linking
+against `cbrt`, and the same C, byte for byte, as `cobc` writes in every form (the default, `--all-checks`,
+`-g`, `--no-line-directives`, `--lib`, and each level of D-0274's bootstrap form, `COBALTC_BOOTSTRAP_UPTO=N`).
+`cbc --emit-c [--c-name NAME] FILE` prints the C alone. `selfhost/build.sh` builds it with `cobc`;
+`selfhost/compare_c.sh` compares the two compilers' C on any set of files (`LEVEL=`, `FLAGS=`);
+`selfhost/fixpoint.sh` checks the fixed point: `cbc` built by `cobc` writes its own C, which is `cobc`'s; the
+C compiler builds a second `cbc` from that C, which writes the same C again (about 65 minutes at the default
+level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the compiler under test. `cbc` compiles about
+15 to 25 times slower than `cobc` (its own source: about 25 minutes against 75 seconds; the runtime's
+object tracking, as in the front end); the programs it builds
+are the same programs. `cobc` stays in the tree as the Rust reference and the oracle.
 
 ## `std`
 

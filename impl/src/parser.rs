@@ -2839,7 +2839,7 @@ pub fn prelude_state(src: &str) -> Result<PreludeState, String> {
 }
 
 /// The prelude's declarations (CHG-0352): its text with every function's
-/// body emptied and every `unittest` left out, each line where it was;
+/// and every `unittest`'s body emptied, each line where it was;
 /// what the name resolver written in CobaltC reads of `std`
 /// (`--prelude-summary`). Checked here: its items, bodies aside, are the
 /// prelude's.
@@ -2886,13 +2886,16 @@ pub fn prelude_declarations(src: &str) -> Result<String, String> {
                         i = k + 1;
                     }
                 }
+                // A test is kept, its body emptied: the declarations make
+                // the prelude's `__unittest_N` functions (D-0230), which
+                // `--unittest-std` runs.
                 Tok::Unittest => {
                     let mut k = i;
                     while toks[k].tok != Tok::LBrace {
                         k += 1;
                     }
                     let c = close[k];
-                    keep[i..=c].iter_mut().for_each(|b| *b = false);
+                    keep[k + 1..c].iter_mut().for_each(|b| *b = false);
                     i = c + 1;
                 }
                 Tok::LBrace => i = close[i] + 1,
@@ -2981,6 +2984,8 @@ pub fn prelude_bodies(src: &str) -> Result<Vec<PreludeBody>, String> {
         end: usize,
         key: String,
         module: String,
+        // A `unittest`'s place among the prelude's (from 1), else 0.
+        test: usize,
     }
     fn scan(toks: &[crate::lexer::TriviaTok], close: &[usize], path: &mut Vec<String>, out: &mut Vec<Found>, mut i: usize, end: usize) {
         while i < end {
@@ -2991,6 +2996,16 @@ pub fn prelude_bodies(src: &str) -> Result<Vec<PreludeBody>, String> {
                     scan(toks, close, path, out, i + 3, c);
                     path.pop();
                     i = c + 1;
+                }
+                // D-0230: a test is the function `__unittest_N`.
+                Tok::Unittest => {
+                    let mut k = i;
+                    while toks[k].tok != Tok::LBrace {
+                        k += 1;
+                    }
+                    let test = out.iter().filter(|f| f.test > 0).count() + 1;
+                    out.push(Found { start: i, end: close[k], key: crate::modres::qualify(path, &format!("__unittest_{}", test)), module: path.join("::"), test });
+                    i = close[k] + 1;
                 }
                 Tok::Fn => {
                     let start = if i > 0 && toks[i - 1].tok == Tok::Export { i - 1 } else { i };
@@ -3006,7 +3021,7 @@ pub fn prelude_bodies(src: &str) -> Result<Vec<PreludeBody>, String> {
                         k += 1;
                     }
                     if k < end && toks[k].tok == Tok::LBrace {
-                        out.push(Found { start, end: close[k], key: crate::modres::qualify(path, &simple), module: path.join("::") });
+                        out.push(Found { start, end: close[k], key: crate::modres::qualify(path, &simple), module: path.join("::"), test: 0 });
                         i = close[k] + 1;
                     } else {
                         i = k + 1;
@@ -3045,6 +3060,7 @@ pub fn prelude_bodies(src: &str) -> Result<Vec<PreludeBody>, String> {
         }
     }
     collect(&program.items, &mut Vec::new(), &mut parsed);
+    let whole_tests = program.tests.clone();
     let skeleton = crate::lexer::Lexer::new(&prelude_skeleton(src)?).tokenize().map_err(|e| e.msg)?;
     let mut out = Vec::new();
     for f in found {
@@ -3064,6 +3080,10 @@ pub fn prelude_bodies(src: &str) -> Result<Vec<PreludeBody>, String> {
         p.pos = skeleton.len() - 1;
         p.fresh = fresh;
         p.local_consts = local_consts;
+        // A test is numbered after the prelude's tests before it.
+        if f.test > 0 {
+            p.tests = whole_tests[..f.test - 1].to_vec();
+        }
         let item = p.parse_item().map_err(|e| format!("`{}` does not parse alone: {}", f.key, e))?;
         let one = Program { items: vec![item], tests: Vec::new() };
         if parsed.get(&f.key) != Some(&crate::astdump::program(&one, 0, 0, 0)) {

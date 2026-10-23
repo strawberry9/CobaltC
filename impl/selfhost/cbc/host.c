@@ -1,7 +1,8 @@
 /* What cbc's driver needs of the platform that `std` does not offer
    (impl/selfhost/cbc/driver.cb): whether a stream is a terminal, standard
    input gathered as it arrives by a thread nothing waits for, and a guard
-   on a started program. cobc does these in Rust (`std::io::IsTerminal`, a
+   on a started program, and on Unix a program started with arguments that
+   need not be UTF-8. cobc does these in Rust (`std::io::IsTerminal`, a
    detached `std::thread`, `child_guard`/`job_guard` in cobc/src/main.rs).
    Plain C for Linux (glibc) and Windows (MinGW-w64), no other library. */
 
@@ -26,6 +27,12 @@
 #include <time.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <stdio.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 
 /* ---- terminals ---- */
@@ -321,3 +328,137 @@ void cbc_host_unguard(uint64_t h)
     (void)h;
 #endif
 }
+
+/* ---- running a built program (Unix) ---- */
+
+#ifndef _WIN32
+/* The runtime's arguments (cbrt `cb_arg_bytes`, std's `arg_bytes`): the
+   bytes of argument `i` (after the program's name) into [p, p + n), its
+   length; < 0 when there is no argument `i`. */
+extern int64_t cb_arg_bytes(uint64_t i, uint8_t *p, uint64_t n);
+
+static uint8_t *run_path;
+static uint64_t run_path_len, run_path_cap;
+
+/* The path of the program `cbc_host_run` starts, a byte at a time. */
+void cbc_host_run_path_byte(int64_t b)
+{
+    if (b < 0)
+    {
+        run_path_len = 0;
+        return;
+    }
+    if (run_path_len + 2 > run_path_cap)
+    {
+        run_path_cap = run_path_cap * 2 + 64;
+        run_path = realloc(run_path, run_path_cap);
+        if (run_path == NULL)
+        {
+            abort();
+        }
+    }
+    run_path[run_path_len++] = (uint8_t)b;
+    run_path[run_path_len] = 0;
+}
+
+/* `--run`: the program at the path given, with cbc's own arguments from
+   `first` on as its arguments, byte for byte (an argument need not be
+   UTF-8), started as cobc starts it (`child_guard`: ended when cbc ends,
+   `secs` seconds of CPU time when >= 0, `COBALTC_SCHEDULE_SEED` set to `seed`
+   when >= 0), its streams cbc's. Its exit status, minus its signal when a
+   signal ended it, or -1000 when it could not be started. */
+int64_t cbc_host_run(uint64_t first, int64_t secs, int64_t seed)
+{
+    int64_t n = 0;
+    while (cb_arg_bytes(first + (uint64_t)n, NULL, 0) >= 0)
+    {
+        n += 1;
+    }
+    char **argv = calloc((size_t)n + 2, sizeof(char *));
+    if (argv == NULL || run_path == NULL)
+    {
+        return -1000;
+    }
+    argv[0] = (char *)run_path;
+    for (int64_t i = 0; i < n; i++)
+    {
+        int64_t len = cb_arg_bytes(first + (uint64_t)i, NULL, 0);
+        char *a = malloc((size_t)len + 1);
+        if (a == NULL)
+        {
+            return -1000;
+        }
+        cb_arg_bytes(first + (uint64_t)i, (uint8_t *)a, (uint64_t)len);
+        a[len] = 0;
+        argv[i + 1] = a;
+    }
+    char seed_text[32];
+    snprintf(seed_text, sizeof seed_text, "%lld", (long long)seed);
+    pid_t parent = getpid();
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        return -1000;
+    }
+    if (pid == 0)
+    {
+#ifdef __linux__
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 || getppid() != parent)
+        {
+            _exit(127);
+        }
+#else
+        (void)parent;
+#endif
+        if (secs >= 0)
+        {
+            struct rlimit r;
+            r.rlim_cur = (rlim_t)secs;
+            r.rlim_max = (rlim_t)secs + 1;
+            if (setrlimit(RLIMIT_CPU, &r) != 0)
+            {
+                _exit(127);
+            }
+        }
+        if (seed >= 0)
+        {
+            setenv("COBALTC_SCHEDULE_SEED", seed_text, 1);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    for (int64_t i = 0; i < n; i++)
+    {
+        free(argv[i + 1]);
+    }
+    free(argv);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno != EINTR)
+        {
+            return -1000;
+        }
+    }
+    if (WIFSIGNALED(status))
+    {
+        return -(int64_t)WTERMSIG(status);
+    }
+    return (int64_t)WEXITSTATUS(status);
+}
+#else
+/* Windows: a command line is UTF-16, so every argument is text and std's
+   commands pass it on; never called there. */
+void cbc_host_run_path_byte(int64_t b)
+{
+    (void)b;
+}
+
+int64_t cbc_host_run(uint64_t first, int64_t secs, int64_t seed)
+{
+    (void)first;
+    (void)secs;
+    (void)seed;
+    return -1000;
+}
+#endif

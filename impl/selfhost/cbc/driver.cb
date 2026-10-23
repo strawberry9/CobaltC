@@ -479,6 +479,10 @@ export fn driver_main() : u8
     Option<String> file_arg = None;
     Vec<String> prog_args = Vec::new();
     Vec<Arg> args = arg_list();
+    // Where the program's arguments start (`arg` numbering), and whether one
+    // is not UTF-8: only `host::run_raw` passes such an argument on.
+    usize prog_first = Vec::len(&args);
+    bool prog_raw = false;
     usize ai = 0;
     while (ai < Vec::len(&args))
     {
@@ -486,12 +490,18 @@ export fn driver_main() : u8
         // With --run, everything after FILE.cb is the program's.
         if (run && Option::is_some(&file_arg))
         {
+            if (Vec::len(&prog_args) == 0)
+            {
+                prog_first = ai - 1;
+            }
             match (&args[ai - 1].text)
             {
                 Some(t) : Vec::push(&mut prog_args, String::clone(t)),
-                // An argument that is not UTF-8 cannot be passed on (std's
-                // commands take text).
-                None    : return usage(),
+                None    :
+                {
+                    Vec::push(&mut prog_args, String::new());
+                    prog_raw = true;
+                },
             }
             continue;
         }
@@ -817,7 +827,8 @@ export fn driver_main() : u8
     u64 t_lower = monotonic_ns();
     Gen lowering = new_gen(prog);
     lowering.bootstrap = level;
-    lowering.all_checks = lowering.all_checks || lowering.bootstrap > 0;
+    // `--all-checks` is in the driver's flags, not the environment `new_gen` reads.
+    lowering.all_checks = lowering.all_checks || env_flag("COBALTC_ALL_CHECKS") || lowering.bootstrap > 0;
     lowering.line_directives = line_directives && !report_tracking;
     Generated gen = generate_parts(&mut lowering, lib);
     if (report_tracking)
@@ -1064,6 +1075,13 @@ export fn driver_main() : u8
             },
         }
     }
+    // std's commands take text: an argument that is not UTF-8 reaches the
+    // program only through `host::run_raw` (Unix, no runner).
+    bool raw_run = Option::is_none(&runner) && !Target::windows(Option::unwrap_or(host, Target::LinuxX64));
+    if (prog_raw && (Option::is_some(&explore) || !raw_run))
+    {
+        return usage();
+    }
     match (explore)
     {
         Some(n) :
@@ -1095,13 +1113,22 @@ export fn driver_main() : u8
             None    : {},
         }
         show(&cmd);
-        // std runs a program with this one's streams only to its end
-        // (`Command::status`), with no hook before it starts and no number
-        // for it: cobc's guards (`child_guard`, `job_guard`) are not applied.
+        // On Windows std runs a program with this one's streams only to its
+        // end (`Command::status`), with no hook before it starts and no
+        // number for it: cobc's `job_guard` is not applied there.
         // What cbc wrote is out before the program writes (Rust's `print!`
         // writes at once; a CobaltC program's standard output is buffered).
         flush_stdout();
-        i32 st = Result::expect(Command::status(&Cmd::to_command(&cmd)), "run compiled program");
+        i32 st = if (raw_run)
+        {
+            // Unix: started as cobc's `child_guard` starts it, its arguments
+            // byte for byte.
+            Option::expect(run_raw(String::as_view(&exe), prog_first, cpu_limit(), seed), "run compiled program")
+        }
+        else
+        {
+            Result::expect(Command::status(&Cmd::to_command(&cmd)), "run compiled program")
+        };
         if (st < 0 && !Target::windows(Option::unwrap_or(host, Target::LinuxX64)))
         {
             if (st == -24)

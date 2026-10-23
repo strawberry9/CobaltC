@@ -960,6 +960,10 @@ fn is_std_key(ref<String, shared> key) : bool
 
 /// A `static_assert` (D-0052) to compute once the static pass accepts the
 /// program.
+// Where a diagnostic's line inside `std` begins: `STD_LINE + N` is line N of
+// the prelude (`PRELUDE_STD_ORIGINS` places it in `std`'s files).
+export const usize STD_LINE = 1099511627776;
+
 export struct StaticAssert
 {
     String key_code;
@@ -13340,12 +13344,14 @@ fn check_static_assert(
             .key_code = key,
             .cond = clone(&args[0]),
             .subst = clone(&b.subst),
-            // An assertion of `std`'s is reported at line 0, as coby's (whose
-            // `std` lines precede the program's).
+            // An assertion of `std`'s is reported at its prelude line past
+            // `STD_LINE`, apart from the program's lines (coby's `std` lines
+            // precede the program's): `line 0` in a dump, `<std>/FILE:LINE`
+            // in a report.
             .line = if (String::eq_str(
                 &b.module_,
                 "std",
-            ) || String::starts_with(&b.module_, "std::")) { 0 } else { args[0].line },
+            ) || String::starts_with(&b.module_, "std::")) { STD_LINE + args[0].line } else { args[0].line },
             .message = msg,
             .message_fmt = message_fmt,
         });
@@ -13762,10 +13768,12 @@ fn check_integer_intrinsic_operands(
                             f64 tr = trunc(x);
                             if (!is_finite(x) || tr < to_float<f64>(r.min) || tr > to_float<f64>(r.max))
                             {
+                                // Rust's `{}` of an f64: no `.0` on a whole number.
+                                String xs = rust_float_text(x);
                                 String msg = sprintf(
-                                    "`to_int<%s>` of %v does not fit (`%s` is %v to %v)",
+                                    "`to_int<%s>` of %s does not fit (`%s` is %v to %v)",
                                     &ts,
-                                    x,
+                                    &xs,
                                     &ts,
                                     r.min,
                                     r.max,
@@ -17689,4 +17697,95 @@ fn type_depth(ref<Type, shared> t) : usize
         _                : 0,
     };
     1 + inner
+}
+
+// An f64 as Rust's `{}` writes it (coby's messages): the shortest digits
+// that read back, never an exponent, no `.0` on a whole number.
+fn rust_float_text(f64 x) : String
+{
+    String v = sprintf("%v", x);
+    if (!is_finite(x))
+    {
+        return v;
+    }
+    StringView t = String::as_view(&v);
+    String out = String::new();
+    match (StringView::strip_prefix(t, "-"))
+    {
+        Some(r) :
+        {
+            String::push_ascii(&mut out, b'-');
+            t = r;
+        },
+        None    : {},
+    }
+    // Mantissa digits and the position of the point in them.
+    slice<u8, shared> b = StringView::as_bytes(t);
+    String digits = String::new();
+    i64 point = -1;
+    i64 exp = 0;
+    usize i = 0;
+    while (i < slice_len(b))
+    {
+        u8 c = b[i];
+        if (c == b'.')
+        {
+            point = narrow<i64>(String::len(&digits));
+        }
+        else if (c == b'e')
+        {
+            exp = Result::unwrap_or(StringView::parse<i64>(StringView::sub(t, i + 1, slice_len(b))), 0);
+            break;
+        }
+        else
+        {
+            String::push_ascii(&mut digits, c);
+        }
+        i += 1;
+    }
+    if (point < 0)
+    {
+        point = narrow<i64>(String::len(&digits));
+    }
+    point += exp;
+    ref<Vec<u8>, shared> d = String::as_bytes(&digits);
+    i64 n = narrow<i64>(Vec::len(d));
+    // Leading and trailing zeros of the digits do not count.
+    i64 lo = 0;
+    while (lo < n - 1 && d[narrow<usize>(lo)] == b'0' && lo < point - 1)
+    {
+        lo += 1;
+    }
+    i64 hi = n;
+    while (hi > lo + 1 && d[narrow<usize>(hi - 1)] == b'0' && hi > point)
+    {
+        hi -= 1;
+    }
+    if (point <= 0)
+    {
+        String::push_ascii(&mut out, b'0');
+        String::push_ascii(&mut out, b'.');
+        for (i64 k = point; k < 0; k += 1)
+        {
+            String::push_ascii(&mut out, b'0');
+        }
+        for (i64 k = lo; k < hi; k += 1)
+        {
+            String::push_ascii(&mut out, d[narrow<usize>(k)]);
+        }
+        return out;
+    }
+    for (i64 k = lo; k < point; k += 1)
+    {
+        String::push_ascii(&mut out, if (k < hi) { d[narrow<usize>(k)] } else { b'0' });
+    }
+    if (hi > point)
+    {
+        String::push_ascii(&mut out, b'.');
+        for (i64 k = point; k < hi; k += 1)
+        {
+            String::push_ascii(&mut out, d[narrow<usize>(k)]);
+        }
+    }
+    out
 }

@@ -8030,3 +8030,27 @@ crossing to C by value.
   had one: a `match` on it bound an untyped payload, and `a == "x"` on a `String` binder faulted
   `diag.read-of-resource` at run time, under `coby` and `cobc`. It has the `then` branch's type now, in the
   static pass and in the one written in CobaltC. `CHG-0369`, `conf.if-variant-else-branch-takes-sibling-type`.
+- D-0276: `cbc` (`impl/selfhost/cbc/`, `back/`) is `cobc` written in CobaltC and replaces it as the compiler
+  the project is built and verified with. Every optimisation D-0274 switched off is ported (closures' forms,
+  fused scrutinees, unstored and direct reference parameters, holder confinement, the native `std` bodies,
+  the local analyses, dual and frozen bodies, the call shortcuts, the per-expression proofs, the text
+  passes), level by level against `cobc` at `COBALTC_BOOTSTRAP_UPTO=N`, and so is the driver: every option,
+  the C compiler and linking, `--target`, `--lib`, `--unittest` and `--unittest-std`, `--run`, `--explore`,
+  `--report-tracking`, the object cache and the stale-runtime check. Its C is `cobc`'s, byte for byte, on
+  every tracked program in the default form, with `--all-checks`, `-g`, `--no-line-directives` and `--lib`,
+  and at every bootstrap level; it builds itself to a fixed point in the default form; `cobc`'s tests pass
+  with it (`COBC=PATH cargo test -p cobc`, every test of `cobc` now honouring `COBC`), under gcc and clang.
+  It compiles 15 to 25 times more slowly than `cobc`: the runtime's tracking, the next phase.
+- `cbc`'s driver needs a few things `std` does not give, in its own C (`cbc/host.c`): whether a stream is a
+  terminal, standard input gathered by a thread nothing waits for, a started program's guard, and on Unix
+  `--run`'s program started as `cobc` starts it (ended with `cbc`, `COBALTC_CPU_LIMIT`), with arguments
+  passed on byte for byte, UTF-8 or not.
+- `coby --prelude-summary` also writes where each prelude line came from (`PRELUDE_STD_ORIGINS`), so a
+  diagnostic inside `std` is placed `<std>/FILE:LINE` by the front end in CobaltC too, and `std`'s own tests
+  (their declarations and bodies), which `--unittest-std` runs.
+- The front end in CobaltC read the literal `1e400` as `0.0` instead of infinity (which
+  `[Literal-Out-Of-Range]` rejects), and wrote `to_int<i32>(1e20)`'s message with `1.0e20`-style text where
+  `coby` writes Rust's `{}`; both as `coby` now.
+- `selfhost/compare_c.sh` compares the default form unless `LEVEL=` says otherwise, and both drivers with
+  `FLAGS=`; the layout queries of the code generator in CobaltC borrow the declarations instead of copying
+  them (a fifth of its time on some programs).

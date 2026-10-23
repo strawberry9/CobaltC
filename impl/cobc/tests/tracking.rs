@@ -27,7 +27,7 @@ fn scratch(tag: &str) -> PathBuf {
 fn report(tag: &str, src: &str) -> std::collections::HashMap<usize, String> {
     let dir = scratch(tag);
     fs::write(dir.join("prog.cb"), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--report-tracking", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--report-tracking", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let _ = fs::remove_dir_all(&dir);
@@ -119,7 +119,7 @@ fn string_literals_keep_no_scopes() {
     for cc in oracle::c_compilers() {
         let dir = scratch(&format!("lit-{}", cc));
         fs::write(dir.join("prog.cb"), src).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--cc", cc, "--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
+        let out = Command::new(oracle::cobc_exe()).args(["--cc", cc, "--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
         let c = fs::read_to_string(dir.join("prog.c")).unwrap();
         // The definition's body: the line naming the function that is not
@@ -213,7 +213,7 @@ fn state_and_input_gets_a_dual_body_within_the_cap() {
     let big: String = (0..700).map(|k| format!("    a.n += widen<usize>(data[{}]);\n", k % 4)).collect();
     let src = format!("import std;\n\nstruct Acc\n{{\n    u64 sum;\n    usize n;\n}}\n\nfn feed(ref<Acc, exclusive> a, slice<u8, shared> data)\n{{\n    for (usize i = 0; i < slice_len(data); i += 1)\n    {{\n        a.sum += widen<u64>(data[i]);\n        a.n += 1;\n    }}\n}}\n\nfn feed_big(ref<Acc, exclusive> a, slice<u8, shared> data)\n{{\n{}}}\n\nfn main()\n{{\n    Vec<u8> v = Vec::filled(10, 3: u8);\n    Acc a = Acc {{ .sum = 0, .n = 0 }};\n    feed(&mut a, &v[0..$]);\n    feed_big(&mut a, &v[2..6]);\n    printf(\"%v %v\\n\", a.sum, a.n);\n}}\n", big);
     fs::write(dir.join("prog.cb"), &src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let c = fs::read_to_string(dir.join("prog.c")).unwrap();
     let defines = |name: &str| c.lines().any(|l| !l.ends_with(';') && l.contains(&format!(" {}(", name)));
@@ -247,7 +247,7 @@ fn struct_field_loop_gets_a_dual_body() {
     let dir = scratch("fielddual");
     let src = "import std;\n\nstruct G\n{\n    Vec<i64> cells;\n    i64 total;\n}\n\nfn count(ref<Vec<i64>, shared> v) : usize\n{\n    Vec::len(v)\n}\n\nfn step(ref<G, exclusive> g)\n{\n    for (usize i = 0; i < Vec::len(&g.cells); i += 1)\n    {\n        g.cells[i] = g.cells[i] + 1;\n        g.total += g.cells[i];\n    }\n}\n\nfn other(ref<G, exclusive> g)\n{\n    for (usize i = 0; i < count(&g.cells); i += 1)\n    {\n        g.total += g.cells[i];\n    }\n}\n\nfn main()\n{\n    G g = G { .cells = Vec::filled(10, 1: i64), .total = 0 };\n    step(&mut g);\n    other(&mut g);\n    printf(\"%v\\n\", g.total);\n}\n";
     fs::write(dir.join("prog.cb"), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_cobc")).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+    let out = Command::new(oracle::cobc_exe()).args(["--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let c = fs::read_to_string(dir.join("prog.c")).unwrap();
     let defines = |name: &str| c.lines().any(|l| !l.ends_with(';') && l.contains(&format!(" {}(", name)));

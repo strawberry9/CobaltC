@@ -369,6 +369,31 @@ pub fn run_prelude_summary(tool: &str) -> u8 {
     }
     let float_fns: Vec<&str> = crate::typecheck::FLOAT_FNS.iter().chain(crate::typecheck::FLOAT2_FNS).map(|f| f.trim_start_matches("std::")).collect();
     let float_fns = float_fns.join(" ");
+    // Where each run of the prelude's lines came from in `std`'s files
+    // (`prelude::std_location`), for a diagnostic inside `std` itself: one
+    // record a line, `first_line file file_line count`.
+    let mut origins = String::new();
+    let mut run: Option<(usize, &str, usize, usize)> = None;
+    for n in 1..=crate::prelude::line_count() {
+        let at = crate::prelude::std_location(n);
+        let extends = match (&run, at) {
+            (Some((_, f, l, c)), Some((g, m))) => *f == g && l + c == m,
+            _ => false,
+        };
+        if extends {
+            if let Some(r) = run.as_mut() {
+                r.3 += 1;
+            }
+            continue;
+        }
+        if let Some((first, f, l, c)) = run.take() {
+            origins.push_str(&format!("{} {} {} {}\n", first, f, l, c));
+        }
+        run = at.map(|(f, l)| (n, f, l, 1));
+    }
+    if let Some((first, f, l, c)) = run {
+        origins.push_str(&format!("{} {} {} {}\n", first, f, l, c));
+    }
     // `text` as a CobaltC string literal, in pieces of about 100 bytes,
     // each ending at a character's end.
     let literal = |text: &str| -> String {
@@ -429,7 +454,12 @@ pub fn run_prelude_summary(tool: &str) -> u8 {
          // line, `key module line col fresh local_consts offset length`, into the\n\
          // texts.\n\
          export const str PRELUDE_BODY_INDEX =\n{};\n\
-         export const str PRELUDE_BODIES =\n{};\n",
+         export const str PRELUDE_BODIES =\n{};\n\
+         \n\
+         // Where the prelude's lines came from in `std`'s files\n\
+         // (`prelude::std_location`): one record a line, `first_line file\n\
+         // file_line count`.\n\
+         export const str PRELUDE_STD_ORIGINS =\n{};\n",
         literal(&skel),
         st.fresh,
         st.local_consts,
@@ -440,7 +470,8 @@ pub fn run_prelude_summary(tool: &str) -> u8 {
         literal(&all_intrinsics),
         literal(&dynamic),
         literal(&index),
-        literal(&texts)
+        literal(&texts),
+        literal(&origins)
     );
     0
 }
