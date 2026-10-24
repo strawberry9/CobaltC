@@ -1,0 +1,2381 @@
+// `std::collections` (spec/21 §1, §1b, §2g, §2i): `Vec`, with its sorting,
+// `HashMap`, `HashSet`, `Queue` and `PriorityQueue`; integers as bytes and
+// back (`Vec::push_le`/`push_be`, `read_le`/`read_be`, D-0119, D-0177).
+
+/// A growable array of `T`, owning its elements.
+///
+/// `v[i]` reads or writes element `i` (`index_out_of_bounds` past the end), `&v[lo..hi]` is a slice of it,
+/// and `foreach` visits it by value, `&v` or `&mut v`. A reference to an element is stale after a `push`
+/// that reallocates. Dropping a `Vec` destroys its elements, first to last, then frees its buffer.
+export resource struct Vec<T>
+{
+    rawptr<T> ptr;
+    usize len;
+    usize cap;
+}
+
+/// A new, empty `Vec`; nothing is allocated until it first grows.
+export fn Vec::new<T>() : Vec<T>
+{
+    Vec { .ptr = dangling<T>(), .len = 0, .cap = 0 }
+}
+
+/// The number of elements in `v`.
+export fn Vec::len<T>(ref<Vec<T>, shared> v) : usize
+{
+    v.len
+}
+
+// trusted: [Rawptr-Write]/[Rawptr-Move-In] at index len: len < cap after grow, so the slot lies inside the buffer allocate returned, and no element object is established there (pop and take_raw release theirs).
+/// Appends `x` to the end of `v`.
+///
+/// Amortised constant time: when the buffer is full it is reallocated at twice its capacity, and references
+/// to elements held across that are stale at their next use. Faults (`alloc_failure`) when memory runs out.
+export fn Vec::push<T>(ref<Vec<T>, exclusive> v, T x)
+{
+    if (v.len == v.cap)
+    {
+        Vec::grow(v);
+    }
+    unsafe
+    {
+        *(v.ptr + reinterpret<isize>(v.len)) = x;
+    }
+    v.len = v.len + 1;
+}
+
+// trusted: [Rawptr-Read]/[Rawptr-Move-Out] then [Release] of the last slot: index len, after the decrement, is the element push wrote last. A path to its element object does not clash with the &mut v argument (the element is an object of its own): one this thread holds ends with the [Release] and is stale at its next use (spec/08 §4 H5); one another thread holds exclusively makes the [Release] fault before the value read is used (D-0214), so no other thread writes the cell meanwhile.
+/// Removes the last element of `v` and returns it; `None` when `v` is empty.
+export fn Vec::pop<T>(ref<Vec<T>, exclusive> v) : Option<T>
+{
+    if (v.len == 0)
+    {
+        return None;
+    }
+    v.len = v.len - 1;
+    unsafe
+    {
+        rawptr<T> p = v.ptr + reinterpret<isize>(v.len);
+        auto x = *p;
+        release(reinterpret_ptr<u8>(p), sizeof<T>());
+        Some(x)
+    }
+}
+
+// trusted: [Reclaim] of slot i: i < len was checked just above; the cells lie inside the buffer and hold the element push wrote there; a reclaimed object already there is re-attached, not re-established.
+/// The element at index `i` of `v`, as a shared reference; what `v[i]` reads, so programs write `v[i]`.
+///
+/// Faults (`index_out_of_bounds`) when `i >= len`.
+export fn Vec::index_shared<T>(ref<Vec<T>, shared> v, usize i) : ref<T, shared>
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    unsafe
+    {
+        &reclaim<T>(v.ptr + reinterpret<isize>(i))
+    }
+}
+
+// trusted: [Reclaim] of slot i, as index_shared: i < len was checked just above.
+/// The element at index `i` of `v`, as an exclusive reference; what `v[i]` is when it is written, so
+/// programs write `v[i]`.
+///
+/// Faults (`index_out_of_bounds`) when `i >= len`. A live slice of `v` holding `i` conflicts with it.
+export fn Vec::index_exclusive<T>(ref<Vec<T>, exclusive> v, usize i) : ref<T, exclusive>
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    // D-0222: element i of `*v` is accessed exclusively through `v`, as `[Index-Vec]` checks `(*v)[i]`
+    // written: a live shared path to the vector, or a slice holding i, meets it.
+    _ = &mut (*v)[i .. i + 1];
+    unsafe
+    {
+        &mut reclaim<T>(v.ptr + reinterpret<isize>(i))
+    }
+}
+
+// trusted: [Copy-Raw] into the range allocate just returned, fresh and overlapping nothing live; [Deallocate] of (ptr, cap * sizeof, align), exactly what the previous grow or reserve allocated and nobody has freed, which ends the element objects over the old buffer and faults if another thread holds an exclusive path to one (D-0214).
+fn Vec::grow<T>(ref<Vec<T>, exclusive> v)
+{
+    usize new_cap = if (v.cap == 0)
+    {
+        4
+    }
+    else
+    {
+        v.cap * 2
+    };
+    usize bytes = new_cap * sizeof<T>();
+    rawptr<u8> p = match (allocate(bytes, alignof<T>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<u8> old = reinterpret_ptr<u8>(v.ptr);
+    usize old_cap = v.cap;
+    unsafe
+    {
+        copy_raw(p, old, v.len * sizeof<T>());
+    }
+    // The two checked writes before the old cells go (CHG-0332): a write
+    // that faults (this exclusive path's first write meeting a shared path
+    // of the same `Vec`, D-0022) leaves `v` as it was, so the unwind's
+    // `Vec::drop` frees the old cells once; the new block is then lost
+    // with the thread.
+    v.ptr = reinterpret_ptr<T>(p);
+    v.cap = new_cap;
+    unsafe
+    {
+        if (old_cap > 0)
+        {
+            deallocate(old, old_cap * sizeof<T>(), alignof<T>());
+        }
+    }
+}
+
+// D-0129: room for `n` more elements: afterwards `cap >= len + n`. Grows
+// at most once, to the larger of `len + n` and twice the capacity (as
+// `push` grows, so that small reserves in a loop stay amortized); never
+// shrinks, never changes the length or the elements. `len + n`
+// overflowing is `diag.arith-overflow`, before anything is allocated.
+// trusted: [Copy-Raw] and [Deallocate] as grow: the new range is fresh, the old one is the previous allocation.
+/// Makes room for `n` more elements: afterwards the capacity is at least `len + n`.
+///
+/// Grows at most once, to the larger of `len + n` and twice the capacity, so small reserves in a loop stay
+/// amortised; never shrinks and never changes the length or the elements. It changes only how fast a
+/// program runs. `len + n` overflowing is `diag.arith-overflow`, before anything is allocated.
+export fn Vec::reserve<T>(ref<Vec<T>, exclusive> v, usize n)
+{
+    usize need = v.len + n;
+    if (need <= v.cap)
+    {
+        return;
+    }
+    usize new_cap = if (v.cap > need - v.cap)
+    {
+        v.cap * 2
+    }
+    else
+    {
+        need
+    };
+    usize bytes = new_cap * sizeof<T>();
+    rawptr<u8> p = match (allocate(bytes, alignof<T>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<u8> old = reinterpret_ptr<u8>(v.ptr);
+    usize old_cap = v.cap;
+    unsafe
+    {
+        copy_raw(p, old, v.len * sizeof<T>());
+    }
+    // The two checked writes before the old cells go (CHG-0332): a write
+    // that faults (this exclusive path's first write meeting a shared path
+    // of the same `Vec`, D-0022) leaves `v` as it was, so the unwind's
+    // `Vec::drop` frees the old cells once; the new block is then lost
+    // with the thread.
+    v.ptr = reinterpret_ptr<T>(p);
+    v.cap = new_cap;
+    unsafe
+    {
+        if (old_cap > 0)
+        {
+            deallocate(old, old_cap * sizeof<T>(), alignof<T>());
+        }
+    }
+}
+
+// trusted: [Reclaim] of each slot below len, as index_shared, to destroy its element; then [Deallocate] of the buffer, the Vec's one deallocation, under [Destroy]'s single-use authority.
+/// Destroys every element of `self`, first to last, then frees the buffer; the destructor run when a `Vec`
+/// goes out of scope, not called by programs.
+export fn Vec::drop<T>(ref<Vec<T>, exclusive> self)
+{
+    usize mut_i = 0;
+    while (mut_i < self.len)
+    {
+        unsafe
+        {
+            drop(reclaim<T>(self.ptr + reinterpret<isize>(mut_i)));
+        }
+        mut_i = mut_i + 1;
+    }
+    if (self.cap > 0)
+    {
+        unsafe
+        {
+            deallocate(reinterpret_ptr<u8>(self.ptr), self.cap * sizeof<T>(), alignof<T>());
+        }
+    }
+}
+
+// Sorting and searching (`rule.stdlib.sort`, spec/21 §1b, D-0062). The
+// order `Vec::sort` and `Vec::binary_search` use: `key_less`, the key
+// types' own (integers by value, `false` before `true`, text by its
+// bytes), as a `fn` value.
+fn key_before<T>(ref<T, shared> a, ref<T, shared> b) : bool
+{
+    key_less(a, b)
+}
+
+// The positions 0..n of `v` in the order `less` gives, equal elements in
+// their original order: a bottom-up merge sort of positions, which reads
+// the elements only through shared references.
+fn Vec::sorted_order<T>(ref<Vec<T>, shared> v, fn(ref<T, shared>, ref<T, shared>) : bool less) : Vec<usize>
+{
+    usize n = v.len;
+    Vec<usize> a = Vec::new();
+    Vec<usize> b = Vec::new();
+    usize i = 0;
+    while (i < n)
+    {
+        Vec::push(&mut a, i);
+        Vec::push(&mut b, 0);
+        i += 1;
+    }
+    usize width = 1;
+    while (width < n)
+    {
+        usize lo = 0;
+        while (lo < n)
+        {
+            usize mid = if (n - lo > width)
+            {
+                lo + width
+            }
+            else
+            {
+                n
+            };
+            usize hi = if (n - mid > width)
+            {
+                mid + width
+            }
+            else
+            {
+                n
+            };
+            usize l = lo;
+            usize r = mid;
+            usize k = lo;
+            while (k < hi)
+            {
+                // From the left run unless the right one's element is
+                // strictly less: equal elements keep their order.
+                bool take_left = l < mid && (r >= hi || !less(Vec::index_shared(v, a[r]), Vec::index_shared(v, a[l])));
+                if (take_left)
+                {
+                    b[k] = a[l];
+                    l += 1;
+                }
+                else
+                {
+                    b[k] = a[r];
+                    r += 1;
+                }
+                k += 1;
+            }
+            lo = hi;
+        }
+        swap(&mut a, &mut b);
+        width = if (width > n)
+        {
+            n
+        }
+        else
+        {
+            width * 2
+        };
+    }
+    a
+}
+
+// `sorted_order` in the key types' own order, comparing elements in
+// place (`key_less_at`) rather than through a reference to each.
+fn Vec::sorted_order_keys<T>(ref<Vec<T>, shared> v) : Vec<usize>
+{
+    usize n = v.len;
+    Vec<usize> a = Vec::new();
+    Vec<usize> b = Vec::new();
+    usize i = 0;
+    while (i < n)
+    {
+        Vec::push(&mut a, i);
+        Vec::push(&mut b, 0);
+        i += 1;
+    }
+    usize width = 1;
+    while (width < n)
+    {
+        usize lo = 0;
+        while (lo < n)
+        {
+            usize mid = if (n - lo > width)
+            {
+                lo + width
+            }
+            else
+            {
+                n
+            };
+            usize hi = if (n - mid > width)
+            {
+                mid + width
+            }
+            else
+            {
+                n
+            };
+            usize l = lo;
+            usize r = mid;
+            usize k = lo;
+            while (k < hi)
+            {
+                bool take_left = l < mid && (r >= hi || !key_less_at(v, a[r], a[l]));
+                if (take_left)
+                {
+                    b[k] = a[l];
+                    l += 1;
+                }
+                else
+                {
+                    b[k] = a[r];
+                    r += 1;
+                }
+                k += 1;
+            }
+            lo = hi;
+        }
+        swap(&mut a, &mut b);
+        width = if (width > n)
+        {
+            n
+        }
+        else
+        {
+            width * 2
+        };
+    }
+    a
+}
+
+// Moves every element of `v` once, into the order `order` gives.
+fn Vec::apply_order<T>(ref<Vec<T>, exclusive> v, ref<Vec<usize>, shared> order)
+{
+    Vec<T> out = Vec::new();
+    foreach (p in order)
+    {
+        Vec::push(&mut out, Vec::take_raw(v, *p));
+    }
+    v.len = 0;
+    swap(v, &mut out);
+}
+
+// Sorts `v` by `less` (true when its first argument goes before its
+// second), keeping equal elements in their order.
+/// Sorts `v` by `less`, which is true when its first argument goes before its second.
+///
+/// Stable: equal elements (neither before the other) keep their order. Each element moves once.
+/// `less` must be a strict weak order (never `less(a, a)`, transitive); with one that is not, the elements
+/// end as a permutation of what they were, in an unspecified order. For a key type `Vec::sort` needs no
+/// `less`.
+export fn Vec::sort_by<T>(ref<Vec<T>, exclusive> v, fn(ref<T, shared>, ref<T, shared>) : bool less)
+{
+    if (v.len < 2)
+    {
+        return;
+    }
+    Vec<usize> order = Vec::sorted_order(v, less);
+    Vec::apply_order(v, &order);
+}
+
+/// Elements `less` calls equal keep their order.
+unittest "Vec::sort_by: stable"
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 13);
+    Vec::push(&mut v, 21);
+    Vec::push(&mut v, 12);
+    Vec::push(&mut v, 25);
+    Vec::sort_by(&mut v, [](ref<i32, shared> a, ref<i32, shared> b) : bool { *a / 10 < *b / 10 });
+    assert(v[0] == 13 && v[1] == 12 && v[2] == 21 && v[3] == 25);
+}
+
+// Sorts `v` in its elements' own order; `T` a key type (integers, `bool`,
+// `str`, `String`).
+/// Sorts `v` in its elements' own order, keeping equal elements in their order.
+///
+/// `T` must be a key type: integers by value, `false` before `true`, `str` and `String` by their bytes (a
+/// prefix first), a struct field by field, an enum by the order its variants are declared in, then by
+/// payload. Any other `T` is rejected at compile time; use `Vec::sort_by` for those.
+export fn Vec::sort<T>(ref<Vec<T>, exclusive> v)
+{
+    if (v.len < 2)
+    {
+        return;
+    }
+    Vec<usize> order = Vec::sorted_order_keys(v);
+    Vec::apply_order(v, &order);
+}
+
+// In a `v` sorted by `less`: Ok(i), i the first position holding an
+// element equal to `key` (neither goes before the other), or Err(i), the
+// position where `key` would go.
+/// Searches `v`, sorted by `less`, for `key`.
+///
+/// Returns `Ok(i)` with `i` the first position whose element is equal to `key` (neither goes before the
+/// other), or `Err(i)` with `i` the position where `key` would be inserted to keep `v` sorted. `v` must be
+/// sorted by the same `less`, or the result is unspecified.
+export fn Vec::binary_search_by<T>(
+    ref<Vec<T>, shared> v,
+    ref<T, shared> key,
+    fn(ref<T, shared>, ref<T, shared>) : bool less,
+) : Result<usize, usize>
+{
+    usize lo = 0;
+    usize hi = v.len;
+    while (lo < hi)
+    {
+        usize mid = lo + (hi - lo) / 2;
+        if (less(Vec::index_shared(v, mid), key))
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    if (lo < v.len && !less(key, Vec::index_shared(v, lo)))
+    {
+        return Ok(lo);
+    }
+    Err(lo)
+}
+
+// `binary_search_by` in the elements' own order; `T` a key type.
+/// Searches `v`, sorted in its elements' own order, for `key`.
+///
+/// `T` a key type, as for `Vec::sort`. `Ok(i)` for the first position holding an element equal to `key`,
+/// otherwise `Err(i)`, the position where `key` would go.
+export fn Vec::binary_search<T>(ref<Vec<T>, shared> v, ref<T, shared> key) : Result<usize, usize>
+{
+    Vec::binary_search_by(v, key, key_before<T>)
+}
+
+/// `Ok` gives the first equal element, `Err` the place a missing key would go.
+unittest "Vec::binary_search: found and missing"
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 10);
+    Vec::push(&mut v, 20);
+    Vec::push(&mut v, 20);
+    Vec::push(&mut v, 30);
+    i32 present = 20;
+    i32 absent = 25;
+    assert(Result::unwrap_or(Vec::binary_search(&v, &present), 99) == 1);
+    match (Vec::binary_search(&v, &absent))
+    {
+        Ok(_)  : assert(false),
+        Err(i) : assert(i == 3),
+    }
+}
+
+// Puts x in slot i of v and returns what was there. Private to `std`:
+// `HashMap::insert` replaces a value with it.
+// trusted: [Rawptr-Read]/[Rawptr-Move-Out], [Release] and [Rawptr-Write]/[Rawptr-Move-In] of slot i: the caller checked i < len; the old element is moved out and its object released before the new one is written, the [Release] faulting if another thread holds an exclusive path to it (D-0214).
+fn Vec::replace<T>(ref<Vec<T>, exclusive> v, usize i, T x) : T
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    unsafe
+    {
+        rawptr<T> p = v.ptr + reinterpret<isize>(i);
+        auto old = *p;
+        release(reinterpret_ptr<u8>(p), sizeof<T>());
+        *p = x;
+        old
+    }
+}
+
+// Takes element i out of v; the elements after it keep their order
+// (they come off the end and go back on). Private to `std`:
+// `HashMap::remove` and `swap_remove` use it.
+fn Vec::remove_at<T>(ref<Vec<T>, exclusive> v, usize i) : T
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    Vec<T> later = Vec::new();
+    while (v.len > i + 1)
+    {
+        match (Vec::pop(v))
+        {
+            Some(x) :
+            {
+                Vec::push(&mut later, x);
+            },
+            None    :
+            {
+            },
+        }
+    }
+    auto taken = match (Vec::pop(v))
+    {
+        Some(x) : x,
+        None    : fault(index_out_of_bounds),
+    };
+    while (Vec::len(&later) > 0)
+    {
+        match (Vec::pop(&mut later))
+        {
+            Some(x) :
+            {
+                Vec::push(v, x);
+            },
+            None    :
+            {
+            },
+        }
+    }
+    taken
+}
+
+// Moves element i out of v, leaving its slot empty. Private to `std`:
+// only a holder that sets `len` to 0 before the Vec is destroyed may use
+// it (`Drain`, `HashDrain`).
+// trusted: [Rawptr-Read]/[Rawptr-Move-Out] and [Release] of slot i: the callers pass i < len and overwrite the slot or shorten the Vec past it before any read of it; the [Release] faults if another thread holds an exclusive path to the element (D-0214).
+fn Vec::take_raw<T>(ref<Vec<T>, exclusive> v, usize i) : T
+{
+    unsafe
+    {
+        rawptr<T> p = v.ptr + reinterpret<isize>(i);
+        auto x = *p;
+        release(reinterpret_ptr<u8>(p), sizeof<T>());
+        x
+    }
+}
+
+// Empties v: its elements are destroyed in order, first to last, as
+// the Vec's own destructor would; its buffer is kept for reuse (D-0044).
+/// Removes every element of `v`, destroying them first to last; the buffer is kept for reuse.
+export fn Vec::clear<T>(ref<Vec<T>, exclusive> v)
+{
+    usize i = 0;
+    while (i < v.len)
+    {
+        drop(Vec::take_raw(v, i));
+        i = i + 1;
+    }
+    v.len = 0;
+}
+
+// A consumed Vec that `foreach` takes elements from in order
+// (`rule.control.foreach`, spec/14, D-0042). The elements not yet taken
+// when the loop ends are destroyed with it.
+resource struct Drain<T>
+{
+    Vec<T> v;
+    usize next;
+}
+
+fn Vec::drain<T>(Vec<T> v) : Drain<T>
+{
+    Drain { .v = v, .next = 0 }
+}
+
+fn Drain::total<T>(ref<Drain<T>, shared> d) : usize
+{
+    d.v.len
+}
+
+fn Drain::take<T>(ref<Drain<T>, exclusive> d) : T
+{
+    auto x = Vec::take_raw(&mut d.v, d.next);
+    d.next = d.next + 1;
+    x
+}
+
+fn Drain::drop<T>(ref<Drain<T>, exclusive> self)
+{
+    while (self.next < self.v.len)
+    {
+        drop(Vec::take_raw(&mut self.v, self.next));
+        self.next = self.next + 1;
+    }
+    self.v.len = 0;                 // every element is gone: the Vec frees only its buffer
+}
+
+// `Vec`'s helpers (D-0073, D-0082, D-0085, D-0112), beside its other
+// functions (D-0134).
+// D-0073: `x` placed at index `i` (0 ≤ i ≤ len), the elements from `i`
+// on moving up one; and the element at `i` taken out, those after it
+// moving down one. Each moves by `Vec::swap`, so no element is copied.
+/// Inserts `x` at index `i`, moving the elements from `i` on up by one.
+///
+/// `i` may equal `len`, which appends. Faults (`index_out_of_bounds`) when `i > len`. Linear in the number
+/// of elements after `i`; no element is copied.
+export fn Vec::insert<T>(ref<Vec<T>, exclusive> v, usize i, T x)
+{
+    if (i > v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    Vec::push(v, x);
+    usize k = v.len - 1;
+    while (k > i)
+    {
+        Vec::swap(v, k - 1, k);
+        k = k - 1;
+    }
+}
+
+/// Inserting at an index moves later elements up; inserting at `len` appends.
+unittest "Vec::insert: middle and end"
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 3);
+    Vec::insert(&mut v, 1, 2);
+    Vec::insert(&mut v, 3, 4);
+    assert(Vec::len(&v) == 4);
+    assert(v[0] == 1 && v[1] == 2 && v[2] == 3 && v[3] == 4);
+}
+
+/// Removes the element at index `i` and returns it, moving the elements after it down by one.
+///
+/// Keeps the order and takes time linear in the elements after `i`; `Vec::swap_remove` takes constant time
+/// but does not keep the order. Faults (`index_out_of_bounds`) when `i >= len`.
+export fn Vec::remove<T>(ref<Vec<T>, exclusive> v, usize i) : T
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    usize k = i;
+    while (k + 1 < v.len)
+    {
+        Vec::swap(v, k, k + 1);
+        k = k + 1;
+    }
+    match (Vec::pop(v))
+    {
+        Some(x) : x,
+        None    : fault(index_out_of_bounds),
+    }
+}
+
+// D-0193: the element at i taken out and the last element moved into its
+// place, so the order is not kept and nothing else moves; i < len.
+/// Removes the element at index `i` and returns it, moving the last element into its place.
+///
+/// Constant time, but the order is not kept; `Vec::remove` keeps it. Faults (`index_out_of_bounds`) when
+/// `i >= len`.
+export fn Vec::swap_remove<T>(ref<Vec<T>, exclusive> v, usize i) : T
+{
+    if (i >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    usize last = v.len - 1;
+    Vec::swap(v, i, last);
+    match (Vec::pop(v))
+    {
+        Some(x) : x,
+        None    : fault(index_out_of_bounds),
+    }
+}
+
+/// `remove` keeps the order; `swap_remove` moves the last element into the gap.
+unittest "Vec::swap_remove: order not kept"
+{
+    Vec<i32> a = Vec::new();
+    Vec::push(&mut a, 1);
+    Vec::push(&mut a, 2);
+    Vec::push(&mut a, 3);
+    Vec::push(&mut a, 4);
+    Vec<i32> b = Vec::clone(&a);
+    assert(Vec::remove(&mut a, 0) == 1);
+    assert(a[0] == 2 && a[1] == 3 && a[2] == 4);
+    assert(Vec::swap_remove(&mut b, 0) == 1);
+    assert(b[0] == 4 && b[1] == 2 && b[2] == 3);
+}
+
+// D-0082: a copy of v. `clone` copies each element, so `T` owns nothing
+// (checked at the call); `clone_by` makes each copy with `copy`.
+/// A new `Vec` holding a copy of each element of `v`, in order.
+///
+/// `T` must be `clone` (owning nothing); for other element types use `Vec::clone_by`.
+export fn Vec::clone<T: clone>(ref<Vec<T>, shared> v) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    for (usize i = 0; i < v.len; i += 1)
+    {
+        Vec::push(&mut out, clone(Vec::index_shared(v, i)));
+    }
+    out
+}
+
+// D-0085: a new Vec holding a copy of each element of a slice (a plain
+// element type, as for `Vec::clone`).
+/// A new `Vec` holding a copy of each element of `s`, in order.
+///
+/// `T` must be `clone`. The buffer is allocated once, at the slice's length.
+export fn Vec::from_slice<T: clone>(slice<T, shared> s) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    Vec::reserve(&mut out, slice_len(s));
+    for (usize i = 0; i < slice_len(s); i += 1)
+    {
+        Vec::push(&mut out, clone(&s[i]));
+    }
+    out
+}
+
+// D-0085: the first `n` elements stay; the rest are destroyed, last
+// first. `n` at or beyond the length leaves `v` unchanged.
+/// Keeps the first `n` elements of `v` and destroys the rest, last first.
+///
+/// `n` at or beyond the length leaves `v` unchanged.
+export fn Vec::truncate<T>(ref<Vec<T>, exclusive> v, usize n)
+{
+    while (v.len > n)
+    {
+        drop(Vec::pop(v));
+    }
+}
+
+/// A length beyond the end leaves the `Vec` unchanged.
+unittest "Vec::truncate: beyond the end"
+{
+    Vec<i32> v = Vec::filled(3, 7);
+    Vec::truncate(&mut v, 10);
+    assert(Vec::len(&v) == 3);
+    Vec::truncate(&mut v, 1);
+    assert(Vec::len(&v) == 1);
+}
+
+/// A new `Vec` holding `copy(&x)` for each element `x` of `v`, in order.
+///
+/// For element types that are not `clone`; `copy` makes each new element.
+export fn Vec::clone_by<T>(ref<Vec<T>, shared> v, fn(ref<T, shared>) : T copy) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    for (usize i = 0; i < v.len; i += 1)
+    {
+        Vec::push(&mut out, copy(Vec::index_shared(v, i)));
+    }
+    out
+}
+
+// D-0112: the loops every program wrote. `filled` and `extend_from` copy
+// each element with `clone` (D-0116), so `T` must be `clone`; `from_fn`
+// and `append` serve the rest.
+/// A new `Vec` of `n` copies of `x`.
+///
+/// `T` must be `clone`; `Vec::from_fn` builds elements that are not.
+export fn Vec::filled<T: clone>(usize n, T x) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut out, clone(&x));
+    }
+    out
+}
+
+/// `n` elements of plain data copied from C memory into a `Vec`: a buffer a
+/// C caller owns, taken as a value the checks then cover (D-0257). Called
+/// inside `unsafe { }` (`[Trusted-Call]`): the caller vouches that the `n`
+/// elements at `p` are readable and stay put for the call.
+export fn Vec::from_raw<T: plain>(rawptr<T> p, usize n) : Vec<T>
+{
+    if (n > 0 && p == null_rawptr<T>())
+    {
+        fault(null_pointer);
+    }
+    Vec<T> out = Vec::new();
+    Vec::reserve(&mut out, n);
+    // trusted: [Copy-Raw] of n * sizeof<T>() bytes from `p`, the caller's assertion in its `unsafe` that the n elements at `p` are readable and stay put (a [Trusted-Call], spec/20 §1), into the range `Vec::reserve` just allocated, fresh and overlapping nothing live; T is `plain`, so the bytes are the elements.
+    unsafe
+    {
+        copy_raw(reinterpret_ptr<u8>(out.ptr), reinterpret_ptr<u8>(p), n * sizeof<T>());
+    }
+    out.len = n;
+    out
+}
+
+// D-0252: one of the two calls of `std` written only inside `unsafe`
+// (`spec/20` §1, the trusted-call list), because it reads where `p`
+// points.
+// trusted: [Rawptr-Read] of each byte from `p` to its NUL, the caller's assertion in its `unsafe` that `p` points at readable bytes ending in a NUL; [Copy-Raw] into the range `Vec::reserve` just allocated, fresh and overlapping nothing live.
+/// A copy of the bytes C's text at `p` holds, up to and without its NUL.
+///
+/// Called only inside `unsafe`: `p` must point at readable bytes ending in a NUL, as a C function's `char *`
+/// result does. A null `p` faults (`null_pointer`); test with `is_null` first when C may return `NULL`.
+/// `String::from_c` also checks that the bytes are UTF-8.
+export fn Vec::from_c_bytes(rawptr<u8> p) : Vec<u8>
+{
+    if (p == null_rawptr<u8>())
+    {
+        fault(null_pointer);
+    }
+    usize n = 0;
+    while (true)
+    {
+        u8 b = unsafe
+        {
+            *(p + reinterpret<isize>(n))
+        };
+        if (b == 0)
+        {
+            break;
+        }
+        n += 1;
+    }
+    Vec<u8> out = Vec::new();
+    Vec::reserve(&mut out, n);
+    unsafe
+    {
+        copy_raw(reinterpret_ptr<u8>(out.ptr), p, n);
+    }
+    out.len = n;
+    out
+}
+
+/// A new `Vec` of `f(0), f(1), …, f(n - 1)`, called in that order.
+///
+/// Works for any `T`, including resources.
+export fn Vec::from_fn<T>(usize n, fn(usize) : T f) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut out, f(i));
+    }
+    out
+}
+
+/// Building a `Vec` from its indices, then keeping the even elements.
+unittest "Vec::from_fn: with retain"
+{
+    Vec<i32> v = Vec::from_fn(6, [](usize i) : i32 { narrow<i32>(i) });
+    Vec::retain(&mut v, [](ref<i32, shared> x) : bool { *x % 2 == 0 });
+    assert(Vec::len(&v) == 3);
+    assert(v[0] == 0 && v[1] == 2 && v[2] == 4);
+}
+
+/// Moves every element of `b` onto the end of `a`, in order; `b` is consumed.
+export fn Vec::append<T>(ref<Vec<T>, exclusive> a, Vec<T> b)
+{
+    foreach (x in b)
+    {
+        Vec::push(a, x);
+    }
+}
+
+/// Appends a copy of each element of `s` to the end of `a`, in order.
+///
+/// `T` must be `clone`. A slice of `a` itself is rejected (`diag.aliasing-conflict`).
+export fn Vec::extend_from<T: clone>(ref<Vec<T>, exclusive> a, slice<T, shared> s)
+{
+    for (usize i = 0; i < slice_len(s); i += 1)
+    {
+        Vec::push(a, clone(&s[i]));
+    }
+}
+
+/// The index of the first element for which `p` returns true; `None` when there is none.
+///
+/// `p` is called in index order and not past the first hit. `Vec::index_of` looks for an equal element.
+export fn Vec::position<T>(ref<Vec<T>, shared> v, fn(ref<T, shared>) : bool p) : Option<usize>
+{
+    for (usize i = 0; i < v.len; i += 1)
+    {
+        if (p(Vec::index_shared(v, i)))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `position` takes a predicate, `index_of` a value; both find the first match.
+unittest "Vec::position: first match"
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 4);
+    Vec::push(&mut v, 9);
+    Vec::push(&mut v, 6);
+    assert(Option::unwrap(Vec::position(&v, [](ref<i32, shared> x) : bool { *x > 5 })) == 1);
+    i32 six = 6;
+    assert(Option::unwrap(Vec::index_of(&v, &six)) == 2);
+    assert(Option::is_none(&Vec::position(&v, [](ref<i32, shared> x) : bool { *x > 9 })));
+}
+
+// D-0205: whether `a` and `b` hold equal elements in the same order (a
+// `Vec`'s through `&v[0..$]`, an array's, a view's bytes).
+/// Whether `a` and `b` have the same length and equal elements in the same order.
+///
+/// Elements are compared with `==` in index order, stopping at the first difference. Slices have no `==`
+/// of their own; a `Vec` is passed as `&v[0..$]`, an array as `&a[0..$]`.
+export fn slice_eq<T: eq>(slice<T, shared> a, slice<T, shared> b) : bool
+{
+    if (slice_len(a) != slice_len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        if (!(a[i] == b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `Vec` and an array compare equal when their elements do.
+unittest "slice_eq: Vec and array"
+{
+    Vec<u8> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 2);
+    array<u8, 2> a = [1, 2];
+    assert(slice_eq(&v[0..$], &a[0..$]));
+    assert(!slice_eq(&v[0..1], &a[0..$]));
+}
+
+/// The index of the first element equal to `*x`; `None` when there is none.
+export fn Vec::index_of<T: eq>(ref<Vec<T>, shared> v, ref<T, shared> x) : Option<usize>
+{
+    for (usize i = 0; i < v.len; i += 1)
+    {
+        if (*Vec::index_shared(v, i) == *x)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Whether `v` has an element equal to `*x`.
+export fn Vec::contains<T: eq>(ref<Vec<T>, shared> v, ref<T, shared> x) : bool
+{
+    match (Vec::index_of(v, x))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+// D-0112: the order inverted in place.
+/// Reverses the order of the elements of `v` in place; nothing is copied or destroyed.
+export fn Vec::reverse<T>(ref<Vec<T>, exclusive> v)
+{
+    usize n = v.len;
+    for (usize i = 0; i < n / 2; i += 1)
+    {
+        Vec::swap(v, i, n - 1 - i);
+    }
+}
+
+// D-0181: keeps the elements `keep` says to, in their order, and
+// destroys the rest. `keep` is called once per element, in index order,
+// before any is destroyed; the kept elements move down by `Vec::swap`, so
+// none is copied.
+/// Keeps the elements for which `keep` returns true, in their order, and destroys the rest.
+///
+/// `keep` is called once per element, in index order, before any element is destroyed. The kept elements
+/// are moved down, not copied; the removed ones are destroyed last first.
+export fn Vec::retain<T>(ref<Vec<T>, exclusive> v, fn(ref<T, shared>) : bool keep)
+{
+    usize w = 0;
+    for (usize i = 0; i < v.len; i += 1)
+    {
+        if (keep(Vec::index_shared(v, i)))
+        {
+            if (w != i)
+            {
+                Vec::swap(v, w, i);
+            }
+            w += 1;
+        }
+    }
+    Vec::truncate(v, w);
+}
+
+// D-0181: removes every element equal to the one before it, keeping the
+// first of each run (`[Cmp-*]`, in place for `String`): a sorted `Vec`
+// is left with one of each value. The removed elements are destroyed.
+/// Removes every element equal to the one kept before it, keeping the first of each run.
+///
+/// Only adjacent duplicates are removed, so a sorted `Vec` is left with one of each value. The removed
+/// elements are destroyed.
+export fn Vec::dedup<T: eq>(ref<Vec<T>, exclusive> v)
+{
+    if (v.len < 2)
+    {
+        return;
+    }
+    usize w = 1;
+    for (usize i = 1; i < v.len; i += 1)
+    {
+        if (!(*Vec::index_shared(v, i) == *Vec::index_shared(v, w - 1)))
+        {
+            if (w != i)
+            {
+                Vec::swap(v, w, i);
+            }
+            w += 1;
+        }
+    }
+    Vec::truncate(v, w);
+}
+
+/// Only adjacent duplicates are removed.
+unittest "Vec::dedup: adjacent only"
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 2);
+    Vec::push(&mut v, 1);
+    Vec::dedup(&mut v);
+    assert(Vec::len(&v) == 3);
+    assert(v[0] == 1 && v[1] == 2 && v[2] == 1);
+}
+
+// Exchanges elements i and j of v; nothing when i == j.
+/// Exchanges elements `i` and `j` of `v`; nothing happens when `i == j`.
+///
+/// Use it rather than `swap(&mut v[i], &mut v[j])`, which is two exclusive borrows of one place when
+/// `i == j`. Faults (`index_out_of_bounds`) when either index is `>= len`.
+export fn Vec::swap<T>(ref<Vec<T>, exclusive> v, usize i, usize j)
+{
+    if (i >= v.len || j >= v.len)
+    {
+        fault(index_out_of_bounds);
+    }
+    if (i != j)
+    {
+        swap_places(&mut (*v)[i], &mut (*v)[j]);
+    }
+}
+
+// Hash tables (`rule.stdlib.hashmap`, spec/21 §1a, D-0041). A key type
+// is an integer type, `bool`, `str`, `String`, or a struct or enum of
+// key types (D-0110); the std-only intrinsics
+// `key_hash` (FNV-1a over the key's bytes) and `key_eq` realize hashing
+// and equality for each, and the front end checks `K` at every call.
+// Keys and values are kept in insertion order, entry i in keys[i] and
+// values[i], and the table holds their indices, so iteration is in
+// insertion order.
+/// A hash table mapping keys of type `K` to values of type `V`, kept in insertion order.
+///
+/// `K` must be a key type: an integer type, `bool`, `str` or `String`, or a struct or enum built only of key
+/// types (not `f32`/`f64`, not references). Entry `i` (`key_at`, `value_at`) is in insertion order, and
+/// `foreach (k, v in m)` visits the entries in that order; the order depends only on the calls, never on
+/// hash values. Replacing a value keeps its entry's place. Lookups borrow the key, so they copy nothing;
+/// for a `HashMap<String, V>` the `_str` functions look up by a `str` without making a `String`. The map
+/// owns its keys and values and destroys them with itself.
+export struct HashMap<K, V>
+{
+    Vec<K> keys;                        // in insertion order
+    Vec<V> values;                      // values[i] belongs to keys[i]
+    Vec<usize> slots;                   // an entry index, or max_value<usize>() when empty
+}
+
+/// A new, empty map.
+export fn HashMap::new<K, V>() : HashMap<K, V>
+{
+    Vec<usize> slots = Vec::new();
+    usize i = 0;
+    while (i < 8)
+    {
+        Vec::push(&mut slots, max_value<usize>());
+        i = i + 1;
+    }
+    HashMap { .keys = Vec::new(), .values = Vec::new(), .slots = slots }
+}
+
+// D-0116: a map of copies, in the same insertion order.
+/// A new map holding copies of the keys and values of `m`, in the same insertion order.
+export fn HashMap::clone<K: clone, V: clone>(ref<HashMap<K, V>, shared> m) : HashMap<K, V>
+{
+    HashMap<K, V> out = HashMap::new();
+    for (usize i = 0; i < Vec::len(&m.keys); i += 1)
+    {
+        HashMap::insert(&mut out, clone(Vec::index_shared(&m.keys, i)), clone(Vec::index_shared(&m.values, i)));
+    }
+    out
+}
+
+// Every entry removed (the values, then the keys, destroyed first to last); the
+// table back to its first size (D-0091).
+/// Removes every entry of `m`, destroying its values and then its keys, each first to last.
+export fn HashMap::clear<K, V>(ref<HashMap<K, V>, exclusive> m)
+{
+    Vec::clear(&mut m.values);
+    Vec::clear(&mut m.keys);
+    Vec::clear(&mut m.slots);
+    usize i = 0;
+    while (i < 8)
+    {
+        Vec::push(&mut m.slots, max_value<usize>());
+        i = i + 1;
+    }
+}
+
+/// The number of entries in `m`.
+export fn HashMap::len<K, V>(ref<HashMap<K, V>, shared> m) : usize
+{
+    Vec::len(&m.keys)
+}
+
+// Entry i in insertion order, for i < len.
+/// The key of entry `i`, in insertion order.
+///
+/// Faults (`index_out_of_bounds`) when `i >= len`.
+export fn HashMap::key_at<K, V>(ref<HashMap<K, V>, shared> m, usize i) : ref<K, shared>
+{
+    Vec::index_shared(&m.keys, i)
+}
+
+/// The value of entry `i`, in insertion order.
+///
+/// Faults (`index_out_of_bounds`) when `i >= len`.
+export fn HashMap::value_at<K, V>(ref<HashMap<K, V>, shared> m, usize i) : ref<V, shared>
+{
+    Vec::index_shared(&m.values, i)
+}
+
+// The slot holding k, or the empty slot where it belongs (linear
+// probing; the table is never full).
+fn HashMap::find<K, V>(ref<HashMap<K, V>, shared> m, ref<K, shared> k) : usize
+{
+    usize mask = Vec::len(&m.slots) - 1;
+    usize i = narrow_wrapping<usize>(key_hash(k)) & mask;
+    bool searching = true;
+    while (searching)
+    {
+        usize e = *Vec::index_shared(&m.slots, i);
+        if (e == max_value<usize>())
+        {
+            searching = false;
+        }
+        else if (key_eq(Vec::index_shared(&m.keys, e), k))
+        {
+            searching = false;
+        }
+        else
+        {
+            i = (i + 1) & mask;
+        }
+    }
+    i
+}
+
+// The entry index for k, or max_value<usize>() when k is absent.
+fn HashMap::index_of<K, V>(ref<HashMap<K, V>, shared> m, ref<K, shared> k) : usize
+{
+    *Vec::index_shared(&m.slots, HashMap::find(m, k))
+}
+
+// Places every entry again in a table of n slots (n a power of two, at
+// least the current size).
+fn HashMap::reslot<K, V>(ref<HashMap<K, V>, exclusive> m, usize n)
+{
+    usize old = Vec::len(&m.slots);
+    usize i = 0;
+    while (i < n)
+    {
+        if (i < old)
+        {
+            *Vec::index_exclusive(&mut m.slots, i) = max_value<usize>();
+        }
+        else
+        {
+            Vec::push(&mut m.slots, max_value<usize>());
+        }
+        i = i + 1;
+    }
+    usize e = 0;
+    while (e < Vec::len(&m.keys))
+    {
+        usize s = HashMap::find(&*m, Vec::index_shared(&m.keys, e));
+        *Vec::index_exclusive(&mut m.slots, s) = e;
+        e = e + 1;
+    }
+}
+
+// Room for one more entry: the table stays at most three-quarters full.
+fn HashMap::reserve_one<K, V>(ref<HashMap<K, V>, exclusive> m)
+{
+    usize n = Vec::len(&m.slots);
+    if ((Vec::len(&m.keys) + 1) * 4 > n * 3)
+    {
+        HashMap::reslot(m, n * 2);
+    }
+}
+
+// Adds k with value v. If k was present, its value is replaced where it
+// stands and the old one returned; the stored key stays and k is
+// destroyed.
+/// Adds key `k` with value `v`; returns the old value if `k` was already present, otherwise `None`.
+///
+/// A present key keeps its entry's place and its stored key; the `k` passed in is destroyed.
+export fn HashMap::insert<K, V>(ref<HashMap<K, V>, exclusive> m, K k, V v) : Option<V>
+{
+    HashMap::reserve_one(m);
+    usize s = HashMap::find(&*m, &k);
+    usize e = *Vec::index_shared(&m.slots, s);
+    if (e == max_value<usize>())
+    {
+        *Vec::index_exclusive(&mut m.slots, s) = Vec::len(&m.keys);
+        Vec::push(&mut m.keys, k);
+        Vec::push(&mut m.values, v);
+        return None;
+    }
+    Some(Vec::replace(&mut m.values, e, v))
+}
+
+/// Inserting a present key returns the old value and keeps the entry's place.
+unittest "HashMap::insert: replacing a value"
+{
+    HashMap<i32, i32> m = HashMap::new();
+    HashMap::insert(&mut m, 5, 50);
+    HashMap::insert(&mut m, 7, 70);
+    assert(Option::unwrap(HashMap::insert(&mut m, 5, 55)) == 50);
+    assert(HashMap::len(&m) == 2);
+    assert(*HashMap::key_at(&m, 0) == 5 && *HashMap::value_at(&m, 0) == 55);
+}
+
+// The value for k. If k is absent, it is added with `fresh` first; if it
+// is present, `k` and `fresh` are not needed and are destroyed here.
+/// The value for `k`, as an exclusive reference, adding `k` with the value `fresh` first if it is absent.
+///
+/// If `k` is present, `k` and `fresh` are not needed and are destroyed. The usual way to count or to
+/// collect into a map: `*HashMap::entry(&mut m, k, 0) += 1;`.
+export fn HashMap::entry<K, V>(ref<HashMap<K, V>, exclusive> m, K k, V fresh) : ref<V, exclusive>
+{
+    HashMap::reserve_one(m);
+    usize s = HashMap::find(&*m, &k);
+    usize e = *Vec::index_shared(&m.slots, s);
+    if (e == max_value<usize>())
+    {
+        e = Vec::len(&m.keys);
+        *Vec::index_exclusive(&mut m.slots, s) = e;
+        Vec::push(&mut m.keys, k);
+        Vec::push(&mut m.values, fresh);
+    }
+    Vec::index_exclusive(&mut m.values, e)
+}
+
+/// Counting occurrences with `entry`.
+unittest "HashMap::entry: counting"
+{
+    HashMap<i32, i32> counts = HashMap::new();
+    Vec<i32> words = Vec::new();
+    Vec::push(&mut words, 3);
+    Vec::push(&mut words, 1);
+    Vec::push(&mut words, 3);
+    foreach (w in &words)
+    {
+        *HashMap::entry(&mut counts, *w, 0) += 1;
+    }
+    i32 three = 3;
+    assert(*Option::unwrap(HashMap::get(&counts, &three)) == 2);
+}
+
+/// The value for `k`, as a shared reference; `None` when `k` is absent.
+export fn HashMap::get<K, V>(ref<HashMap<K, V>, shared> m, ref<K, shared> k) : Option<ref<V, shared>>
+{
+    usize e = HashMap::index_of(m, k);
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    Some(Vec::index_shared(&m.values, e))
+}
+
+/// The value for `k`, as an exclusive reference; `None` when `k` is absent.
+export fn HashMap::get_mut<K, V>(ref<HashMap<K, V>, exclusive> m, ref<K, shared> k) : Option<ref<V, exclusive>>
+{
+    usize e = HashMap::index_of(&*m, k);
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    Some(Vec::index_exclusive(&mut m.values, e))
+}
+
+/// Whether `m` has an entry for `k`.
+export fn HashMap::contains<K, V>(ref<HashMap<K, V>, shared> m, ref<K, shared> k) : bool
+{
+    HashMap::index_of(m, k) != max_value<usize>()
+}
+
+// Empties slot s, moving later slots of its probe run back so that
+// every entry stays reachable from its home slot (backward-shift
+// deletion: the table needs no tombstones).
+fn HashMap::unslot<K, V>(ref<HashMap<K, V>, exclusive> m, usize s)
+{
+    usize mask = Vec::len(&m.slots) - 1;
+    usize i = s;
+    usize j = s;
+    bool shifting = true;
+    while (shifting)
+    {
+        j = (j + 1) & mask;
+        usize e = *Vec::index_shared(&m.slots, j);
+        if (e == max_value<usize>())
+        {
+            shifting = false;
+        }
+        else
+        {
+            usize home = narrow_wrapping<usize>(key_hash(Vec::index_shared(&m.keys, e))) & mask;
+            // The entry in j may move back to i unless its home lies in (i, j], cyclically.
+            bool stays = if (i <= j)
+            {
+                home > i && home <= j
+            }
+            else
+            {
+                home > i || home <= j
+            };
+            if (!stays)
+            {
+                *Vec::index_exclusive(&mut m.slots, i) = e;
+                i = j;
+            }
+        }
+    }
+    *Vec::index_exclusive(&mut m.slots, i) = max_value<usize>();
+}
+
+// Removes k and returns its value, in constant time: the last entry
+// moves into k's place, so insertion order holds only up to the first
+// such removal. `remove` keeps the order.
+/// Removes `k` and returns its value, in constant time; `None` when `k` is absent.
+///
+/// The last entry moves into the removed one's place, so the insertion order is not kept;
+/// `HashMap::remove` keeps it. The removed key is destroyed.
+export fn HashMap::swap_remove<K, V>(ref<HashMap<K, V>, exclusive> m, ref<K, shared> k) : Option<V>
+{
+    usize s = HashMap::find(&*m, k);
+    usize e = *Vec::index_shared(&m.slots, s);
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    usize last = Vec::len(&m.keys) - 1;
+    if (e != last)
+    {
+        // The last entry's slot names e from now on.
+        usize t = HashMap::find(&*m, Vec::index_shared(&m.keys, last));
+        *Vec::index_exclusive(&mut m.slots, t) = e;
+    }
+    auto k_last = Vec::remove_at(&mut m.keys, last);
+    auto v_last = Vec::remove_at(&mut m.values, last);
+    auto v = if (e != last)
+    {
+        drop(Vec::replace(&mut m.keys, e, k_last));
+        Vec::replace(&mut m.values, e, v_last)
+    }
+    else
+    {
+        drop(k_last);
+        v_last
+    };
+    HashMap::unslot(m, s);
+    Some(v)
+}
+
+// Removes k and returns its value; the other entries keep their order.
+// It takes time in proportion to the size of the map.
+/// Removes `k` and returns its value; `None` when `k` is absent.
+///
+/// The other entries keep their order. Takes time in proportion to the size of the map;
+/// `HashMap::swap_remove` takes constant time but does not keep the order. The removed key is destroyed.
+export fn HashMap::remove<K, V>(ref<HashMap<K, V>, exclusive> m, ref<K, shared> k) : Option<V>
+{
+    usize s = HashMap::find(&*m, k);
+    HashMap::remove_slot(m, s)
+}
+
+/// `remove` keeps the insertion order; `swap_remove` moves the last entry.
+unittest "HashMap::remove: order kept"
+{
+    HashMap<i32, bool> a = HashMap::new();
+    HashMap::insert(&mut a, 1, true);
+    HashMap::insert(&mut a, 2, true);
+    HashMap::insert(&mut a, 3, true);
+    HashMap<i32, bool> b = HashMap::clone(&a);
+    i32 one = 1;
+    HashMap::remove(&mut a, &one);
+    assert(*HashMap::key_at(&a, 0) == 2 && *HashMap::key_at(&a, 1) == 3);
+    HashMap::swap_remove(&mut b, &one);
+    assert(*HashMap::key_at(&b, 0) == 3 && *HashMap::key_at(&b, 1) == 2);
+}
+
+// The entry slot s names taken out, the others keeping their order;
+// None when s is empty. `remove` and `remove_str` find s.
+fn HashMap::remove_slot<K, V>(ref<HashMap<K, V>, exclusive> m, usize s) : Option<V>
+{
+    usize e = *Vec::index_shared(&m.slots, s);
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    HashMap::unslot(m, s);
+    drop(Vec::remove_at(&mut m.keys, e));
+    auto v = Vec::remove_at(&mut m.values, e);
+    // Entries after e moved down by one.
+    usize i = 0;
+    while (i < Vec::len(&m.slots))
+    {
+        usize x = *Vec::index_shared(&m.slots, i);
+        if (x != max_value<usize>() && x > e)
+        {
+            *Vec::index_exclusive(&mut m.slots, i) = x - 1;
+        }
+        i = i + 1;
+    }
+    Some(v)
+}
+
+// D-0113: lookups of a String-keyed map by a `str`, without making a
+// String: `[Key-Bytes]` gives a str and a String of one text the same
+// bytes, so `key_hash` the same slot; the entry is found by `eq_str`.
+fn HashMap::find_str<V>(ref<HashMap<String, V>, shared> m, str k) : usize
+{
+    usize mask = Vec::len(&m.slots) - 1;
+    usize i = narrow_wrapping<usize>(key_hash(&k)) & mask;
+    bool searching = true;
+    while (searching)
+    {
+        usize e = *Vec::index_shared(&m.slots, i);
+        if (e == max_value<usize>())
+        {
+            searching = false;
+        }
+        else if (String::eq_str(Vec::index_shared(&m.keys, e), k))
+        {
+            searching = false;
+        }
+        else
+        {
+            i = (i + 1) & mask;
+        }
+    }
+    i
+}
+
+/// The value for the key `k` in a `String`-keyed map, as a shared reference; `None` when it is absent.
+///
+/// Looks the key up by its bytes without making a `String`, so a literal key costs nothing.
+export fn HashMap::get_str<V>(ref<HashMap<String, V>, shared> m, str k) : Option<ref<V, shared>>
+{
+    usize e = *Vec::index_shared(&m.slots, HashMap::find_str(m, k));
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    Some(Vec::index_shared(&m.values, e))
+}
+
+/// A `String`-keyed map looked up by a literal.
+unittest "HashMap::get_str: literal key"
+{
+    HashMap<String, i32> m = HashMap::new();
+    HashMap::insert(&mut m, "apple", 3);
+    assert(*Option::unwrap(HashMap::get_str(&m, "apple")) == 3);
+    assert(!HashMap::contains_str(&m, "pear"));
+}
+
+/// The value for the key `k` in a `String`-keyed map, as an exclusive reference; `None` when it is absent.
+///
+/// No `String` is made.
+export fn HashMap::get_mut_str<V>(ref<HashMap<String, V>, exclusive> m, str k) : Option<ref<V, exclusive>>
+{
+    usize e = *Vec::index_shared(&m.slots, HashMap::find_str(&*m, k));
+    if (e == max_value<usize>())
+    {
+        return None;
+    }
+    Some(Vec::index_exclusive(&mut m.values, e))
+}
+
+/// Whether a `String`-keyed map has an entry for the key `k`; no `String` is made.
+export fn HashMap::contains_str<V>(ref<HashMap<String, V>, shared> m, str k) : bool
+{
+    *Vec::index_shared(&m.slots, HashMap::find_str(m, k)) != max_value<usize>()
+}
+
+/// Removes the key `k` from a `String`-keyed map and returns its value; `None` when it is absent.
+///
+/// As `HashMap::remove`: the other entries keep their order. No `String` is made for the lookup.
+export fn HashMap::remove_str<V>(ref<HashMap<String, V>, exclusive> m, str k) : Option<V>
+{
+    usize s = HashMap::find_str(&*m, k);
+    HashMap::remove_slot(m, s)
+}
+
+// A consumed HashMap that `foreach (k, v in m)` takes entries from, key
+// then value, in order; the entries not yet taken are destroyed with it.
+resource struct HashDrain<K, V>
+{
+    HashMap<K, V> m;
+    usize next;
+}
+
+fn HashMap::drain<K, V>(HashMap<K, V> m) : HashDrain<K, V>
+{
+    HashDrain { .m = m, .next = 0 }
+}
+
+fn HashDrain::total<K, V>(ref<HashDrain<K, V>, shared> d) : usize
+{
+    d.m.keys.len
+}
+
+fn HashDrain::take_key<K, V>(ref<HashDrain<K, V>, exclusive> d) : K
+{
+    Vec::take_raw(&mut d.m.keys, d.next)
+}
+
+fn HashDrain::take_value<K, V>(ref<HashDrain<K, V>, exclusive> d) : V
+{
+    auto v = Vec::take_raw(&mut d.m.values, d.next);
+    d.next = d.next + 1;
+    v
+}
+
+fn HashDrain::drop<K, V>(ref<HashDrain<K, V>, exclusive> self)
+{
+    while (self.next < self.m.keys.len)
+    {
+        drop(Vec::take_raw(&mut self.m.keys, self.next));
+        drop(Vec::take_raw(&mut self.m.values, self.next));
+        self.next = self.next + 1;
+    }
+    self.m.keys.len = 0;
+    self.m.values.len = 0;
+}
+
+// A set of keys: a HashMap whose values are not used.
+/// A set of keys of type `K`, kept in insertion order.
+///
+/// `K` is a key type, as for `HashMap`. Key `i` (`key_at`) is in insertion order, and `foreach (k in s)`
+/// visits the keys in that order. The set owns its keys and destroys them with itself.
+export struct HashSet<K>
+{
+    HashMap<K, bool> map;
+}
+
+/// A new, empty set.
+export fn HashSet::new<K>() : HashSet<K>
+{
+    HashSet { .map = HashMap::new() }
+}
+
+/// The number of keys in `s`.
+export fn HashSet::len<K>(ref<HashSet<K>, shared> s) : usize
+{
+    HashMap::len(&s.map)
+}
+
+// Adds k; true if it was not already present.
+/// Adds `k` to `s`; returns true if it was not already present.
+///
+/// A key already present keeps its place, and the `k` passed in is destroyed.
+export fn HashSet::insert<K>(ref<HashSet<K>, exclusive> s, K k) : bool
+{
+    match (HashMap::insert(&mut s.map, k, true))
+    {
+        Some(_) : false,
+        None    : true,
+    }
+}
+
+/// Inserting a key already present returns false.
+unittest "HashSet::insert: duplicate"
+{
+    HashSet<i32> s = HashSet::new();
+    assert(HashSet::insert(&mut s, 4));
+    assert(!HashSet::insert(&mut s, 4));
+    assert(HashSet::len(&s) == 1);
+}
+
+/// A new set holding copies of the keys of `s`, in the same order.
+export fn HashSet::clone<K: clone>(ref<HashSet<K>, shared> s) : HashSet<K>
+{
+    HashSet { .map = HashMap::clone(&s.map) }
+}
+
+// D-0138: the set operations. Each makes a new set, copying the keys it
+// keeps with `clone`, and leaves `a` and `b` as they are. The keys keep
+// `a`'s order; `union` then adds `b`'s keys that are not in `a`, in `b`'s
+// order.
+/// A new set of the keys in `a` or `b`: `a`'s keys in `a`'s order, then `b`'s keys not in `a`, in `b`'s
+/// order.
+///
+/// The keys are copied with `clone`; `a` and `b` are left as they are.
+export fn HashSet::union<K: clone>(ref<HashSet<K>, shared> a, ref<HashSet<K>, shared> b) : HashSet<K>
+{
+    HashSet<K> out = HashSet::clone(a);
+    foreach (i in 0..HashSet::len(b))
+    {
+        ref<K, shared> k = HashSet::key_at(b, i);
+        if (!HashSet::contains(a, k))
+        {
+            HashSet::insert(&mut out, clone(k));
+        }
+    }
+    out
+}
+
+/// The union keeps the first set's order, then adds the second's new keys.
+unittest "HashSet::union: order"
+{
+    HashSet<i32> a = HashSet::new();
+    HashSet<i32> b = HashSet::new();
+    HashSet::insert(&mut a, 3);
+    HashSet::insert(&mut a, 1);
+    HashSet::insert(&mut b, 2);
+    HashSet::insert(&mut b, 3);
+    HashSet<i32> u = HashSet::union(&a, &b);
+    assert(HashSet::len(&u) == 3);
+    assert(*HashSet::key_at(&u, 0) == 3 && *HashSet::key_at(&u, 1) == 1 && *HashSet::key_at(&u, 2) == 2);
+}
+
+// The keys of `a` that are also in `b`.
+/// A new set of the keys of `a` that are also in `b`, in `a`'s order.
+///
+/// The keys are copied with `clone`; `a` and `b` are left as they are.
+export fn HashSet::intersection<K: clone>(ref<HashSet<K>, shared> a, ref<HashSet<K>, shared> b) : HashSet<K>
+{
+    HashSet<K> out = HashSet::new();
+    foreach (i in 0..HashSet::len(a))
+    {
+        ref<K, shared> k = HashSet::key_at(a, i);
+        if (HashSet::contains(b, k))
+        {
+            HashSet::insert(&mut out, clone(k));
+        }
+    }
+    out
+}
+
+// The keys of `a` that are not in `b`.
+/// A new set of the keys of `a` that are not in `b`, in `a`'s order.
+///
+/// The keys are copied with `clone`; `a` and `b` are left as they are.
+export fn HashSet::difference<K: clone>(ref<HashSet<K>, shared> a, ref<HashSet<K>, shared> b) : HashSet<K>
+{
+    HashSet<K> out = HashSet::new();
+    foreach (i in 0..HashSet::len(a))
+    {
+        ref<K, shared> k = HashSet::key_at(a, i);
+        if (!HashSet::contains(b, k))
+        {
+            HashSet::insert(&mut out, clone(k));
+        }
+    }
+    out
+}
+
+/// Whether `s` holds `k`.
+export fn HashSet::contains<K>(ref<HashSet<K>, shared> s, ref<K, shared> k) : bool
+{
+    HashMap::contains(&s.map, k)
+}
+
+// Removes k; true if it was present. As `HashMap::swap_remove`, the
+// last key takes k's place.
+/// Removes `k` from `s` in constant time; returns true if it was present.
+///
+/// As `HashMap::swap_remove`, the last key takes `k`'s place, so the order is not kept; `HashSet::remove`
+/// keeps it.
+export fn HashSet::swap_remove<K>(ref<HashSet<K>, exclusive> s, ref<K, shared> k) : bool
+{
+    match (HashMap::swap_remove(&mut s.map, k))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+// Removes k keeping the order of the others; true if it was present.
+/// Removes `k` from `s`, keeping the order of the other keys; returns true if it was present.
+///
+/// Takes time in proportion to the size of the set; `HashSet::swap_remove` is constant time.
+export fn HashSet::remove<K>(ref<HashSet<K>, exclusive> s, ref<K, shared> k) : bool
+{
+    match (HashMap::remove(&mut s.map, k))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+/// Whether a set of `String`s holds the text `k`; no `String` is made.
+export fn HashSet::contains_str(ref<HashSet<String>, shared> s, str k) : bool
+{
+    HashMap::contains_str(&s.map, k)
+}
+
+/// Removes the text `k` from a set of `String`s, keeping the order of the others; returns true if it was
+/// present.
+export fn HashSet::remove_str(ref<HashSet<String>, exclusive> s, str k) : bool
+{
+    match (HashMap::remove_str(&mut s.map, k))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+// A consumed HashSet that `foreach (k in s)` takes keys from.
+struct SetDrain<K>
+{
+    HashDrain<K, bool> d;
+}
+
+fn HashSet::drain<K>(HashSet<K> s) : SetDrain<K>
+{
+    HashSet { map } = s;
+    SetDrain { .d = HashMap::drain(map) }
+}
+
+fn SetDrain::total<K>(ref<SetDrain<K>, shared> s) : usize
+{
+    HashDrain::total(&s.d)
+}
+
+fn SetDrain::take<K>(ref<SetDrain<K>, exclusive> s) : K
+{
+    auto k = HashDrain::take_key(&mut s.d);
+    HashDrain::take_value(&mut s.d);
+    k
+}
+
+// Key i in insertion order, for i < len.
+/// Key `i` of `s`, in insertion order.
+///
+/// Faults (`index_out_of_bounds`) when `i >= len`.
+export fn HashSet::key_at<K>(ref<HashSet<K>, shared> s, usize i) : ref<K, shared>
+{
+    HashMap::key_at(&s.map, i)
+}
+
+// D-0134: every key removed, as `HashMap::clear`.
+/// Removes every key of `s`, destroying them, as `HashMap::clear` does.
+export fn HashSet::clear<K>(ref<HashSet<K>, exclusive> s)
+{
+    HashMap::clear(&mut s.map);
+}
+
+// Queues (`rule.stdlib.queue`, spec/21 §2i, D-0137): two `Vec`s used
+// as stacks, so every step is a `Vec`'s `push`, `pop` or index. `head`
+// holds the front part with the front element last; `tail` holds the back
+// part in order, the back element last. Taking from an empty side first
+// moves elements across from the other (`Queue::shift`): all of them
+// while the queue is taken from at one end only, so each element moves
+// at most once; half of them once it has been taken from at both, so
+// alternating the ends still moves each element a bounded number of
+// times.
+/// A double-ended queue: elements are added and taken at either end in amortised constant time.
+///
+/// The queue owns its elements; dropping it destroys them front to back. There is no positional access,
+/// no `foreach`, no `clone` and no `reserve`; a `Vec` serves those needs.
+export resource struct Queue<T>
+{
+    Vec<T> head;                        // the front part, front element last
+    Vec<T> tail;                        // the back part, back element last
+    bool took_front;                    // `pop_front` has taken an element
+    bool took_back;                     // `pop_back` has
+}
+
+/// A new, empty queue.
+export fn Queue::new<T>() : Queue<T>
+{
+    Queue { .head = Vec::new(), .tail = Vec::new(), .took_front = false, .took_back = false }
+}
+
+/// The number of elements in `q`.
+export fn Queue::len<T>(ref<Queue<T>, shared> q) : usize
+{
+    q.head.len + q.tail.len
+}
+
+// `to` is empty. With `half`, the half of `from`'s elements nearest `to`'s
+// end (its first ones, rounding up) move to `to`, the rest moving down to
+// the start of `from` in order; otherwise all of them move. Either way
+// they arrive in `to`'s order, `to`'s last being `from`'s first. Each
+// element moves by `copy_raw` into a slot that holds nothing, and the
+// slots left are released together.
+// trusted: [Copy-Raw] between the two buffers: both ranges lie below their Vecs' capacities, reserved by the caller, and the destination slots hold no element (to.len is 0 there).
+fn Queue::shift<T>(ref<Vec<T>, exclusive> from, ref<Vec<T>, exclusive> to, bool half)
+{
+    usize n = from.len;
+    usize stay = if (half)
+    {
+        n / 2
+    }
+    else
+    {
+        0
+    };
+    usize m = n - stay;
+    usize size = sizeof<T>();
+    Vec::reserve(to, m);
+    rawptr<T> src = from.ptr;
+    rawptr<T> dst = to.ptr;
+    unsafe
+    {
+        for (usize k = 0; k < m; k += 1)
+        {
+            copy_raw(
+                reinterpret_ptr<u8>(dst + reinterpret<isize>(m - 1 - k)),
+                reinterpret_ptr<u8>(src + reinterpret<isize>(k)),
+                size,
+            );
+        }
+        release(reinterpret_ptr<u8>(src), m * size);
+        if (stay > 0)
+        {
+            // `m >= stay`: the ranges do not overlap.
+            copy_raw(reinterpret_ptr<u8>(src), reinterpret_ptr<u8>(src + reinterpret<isize>(m)), stay * size);
+            release(reinterpret_ptr<u8>(src + reinterpret<isize>(stay)), m * size);
+        }
+    }
+    to.len = m;
+    from.len = stay;
+}
+
+/// Adds `x` at the back of `q`.
+export fn Queue::push_back<T>(ref<Queue<T>, exclusive> q, T x)
+{
+    Vec::push(&mut q.tail, x);
+}
+
+/// Adds `x` at the front of `q`.
+export fn Queue::push_front<T>(ref<Queue<T>, exclusive> q, T x)
+{
+    Vec::push(&mut q.head, x);
+}
+
+/// Removes the front element of `q` and returns it; `None` when `q` is empty.
+export fn Queue::pop_front<T>(ref<Queue<T>, exclusive> q) : Option<T>
+{
+    if (q.head.len == 0)
+    {
+        if (q.tail.len == 0)
+        {
+            return None;
+        }
+        q.took_front = true;
+        Queue::shift(&mut q.tail, &mut q.head, q.took_back);
+    }
+    Vec::pop(&mut q.head)
+}
+
+/// Removes the back element of `q` and returns it; `None` when `q` is empty.
+export fn Queue::pop_back<T>(ref<Queue<T>, exclusive> q) : Option<T>
+{
+    if (q.tail.len == 0)
+    {
+        if (q.head.len == 0)
+        {
+            return None;
+        }
+        q.took_back = true;
+        Queue::shift(&mut q.head, &mut q.tail, q.took_front);
+    }
+    Vec::pop(&mut q.tail)
+}
+
+/// The front element of `q`, as a shared reference; `None` when `q` is empty.
+///
+/// The reference borrows the queue, which cannot change while it is in use.
+export fn Queue::front<T>(ref<Queue<T>, shared> q) : Option<ref<T, shared>>
+{
+    if (q.head.len > 0)
+    {
+        return Some(Vec::index_shared(&q.head, q.head.len - 1));
+    }
+    if (q.tail.len > 0)
+    {
+        return Some(Vec::index_shared(&q.tail, 0));
+    }
+    None
+}
+
+/// The back element of `q`, as a shared reference; `None` when `q` is empty.
+///
+/// The reference borrows the queue, which cannot change while it is in use.
+export fn Queue::back<T>(ref<Queue<T>, shared> q) : Option<ref<T, shared>>
+{
+    if (q.tail.len > 0)
+    {
+        return Some(Vec::index_shared(&q.tail, q.tail.len - 1));
+    }
+    if (q.head.len > 0)
+    {
+        return Some(Vec::index_shared(&q.head, 0));
+    }
+    None
+}
+
+/// Adding and taking at both ends.
+unittest "Queue: both ends"
+{
+    Queue<i32> q = Queue::new();
+    Queue::push_back(&mut q, 2);
+    Queue::push_back(&mut q, 3);
+    Queue::push_front(&mut q, 1);
+    assert(*Option::unwrap(Queue::front(&q)) == 1);
+    assert(*Option::unwrap(Queue::back(&q)) == 3);
+    assert(Option::unwrap(Queue::pop_back(&mut q)) == 3);
+    assert(Option::unwrap(Queue::pop_front(&mut q)) == 1);
+    assert(Queue::len(&q) == 1);
+}
+
+// Empties q, destroying its elements front to back: `head` last first,
+// then `tail` first to last. The buffers are kept.
+/// Removes every element of `q`, destroying them front to back; the buffers are kept.
+export fn Queue::clear<T>(ref<Queue<T>, exclusive> q)
+{
+    Vec::truncate(&mut q.head, 0);
+    Vec::clear(&mut q.tail);
+}
+
+/// Destroys the elements of `self`, front to back; the destructor run when a `Queue` goes out of scope, not
+/// called by programs.
+export fn Queue::drop<T>(ref<Queue<T>, exclusive> self)
+{
+    Queue::clear(self);
+}
+
+// Priority queues (`rule.stdlib.priority-queue`, spec/21 §2i, D-0137):
+// a binary heap in a `Vec`, each element's parent going before it. Each
+// element has an arrival number, kept at the same position of a second
+// `Vec`, so elements the order calls equal leave first in, first out.
+/// A priority queue: it gives its elements back least first, in an order fixed when it is made.
+///
+/// `PriorityQueue::new` uses the key types' own order, `PriorityQueue::new_by` the caller's `less`.
+/// Elements the order calls equal come out first in, first out. A binary heap: `push` and `pop` take time
+/// in proportion to the logarithm of the length. The queue owns its elements. There is no `peek_mut`
+/// (`pop`, change and `push` instead), no `foreach`, no `clone` and no `reserve`.
+export struct PriorityQueue<T>
+{
+    Vec<T> items;
+    Vec<u64> seqs;                      // seqs[i] is items[i]'s arrival number
+    bool keyed;                         // the key types' order, not `less`
+    fn(ref<T, shared>, ref<T, shared>) : bool less;
+    u64 next;                           // the next arrival number
+}
+
+// A queue in the key types' own order (as `Vec::sort`'s): smallest first.
+/// A new, empty priority queue in the key types' own order, smallest first (as `Vec::sort` orders).
+///
+/// `T` must be a key type; for any other `T` use `PriorityQueue::new_by`.
+export fn PriorityQueue::new<T>() : PriorityQueue<T>
+{
+    PriorityQueue { .items = Vec::new(), .seqs = Vec::new(), .keyed = true, .less = key_before<T>, .next = 0 }
+}
+
+// A queue in the order `less` gives (true when its first argument goes
+// before its second): the element no other goes before comes out first.
+/// A new, empty priority queue in the order `less` gives: the element no other goes before comes out
+/// first.
+///
+/// `less` is true when its first argument goes before its second and must be a strict weak order, as for
+/// `Vec::sort_by`. A largest-first queue passes a `less` that answers "greater".
+export fn PriorityQueue::new_by<T>(fn(ref<T, shared>, ref<T, shared>) : bool less) : PriorityQueue<T>
+{
+    PriorityQueue { .items = Vec::new(), .seqs = Vec::new(), .keyed = false, .less = less, .next = 0 }
+}
+
+/// Largest tens digit first; equal elements leave in the order they arrived.
+unittest "PriorityQueue::new_by: first in, first out among equals"
+{
+    auto larger_tens = [](ref<i32, shared> a, ref<i32, shared> b) : bool { *a / 10 > *b / 10 };
+    PriorityQueue<i32> q = PriorityQueue::new_by(larger_tens);
+    PriorityQueue::push(&mut q, 15);
+    PriorityQueue::push(&mut q, 31);
+    PriorityQueue::push(&mut q, 12);
+    PriorityQueue::push(&mut q, 38);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 31);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 38);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 15);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 12);
+}
+
+/// The number of elements in `q`.
+export fn PriorityQueue::len<T>(ref<PriorityQueue<T>, shared> q) : usize
+{
+    q.items.len
+}
+
+// Whether element i comes out before element j: the earlier arrival
+// unless the later goes before it, the later only if it goes before the
+// earlier. One comparison decides, the order being a strict weak order
+// (§2i); the key types' is compared in place (`key_less_at`, as
+// `Vec::sort` does).
+// trusted: [Rawptr-Read] of the sequence numbers at i and j, both below len: plain u64 cells no path reaches.
+fn PriorityQueue::before<T>(
+    ref<PriorityQueue<T>, shared> q,
+    bool keyed,
+    ref<Vec<T>, shared> items,
+    rawptr<u64> sb,
+    usize i,
+    usize j,
+) : bool
+{
+    bool earlier = unsafe
+    {
+        *(sb + reinterpret<isize>(i)) < *(sb + reinterpret<isize>(j))
+    };
+    if (earlier)
+    {
+        if (keyed)
+        {
+            !key_less_at(items, j, i)
+        }
+        else
+        {
+            !(q.less)(Vec::index_shared(items, j), Vec::index_shared(items, i))
+        }
+    }
+    else
+    {
+        if (keyed)
+        {
+            key_less_at(items, i, j)
+        }
+        else
+        {
+            (q.less)(Vec::index_shared(items, i), Vec::index_shared(items, j))
+        }
+    }
+}
+
+// The heap moves its elements by copying their bytes into a slot that
+// holds nothing (`copy_raw`) and releasing the slot they left, rather
+// than by `Vec::swap`, so no reference is formed for a move. Each loop
+// holds one shared reference to each `Vec` for its comparisons and
+// reaches the slots through `ib` and `sb`: the buffers do not move while
+// the loop runs.
+
+// Moves element i up past every ancestor it comes out before. The place
+// is found first, comparing with the element where it stands; then the
+// ancestors on the way move down one each and it takes the place.
+// trusted: [Copy-Raw], [Release] and [Rawptr-Read]/[Rawptr-Write]/[Rawptr-Move-In] on slots below len: an element's old slot is released as it moves (faulting if another thread holds an exclusive path to it, D-0214), and the hole t is written once; the sequence numbers are plain cells.
+fn PriorityQueue::sift_up<T>(ref<PriorityQueue<T>, exclusive> q, usize i)
+{
+    rawptr<u64> sb = q.seqs.ptr;
+    usize t = i;
+    {
+        ref<PriorityQueue<T>, shared> s = &*q;
+        ref<Vec<T>, shared> items = &s.items;
+        bool keyed = s.keyed;
+        while (t > 0)
+        {
+            usize p = (t - 1) / 2;
+            if (!PriorityQueue::before(s, keyed, items, sb, i, p))
+            {
+                break;
+            }
+            t = p;
+        }
+    }
+    if (t == i)
+    {
+        return;
+    }
+    T x = Vec::take_raw(&mut q.items, i);
+    u64 xs = q.seqs[i];
+    usize size = sizeof<T>();
+    rawptr<T> ib = q.items.ptr;
+    usize j = i;
+    while (j != t)
+    {
+        usize p = (j - 1) / 2;
+        unsafe
+        {
+            copy_raw(
+                reinterpret_ptr<u8>(ib + reinterpret<isize>(j)),
+                reinterpret_ptr<u8>(ib + reinterpret<isize>(p)),
+                size,
+            );
+            release(reinterpret_ptr<u8>(ib + reinterpret<isize>(p)), size);
+            *(sb + reinterpret<isize>(j)) = *(sb + reinterpret<isize>(p));
+        }
+        j = p;
+    }
+    unsafe
+    {
+        *(ib + reinterpret<isize>(t)) = x;
+        *(sb + reinterpret<isize>(t)) = xs;
+    }
+}
+
+/// Adds `x` to `q`; logarithmic in the length.
+export fn PriorityQueue::push<T>(ref<PriorityQueue<T>, exclusive> q, T x)
+{
+    Vec::push(&mut q.items, x);
+    Vec::push(&mut q.seqs, q.next);
+    q.next = q.next + 1;
+    PriorityQueue::sift_up(q, q.items.len - 1);
+}
+
+// The first element leaves a hole at the top. The hole moves down to a
+// leaf, the child that comes out first rising into it at each level (one
+// comparison per level); the last element fills the hole and moves up to
+// its place, which is seldom far.
+// trusted: [Copy-Raw], [Release] and [Rawptr-Read]/[Rawptr-Write] on slots below len, as sift_up: each moved element's old slot is released before the hole is written (D-0214 as there).
+/// Removes the element that comes out first and returns it; `None` when `q` is empty.
+///
+/// Among elements the order calls equal, the one pushed first comes out first. Logarithmic in the length.
+export fn PriorityQueue::pop<T>(ref<PriorityQueue<T>, exclusive> q) : Option<T>
+{
+    usize n = q.items.len;
+    if (n == 0)
+    {
+        return None;
+    }
+    T top = Vec::take_raw(&mut q.items, 0);
+    usize size = sizeof<T>();
+    rawptr<T> ib = q.items.ptr;
+    rawptr<u64> sb = q.seqs.ptr;
+    usize last = n - 1;
+    usize hole = 0;
+    {
+        ref<PriorityQueue<T>, shared> s = &*q;
+        ref<Vec<T>, shared> items = &s.items;
+        bool keyed = s.keyed;
+        while (2 * hole + 1 < last)
+        {
+            usize c = 2 * hole + 1;
+            if (c + 1 < last && PriorityQueue::before(s, keyed, items, sb, c + 1, c))
+            {
+                c = c + 1;
+            }
+            unsafe
+            {
+                copy_raw(
+                    reinterpret_ptr<u8>(ib + reinterpret<isize>(hole)),
+                    reinterpret_ptr<u8>(ib + reinterpret<isize>(c)),
+                    size,
+                );
+                release(reinterpret_ptr<u8>(ib + reinterpret<isize>(c)), size);
+                *(sb + reinterpret<isize>(hole)) = *(sb + reinterpret<isize>(c));
+            }
+            hole = c;
+        }
+    }
+    if (hole != last)
+    {
+        unsafe
+        {
+            copy_raw(
+                reinterpret_ptr<u8>(ib + reinterpret<isize>(hole)),
+                reinterpret_ptr<u8>(ib + reinterpret<isize>(last)),
+                size,
+            );
+            release(reinterpret_ptr<u8>(ib + reinterpret<isize>(last)), size);
+            *(sb + reinterpret<isize>(hole)) = *(sb + reinterpret<isize>(last));
+        }
+    }
+    q.items.len = last;
+    q.seqs.len = last;
+    if (hole != last)
+    {
+        PriorityQueue::sift_up(q, hole);
+    }
+    Some(top)
+}
+
+/// The element `pop` would return next, as a shared reference; `None` when `q` is empty.
+///
+/// The reference borrows the queue.
+export fn PriorityQueue::peek<T>(ref<PriorityQueue<T>, shared> q) : Option<ref<T, shared>>
+{
+    if (q.items.len == 0)
+    {
+        return None;
+    }
+    Some(Vec::index_shared(&q.items, 0))
+}
+
+/// The default order gives the smallest element first.
+unittest "PriorityQueue: smallest first"
+{
+    PriorityQueue<i32> q = PriorityQueue::new();
+    PriorityQueue::push(&mut q, 5);
+    PriorityQueue::push(&mut q, 1);
+    PriorityQueue::push(&mut q, 3);
+    assert(*Option::unwrap(PriorityQueue::peek(&q)) == 1);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 1);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 3);
+    assert(Option::unwrap(PriorityQueue::pop(&mut q)) == 5);
+    assert(Option::is_none(&PriorityQueue::pop(&mut q)));
+}
+
+// Empties q, destroying its elements in the order the heap holds them.
+/// Removes every element of `q`, destroying them in the order the heap holds them (not priority order).
+export fn PriorityQueue::clear<T>(ref<PriorityQueue<T>, exclusive> q)
+{
+    Vec::clear(&mut q.items);
+    Vec::clear(&mut q.seqs);
+    q.next = 0;
+}
+
+// D-0119: integers as bytes in a fixed order, and back. `push_le`
+// writes the least significant byte first, `push_be` the most; each
+// byte is the low eight bits of the value shifted down (two's
+// complement for a signed `T`). `read_le`/`read_be` assemble the `T`
+// whose bytes start at `s[at]`; `diag.index-out-of-bounds` when fewer
+// than `sizeof<T>()` bytes remain.
+/// Appends the `sizeof<T>()` bytes of `x` to `out`, least significant byte first (little-endian).
+///
+/// A signed `x` is written as its two's-complement image. `read_le` reads it back.
+export fn Vec::push_le<T: integer>(ref<Vec<u8>, exclusive> out, T x)
+{
+    usize n = sizeof<T>();
+    for (usize k = 0; k < n; k += 1)
+    {
+        Vec::push(out, narrow_wrapping<u8>(x >> narrow<u32>(8 * k)));
+    }
+}
+
+/// Appends the `sizeof<T>()` bytes of `x` to `out`, most significant byte first (big-endian, network order).
+///
+/// A signed `x` is written as its two's-complement image. `read_be` reads it back.
+export fn Vec::push_be<T: integer>(ref<Vec<u8>, exclusive> out, T x)
+{
+    usize n = sizeof<T>();
+    for (usize k = 0; k < n; k += 1)
+    {
+        Vec::push(out, narrow_wrapping<u8>(x >> narrow<u32>(8 * (n - 1 - k))));
+    }
+}
+
+/// The `T` whose `sizeof<T>()` bytes start at `s[at]`, least significant byte first (little-endian).
+///
+/// The type is written at the call: `read_le<u32>(&buf[0..$], 4)`. A signed `T` is read as two's
+/// complement. Faults (`index_out_of_bounds`) when fewer than `sizeof<T>()` bytes remain from `at`.
+export fn read_le<T: integer>(slice<u8, shared> s, usize at) : T
+{
+    usize n = sizeof<T>();
+    if (at > slice_len(s) || slice_len(s) - at < n)
+    {
+        fault(index_out_of_bounds);
+    }
+    T acc = 0;
+    for (usize k = 0; k < n; k += 1)
+    {
+        acc = acc | (narrow_wrapping<T>(s[at + k]) << narrow<u32>(8 * k));
+    }
+    acc
+}
+
+/// Bytes written in either order are read back with the matching function.
+unittest "read_le: round trip"
+{
+    Vec<u8> out = Vec::new();
+    Vec::push_be(&mut out, 0x0102: u16);
+    Vec::push_le(&mut out, -2: i16);
+    assert(out[0] == 0x01 && out[1] == 0x02 && out[2] == 0xfe && out[3] == 0xff);
+    assert(read_be<u16>(&out[0..$], 0) == 0x0102);
+    assert(read_le<i16>(&out[0..$], 2) == -2);
+}
+
+/// The `T` whose `sizeof<T>()` bytes start at `s[at]`, most significant byte first (big-endian).
+///
+/// The type is written at the call: `read_be<u16>(&buf[0..$], 0)`. A signed `T` is read as two's
+/// complement. Faults (`index_out_of_bounds`) when fewer than `sizeof<T>()` bytes remain from `at`.
+export fn read_be<T: integer>(slice<u8, shared> s, usize at) : T
+{
+    usize n = sizeof<T>();
+    if (at > slice_len(s) || slice_len(s) - at < n)
+    {
+        fault(index_out_of_bounds);
+    }
+    T acc = 0;
+    for (usize k = 0; k < n; k += 1)
+    {
+        acc = acc | (narrow_wrapping<T>(s[at + k]) << narrow<u32>(8 * (n - 1 - k)));
+    }
+    acc
+}
+
+// D-0204: `s` split into `parts` runs of consecutive elements, in order,
+// as nearly equal in length as they can be (the first ones one longer):
+// disjoint, each an exclusive slice of its own, so each can be given to a
+// thread of its own (`spawn(work, part)`). Empty when `parts` is 0.
+/// Splits `s` into `parts` disjoint exclusive slices of consecutive elements, in order, as nearly equal in
+/// length as they can be.
+///
+/// With `n` elements, each part has `n / parts` elements and the first `n % parts` parts one more; some are
+/// empty when `parts > n`. The result is empty when `parts` is 0. The parts are disjoint, so each can be
+/// given to a thread of its own (`spawn(work, part)`) and written there without a lock; the borrow of `s`
+/// ends when the last part ends.
+export fn slice_parts<T>(slice<T, exclusive> s, usize parts) : Vec<slice<T, exclusive>>
+{
+    Vec<slice<T, exclusive>> out = Vec::new();
+    if (parts == 0)
+    {
+        return out;
+    }
+    usize n = slice_len(s);
+    usize at = 0;
+    for (usize k = 0; k < parts; k += 1)
+    {
+        usize size = n / parts;
+        if (k < n % parts)
+        {
+            size += 1;
+        }
+        Vec::push(&mut out, &mut s[at..at + size]);
+        at += size;
+    }
+    out
+}
+
+/// Five elements in two parts: the first part is the longer.
+unittest "slice_parts: lengths"
+{
+    array<i32, 5> a = [1, 2, 3, 4, 5];
+    Vec<slice<i32, exclusive>> parts = slice_parts(&mut a[0..$], 2);
+    assert(Vec::len(&parts) == 2);
+    assert(slice_len(parts[0]) == 3 && slice_len(parts[1]) == 2);
+}
+
+// Exchanges elements i and j of s; nothing when i == j.
+/// Exchanges elements `i` and `j` of `s`; nothing happens when `i == j`.
+///
+/// Faults (`index_out_of_bounds`) when either index is `>= slice_len(s)`.
+export fn slice_swap<T>(slice<T, exclusive> s, usize i, usize j)
+{
+    if (i >= slice_len(s) || j >= slice_len(s))
+    {
+        fault(index_out_of_bounds);
+    }
+    if (i != j)
+    {
+        swap_places(&mut s[i], &mut s[j]);
+    }
+}

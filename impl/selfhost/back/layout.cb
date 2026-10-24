@@ -1,0 +1,1079 @@
+// C types and layouts (impl/cobc/src/lower/layout.rs): what a type is in
+// C, its size and alignment, whether it is a resource, holds references or
+// `fn` values, and its runtime type descriptor. Types are keyed by
+// `type_code` where cobc keys them by the `Type` itself.
+
+import std;
+import ast;
+import items;
+import typecheck;
+import passes;
+import cnames;
+import typeops;
+import state;
+
+export fn struct_decl(ref<Gen, shared> g, ref<String, shared> name) : Option<StructDecl>
+{
+    match (HashMap::get(&g.prog.table.structs, name))
+    {
+        Some(sd) : Some(clone(sd)),
+        None     : None,
+    }
+}
+
+export fn enum_decl(ref<Gen, shared> g, ref<String, shared> name) : Option<EnumDecl>
+{
+    match (HashMap::get(&g.prog.table.enums, name))
+    {
+        Some(ed) : Some(clone(ed)),
+        None     : None,
+    }
+}
+
+// `rule.type.is-resource`.
+export fn is_resource(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TClosure(id) :
+        {
+            Vec<Type> fts = closure_fields(g, *id);
+            foreach (ft in &fts)
+            {
+                if (is_resource(g, ft))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TNamed(n)    :
+        {
+            match (HashMap::get(&g.prog.table.structs, &Box::get(n).name))
+            {
+                Some(sd) :
+                {
+                    if (sd.resource_)
+                    {
+                        return true;
+                    }
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                    foreach (f in &sd.fields)
+                    {
+                        if (is_resource(g, &apply(&f.ty, &sub)))
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+                None     : {},
+            }
+            match (HashMap::get(&g.prog.table.enums, &Box::get(n).name))
+            {
+                Some(ed) :
+                {
+                    if (ed.resource_)
+                    {
+                        return true;
+                    }
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &Box::get(n).args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                if (is_resource(g, &apply(p, &sub)))
+                                {
+                                    return true;
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                    false
+                },
+                None     : false,
+            }
+        },
+        Type::TArray(a)    : is_resource(g, &Box::get(a).inner),
+        Type::THandle(_)   : true,
+        Type::TMutex(_)    : true,
+        Type::TGuard(_)    : true,
+        _                  : false,
+    }
+}
+
+// What a predicate asks of a named type's parts: 0 `holds_fn`, 1 `has_refs`.
+fn any_part(ref<Gen, shared> g, ref<NamedTy, shared> n, u8 what) : bool
+{
+    match (HashMap::get(&g.prog.table.structs, &n.name))
+    {
+        Some(sd) :
+        {
+            HashMap<String, Type> sub = subst_of(&sd.type_params, &n.args);
+            foreach (f in &sd.fields)
+            {
+                Type ft = apply(&f.ty, &sub);
+                if ((what == 0 && holds_fn(g, &ft)) || (what == 1 && has_refs(g, &ft)))
+                {
+                    return true;
+                }
+            }
+            return false;
+        },
+        None     : {},
+    }
+    match (HashMap::get(&g.prog.table.enums, &n.name))
+    {
+        Some(ed) :
+        {
+            HashMap<String, Type> sub = subst_of(&ed.type_params, &n.args);
+            foreach (v in &ed.variants)
+            {
+                match (&v.payload)
+                {
+                    Some(p) :
+                    {
+                        Type pt = apply(p, &sub);
+                        if ((what == 0 && holds_fn(g, &pt)) || (what == 1 && has_refs(g, &pt)))
+                        {
+                            return true;
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            false
+        },
+        None     : false,
+    }
+}
+
+// D-0089: a value of `t` holds a `fn` value somewhere, whose closure it owns.
+export fn holds_fn(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TFn(_)       : true,
+        Type::TClosure(id) :
+        {
+            Vec<Type> fts = closure_fields(g, *id);
+            foreach (ft in &fts)
+            {
+                if (holds_fn(g, ft))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TNamed(n)    : any_part(g, Box::get(n), 0),
+        Type::TArray(a)    : holds_fn(g, &Box::get(a).inner),
+        Type::TMutex(i)    : holds_fn(g, Box::get(i)),
+        _                  : false,
+    }
+}
+
+// Whether a value of this type holds references (slots the runtime tracks).
+export fn has_refs(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(_)      : true,
+        Type::TSlice(_)    : true,
+        Type::TClosure(id) :
+        {
+            Vec<Type> fts = closure_fields(g, *id);
+            foreach (ft in &fts)
+            {
+                if (has_refs(g, ft))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TNamed(n)    : any_part(g, Box::get(n), 1),
+        Type::TArray(a)    : has_refs(g, &Box::get(a).inner),
+        Type::TGuard(_)    : true,
+        Type::TMutex(i)    : has_refs(g, Box::get(i)),
+        _                  : false,
+    }
+}
+
+// A value with nothing for the runtime to track when it is copied or
+// dropped: no resource, no reference, no fn value, at any depth.
+export fn plain_data(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_)    : true,
+        Type::TF32       : true,
+        Type::TF64       : true,
+        Type::TBool      : true,
+        Type::TStr       : true,
+        Type::TRawptr(_) : true,
+        Type::TArray(a)  : plain_data(g, &Box::get(a).inner),
+        Type::TNamed(n)  :
+        {
+            match (HashMap::get(&g.prog.table.structs, &Box::get(n).name))
+            {
+                Some(sd) :
+                {
+                    if (sd.resource_)
+                    {
+                        return false;
+                    }
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                    foreach (f in &sd.fields)
+                    {
+                        if (!plain_data(g, &apply(&f.ty, &sub)))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                None     : {},
+            }
+            match (HashMap::get(&g.prog.table.enums, &Box::get(n).name))
+            {
+                Some(ed) :
+                {
+                    if (ed.resource_)
+                    {
+                        return false;
+                    }
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &Box::get(n).args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                if (!plain_data(g, &apply(p, &sub)))
+                                {
+                                    return false;
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                    true
+                },
+                None     : false,
+            }
+        },
+        _                : false,
+    }
+}
+
+export struct SizeAlign
+{
+    export u64 size;
+    export u64 align;
+}
+
+fn sa(u64 s, u64 a) : SizeAlign
+{
+    SizeAlign { .size = s, .align = a }
+}
+
+export fn round_up(u64 n, u64 a) : u64
+{
+    if (a == 0)
+    {
+        return n;
+    }
+    (n + a - 1) / a * a
+}
+
+// `[Sizeof-*]` and `rule.agg.layout`, recomputed from the spec.
+export fn size_align(ref<Gen, shared> g, ref<Type, shared> t) : SizeAlign
+{
+    match (t)
+    {
+        Type::TInt(i)      :
+        {
+            u64 n = widen<u64>(int_ty_bits(*i, 64) / 8);
+            sa(n, n)
+        },
+        Type::TF32         : sa(4, 4),
+        Type::TF64         : sa(8, 8),
+        Type::TBool        : sa(1, 1),
+        Type::TVoid        : sa(0, 1),
+        Type::TNever       : sa(0, 1),
+        Type::TStr         : sa(16, 8),
+        Type::TRef(_)      : sa(8, 8),
+        Type::TRawptr(_)   : sa(8, 8),
+        Type::TFn(_)       : sa(8, 8),
+        Type::THandle(_)   : sa(8, 8),
+        Type::TGuard(_)    : sa(8, 8),
+        Type::TSlice(_)    : sa(24, 8),
+        // `[Sizeof-Mutex]`: the layout of `struct { τ inner; usize state; }`.
+        Type::TMutex(i)    :
+        {
+            SizeAlign x = size_align(g, Box::get(i));
+            u64 al = if (x.align > 8) { x.align } else { 8 };
+            sa(round_up(round_up(x.size, 8) + 8, al), al)
+        },
+        Type::TArray(a)    :
+        {
+            SizeAlign x = size_align(g, &Box::get(a).inner);
+            sa(x.size * narrow<u64>(Box::get(a).n), x.align)
+        },
+        // D-0254 `[Layout-Simd]`: aligned to its whole size.
+        Type::TSimd(a)     :
+        {
+            SizeAlign x = size_align(g, &Box::get(a).inner);
+            u64 whole = x.size * narrow<u64>(Box::get(a).n);
+            sa(whole, whole)
+        },
+        Type::TNamed(n)    :
+        {
+            match (HashMap::get(&g.prog.table.structs, &Box::get(n).name))
+            {
+                Some(sd) :
+                {
+                    match (sd.bits)
+                    {
+                        Some(b) : return size_align(g, &Type::TInt(b)),
+                        None    : {},
+                    }
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                    // D-0251: `align(N)` raises the struct's alignment.
+                    u64 off = 0;
+                    u64 al = match (sd.align)
+                    {
+                        Some(k) : k,
+                        None    : 1,
+                    };
+                    foreach (f in &sd.fields)
+                    {
+                        SizeAlign x = size_align(g, &apply(&f.ty, &sub));
+                        off = round_up(off, x.align);
+                        off += x.size;
+                        if (x.align > al)
+                        {
+                            al = x.align;
+                        }
+                    }
+                    return sa(round_up(off, al), al);
+                },
+                None     : {},
+            }
+            match (HashMap::get(&g.prog.table.enums, &Box::get(n).name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &Box::get(n).args);
+                    u64 ps = 0;
+                    u64 pa = 1;
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                SizeAlign x = size_align(g, &apply(p, &sub));
+                                if (x.size > ps)
+                                {
+                                    ps = x.size;
+                                }
+                                if (x.align > pa)
+                                {
+                                    pa = x.align;
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                    u64 payload_off = round_up(4, pa);
+                    u64 al = if (pa > 4) { pa } else { 4 };
+                    sa(round_up(payload_off + ps, al), al)
+                },
+                None     :
+                {
+                    assert(false, "cobc: unknown type");
+                    sa(0, 1)
+                },
+            }
+        },
+        Type::TClosure(id) :
+        {
+            u64 off = 0;
+            u64 align = 1;
+            Vec<Type> fts = closure_fields(g, *id);
+            foreach (ft in &fts)
+            {
+                SizeAlign x = size_align(g, ft);
+                off = round_up(off, x.align);
+                off += x.size;
+                if (x.align > align)
+                {
+                    align = x.align;
+                }
+            }
+            sa(round_up(off, align), align)
+        },
+    }
+}
+
+// The C spelling of a fully substituted type as stored in memory, emitting
+// its definition (fields first) on first use.
+export fn ctype(ref<Gen, exclusive> g, ref<Type, shared> t) : String
+{
+    match (t)
+    {
+        Type::TInt(i)      : String::from_str(c_int_type(*i)),
+        Type::TF32         : String::from_str("float"),
+        Type::TF64         : String::from_str("double"),
+        Type::TBool        : String::from_str("uint8_t"),
+        Type::TVoid        : String::from_str("cb_unit"),
+        Type::TNever       : String::from_str("cb_unit"),
+        Type::TStr         : String::from_str("cb_str"),
+        Type::TRef(_)      : String::from_str("void *"),
+        // A slice (D-0047): the reference slot that holds the borrow of its
+        // source, a pointer to its first element, its length.
+        Type::TSlice(m)    :
+        {
+            String name = forward_name(g, t);
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                String ic = ctype(g, &Box::get(m).inner);
+                String::append(
+                    &mut g.types,
+                    &sprintf("struct %s { void * src; %s * data; uint64_t len; };\n", &name, &ic),
+                );
+                assert_layout(g, t, &name);
+            }
+            sprintf("struct %s", &name)
+        },
+        Type::TRawptr(i)   :
+        {
+            String inner_c = match (Box::get(i))
+            {
+                Type::TNamed(_) : sprintf("struct %s", &forward_name(g, Box::get(i))),
+                _               : ctype(g, Box::get(i)),
+            };
+            sprintf("%s *", &inner_c)
+        },
+        Type::TFn(_)       : String::from_str("void *"),
+        // `[Repr-Handle]`: the thread id. `[Repr-Guard]`: as a reference, the
+        // address of the mutex's interior.
+        Type::THandle(_)   : String::from_str("uint64_t"),
+        Type::TGuard(_)    : String::from_str("void *"),
+        // `[Sizeof-Mutex]`: `struct { τ inner; usize state; }`.
+        Type::TMutex(i)    :
+        {
+            String name = forward_name(g, t);
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                String ic = ctype(g, Box::get(i));
+                String::append(&mut g.types, &sprintf("struct %s { %s inner; uint64_t state; };\n", &name, &ic));
+                assert_layout(g, t, &name);
+            }
+            sprintf("struct %s", &name)
+        },
+        Type::TClosure(id) :
+        {
+            String name = forward_name(g, t);
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                String body = String::new();
+                Vec<Type> fs = closure_fields(g, *id);
+                for (usize i = 0; i < Vec::len(&fs); i += 1)
+                {
+                    String fc = ctype(g, &fs[i]);
+                    String::appendf(&mut body, " %s f%v;", &fc, i);
+                }
+                String::appendf(&mut g.types, "struct %s {%s };\n", &name, &body);
+                assert_layout(g, t, &name);
+            }
+            sprintf("struct %s", &name)
+        },
+        Type::TArray(a)    :
+        {
+            String name = forward_name(g, t);
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                String ic = ctype(g, &Box::get(a).inner);
+                String::append(&mut g.types, &sprintf("struct %s { %s a[%v]; };\n", &name, &ic, Box::get(a).n));
+                assert_layout(g, t, &name);
+            }
+            sprintf("struct %s", &name)
+        },
+        // D-0254: a GCC/Clang vector type, and for integer lanes its
+        // unsigned twin (`cbvu_...`), in which the arithmetic is done so that
+        // a wrap is never undefined behaviour in C.
+        Type::TSimd(sv)    :
+        {
+            String name = sprintf("cbv_%s", &mangle(t));
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                String ic = ctype(g, &Box::get(sv).inner);
+                u64 bytes = size_align(g, &Box::get(sv).inner).size * narrow<u64>(Box::get(sv).n);
+                String::appendf(&mut g.types, "typedef %s %s __attribute__((vector_size(%v)));\n", &ic, &name, bytes);
+                match (&Box::get(sv).inner)
+                {
+                    Type::TInt(it) : String::appendf(
+                        &mut g.types,
+                        "typedef %s cbvu_%s __attribute__((vector_size(%v)));\n",
+                        c_uint_type(*it),
+                        &mangle(t),
+                        bytes,
+                    ),
+                    _ : {},
+                }
+            }
+            name
+        },
+        Type::TNamed(n)    :
+        {
+            String cname = forward_name(g, t);
+            if (HashSet::insert(&mut g.defined, type_code(t)))
+            {
+                match (HashMap::get(&g.prog.table.structs, &Box::get(n).name))
+                {
+                    Some(sd) :
+                    {
+                        match (sd.bits)
+                        {
+                            // D-0118: a bitstruct is its backing integer.
+                            Some(b) : String::append(
+                                &mut g.types,
+                                &sprintf("struct %s { %s bits; };\n", &cname, c_int_type(b)),
+                            ),
+                            None :
+                            {
+                                HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                                String body = String::new();
+                                foreach (f in &sd.fields)
+                                {
+                                    String fc = ctype(g, &apply(&f.ty, &sub));
+                                    String::append(&mut body, &sprintf(" %s %s;", &fc, &san(String::as_view(&f.name))));
+                                }
+                                // D-0251: GCC's and Clang's spelling of `alignas` on a type.
+                                String al = match (sd.align)
+                                {
+                                    Some(k) : if (k > 1)
+                                    {
+                                        sprintf(
+                                            " __attribute__((aligned(%v)))",
+                                            k,
+                                        )
+                                    }
+                                    else { String::new() },
+                                    None : String::new(),
+                                };
+                                String::append(&mut g.types, &sprintf("struct %s {%s }%s;\n", &cname, &body, &al));
+                            },
+                        }
+                    },
+                    None     :
+                    {
+                        match (HashMap::get(&g.prog.table.enums, &Box::get(n).name))
+                        {
+                            Some(ed) :
+                            {
+                                HashMap<String, Type> sub = subst_of(&ed.type_params, &Box::get(n).args);
+                                String body = String::new();
+                                for (usize k = 0; k < Vec::len(&ed.variants); k += 1)
+                                {
+                                    match (&ed.variants[k].payload)
+                                    {
+                                        Some(p) :
+                                        {
+                                            String pc = ctype(g, &apply(p, &sub));
+                                            String::append(&mut body, &sprintf(" %s v%v;", &pc, k));
+                                        },
+                                        None    : {},
+                                    }
+                                }
+                                if (String::len(&body) == 0)
+                                {
+                                    String::append(&mut g.types, &sprintf("struct %s { uint32_t tag; };\n", &cname));
+                                }
+                                else
+                                {
+                                    String::append(
+                                        &mut g.types,
+                                        &sprintf("struct %s { uint32_t tag; union {%s } u; };\n", &cname, &body),
+                                    );
+                                }
+                            },
+                            None     : assert(false, "cobc: unknown type"),
+                        }
+                    },
+                }
+                assert_layout(g, t, &cname);
+            }
+            sprintf("struct %s", &cname)
+        },
+    }
+}
+
+export fn forward_name(ref<Gen, exclusive> g, ref<Type, shared> t) : String
+{
+    String key = type_code(t);
+    match (HashMap::get(&g.type_names, &key))
+    {
+        Some(n) : return String::clone(n),
+        None    : {},
+    }
+    str prefix = match (t)
+    {
+        Type::TArray(_) : "a_",
+        Type::TNamed(n) : if (HashMap::contains(&g.prog.table.enums, &Box::get(n).name)) { "e_" } else { "s_" },
+        _               : "s_",
+    };
+    String name = sprintf("%s%s", prefix, &mangle(t));
+    String::append(&mut g.fwd, &sprintf("struct %s;\n", &name));
+    HashMap::insert(&mut g.type_names, key, String::clone(&name));
+    name
+}
+
+fn assert_layout(ref<Gen, exclusive> g, ref<Type, shared> t, ref<String, shared> cname)
+{
+    SizeAlign x = size_align(g, t);
+    String::append(
+        &mut g.types,
+        &sprintf(
+            "_Static_assert(sizeof(struct %s) == %v && _Alignof(struct %s) == %v, \"layout of %s\");\n",
+            cname,
+            x.size,
+            cname,
+            x.align,
+            cname,
+        )
+    );
+}
+
+// The C type of a parameter: a register's, except that a parameter of type
+// `void` is the unit value `cb_unit`, since C has no `void` parameter.
+export fn param_ctype(ref<Gen, exclusive> g, ref<Type, shared> t) : String
+{
+    match (t)
+    {
+        Type::TVoid : String::from_str("cb_unit"),
+        _           : reg_ctype(g, t),
+    }
+}
+
+// The C type of a value in a register: parameters, results, temporaries.
+export fn reg_ctype(ref<Gen, exclusive> g, ref<Type, shared> t) : String
+{
+    match (t)
+    {
+        Type::TVoid   : String::from_str("void"),
+        Type::TNever  : String::from_str("void"),
+        Type::TRef(_) : String::from_str("cb_ref"),
+        _             : ctype(g, t),
+    }
+}
+
+// FNV-1a, 32 bits: the stable id of a type, the same in every program.
+export fn fnv1a32(StringView s) : u32
+{
+    u32 h = 2166136261;
+    foreach (b in StringView::as_bytes(s))
+    {
+        h = wrapping_mul(h ^ widen<u32>(*b), 16777619);
+    }
+    h
+}
+
+fn flag(bool b) : u8
+{
+    if (b) { 1 } else { 0 }
+}
+
+// The runtime type descriptor's index for a type (emitting the descriptor
+// and its C type on first use).
+export fn type_id(ref<Gen, exclusive> g, ref<Type, shared> t) : u32
+{
+    String key = type_code(t);
+    match (HashMap::get(&g.type_ids, &key))
+    {
+        Some(id) : return *id,
+        None     : {},
+    }
+    String name_for_id = mangle(t);
+    u32 id = fnv1a32(String::as_view(&name_for_id));
+    while (id == 0 || id >= 4294967280 || HashMap::contains(&g.type_pos, &id))
+    {
+        id = wrapping_add(id, 1);
+    }
+    HashMap::insert(&mut g.type_pos, id, Vec::len(&g.descs));
+    Vec::push(&mut g.descs, None);
+    Vec::push(&mut g.desc_ids, id);
+    HashMap::insert(&mut g.type_ids, key, id);
+    String cty = ctype(g, t);
+    u8 is_res = flag(is_resource(g, t));
+    u8 refs = flag(has_refs(g, t));
+    String size = if (is_void_or_never(t)) { String::from_str("0") } else { sprintf("sizeof(%s)", &cty) };
+    String name = c_escape(String::as_view(&mangle(t)));
+    String desc = match (t)
+    {
+        Type::TRef(_) : sprintf(
+            "{ \"%s\", %s, CB_K_REF, %v, %v, 0, 0, 0, 0, 0, 0, 0, 0 }",
+            &name,
+            &size,
+            is_res,
+            refs,
+        ),
+        // A slice: a struct whose one tracked field is its reference slot.
+        Type::TSlice(m)     :
+        {
+            Type rt = Type::TRef(Box::new(ModedTy { .inner = clone(&Box::get(m).inner), .mode = Box::get(m).mode }));
+            u32 rid = type_id(g, &rt);
+            String farr = sprintf("cb_f_%v", id);
+            String::append(
+                &mut g.desc_aux,
+                &sprintf("static const cb_field %s[] = { { offsetof(%s, src), %vu }, {0, 0} };\n", &farr, &cty, rid),
+            );
+            sprintf("{ \"%s\", %s, CB_K_STRUCT, 0, 1, 0, 1u, %s, 0, 0, 0, 0, 0 }", &name, &size, &farr)
+        },
+        Type::TFn(_)        : sprintf("{ \"%s\", %s, CB_K_FN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }", &name, &size),
+        Type::THandle(_)    : sprintf("{ \"%s\", %s, CB_K_HANDLE, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 }", &name, &size),
+        Type::TGuard(_)     : sprintf("{ \"%s\", %s, CB_K_GUARD, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0 }", &name, &size),
+        // A mutex is destroyed as the struct it is laid out as.
+        Type::TMutex(i)     :
+        {
+            u32 fid = type_id(g, Box::get(i));
+            String farr = sprintf("cb_f_%v", id);
+            String::append(
+                &mut g.desc_aux,
+                &sprintf("static const cb_field %s[] = { { offsetof(%s, inner), %vu }, {0, 0} };\n", &farr, &cty, fid),
+            );
+            sprintf("{ \"%s\", %s, CB_K_STRUCT, 1, %v, 0, 1u, %s, 0, 0, 0, 0, 0, 1 }", &name, &size, refs, &farr)
+        },
+        Type::TClosure(cid) :
+        {
+            String fs = String::new();
+            Vec<Type> fts = closure_fields(g, *cid);
+            for (usize i = 0; i < Vec::len(&fts); i += 1)
+            {
+                u32 fid = type_id(g, &fts[i]);
+                String::appendf(&mut fs, "{ offsetof(%s, f%v), %vu }, ", &cty, i, fid);
+            }
+            String farr = sprintf("cb_f_%v", id);
+            String::appendf(&mut g.desc_aux, "static const cb_field %s[] = { %s{0, 0} };\n", &farr, &fs);
+            sprintf(
+                "{ \"%s\", %s, CB_K_STRUCT, %v, %v, 0, %vu, %s, 0, 0, 0, 0, 0, 1 }",
+                &name,
+                &size,
+                is_res,
+                refs,
+                Vec::len(&fts),
+                &farr,
+            )
+        },
+        Type::TArray(a)     :
+        {
+            u32 eid = type_id(g, &Box::get(a).inner);
+            sprintf(
+                "{ \"%s\", %s, CB_K_ARRAY, %v, %v, 0, 0, 0, 0, 0, 0, %vu, %vu }",
+                &name,
+                &size,
+                is_res,
+                refs,
+                eid,
+                Box::get(a).n,
+            )
+        },
+        Type::TNamed(n)     : named_desc(g, Box::get(n), id, &cty, &name, &size, is_res, refs),
+        _                   : sprintf("{ \"%s\", %s, CB_K_SCALAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }", &name, &size),
+    };
+    usize pos = *Option::expect(HashMap::get(&g.type_pos, &id), "a type's position");
+    g.descs[pos] = Some(desc);
+    id
+}
+
+fn is_void_or_never(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TVoid  : true,
+        Type::TNever : true,
+        _            : false,
+    }
+}
+
+fn named_desc(
+    ref<Gen, exclusive> g,
+    ref<NamedTy, shared> n,
+    u32 id,
+    ref<String, shared> cty,
+    ref<String, shared> name,
+    ref<String, shared> size,
+    u8 is_res,
+    u8 refs,
+) : String
+{
+    match (HashMap::get(&g.prog.table.structs, &n.name))
+    {
+        Some(sd) :
+        {
+            HashMap<String, Type> sub = subst_of(&sd.type_params, &n.args);
+            String fields = String::new();
+            // D-0118: a bitstruct's fields are bits of one integer, nothing
+            // the runtime tracks.
+            if (Option::is_none(&sd.bits))
+            {
+                foreach (f in &sd.fields)
+                {
+                    u32 fid = type_id(g, &apply(&f.ty, &sub));
+                    String::append(
+                        &mut fields,
+                        &sprintf("{ offsetof(%s, %s), %vu }, ", cty, &san(String::as_view(&f.name)), fid),
+                    );
+                }
+            }
+            String farr = sprintf("cb_f_%v", id);
+            String::append(&mut g.desc_aux, &sprintf("static const cb_field %s[] = { %s{0, 0} };\n", &farr, &fields));
+            String dname = sprintf("%s::drop", &n.name);
+            String drop = if (HashMap::contains(
+                &g.prog.table.fns,
+                &dname,
+            )) { request_fn(g, String::as_view(&dname), clone(&n.args)) } else { String::from_str("0") };
+            // A Box's `elem` is its referent's id + 1.
+            u32 box_mark = if (n.name == "std::Box" && Vec::len(&n.args) == 1)
+            {
+                type_id(
+                    g,
+                    &n.args[0],
+                ) + 1
+            }
+            else { 0 };
+            // A `Vec<T>` whose `drop` is the native one for a plain,
+            // non-zero-sized `T`: its `count` is `sizeof(T)` + 1.
+            u64 vec_mark = 0;
+            if (n.name == "std::Vec" && Vec::len(&n.args) == 1 && plain_data(
+                g,
+                &n.args[0],
+            ) && size_align(g, &n.args[0]).size > 0)
+            {
+                vec_mark = size_align(g, &n.args[0]).size + 1;
+            }
+            usize nfields = if (Option::is_some(&sd.bits)) { 0 } else { Vec::len(&sd.fields) };
+            sprintf(
+                "{ \"%s\", %s, CB_K_STRUCT, %v, %v, %s, %vu, %s, 0, 0, 0, %vu, %vu, %v }",
+                name,
+                size,
+                is_res,
+                refs,
+                &drop,
+                nfields,
+                &farr,
+                box_mark,
+                vec_mark,
+                flag(type_is_owner(&g.prog.table, &n.name))
+            )
+        },
+        None     :
+        {
+            match (HashMap::get(&g.prog.table.enums, &n.name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &n.args);
+                    String vars = String::new();
+                    bool any_payload = false;
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                any_payload = true;
+                                u32 pid = type_id(g, &apply(p, &sub));
+                                String::append(&mut vars, &sprintf("%vu, ", pid));
+                            },
+                            None    : String::append(&mut vars, "CB_NOTYPE, "),
+                        }
+                    }
+                    String varr = sprintf("cb_v_%v", id);
+                    String::append(&mut g.desc_aux, &sprintf("static const uint32_t %s[] = { %s0 };\n", &varr, &vars));
+                    String poff = if (any_payload) { sprintf("offsetof(%s, u)", cty) } else { String::from_str("0") };
+                    sprintf(
+                        "{ \"%s\", %s, CB_K_ENUM, %v, %v, 0, 0, 0, %vu, %s, %s, 0, 0, %v }",
+                        name,
+                        size,
+                        is_res,
+                        refs,
+                        Vec::len(&ed.variants),
+                        &varr,
+                        &poff,
+                        flag(type_is_owner(&g.prog.table, &n.name))
+                    )
+                },
+                None     :
+                {
+                    assert(false, "cobc: unknown type");
+                    String::new()
+                },
+            }
+        },
+    }
+}
+
+// Whether a type is made of `std` and built-in types alone.
+export fn std_only(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_)    : true,
+        Type::TF32       : true,
+        Type::TF64       : true,
+        Type::TBool      : true,
+        Type::TStr       : true,
+        Type::TVoid      : true,
+        Type::TNever     : true,
+        Type::TRef(m)    : std_only(&Box::get(m).inner),
+        Type::TSlice(m)  : std_only(&Box::get(m).inner),
+        Type::TRawptr(i) : std_only(Box::get(i)),
+        Type::TArray(s)  : std_only(&Box::get(s).inner),
+        Type::THandle(i) : std_only(Box::get(i)),
+        Type::TMutex(i)  : std_only(Box::get(i)),
+        Type::TGuard(i)  : std_only(Box::get(i)),
+        Type::TFn(f)     : all_std_only(&Box::get(f).params) && std_only(&Box::get(f).ret),
+        Type::TNamed(n)  : String::starts_with(&Box::get(n).name, "std::") && all_std_only(&Box::get(n).args),
+        _                : false,
+    }
+}
+
+export fn all_std_only(ref<Vec<Type>, shared> ts) : bool
+{
+    foreach (t in ts)
+    {
+        if (!std_only(t))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether `t` names one of `params` anywhere in it.
+fn mentions_param(ref<Type, shared> t, ref<Vec<String>, shared> params) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n)  :
+        {
+            if (Vec::len(&Box::get(n).args) == 0 && Vec::contains(params, &Box::get(n).name))
+            {
+                return true;
+            }
+            foreach (a in &Box::get(n).args)
+            {
+                if (mentions_param(a, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TRef(m)    : mentions_param(&Box::get(m).inner, params),
+        Type::TSlice(m)  : mentions_param(&Box::get(m).inner, params),
+        Type::TRawptr(i) : mentions_param(Box::get(i), params),
+        Type::TArray(a)  : mentions_param(&Box::get(a).inner, params),
+        Type::TSimd(a)   : mentions_param(&Box::get(a).inner, params),
+        Type::THandle(i) : mentions_param(Box::get(i), params),
+        Type::TMutex(i)  : mentions_param(Box::get(i), params),
+        Type::TGuard(i)  : mentions_param(Box::get(i), params),
+        Type::TFn(f)     :
+        {
+            foreach (p in &Box::get(f).params)
+            {
+                if (mentions_param(p, params))
+                {
+                    return true;
+                }
+            }
+            mentions_param(&Box::get(f).ret, params)
+        },
+        _                : false,
+    }
+}
+
+// CHG-0358: whether a value of type `t` can carry a reference argument
+// `ref<inner, _>`'s own path back out of a call: a reference to that very
+// type, somewhere in it. A type parameter still open, or a guard, may.
+export fn may_carry_ref_to(
+    ref<Gen, shared> g,
+    ref<Type, shared> t,
+    ref<Type, shared> inner,
+    ref<Vec<String>, shared> params,
+) : bool
+{
+    match (t)
+    {
+        Type::TRef(x)      : type_eq(&Box::get(x).inner, inner) || mentions_param(&Box::get(x).inner, params),
+        Type::TGuard(_)    : true,
+        Type::TClosure(id) :
+        {
+            Vec<Type> fts = closure_fields(g, *id);
+            foreach (ft in &fts)
+            {
+                if (may_carry_ref_to(g, ft, inner, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TNamed(n)    :
+        {
+            if (Vec::len(&Box::get(n).args) == 0 && Vec::contains(params, &Box::get(n).name))
+            {
+                return true;
+            }
+            match (HashMap::get(&g.prog.table.structs, &Box::get(n).name))
+            {
+                Some(sd) :
+                {
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                    foreach (f in &sd.fields)
+                    {
+                        if (may_carry_ref_to(g, &apply(&f.ty, &sub), inner, params))
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+                None     : {},
+            }
+            match (HashMap::get(&g.prog.table.enums, &Box::get(n).name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &Box::get(n).args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                if (may_carry_ref_to(g, &apply(p, &sub), inner, params))
+                                {
+                                    return true;
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                    false
+                },
+                None     : false,
+            }
+        },
+        Type::TArray(a)    : may_carry_ref_to(g, &Box::get(a).inner, inner, params),
+        Type::TMutex(i)    : may_carry_ref_to(g, Box::get(i), inner, params),
+        _                  : false,
+    }
+}

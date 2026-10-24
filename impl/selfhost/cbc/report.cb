@@ -1,0 +1,497 @@
+// `--report-tracking FILE.cb`, as impl/cobc/src/report.rs makes it: where
+// the compiled program still pays for run-time tracking. The generated C is
+// read back: every call of the runtime's tracking interface -- paths,
+// objects, checked reads and writes -- is attributed to the source line
+// named by the nearest `cb_at`/`cb_stmt_push_at`/`cb_frame_push_at` before
+// it, and the program's own lines (not `std`'s) that carry any are listed,
+// those inside a loop of the generated C first. Bounds and overflow checks
+// are not tracking. The counts are static (calls written in the C, not calls
+// made).
+
+import std;
+import target;
+
+fn tracking() : Vec<str>
+{
+    Vec<str> v = Vec::new();
+    foreach (t in [
+        "cb_borrow_range_unminted", "cb_borrow_unminted", "cb_borrow_unstamped", "cb_borrow_range", "cb_borrow_check", "cb_borrow",
+        "cb_elem_borrow_here", "cb_elem_borrow_datum", "cb_elem_borrow", "cb_elem_access", "cb_read", "cb_write",
+        "cb_recv_datum_tok", "cb_recv_datum", "cb_recv", "cb_send_datum", "cb_send_ref", "cb_send", "cb_copy_datum", "cb_new", "cb_bind",
+        "cb_move_to", "cb_store_ref", "cb_load_ref", "cb_frame_hold", "cb_valid", "cb_absorb",
+    ])
+    {
+        Vec::push(&mut v, t);
+    }
+    v
+}
+
+fn word(u8 c) : bool
+{
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+}
+
+// The tracking calls on one line of generated C.
+fn calls(StringView row, ref<Vec<str>, shared> names) : Vec<str>
+{
+    slice<u8, shared> b = StringView::as_bytes(row);
+    usize n = StringView::len(row);
+    Vec<str> out = Vec::new();
+    usize i = 0;
+    while (true)
+    {
+        usize k = match (StringView::find(StringView::sub(row, i, n), "cb_"))
+        {
+            Some(k) : k,
+            None    : break,
+        };
+        usize at = i + k;
+        bool word_start = at == 0 || !word(b[at - 1]);
+        usize name_end = at;
+        while (name_end < n && word(b[name_end]))
+        {
+            name_end += 1;
+        }
+        if (word_start && StringView::starts_with(StringView::trim_start(StringView::sub(row, name_end, n)), "("))
+        {
+            StringView name = StringView::sub(row, at, name_end);
+            foreach (t in names)
+            {
+                if (StringView::eq_str(name, *t))
+                {
+                    Vec::push(&mut out, *t);
+                    break;
+                }
+            }
+        }
+        i = if (name_end > at + 3) { name_end } else { at + 3 };
+    }
+    out
+}
+
+struct Pos
+{
+    usize file;
+    usize line;
+}
+
+fn trim_u(StringView s) : StringView
+{
+    StringView t = StringView::trim(s);
+    while (StringView::ends_with(t, "u"))
+    {
+        t = StringView::sub(t, 0, StringView::len(t) - 1);
+    }
+    t
+}
+
+// `cb_at(F, L)` and its relatives: the last source position on the line.
+fn position(StringView row) : Option<Pos>
+{
+    Option<usize> last_at = None;
+    Option<Pos> last = None;
+    usize n = StringView::len(row);
+    foreach (marker in ["cb_at(", "cb_stmt_push_at(", "cb_frame_push_at("])
+    {
+        usize from = 0;
+        while (true)
+        {
+            usize k = match (StringView::find(StringView::sub(row, from, n), StringView::of(marker)))
+            {
+                Some(k) : k,
+                None    : break,
+            };
+            StringView args = StringView::sub(row, from + k + StringView::len(StringView::of(marker)), n);
+            usize end = match (StringView::find(args, ")"))
+            {
+                Some(e) : e,
+                None    : StringView::len(args),
+            };
+            Vec<StringView> parts = StringView::split(StringView::sub(args, 0, end), ",");
+            if (Vec::len(&parts) >= 2)
+            {
+                match (StringView::parse<usize>(trim_u(parts[0])))
+                {
+                    Ok(f)  :
+                    {
+                        match (StringView::parse<usize>(trim_u(parts[1])))
+                        {
+                            Ok(l)  :
+                            {
+                                bool later = match (last_at)
+                                {
+                                    Some(o) : o < from + k,
+                                    None    : true,
+                                };
+                                if (later)
+                                {
+                                    last_at = Some(from + k);
+                                    last = Some(Pos { .file = f, .line = l });
+                                }
+                            },
+                            Err(_) : {},
+                        }
+                    },
+                    Err(_) : {},
+                }
+            }
+            from += k + StringView::len(StringView::of(marker));
+        }
+    }
+    last
+}
+
+// The names in `static const char *const cb_files[] = {"a.cb", …, 0};`.
+fn file_names(StringView c) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    Vec<StringView> rows = StringView::lines(c);
+    foreach (row in &rows)
+    {
+        if (StringView::starts_with(*row, "static const char *const cb_files[]"))
+        {
+            Vec<StringView> parts = StringView::split(*row, "\"");
+            for (usize i = 1; i < Vec::len(&parts); i += 2)
+            {
+                Vec::push(&mut out, String::from_view(parts[i]));
+            }
+            return out;
+        }
+    }
+    out
+}
+
+fn pos_key(Pos p) : String
+{
+    sprintf("%v:%v", p.file, p.line)
+}
+
+// One listed line: its place, whether inside a loop, its calls' counts.
+struct LineCalls
+{
+    Pos p;
+    bool looping;
+    Vec<str> kinds;
+    Vec<usize> counts;
+}
+
+fn less_line(ref<LineCalls, shared> a, ref<LineCalls, shared> b) : bool
+{
+    // `(!in_loop, p)`.
+    if (a.looping != b.looping)
+    {
+        return a.looping;
+    }
+    if (a.p.file != b.p.file)
+    {
+        return a.p.file < b.p.file;
+    }
+    a.p.line < b.p.line
+}
+
+fn pad(ref<String, shared> s, usize width) : String
+{
+    String out = String::clone(s);
+    usize n = String::char_count(s);
+    while (n < width)
+    {
+        String::push_ascii(&mut out, b' ');
+        n += 1;
+    }
+    out
+}
+
+fn source_lines(ref<String, shared> name, StringView dir) : Vec<String>
+{
+    // As `cb_files` names it (the path cobc was given), else beside the
+    // entry file.
+    String base = match (path_file_name(String::as_view(name)))
+    {
+        Some(b) : b,
+        None    : String::clone(name),
+    };
+    String text = match (read_file(String::as_view(name)))
+    {
+        Ok(t) : t,
+        Err(_) : match (read_file(String::as_view(&pjoin(dir, String::as_view(&base)))))
+        {
+            Ok(t)  : t,
+            Err(_) : String::new(),
+        },
+    };
+    Vec<String> out = Vec::new();
+    Vec<StringView> rows = String::lines(&text);
+    foreach (r in &rows)
+    {
+        Vec::push(&mut out, String::from_view(*r));
+    }
+    out
+}
+
+struct FnCount
+{
+    String name;
+    usize n;
+}
+
+export fn report(StringView c, StringView entry) : String
+{
+    Vec<str> names_t = tracking();
+    Vec<String> names = file_names(c);
+    Vec<LineCalls> per_line = Vec::new();
+    HashMap<String, usize> line_index = HashMap::new();
+    Vec<FnCount> per_fn = Vec::new();
+    HashMap<String, usize> fn_index = HashMap::new();
+    String func = String::new();
+    Option<Pos> cur = None;
+    Vec<bool> stack = Vec::new();
+    Vec<StringView> rows = StringView::lines(c);
+    foreach (rp in &rows)
+    {
+        StringView row = *rp;
+        // A function's definition begins at column 0 with its signature.
+        if (!StringView::starts_with(row, " ") && StringView::contains(row, "f_") && StringView::ends_with(row, ")")
+            && !StringView::ends_with(row, ";"))
+        {
+            StringView head = match (StringView::find(row, "("))
+            {
+                Some(k) : StringView::sub(row, 0, k),
+                None    : row,
+            };
+            Vec<StringView> words = StringView::split(head, " ");
+            StringView last = words[Vec::len(&words) - 1];
+            while (StringView::starts_with(last, "*"))
+            {
+                last = StringView::sub(last, 1, StringView::len(last));
+            }
+            func = String::from_view(last);
+            cur = None;
+            Vec::clear(&mut stack);
+            continue;
+        }
+        match (position(row))
+        {
+            Some(p) : cur = Some(p),
+            None    : {},
+        }
+        bool looping = false;
+        foreach (l in &stack)
+        {
+            if (*l)
+            {
+                looping = true;
+            }
+        }
+        Vec<str> found = calls(row, &names_t);
+        foreach (k in &found)
+        {
+            // File 0 onward are the program's files; `std`'s calls carry no
+            // position of the program's.
+            match (&cur)
+            {
+                Some(p) :
+                {
+                    if (p.file < Vec::len(&names))
+                    {
+                        String key = pos_key(*p);
+                        usize at = match (HashMap::get(&line_index, &key))
+                        {
+                            Some(i) : *i,
+                            None    :
+                            {
+                                usize i = Vec::len(&per_line);
+                                Vec::push(&mut per_line, LineCalls {
+                                    .p = *p,
+                                    .looping = false,
+                                    .kinds = Vec::new(),
+                                    .counts = Vec::new(),
+                                });
+                                _ = HashMap::insert(&mut line_index, key, i);
+                                i
+                            },
+                        };
+                        ref<LineCalls, exclusive> lc = &mut per_line[at];
+                        bool counted = false;
+                        for (usize j = 0; j < Vec::len(&lc.kinds); j += 1)
+                        {
+                            if (StringView::eq_str(StringView::of(lc.kinds[j]), *k))
+                            {
+                                lc.counts[j] += 1;
+                                counted = true;
+                            }
+                        }
+                        if (!counted)
+                        {
+                            Vec::push(&mut lc.kinds, *k);
+                            Vec::push(&mut lc.counts, 1);
+                        }
+                        if (looping)
+                        {
+                            lc.looping = true;
+                        }
+                        match (HashMap::get(&fn_index, &func))
+                        {
+                            Some(i) : per_fn[*i].n += 1,
+                            None    :
+                            {
+                                _ = HashMap::insert(&mut fn_index, String::clone(&func), Vec::len(&per_fn));
+                                Vec::push(&mut per_fn, FnCount { .name = String::clone(&func), .n = 1 });
+                            },
+                        }
+                    }
+                },
+                None    : {},
+            }
+        }
+        StringView code = match (StringView::find(row, "//"))
+        {
+            Some(k) : StringView::sub(row, 0, k),
+            None    : row,
+        };
+        foreach (ch in StringView::as_bytes(code))
+        {
+            if (*ch == b'{')
+            {
+                Vec::push(&mut stack, StringView::contains(code, "for (;;)") || StringView::contains(code, "while ("));
+            }
+            else if (*ch == b'}')
+            {
+                _ = Vec::pop(&mut stack);
+            }
+        }
+    }
+    String dir = match (path_parent(entry))
+    {
+        Some(d) : if (String::len(&d) == 0) { String::from_str(".") } else { d },
+        None    : String::from_str("."),
+    };
+    String out = String::new();
+    if (Vec::len(&per_line) == 0)
+    {
+        String::append(&mut out, "no run-time tracking left in the program's own code\n");
+        return out;
+    }
+    String::append(
+        &mut out,
+        "Run-time tracking left in the program's own code (calls written in the C, per source line;\n",
+    );
+    String::append(&mut out, "`loop` marks lines inside a loop, listed first):\n");
+    // Sorted by `(!in_loop, p)`.
+    for (usize i = 1; i < Vec::len(&per_line); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && less_line(&per_line[j], &per_line[j - 1]))
+        {
+            Vec::swap(&mut per_line, j - 1, j);
+            j -= 1;
+        }
+    }
+    HashMap<usize, Vec<String>> texts = HashMap::new();
+    foreach (lc in &per_line)
+    {
+        ref<String, shared> name = &names[lc.p.file];
+        if (!HashMap::contains(&texts, &lc.p.file))
+        {
+            _ = HashMap::insert(&mut texts, lc.p.file, source_lines(name, String::as_view(&dir)));
+        }
+        ref<Vec<String>, shared> lines = Option::expect(HashMap::get(&texts, &lc.p.file), "read");
+        String text = if (lc.p.line >= 1 && lc.p.line - 1 < Vec::len(lines))
+        {
+            String::from_view(String::trim(&lines[lc.p.line - 1]))
+        }
+        else
+        {
+            String::new()
+        };
+        // The kinds, by count (most first), then by name.
+        Vec<usize> order = Vec::new();
+        for (usize k = 0; k < Vec::len(&lc.kinds); k += 1)
+        {
+            Vec::push(&mut order, k);
+        }
+        for (usize a = 1; a < Vec::len(&order); a += 1)
+        {
+            usize b = a;
+            while (b > 0)
+            {
+                usize x = order[b];
+                usize y = order[b - 1];
+                bool before = lc.counts[x] > lc.counts[y]
+                    || (lc.counts[x] == lc.counts[y] && StringView::less(
+                        StringView::of(lc.kinds[x]),
+                        StringView::of(lc.kinds[y]),
+                    ));
+                if (!before)
+                {
+                    break;
+                }
+                Vec::swap(&mut order, b - 1, b);
+                b -= 1;
+            }
+        }
+        Vec<String> kinds = Vec::new();
+        foreach (k in &order)
+        {
+            StringView kn = StringView::of(lc.kinds[*k]);
+            Vec::push(&mut kinds, sprintf("%v x%v", StringView::sub(kn, 3, StringView::len(kn)), lc.counts[*k]));
+        }
+        String short = String::new();
+        Vec<StringView> cs = String::chars(&text);
+        for (usize k = 0; k < Vec::len(&cs) && k < 56; k += 1)
+        {
+            String::append(&mut short, cs[k]);
+        }
+        String shown = match (path_file_name(String::as_view(name)))
+        {
+            Some(n) : n,
+            None    : String::clone(name),
+        };
+        String::appendf(
+            &mut out,
+            "  %s:%s %s %s  %s\n",
+            &shown,
+            &pad(&sprintf("%v", lc.p.line), 5),
+            &pad(&String::from_str(if (lc.looping) { "loop" } else { "" }), 4),
+            &pad(&short, 56),
+            &String::join(&kinds[0..$], ", "),
+        );
+    }
+    // By count (most first), then by name; the first ten.
+    Vec<FnCount> fns = Vec::new();
+    foreach (f in &per_fn)
+    {
+        if (String::len(&f.name) > 0)
+        {
+            Vec::push(&mut fns, clone(f));
+        }
+    }
+    for (usize a = 1; a < Vec::len(&fns); a += 1)
+    {
+        usize b = a;
+        while (b > 0)
+        {
+            bool before = fns[b].n > fns[b - 1].n || (fns[b].n == fns[b - 1].n && String::less(
+                &fns[b].name,
+                &fns[b - 1].name,
+            ));
+            if (!before)
+            {
+                break;
+            }
+            Vec::swap(&mut fns, b - 1, b);
+            b -= 1;
+        }
+    }
+    Vec<String> shown_fns = Vec::new();
+    for (usize k = 0; k < Vec::len(&fns) && k < 10; k += 1)
+    {
+        StringView nm = String::as_view(&fns[k].name);
+        while (StringView::starts_with(nm, "f_"))
+        {
+            nm = StringView::sub(nm, 2, StringView::len(nm));
+        }
+        Vec::push(&mut shown_fns, sprintf("%v %v", nm, fns[k].n));
+    }
+    String::appendf(&mut out, "By function: %s\n", &String::join(&shown_fns[0..$], ", "));
+    out
+}

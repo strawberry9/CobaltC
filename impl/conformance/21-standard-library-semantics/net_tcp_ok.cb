@@ -1,0 +1,96 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.net [Bind] [Accept] [Connect] [Stream-Read] [Stream-Write] [Shutdown] [Stream-Timeout] [Net-Error] (D-0144); conf.net-bind-port, conf.net-echo, conf.net-shutdown-read-zero, conf.net-refused, conf.net-accept-timeout, conf.net-addr-in-use, conf.net-read-exact
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 626f756e6420746f2061206672656520706f72743a20747275650a7065657220697320746865207365727665723a20747275650a6563686f3a205b48454c4c4f2c205345525645525d0a726561645f657861637420343a20747275652c20627974657320340a7468656e20726561643a20300a726561645f657861637420706173742074686520656e643a20436c6f7365640a7365727665723a20300a7365636f6e642062696e643a206164647265737320696e207573650a6163636570742077697468206e6f20636c69656e743a2074696d6564206f75740a636f6e6e65637420746f206120636c6f73656420706f72743a20636f6e6e656374696f6e20726566757365640a
+//
+// Hermetic: loopback only, port 0, server and client in one program. A
+// server thread accepts one connection, reads a line, writes it back in
+// capitals with `printf`, sends four more bytes and closes its side; the
+// main thread's `read_line`, `read_exact` and a `read` of 0 see exactly
+// that. Each blocking call lets the other thread run. A second `bind` of
+// one address is `AddrInUse`; an `accept` with a 100 ms timeout and no
+// client is `TimedOut`; a connection to a closed port is `Refused`.
+
+import std;
+
+fn serve(TcpListener l) : u8
+{
+    TcpStream s = match (TcpListener::accept(&mut l))
+    {
+        Ok(s)  : s,
+        Err(_) : return 1,
+    };
+    match (TcpStream::read_line(&mut s))
+    {
+        Ok(Some(line)) :
+        {
+            String up = String::to_ascii_upper(&line);
+            _ = TcpStream::printf(&mut s, "%s\r\n", &up);
+        },
+        _              : return 2,
+    }
+    _ = TcpStream::write(&mut s, &b"tail"[0..$]);
+    _ = TcpStream::shutdown_write(&mut s);
+    0
+}
+
+fn main() : u8
+{
+    TcpListener l = match (TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(l)  : l,
+        Err(_) : return 1,
+    };
+    SocketAddr at = TcpListener::local_addr(&l);
+    printf("bound to a free port: %v\n", at.port != 0);
+    auto server = spawn(serve, l);
+    TcpStream c = match (TcpStream::connect(at))
+    {
+        Ok(c)  : c,
+        Err(_) : return 2,
+    };
+    TcpStream::set_nodelay(&mut c, true);
+    TcpStream::set_read_timeout_ms(&mut c, 10000);
+    printf("peer is the server: %v\n", TcpStream::peer_addr(&c).port == at.port);
+    _ = TcpStream::write_text(&mut c, "hello, server\n");
+    match (TcpStream::read_line(&mut c))
+    {
+        Ok(Some(line)) : printf("echo: [%s]\n", &line),
+        _              : printf("no echo\n"),
+    }
+    Vec<u8> buf = Vec::new();
+    printf("read_exact 4: %v, bytes %u\n", Result::is_ok(&TcpStream::read_exact(&mut c, &mut buf, 4)), Vec::len(&buf));
+    printf("then read: %v\n", Result::unwrap_or(TcpStream::read(&mut c, &mut buf, 100), 99));
+    match (TcpStream::read_exact(&mut c, &mut buf, 1))
+    {
+        Err(Closed) : printf("read_exact past the end: Closed\n"),
+        _           : printf("read_exact: ?\n"),
+    }
+    printf("server: %u\n", join(server));
+    TcpListener m = match (TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(m)  : m,
+        Err(_) : return 3,
+    };
+    SocketAddr ma = TcpListener::local_addr(&m);
+    match (TcpListener::bind(ma))
+    {
+        Err(e) : printf("second bind: %s\n", NetError::text(&e)),
+        Ok(_)  : printf("second bind: ok?\n"),
+    }
+    TcpListener::set_accept_timeout_ms(&mut m, 100);
+    match (TcpListener::accept(&mut m))
+    {
+        Err(e) : printf("accept with no client: %s\n", NetError::text(&e)),
+        Ok(_)  : printf("accept: ok?\n"),
+    }
+    drop(m);
+    match (TcpStream::connect(ma))
+    {
+        Err(e) : printf("connect to a closed port: %s\n", NetError::text(&e)),
+        Ok(_)  : printf("connect: ok?\n"),
+    }
+    0
+}

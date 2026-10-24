@@ -1,0 +1,313 @@
+// The program's own C code, as impl/cobc/src/link.rs resolves it: every
+// `extern "…";` (spec/20 `rule.trust.extern-code`, D-0030), resolved and
+// handed to the C compiler after the generated program.
+//
+// A string beginning `./`, `../` or `/` is a file, relative to the file that
+// declares it (as `module m "./m.cb";` is): a `.c` file, or an assembly file
+// `.S` (run through the C preprocessor) or `.s` (plain), each compiled here
+// on its own with warnings shown; or a `.o`, `.a` or `.so` file, linked as
+// it is (D-0258). A shared library is linked by its absolute path with its
+// directory as an rpath. Any other string is a library name, linked as
+// `cc -l` links it. Each file (by its canonical path) and each name is
+// linked once.
+
+import std;
+import loader;
+import items;
+import driverbase;
+import target;
+import diags;
+
+export enum Kind
+{
+    // A source file the C compiler compiles here: C, or assembly.
+    KC,
+    KObject,
+    KStatic,
+    KShared,
+}
+
+export struct FileCode
+{
+    export String path;
+    export Kind kind;
+}
+
+export enum Code
+{
+    CFile(FileCode),
+    CName(String),
+}
+
+fn same_kind(Kind a, Kind b) : bool
+{
+    match (a)
+    {
+        KC : match (b)
+        {
+            KC : true,
+            _  : false,
+        },
+        KObject : match (b)
+        {
+            KObject : true,
+            _       : false,
+        },
+        KStatic : match (b)
+        {
+            KStatic : true,
+            _       : false,
+        },
+        KShared : match (b)
+        {
+            KShared : true,
+            _       : false,
+        },
+    }
+}
+
+export fn is_kind(ref<Code, shared> c, Kind k) : bool
+{
+    match (c)
+    {
+        CFile(f) : same_kind(f.kind, k),
+        CName(_) : false,
+    }
+}
+
+// Every declaration, resolved and checked, or the first that is not, as a
+// message naming it and where it is.
+export fn resolve(ref<Vec<ExternCode>, shared> decls, ref<Expansion, shared> ex) : Result<Vec<Code>, String>
+{
+    Vec<Code> out = Vec::new();
+    foreach (d in decls)
+    {
+        ref<String, shared> code = &d.code;
+        Option<Place> at = locate(d.line, ex);
+        String place = match (&at)
+        {
+            Some(p) : sprintf("\n  at %s:%v", &p.file, p.line),
+            None    : String::new(),
+        };
+        Code resolved = if (String::starts_with(
+            code,
+            "./",
+        ) || String::starts_with(code, "../") || String::starts_with(code, "/"))
+        {
+            String dir = match (&at)
+            {
+                Some(p) : Option::unwrap_or(parent(String::as_view(&p.file)), String::new()),
+                None    : String::new(),
+            };
+            String joined = if (path_is_absolute(String::as_view(code))) { String::clone(code) } else
+            {
+                pjoin(
+                    String::as_view(&dir),
+                    String::as_view(code),
+                )
+            };
+            String path = match (canonical(String::as_view(&joined)))
+            {
+                Some(p) :
+                {
+                    if (!is_file(String::as_view(&p)))
+                    {
+                        return Err(sprintf("extern \"%s\": no such file%s", code, &place));
+                    }
+                    plain_path(p)
+                },
+                None    : return Err(sprintf("extern \"%s\": no such file%s", code, &place)),
+            };
+            Kind kind = match (kind_of(String::as_view(&path)))
+            {
+                Some(k) : k,
+                None    : return Err(sprintf("extern \"%s\": not a .c, .S, .s, .o, .a or .so file%s", code, &place)),
+            };
+            Code::CFile(FileCode { .path = path, .kind = kind })
+        }
+        else if (is_library_name(String::as_view(code)))
+        {
+            Code::CName(String::clone(code))
+        }
+        else
+        {
+            return Err(sprintf(
+                "extern \"%s\": neither a library name (as `cc -l` takes it) nor a path beginning ./, ../ or /%s",
+                code,
+                &place,
+            ));
+        };
+        bool dup = false;
+        foreach (c in &out)
+        {
+            match (c)
+            {
+                CFile(a) :
+                {
+                    match (&resolved)
+                    {
+                        CFile(b) : dup = dup || a.path == b.path,
+                        CName(_) : {},
+                    }
+                },
+                CName(a) :
+                {
+                    match (&resolved)
+                    {
+                        CName(b) : dup = dup || *a == *b,
+                        CFile(_) : {},
+                    }
+                },
+            }
+        }
+        if (!dup)
+        {
+            Vec::push(&mut out, resolved);
+        }
+    }
+    Ok(out)
+}
+
+// D-0255: on Windows a canonical path is a verbatim one (`\\?\E:\…`,
+// `\\?\UNC\server\share\…`), which MinGW-w64's GCC cannot open; the same
+// path without the prefix is still the one canonical file.
+fn plain_path(String p) : String
+{
+    match (String::strip_prefix(&p, "\\\\?\\UNC\\"))
+    {
+        Some(rest) : return sprintf("\\\\%v", rest),
+        None       : {},
+    }
+    match (String::strip_prefix(&p, "\\\\?\\"))
+    {
+        Some(rest) : return String::from_view(rest),
+        None       : {},
+    }
+    p
+}
+
+fn kind_of(StringView path) : Option<Kind>
+{
+    String name = match (path_file_name(path))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    String ext = match (path_extension(path))
+    {
+        Some(e) : e,
+        None    : return None,
+    };
+    if (ext == "c" || ext == "S" || ext == "s")
+    {
+        return Some(Kind::KC);
+    }
+    if (ext == "o")
+    {
+        return Some(Kind::KObject);
+    }
+    if (ext == "a")
+    {
+        return Some(Kind::KStatic);
+    }
+    if (ext == "so")
+    {
+        return Some(Kind::KShared);
+    }
+    // A versioned shared library: `libz.so.1`.
+    if (String::contains(&name, ".so."))
+    {
+        return Some(Kind::KShared);
+    }
+    None
+}
+
+// What `cc -lNAME` accepts as one argument, and nothing that could read as
+// another option.
+fn is_library_name(StringView s) : bool
+{
+    if (StringView::len(s) == 0 || StringView::starts_with(s, "-"))
+    {
+        return false;
+    }
+    foreach (b in StringView::as_bytes(s))
+    {
+        u8 c = *b;
+        bool ok = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+            || c == b'-' || c == b'.' || c == b'+';
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The C compiler arguments that link `code`, after compiling each `.c` file
+// into `obj_dir`. A `.c` file's warnings go to standard error; one that does
+// not compile is an error naming it.
+export fn link_args(
+    ref<Vec<Code>, shared> code,
+    StringView cc,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    StringView obj_dir,
+    Target t,
+) : Result<Vec<String>, String>
+{
+    Vec<String> args = Vec::new();
+    for (usize i = 0; i < Vec::len(code); i += 1)
+    {
+        match (&code[i])
+        {
+            CFile(f)    :
+            {
+                match (f.kind)
+                {
+                    KC      :
+                    {
+                        String s = stem_of(String::as_view(&f.path));
+                        String stem = if (String::len(&s) == 0) { String::from_str("code") } else { s };
+                        String obj = pjoin(obj_dir, String::as_view(&sprintf("%v-%s.o", i, &stem)));
+                        Cmd cmd = Cmd::new(cc);
+                        Cmd::arg(&mut cmd, opt);
+                        match (arch)
+                        {
+                            Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+                            None    : {},
+                        }
+                        Cmd::arg(&mut cmd, "-c");
+                        Cmd::arg(&mut cmd, String::as_view(&f.path));
+                        Cmd::arg(&mut cmd, "-o");
+                        Cmd::arg(&mut cmd, String::as_view(&obj));
+                        show(&cmd);
+                        Output out = match (Cmd::output(&cmd))
+                        {
+                            Ok(o)  : o,
+                            Err(e) : return Err(sprintf("cannot run the C compiler `%v`: %v", cc, io_text(&e))),
+                        };
+                        eprintf("%s", &lossy(&out.stderr[0..$]));
+                        if (out.status != 0)
+                        {
+                            return Err(sprintf("%v failed on %s", cc, &f.path));
+                        }
+                        Vec::push(&mut args, obj);
+                    },
+                    KShared :
+                    {
+                        Vec::push(&mut args, String::clone(&f.path));
+                        // A DLL is found beside the executable or on PATH: no rpath.
+                        if (!Target::windows(t))
+                        {
+                            String dir = Option::unwrap_or(parent(String::as_view(&f.path)), String::from_str("/"));
+                            Vec::push(&mut args, sprintf("-Wl,-rpath,%s", &dir));
+                        }
+                    },
+                    _       : Vec::push(&mut args, String::clone(&f.path)),
+                }
+            },
+            CName(name) : Vec::push(&mut args, sprintf("-l%s", name)),
+        }
+    }
+    Ok(args)
+}

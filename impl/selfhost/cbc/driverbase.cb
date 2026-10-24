@@ -1,0 +1,321 @@
+// What the parts of cbc's driver share (impl/cobc/src/main.rs): `-v`'s
+// switch and its lines (`note`, `show`), the commands it runs, and the
+// environment the options set. cobc sets `COBALTC_EXPLAIN`,
+// `COBALTC_WARN_SHADOW`, `COBALTC_ALL_CHECKS` and `COBALTC_BOOTSTRAP_FORM`
+// in its own environment (`std::env::set_var`), which its front end reads
+// and every command it runs inherits; a CobaltC program cannot change its
+// environment, so cbc keeps them here, its front end asks `env_flag`, and
+// each command it runs gets them (`Cmd::to_command`).
+
+import std;
+
+// `-v`: each command shown before it runs (`show`).
+static AtomicBool VERBOSE = false;
+
+// The variables the options set, as cobc's `set_var(…, "1")`.
+static AtomicBool SET_EXPLAIN = false;
+static AtomicBool SET_WARN_SHADOW = false;
+static AtomicBool SET_ALL_CHECKS = false;
+static AtomicBool SET_BOOTSTRAP_FORM = false;
+
+export fn set_verbose()
+{
+    AtomicBool::store(&VERBOSE, true);
+}
+
+export fn verbose() : bool
+{
+    AtomicBool::load(&VERBOSE)
+}
+
+// `std::env::set_var(name, "1")` for one of the four variables.
+export fn set_env_flag(str name)
+{
+    StringView n = StringView::of(name);
+    if (StringView::eq_str(n, "COBALTC_EXPLAIN"))
+    {
+        AtomicBool::store(&SET_EXPLAIN, true);
+    }
+    else if (StringView::eq_str(n, "COBALTC_WARN_SHADOW"))
+    {
+        AtomicBool::store(&SET_WARN_SHADOW, true);
+    }
+    else if (StringView::eq_str(n, "COBALTC_ALL_CHECKS"))
+    {
+        AtomicBool::store(&SET_ALL_CHECKS, true);
+    }
+    else if (StringView::eq_str(n, "COBALTC_BOOTSTRAP_FORM"))
+    {
+        AtomicBool::store(&SET_BOOTSTRAP_FORM, true);
+    }
+}
+
+fn was_set(StringView n) : bool
+{
+    if (StringView::eq_str(n, "COBALTC_EXPLAIN"))
+    {
+        return AtomicBool::load(&SET_EXPLAIN);
+    }
+    if (StringView::eq_str(n, "COBALTC_WARN_SHADOW"))
+    {
+        return AtomicBool::load(&SET_WARN_SHADOW);
+    }
+    if (StringView::eq_str(n, "COBALTC_ALL_CHECKS"))
+    {
+        return AtomicBool::load(&SET_ALL_CHECKS);
+    }
+    if (StringView::eq_str(n, "COBALTC_BOOTSTRAP_FORM"))
+    {
+        return AtomicBool::load(&SET_BOOTSTRAP_FORM);
+    }
+    false
+}
+
+// The variable `name` as cobc's `std::env::var` sees it: `1` once an option
+// set it, else the environment's value.
+export fn env_value(str name) : Option<String>
+{
+    if (was_set(StringView::of(name)))
+    {
+        return Some(String::from_str("1"));
+    }
+    match (env_var(StringView::of(name)))
+    {
+        Ok(v)  : v,
+        Err(_) : None,
+    }
+}
+
+// Whether `name` is set to anything but empty or `0`, the test cobc applies
+// to each of these variables.
+export fn env_flag(str name) : bool
+{
+    match (env_value(name))
+    {
+        Some(v) : String::len(&v) > 0 && !String::eq_str(&v, "0"),
+        None    : false,
+    }
+}
+
+// A line of `-v`'s, on standard error.
+export fn note(StringView msg)
+{
+    if (verbose())
+    {
+        eprintf("cobc: %v\n", msg);
+    }
+}
+
+// A command to run (Rust's `Command`, whose program and arguments `show`
+// reads back; std's `Command` keeps them to itself).
+export struct Cmd
+{
+    export String program;
+    export Vec<String> args;
+    Vec<String> env_names;
+    Vec<String> env_values;
+}
+
+export fn Cmd::new(StringView program) : Cmd
+{
+    Cmd { .program = String::from_view(program), .args = Vec::new(), .env_names = Vec::new(), .env_values = Vec::new() }
+}
+
+export fn Cmd::arg(ref<Cmd, exclusive> c, StringView a)
+{
+    Vec::push(&mut c.args, String::from_view(a));
+}
+
+export fn Cmd::env(ref<Cmd, exclusive> c, StringView name, StringView value)
+{
+    Vec::push(&mut c.env_names, String::from_view(name));
+    Vec::push(&mut c.env_values, String::from_view(value));
+}
+
+// The std command: the program, its arguments, the variables the options
+// set (inherited in cobc), then those set on the command itself.
+export fn Cmd::to_command(ref<Cmd, shared> c) : Command
+{
+    Command cmd = Command::new(String::as_view(&c.program));
+    foreach (a in &c.args)
+    {
+        Command::arg(&mut cmd, String::as_view(a));
+    }
+    foreach (n in ["COBALTC_EXPLAIN", "COBALTC_WARN_SHADOW", "COBALTC_ALL_CHECKS", "COBALTC_BOOTSTRAP_FORM"])
+    {
+        if (was_set(StringView::of(n)))
+        {
+            Command::env(&mut cmd, StringView::of(n), "1");
+        }
+    }
+    for (usize i = 0; i < Vec::len(&c.env_names); i += 1)
+    {
+        Command::env(&mut cmd, String::as_view(&c.env_names[i]), String::as_view(&c.env_values[i]));
+    }
+    cmd
+}
+
+// Runs the command to its end, its output captured (`Command::output`).
+export fn Cmd::output(ref<Cmd, shared> c) : Result<Output, FileError>
+{
+    Command::output(&Cmd::to_command(c))
+}
+
+fn plain_char(u8 c) : bool
+{
+    if ((c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9'))
+    {
+        return true;
+    }
+    foreach (s in StringView::as_bytes("-_./=:,+@%"))
+    {
+        if (*s == c)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// A word as a shell reads it: quoted (`'…'`, a `'` inside as `'\''`) unless
+// it is made of characters no shell treats specially.
+fn quote(StringView w) : String
+{
+    bool plain = StringView::len(w) > 0;
+    foreach (b in StringView::as_bytes(w))
+    {
+        if (!plain_char(*b))
+        {
+            plain = false;
+        }
+    }
+    if (plain)
+    {
+        return String::from_view(w);
+    }
+    sprintf("'%s'", &StringView::replace(w, "'", "'\\''"))
+}
+
+// Under `-v`, `cmd` as a shell would read it: `+ ` and each word, quoted.
+export fn show(ref<Cmd, shared> cmd)
+{
+    if (!verbose())
+    {
+        return;
+    }
+    String line = String::from_str("+ ");
+    String::append(&mut line, &quote(String::as_view(&cmd.program)));
+    foreach (a in &cmd.args)
+    {
+        String::push_ascii(&mut line, b' ');
+        String::append(&mut line, &quote(String::as_view(a)));
+    }
+    eprintf("%s\n", &line);
+}
+
+// Bytes as text, each ill-formed sequence one U+FFFD
+// (`String::from_utf8_lossy`).
+export fn lossy(slice<u8, shared> b) : String
+{
+    String out = String::new();
+    usize n = slice_len(b);
+    usize i = 0;
+    while (i < n)
+    {
+        u8 c = b[i];
+        if (c < 0x80)
+        {
+            String::push_ascii(&mut out, c);
+            i += 1;
+            continue;
+        }
+        // The sequence's length and its second byte's range (RFC 3629).
+        usize need = 0;
+        u8 lo = 0x80;
+        u8 hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF)
+        {
+            need = 2;
+        }
+        else if (c >= 0xE0 && c <= 0xEF)
+        {
+            need = 3;
+            if (c == 0xE0)
+            {
+                lo = 0xA0;
+            }
+            if (c == 0xED)
+            {
+                hi = 0x9F;
+            }
+        }
+        else if (c >= 0xF0 && c <= 0xF4)
+        {
+            need = 4;
+            if (c == 0xF0)
+            {
+                lo = 0x90;
+            }
+            if (c == 0xF4)
+            {
+                hi = 0x8F;
+            }
+        }
+        if (need == 0)
+        {
+            String::push_code_point(&mut out, 0xFFFD);
+            i += 1;
+            continue;
+        }
+        usize k = 1;
+        bool ok = true;
+        while (k < need)
+        {
+            if (i + k >= n)
+            {
+                ok = false;
+                break;
+            }
+            u8 d = b[i + k];
+            bool fits = if (k == 1) { d >= lo && d <= hi } else { d >= 0x80 && d <= 0xBF };
+            if (!fits)
+            {
+                ok = false;
+                break;
+            }
+            k += 1;
+        }
+        if (ok)
+        {
+            u32 cp = widen<u32>(c) & (if (need == 2) { 0x1F: u32 } else if (need == 3) { 0x0F: u32 } else { 0x07: u32 });
+            for (usize j = 1; j < need; j += 1)
+            {
+                cp = (cp << 6) | (widen<u32>(b[i + j]) & 0x3F);
+            }
+            String::push_code_point(&mut out, cp);
+            i += need;
+        }
+        else
+        {
+            String::push_code_point(&mut out, 0xFFFD);
+            i += k;
+        }
+    }
+    out
+}
+
+// An input or output error as Rust's `std::io::Error` shows it, which cobc
+// prints (`No such file or directory (os error 2)`): std's `FileError` keeps
+// only its kind, so a kind other than a missing file, a refusal or text that
+// is not UTF-8 is shown as std names it.
+export fn io_text(ref<FileError, shared> e) : str
+{
+    bool windows = path_join("a", "b") == "a\\b";
+    match (e)
+    {
+        NotFound : if (windows) { "The system cannot find the file specified. (os error 2)" } else { "No such file or directory (os error 2)" },
+        Denied   : if (windows) { "Access is denied. (os error 5)" } else { "Permission denied (os error 13)" },
+        Utf8(_)  : "stream did not contain valid UTF-8",
+        Io       : FileError::text(e),
+    }
+}

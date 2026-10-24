@@ -1,0 +1,659 @@
+// cobc's lower/native_misc.rs, written in CobaltC (D-0274 stage 5): native
+// C bodies for std's Option and Result helpers and empty values, and the
+// dispatcher for the natives of the std types other than `Vec`.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+import native_vec;
+import native_text;
+import native_map;
+import native_io;
+
+fn tys2(Type a, Type b) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, a);
+    Vec::push(&mut v, b);
+    v
+}
+
+fn tys1(Type a) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, a);
+    v
+}
+
+fn is_named0(ref<Type, shared> t, str name) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, name) && Vec::len(&Box::get(n).args) == 0,
+        _               : false,
+    }
+}
+
+fn is_named_any(ref<Type, shared> t, str name) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, name),
+        _               : false,
+    }
+}
+
+// The lines of `b` each with its `\n`, less those containing `drop1` or
+// `drop2` (Rust's `lines().filter(..).map(..).collect()`).
+fn keep_lines(ref<String, shared> b, str drop1, str drop2) : String
+{
+    String out = String::new();
+    foreach (l in StringView::lines(String::as_view(b)))
+    {
+        if (!StringView::contains(l, StringView::of(drop1)) && !StringView::contains(l, StringView::of(drop2)))
+        {
+            String::appendf(&mut out, "%v\n", l);
+        }
+    }
+    out
+}
+
+// D-0200: `Result::unwrap_or(r, d)` natively, for a resource `T` whose
+// destruction is silent (`silent_drop`) holding no reference, and a plain
+// `E`: both arguments received in order, as the body's parameters are; for
+// `Ok(v)`, `d` destroyed (its record ended, its value dropped in place) and
+// `v` given an object and sent; for `Err`, `r`'s record ended (its payload
+// plain) and `d` sent back with the object it came with.
+export fn native_result_unwrap_or(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Type, shared> e) : Option<String>
+{
+    if (!is_resource(
+        g,
+        t,
+    ) || has_refs(g, t) || holds_fn(g, t) || !silent_drop(g, t) || !plain_data(g, e) || has_refs(g, e))
+    {
+        return None;
+    }
+    Type rt = named(StringView::of("std::Result"), tys2(clone(t), clone(e)));
+    if (!is_resource(g, &rt))
+    {
+        return None;
+    }
+    String tc = ctype(g, t);
+    u32 ttid = type_id(g, t);
+    String b = String::new();
+    String::append(&mut b, "    uint64_t orr = cb_recv(&p_r);\n");
+    String::append(&mut b, "    uint64_t od = cb_recv(&p_d);\n");
+    String::append(&mut b, "    if (p_r.tag == 0u) {\n");
+    String::appendf(&mut b, "        %s v = p_r.u.v0;\n", &tc);
+    String::append(&mut b, "        cb_forget_obj(orr);\n");
+    String::append(&mut b, "        cb_forget_obj(od);\n");
+    String::appendf(&mut b, "        cb_drop_local(&p_d, %vu);\n", ttid);
+    String::appendf(&mut b, "        uint64_t ro = cb_new(&v, %vu, CB_NOLOC, 0);\n", ttid);
+    String::append(&mut b, "        cb_send(ro);\n");
+    String::append(&mut b, "        return v;\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_forget_obj(orr);\n");
+    String::append(&mut b, "    cb_send(od);\n");
+    String::append(&mut b, "    return p_d;\n");
+    Some(b)
+}
+
+// `Option::unwrap`/`expect` and `Result::unwrap`/`expect` natively, for a
+// value that is plain data or a reference (and, for a `Result`, an error
+// that is plain data, so a fault leaves nothing to destroy): the body
+// receives the argument (a datum holding the reference, if any), takes the
+// payload of `Some`/`Ok` or faults `diag.unwrap-failed` with its message,
+// and returns the payload (a reference sent back as the caller's
+// `cb_recv_ref` expects). Here the same, without the body's frame, bindings
+// and copies, which nothing else reaches.
+export fn native_unwrap(ref<Gen, exclusive> g, ref<String, shared> name, ref<Vec<Type>, shared> targs) : Option<String>
+{
+    usize k = Vec::len(targs);
+    if (k != 1 && k != 2)
+    {
+        return None;
+    }
+    ref<Type, shared> t = &targs[0];
+    if (k == 2)
+    {
+        if (!plain_data(g, &targs[1]))
+        {
+            return None;
+        }
+    }
+    bool is_ref = match (t)
+    {
+        Type::TRef(_) : true,
+        _             : false,
+    };
+    bool void_never = match (t)
+    {
+        Type::TVoid  : true,
+        Type::TNever : true,
+        _            : false,
+    };
+    if (!(is_ref || plain_data(g, t)) || void_never)
+    {
+        return None;
+    }
+    if (!is_ref && size_align(g, t).size == 0)
+    {
+        return None;
+    }
+    str param = if (String::eq_str(
+        name,
+        "std::Option::unwrap",
+    ) || String::eq_str(name, "std::Option::expect")) { "p_o" } else { "p_r" };
+    Option<str> msg = if (String::eq_str(name, "std::Option::unwrap"))
+    {
+        Some("`Option::unwrap` found `None`")
+    }
+    else if (String::eq_str(name, "std::Result::unwrap"))
+    {
+        Some("`Result::unwrap` found `Err`")
+    }
+    else
+    {
+        None
+    };
+    String fault = match (msg)
+    {
+        Some(m) : sprintf(
+            "cb_fault_msg(\"diag.unwrap-failed\", (const uint8_t *)\"%s\", %vu, CB_NOLOC, 0);",
+            m,
+            StringView::len(StringView::of(m)),
+        ),
+        None : String::from_str("cb_fault_msg(\"diag.unwrap-failed\", p_message.p, p_message.n, CB_NOLOC, 0);"),
+    };
+    String b = String::new();
+    if (is_ref)
+    {
+        String::append(&mut b, "    uint64_t tk = cb_recv_datum_tok();\n");
+        String::appendf(&mut b, "    if (%s.tag != 0u) %s\n", param, &fault);
+        String::append(&mut b, "    cb_send_ref(tk);\n");
+        String::appendf(&mut b, "    return (cb_ref){ (void *)%s.u.v0, tk };\n", param);
+    }
+    else
+    {
+        String::appendf(&mut b, "    if (%s.tag != 0u) %s\n", param, &fault);
+        String::appendf(&mut b, "    return %s.u.v0;\n", param);
+    }
+    Some(b)
+}
+
+// D-0200: `String::new()` and `Vec::new()` natively: the empty value
+// (`dangling` pointer, no length, no capacity) as the body builds it, given
+// an object and sent, as the body's literal is.
+export fn native_empty(ref<Gen, exclusive> g, ref<String, shared> name, ref<Vec<Type>, shared> targs) : Option<String>
+{
+    Type ty = if (String::eq_str(name, "std::String::new"))
+    {
+        named(StringView::of("std::String"), Vec::new())
+    }
+    else
+    {
+        if (Vec::len(targs) != 1)
+        {
+            return None;
+        }
+        named(StringView::of("std::Vec"), tys1(clone(&targs[0])))
+    };
+    String tc = ctype(g, &ty);
+    u32 tid = type_id(g, &ty);
+    String init = empty_value_init(g, &ty);
+    String b = String::new();
+    String::appendf(&mut b, "    %s r;\n", &tc);
+    String::appendf(&mut b, "    %s\n", &String::replace(&init, StringView::of("@"), StringView::of("r")));
+    String::appendf(&mut b, "    uint64_t o = cb_new(&r, %vu, CB_NOLOC, 0);\n", tid);
+    String::append(&mut b, "    cb_send(o);\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// The C statements that make `@` an empty `String` or `Vec<T>`.
+export fn empty_value_init(ref<Gen, exclusive> g, ref<Type, shared> ty) : String
+{
+    match (ty)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            if (String::eq_str(&nt.name, "std::String") && Vec::len(&nt.args) == 0)
+            {
+                return String::from_str("@.bytes.ptr = (uint8_t *)1; @.bytes.len = 0; @.bytes.cap = 0;");
+            }
+            if (String::eq_str(&nt.name, "std::Vec") && Vec::len(&nt.args) == 1)
+            {
+                String pc = ctype(g, &Type::TRawptr(Box::new(clone(&nt.args[0]))));
+                return sprintf("@.ptr = (%s)1; @.len = 0; @.cap = 0;", &pc);
+            }
+        },
+        _               : {},
+    }
+    assert(false, "cobc: an empty value of an unexpected type");
+    String::new()
+}
+
+// The `_raw`/`_rawk`/`_acc` variants' prototype and body.
+fn emit_variant(ref<Gen, exclusive> g, ref<String, shared> sig, ref<String, shared> body)
+{
+    String::appendf(&mut g.protos, "%s;\n", sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, body);
+}
+
+// The native bodies of std's functions on types other than `Vec`
+// (`native_vec_index` dispatches to this first): `None` when the function
+// has none and is lowered as written.
+export fn native_std_body(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<String, shared> cname,
+) : Option<String>
+{
+    StringView nv = String::as_view(name);
+    bool prel = in_prelude(nv, f);
+    usize nt = Vec::len(targs);
+    if ((String::eq_str(name, "std::Queue::front") || String::eq_str(name, "std::Queue::back")) && prel)
+    {
+        match (native_queue_peek(g, name, targs))
+        {
+            Some(b) : return Some(b),
+            None    : {},
+        }
+    }
+    if ((String::eq_str(name, "std::Queue::pop_front") || String::eq_str(name, "std::Queue::pop_back")) && prel)
+    {
+        match (native_queue_op(g, name, targs))
+        {
+            Some(b) : return Some(b),
+            None    : {},
+        }
+    }
+    if (String::eq_str(name, "std::String::append_string") && prel)
+    {
+        return Some(native_append_string(g));
+    }
+    if ((String::eq_str(
+        name,
+        "std::String::append_str",
+    ) || String::eq_str(name, "std::String::append_view") || String::eq_str(name, "std::String::append_text")) && prel)
+    {
+        return native_append_bytes(g, name, targs);
+    }
+    if (String::eq_str(name, "std::StringView::split") && prel)
+    {
+        return native_view_split(g);
+    }
+    if ((String::eq_str(
+        name,
+        "std::StringView::split_whitespace",
+    ) || String::eq_str(name, "std::StringView::chars")) && prel)
+    {
+        return native_view_split_whitespace(g, String::eq_str(name, "std::StringView::chars"));
+    }
+    if ((String::eq_str(name, "std::PriorityQueue::push") || String::eq_str(name, "std::PriorityQueue::pop")) && prel)
+    {
+        if (nt == 1)
+        {
+            return native_pq(g, name, &targs[0]);
+        }
+    }
+    if (String::eq_str(name, "std::Result::unwrap_or") && prel)
+    {
+        if (nt == 2)
+        {
+            return native_result_unwrap_or(g, &targs[0], &targs[1]);
+        }
+    }
+    if (String::eq_str(name, "std::read_line") && prel && nt == 0)
+    {
+        return native_read_line(g);
+    }
+    if (String::eq_str(name, "std::File::read_line") && prel && nt == 0)
+    {
+        return native_file_read_line(g);
+    }
+    if ((String::eq_str(name, "std::File::write") || String::eq_str(name, "std::File::write_text")) && prel && nt == 0)
+    {
+        return native_file_write(g, name);
+    }
+    if ((String::eq_str(name, "std::Channel::send") || String::eq_str(name, "std::Channel::recv")) && prel)
+    {
+        if (nt == 1)
+        {
+            return native_channel(g, String::eq_str(name, "std::Channel::send"), &targs[0]);
+        }
+    }
+    if ((String::eq_str(name, "std::StringView::parse") || String::eq_str(name, "std::String::parse")) && prel)
+    {
+        if (nt == 1)
+        {
+            match (&targs[0])
+            {
+                Type::TInt(it) : return native_parse_int(g, name, *it),
+                _              : {},
+            }
+        }
+    }
+    if (String::eq_str(name, "std::Drain::take") && prel)
+    {
+        if (nt == 1)
+        {
+            return native_drain_take(g, &targs[0]);
+        }
+    }
+    if ((String::eq_str(
+        name,
+        "std::StringView::trim",
+    ) || String::eq_str(
+        name,
+        "std::StringView::trim_start",
+    ) || String::eq_str(name, "std::StringView::trim_end")) && prel)
+    {
+        return native_view_trim(g, name);
+    }
+    if ((String::eq_str(
+        name,
+        "std::String::to_ascii_lower",
+    ) || String::eq_str(name, "std::String::to_ascii_upper")) && prel)
+    {
+        return native_ascii_case(g, String::eq_str(name, "std::String::to_ascii_upper"));
+    }
+    if (String::eq_str(name, "std::StringView::sub") && prel)
+    {
+        return native_view_sub(g);
+    }
+    if ((String::eq_str(
+        name,
+        "std::StringView::find",
+    ) || String::eq_str(name, "std::StringView::contains") || String::eq_str(
+        name,
+        "std::StringView::starts_with",
+    ) || String::eq_str(
+        name,
+        "std::StringView::ends_with",
+    ) || String::eq_str(name, "std::String::find") || String::eq_str(
+        name,
+        "std::String::contains",
+    ) || String::eq_str(name, "std::String::starts_with") || String::eq_str(name, "std::String::ends_with")) && prel)
+    {
+        return native_text_search(g, name);
+    }
+    if (String::eq_str(name, "std::String::view") && prel)
+    {
+        return native_string_view(g);
+    }
+    if ((String::eq_str(
+        name,
+        "std::Option::unwrap",
+    ) || String::eq_str(name, "std::Option::expect") || String::eq_str(name, "std::Result::unwrap") || String::eq_str(
+        name,
+        "std::Result::expect",
+    )) && prel)
+    {
+        return native_unwrap(g, name, targs);
+    }
+    if (String::eq_str(name, "std::replace") && prel)
+    {
+        if (nt == 1)
+        {
+            return native_replace(g, &targs[0]);
+        }
+    }
+    if ((String::eq_str(name, "std::String::new") || String::eq_str(name, "std::Vec::new")) && prel)
+    {
+        return native_empty(g, name, targs);
+    }
+    if (String::eq_str(name, "std::HashSet::insert") && prel && nt == 1 && is_named0(&targs[0], "std::String"))
+    {
+        return native_set_insert_string(g);
+    }
+    if (String::eq_str(name, "std::Vec::sorted_order") && prel)
+    {
+        if (nt == 1)
+        {
+            return native_sorted_order(g, &targs[0]);
+        }
+    }
+    if (String::eq_str(name, "std::StringView::of") && prel)
+    {
+        // The body: `StringView { .bytes = str_slice(s) }` -- a view of the
+        // text's bytes, which are no object's cells (`type.str`), so with no
+        // path (0), sent as the result's one reference
+        // (`cb_send_tok_datum`) as `str_slice` makes it.
+        String svc = ctype(g, &named(StringView::of("std::StringView"), Vec::new()));
+        String b = String::new();
+        String::append(&mut b, "    uint64_t tk = 0;\n");
+        String::appendf(&mut b, "    %s r;\n", &svc);
+        String::append(&mut b, "    r.bytes.src = (void *)p_s.p;\n");
+        String::append(&mut b, "    r.bytes.data = (uint8_t *)p_s.p;\n");
+        String::append(&mut b, "    r.bytes.len = p_s.n;\n");
+        String::append(&mut b, "    cb_send_tok_datum(tk);\n");
+        String::append(&mut b, "    return r;\n");
+        return Some(b);
+    }
+    if (String::eq_str(name, "std::String::from_view") && prel)
+    {
+        Option<String> b = native_string_from_view(g);
+        if (Option::is_some(&b))
+        {
+            // The `_raw` variant (`lower_map_fresh_key`, `lower_push_fresh`):
+            // the copy alone, for a call that hands the new `String` straight
+            // to a native body which stores or frees it; the view is not
+            // sent to it.
+            String sc = ctype(g, &named(StringView::of("std::String"), Vec::new()));
+            String svc = ctype(g, &named(StringView::of("std::StringView"), Vec::new()));
+            String sig = sprintf("%s %s_raw(%s p_v)", &sc, cname, &svc);
+            String raw = String::new();
+            String::appendf(&mut raw, "    %s r;\n", &sc);
+            String::append(&mut raw, "    r.bytes.ptr = (uint8_t *)1;\n");
+            String::append(&mut raw, "    r.bytes.len = 0;\n");
+            String::append(&mut raw, "    r.bytes.cap = 0;\n");
+            String::append(&mut raw, "    uint64_t n = p_v.bytes.len;\n");
+            String::append(&mut raw, "    if (n > 0) {\n");
+            String::append(&mut raw, "        uint8_t *p = cb_allocate(n, 1u);\n");
+            String::append(&mut raw, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+            String::append(&mut raw, "        memcpy(p, p_v.bytes.data, n);\n");
+            String::append(&mut raw, "        r.bytes.ptr = p;\n");
+            String::append(&mut raw, "        r.bytes.cap = n;\n");
+            String::append(&mut raw, "        r.bytes.len = n;\n");
+            String::append(&mut raw, "    }\n");
+            String::append(&mut raw, "    return r;\n");
+            emit_variant(g, &sig, &raw);
+        }
+        return b;
+    }
+    if ((String::eq_str(
+        name,
+        "std::HashMap::get",
+    ) || String::eq_str(
+        name,
+        "std::HashMap::get_mut",
+    ) || String::eq_str(name, "std::HashMap::contains") || String::eq_str(
+        name,
+        "std::HashMap::entry",
+    ) || String::eq_str(name, "std::HashMap::insert")) && prel)
+    {
+        match (native_map_op(g, name, targs))
+        {
+            Some(b) :
+            {
+                bool is_entry = String::eq_str(name, "std::HashMap::entry");
+                // `entry`/`insert` with `String` keys: the `_rawk` variant for
+                // a key no object tracks (`lower_map_fresh_key`): not
+                // received; freed directly when not stored (fresh bytes have
+                // no object over them), stored with nothing to move in.
+                if ((is_entry || String::eq_str(
+                    name,
+                    "std::HashMap::insert",
+                )) && nt > 0 && is_named_any(&targs[0], "std::String"))
+                {
+                    String raw = String::new();
+                    foreach (l in StringView::lines(String::as_view(&b)))
+                    {
+                        if (StringView::contains(
+                            l,
+                            StringView::of("uint64_t ok = cb_recv(&p_k);"),
+                        ) || StringView::contains(l, StringView::of("cb_raw_move_in(ok,")))
+                        {
+                            continue;
+                        }
+                        if (StringView::contains(l, StringView::of("cb_consume(ok, CB_NOLOC, 0);")))
+                        {
+                            String::append(
+                                &mut raw,
+                                "        if (p_k.bytes.cap > 0) cb_deallocate_plain((uint8_t *)p_k.bytes.ptr, p_k.bytes.cap);\n",
+                            );
+                        }
+                        else
+                        {
+                            String::appendf(&mut raw, "%v\n", l);
+                        }
+                    }
+                    assert(nt == 2, "cobc: map arity");
+                    ref<Type, shared> k = &targs[0];
+                    ref<Type, shared> v = &targs[1];
+                    _ = ctype(g, &named(StringView::of("std::HashMap"), tys2(clone(k), clone(v))));
+                    String kc = ctype(g, k);
+                    String vc = ctype(g, v);
+                    String sig = if (is_entry)
+                    {
+                        sprintf("cb_ref %s_rawk(cb_ref p_m, %s p_k, %s p_fresh)", cname, &kc, &vc)
+                    }
+                    else
+                    {
+                        String oc = ctype(g, &named(StringView::of("std::Option"), tys1(clone(v))));
+                        sprintf("%s %s_rawk(cb_ref p_m, %s p_k, %s p_v)", &oc, cname, &kc, &vc)
+                    };
+                    emit_variant(g, &sig, &raw);
+                    if (is_entry)
+                    {
+                        u32 vty = type_id(g, v);
+                        String acc = entry_acc_body(&raw, vty);
+                        String asig = sprintf("%s *%s_rawk_acc(cb_ref p_m, %s p_k, %s p_fresh)", &vc, cname, &kc, &vc);
+                        emit_variant(g, &asig, &acc);
+                    }
+                }
+                if (is_entry)
+                {
+                    if (nt == 2)
+                    {
+                        String kc = ctype(g, &targs[0]);
+                        String vc = ctype(g, &targs[1]);
+                        u32 vty = type_id(g, &targs[1]);
+                        String acc = entry_acc_body(&b, vty);
+                        String sig = sprintf("%s *%s_acc(cb_ref p_m, %s p_k, %s p_fresh)", &vc, cname, &kc, &vc);
+                        emit_variant(g, &sig, &acc);
+                    }
+                }
+                bool is_get_mut = String::eq_str(name, "std::HashMap::get_mut");
+                if (is_get_mut || String::eq_str(name, "std::HashMap::get"))
+                {
+                    if (nt == 2)
+                    {
+                        ref<Type, shared> v = &targs[1];
+                        if (plain_data(g, v))
+                        {
+                            String vc = ctype(g, v);
+                            u32 vty = type_id(g, v);
+                            String acc = get_mut_acc_body(&b, vty, is_get_mut);
+                            String sig = sprintf("%s *%s_acc(cb_ref p_m, cb_ref p_k)", &vc, cname);
+                            emit_variant(g, &sig, &acc);
+                            if (is_get_mut)
+                            {
+                                String xsig = sprintf("%s *%s_acc_x(cb_ref p_m, cb_ref p_k)", &vc, cname);
+                                emit_variant(g, &xsig, &map_excl_unchecked(&acc));
+                            }
+                        }
+                    }
+                }
+                if (is_get_mut)
+                {
+                    // The body for a map checked exclusively at the call
+                    // (`lower_user_call`'s `map_excl_checked`).
+                    assert(nt == 2, "cobc: map arity");
+                    Type rv = Type::TRef(Box::new(ModedTy { .inner = clone(&targs[1]), .mode = Mode::Exclusive }));
+                    String oc = ctype(g, &named(StringView::of("std::Option"), tys1(rv)));
+                    String sig = sprintf("%s %s_x(cb_ref p_m, cb_ref p_k)", &oc, cname);
+                    emit_variant(g, &sig, &map_excl_unchecked(&b));
+                }
+                return Some(b);
+            },
+            None    : {},
+        }
+    }
+    if (String::eq_str(name, "std::HashMap::find_str") && prel)
+    {
+        if (nt == 1)
+        {
+            return Some(native_map_find_str(g, &targs[0]));
+        }
+    }
+    if (String::eq_str(name, "std::HashMap::find") && prel)
+    {
+        if (nt == 2 && is_named0(&targs[0], "std::String"))
+        {
+            return Some(native_map_find_string(g, &targs[1]));
+        }
+        if (nt == 2)
+        {
+            bool scalar = match (&targs[0])
+            {
+                Type::TInt(_) : true,
+                Type::TBool   : true,
+                _             : false,
+            };
+            if (scalar)
+            {
+                return Some(native_map_find_scalar(g, &targs[0], &targs[1]));
+            }
+        }
+    }
+    if ((String::eq_str(name, "std::String::from_str") || String::eq_str(name, "std::String::clone")) && prel)
+    {
+        bool is_clone = String::eq_str(name, "std::String::clone");
+        String b = native_string_copy(g, is_clone);
+        // The `_raw` variant (`lower_map_fresh_key`): the same copy, its
+        // result untracked, for a call that hands it straight to a native
+        // map body which stores or frees it.
+        String raw = keep_lines(&b, "cb_new(&r", "cb_send(o)");
+        String sc = ctype(g, &named(StringView::of("std::String"), Vec::new()));
+        str param = if (is_clone) { "cb_ref p_s" } else { "cb_str p_s" };
+        String sig = sprintf("%s %s_raw(%s)", &sc, cname, param);
+        emit_variant(g, &sig, &raw);
+        return Some(b);
+    }
+    if ((String::eq_str(name, "std::Box::get") || String::eq_str(name, "std::Box::get_mut")) && prel)
+    {
+        // `&reclaim<T>(b.ptr)` / `&mut reclaim<T>(b.ptr)`: the checked read
+        // of `b.ptr`, then `[Reclaim]`, `[Borrow]` and the result's return in
+        // one step, as native `Vec::index_*` makes them.
+        if (nt != 1)
+        {
+            return None;
+        }
+        ref<Type, shared> elem = &targs[0];
+        String bc = ctype(g, &named(StringView::of("std::Box"), tys1(clone(elem))));
+        u32 tid = type_id(g, elem);
+        bool get = String::eq_str(name, "std::Box::get");
+        str m = if (get) { "CB_SHARED" } else { "CB_EXCLUSIVE" };
+        String b = String::new();
+        if (!get)
+        {
+            // D-0222: `_ = &mut *b;`, the box exclusively through `b`.
+            String::append(&mut b, "    cb_borrow_check(p_b.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+        }
+        String::append(&mut b, "    cb_read(p_b.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    void *a = (void *)((%s *)p_b.p)->ptr;\n", &bc);
+        String::appendf(&mut b, "    return (cb_ref){ a, cb_elem_borrow(a, %vu, %s) };\n", tid, m);
+        return Some(b);
+    }
+    None
+}

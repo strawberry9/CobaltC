@@ -1,0 +1,70 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.waiting `Once` (D-0260); [Atomic-Wait], [Atomic-Notify], rule.fail.fault-unwind; conf.once-runs-once, conf.once-fault-retried
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 72756e7320312c20616c6c2073617720697420646f6e653a20747275650a7468652066697273742072756e206661696c65643a20646961672e6173736572742d6661696c65643b20646f6e653a2066616c73650a72756e7320332c20646f6e653a20747275650a
+//
+// Four threads race to initialise; the initialiser runs once, and every
+// thread returns from `call` seeing it done. Then a `Once` whose first
+// initialiser faults: the thread's failure is taken by `try_join`, the
+// `Once` is as it was, and the next caller's initialiser runs and
+// completes it.
+
+import std;
+
+static Atomic<u32> RUNS = 0;
+
+fn init()
+{
+    _ = Atomic::fetch_add(&RUNS, 1);
+}
+
+fn racer(ref<Once, shared> o) : bool
+{
+    Once::call(o, init);
+    Once::is_done(o)
+}
+
+fn attempt(ref<Once, shared> o, bool fail) : bool
+{
+    Once::call(o, move [fail]()
+    {
+        _ = Atomic::fetch_add(&RUNS, 1);
+        if (fail)
+        {
+            fault(assert_failed, "this initialiser gives up");
+        }
+    });
+    Once::is_done(o)
+}
+
+fn main()
+{
+    Once o = Once::new();
+    Vec<handle<bool>> hs = Vec::new();
+    for (u32 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(racer, &o));
+    }
+    bool all_done = true;
+    foreach (h in hs)
+    {
+        all_done = all_done && join(h);
+    }
+    printf("runs %v, all saw it done: %v\n", Atomic::load(&RUNS), all_done);
+
+    Once p = Once::new();
+    handle<bool> first = spawn(attempt, &p, true);
+    match (try_join(first))
+    {
+        Ok(_)  : printf("the first run completed\n"),
+        Err(e) :
+        {
+            String why = ThreadFailure::diagnostic(&e);
+            printf("the first run failed: %v; done: %v\n", &why, Once::is_done(&p));
+        },
+    }
+    bool done = attempt(&p, false);
+    printf("runs %v, done: %v\n", Atomic::load(&RUNS), done);
+}
