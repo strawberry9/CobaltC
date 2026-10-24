@@ -1543,6 +1543,11 @@ struct TypeInfo {
     // A struct's fields that own something (a resource, or a `fn` value),
     // in declaration order: the only ones its destruction has to visit.
     owning: Vec<(u64, u32)>,
+    // Where the reference slots of a value of this type lie, when that does
+    // not depend on the value (no enum inside on the way to one): what
+    // `ref_offsets` would find, worked out once (every datum's send,
+    // receive and copy asks).
+    fixed_refs: Option<Vec<u64>>,
 }
 
 struct Obj {
@@ -2089,7 +2094,8 @@ fn ts() -> &'static mut TState {
 
 #[cold]
 fn make_pending(t: &mut TState) {
-    for (file, line) in std::mem::take(&mut t.pend) {
+    // Drained in place: `pend` keeps its buffer for the next statements.
+    for (file, line) in t.pend.drain(..) {
         t.scopes.push(t.stack.len());
         t.stack.push(Entry::Scope(Scope { temps: Vec::new(), toks: Vec::new(), loc: (file, line) }));
     }
@@ -3266,6 +3272,7 @@ pub unsafe extern "C" fn cb_init(files: *const *const c_char, nfiles: usize, typ
             box_of: if t.kind == K_STRUCT && t.elem != 0 { Some(t.elem - 1) } else { None },
             vec_plain: if t.kind == K_STRUCT && t.count != 0 && t.nfields == 3 { Some(t.count - 1) } else { None },
             owning: Vec::new(),
+            fixed_refs: None,
         });
     }
     // D-0089: `holds_fn` through fields, elements and payloads.
@@ -3287,6 +3294,44 @@ pub unsafe extern "C" fn cb_init(files: *const *const c_char, nfiles: usize, typ
         if !changed {
             break;
         }
+    }
+    // The fixed reference offsets, as `ref_offsets` walks a value (a type
+    // nested too deep for it is left to the walk).
+    fn fixed(ts: &[TypeInfo], at: &dyn Fn(u32) -> Option<usize>, i: usize, depth: u32) -> Option<Vec<u64>> {
+        let t = &ts[i];
+        if !t.has_refs {
+            return Some(Vec::new());
+        }
+        if depth > 32 {
+            return None;
+        }
+        match t.kind {
+            K_REF | K_GUARD => Some(vec![0]),
+            K_STRUCT => {
+                let mut out = Vec::new();
+                for &(off, fty) in &t.fields {
+                    let inner = fixed(ts, at, at(fty)?, depth + 1)?;
+                    out.extend(inner.iter().map(|o| o + off));
+                }
+                Some(out)
+            }
+            K_ARRAY => {
+                let e = at(t.elem)?;
+                let inner = fixed(ts, at, e, depth + 1)?;
+                let esize = ts[e].size;
+                let mut out = Vec::new();
+                for k in 0..t.count {
+                    out.extend(inner.iter().map(|o| o + k * esize));
+                }
+                Some(out)
+            }
+            K_ENUM => None,
+            _ => Some(Vec::new()),
+        }
+    }
+    for i in 0..ts.len() {
+        let f = fixed(&ts, &at, i, 0);
+        ts[i].fixed_refs = f;
     }
     for i in 0..ts.len() {
         if ts[i].kind == K_STRUCT {
@@ -4758,14 +4803,20 @@ fn detach(r: &mut Rt, obj: u64) {
         }
         None => return,
     };
+    // An object is on its frame's or scope's list once, most often last
+    // (bound or sent just after it was made): found from the end.
     if let Some(i) = frame {
         if let Some(Entry::Frame(v)) = ts().stack.get_mut(i) {
-            v.retain(|&x| x != obj);
+            if let Some(k) = v.iter().rposition(|&x| x == obj) {
+                v.remove(k);
+            }
         }
     }
     if let Some(i) = scope {
         if let Some(Entry::Scope(s)) = ts().stack.get_mut(i) {
-            s.temps.retain(|&x| x != obj);
+            if let Some(k) = s.temps.iter().rposition(|&x| x == obj) {
+                s.temps.remove(k);
+            }
         }
     }
     let o = r.objs.get_mut(&obj).unwrap();
@@ -4796,7 +4847,9 @@ fn detach_tok(r: &mut Rt, tok: u64) {
     };
     if let Some(i) = scope {
         if let Some(v) = scope_toks(r, i) {
-            v.retain(|&x| x != tok);
+            if let Some(k) = v.iter().rposition(|&x| x == tok) {
+                v.remove(k);
+            }
         }
     }
     r.paths.get_mut(&tok).unwrap().scope = None;
@@ -5096,7 +5149,11 @@ pub extern "C" fn cb_destroy(root: u64, file: u32, line: u32) {
     let _e = enter();
     let r = rt();
     let (obj, _, _) = path_target(r, root, file, line);
-    set_at(file, line);
+    // A `std` body gives no location (`spec/21`'s own text): a fault in the
+    // destruction is the caller's, where the location already is.
+    if !(file == NOLOC && line == 0) {
+        set_at(file, line);
+    }
     destroy_obj(obj, Some(root));
 }
 
@@ -6715,6 +6772,10 @@ pub extern "C" fn cb_load_ref(slot: *const u8) -> u64 {
 fn ref_offsets(r: &Rt, addr: usize, ty: u32, base: u64, out: &mut Vec<u64>) {
     let info = &r.typ(ty);
     if !info.has_refs {
+        return;
+    }
+    if let Some(f) = &info.fixed_refs {
+        out.extend(f.iter().map(|o| base + o));
         return;
     }
     match info.kind {

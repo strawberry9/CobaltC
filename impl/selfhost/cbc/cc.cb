@@ -1,0 +1,237 @@
+// The C compiler, as impl/cobc/src/cc.rs asks it: the options every compile
+// takes, and one C file compiled to an object (`--lib`). D-0277: the
+// program's C is one file, compiled every time; there is no object
+// cache.
+
+import std;
+import driverbase;
+
+export fn cc_flags_base() : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    foreach (f in ["-std=gnu11", "-ffp-contract=off", "-fno-optimize-sibling-calls", "-w"])
+    {
+        Vec::push(&mut v, String::from_str(f));
+    }
+    v
+}
+
+// What cobc asks the C compiler once per run (`OnceLock`): its identity, the
+// flags it is given, and its `--version` text (`lto_mode`).
+export struct CcFacts
+{
+    export String identity;
+    export Vec<String> flags;
+    export String version;
+}
+
+// `cc_identity` and `cc_flags`: `CC_FLAGS`, and `-fno-optimize-crc` where
+// `cc` accepts it. GCC 15 added a pass (on from -O2) that replaces a
+// bit-at-a-time CRC loop with a table or carry-less multiply; GCC 16.1 gets
+// the loop wrong in the form cobc writes it. GCC before 15 and Clang refuse
+// the flag.
+export fn cc_facts(StringView cc) : CcFacts
+{
+    String version = cc_version(cc);
+    String identity = cc_identity(cc, &version);
+    bool off = false;
+    if (!String::contains(&identity, "clang"))
+    {
+        Cmd c = Cmd::new(cc);
+        foreach (a in ["-fno-optimize-crc", "-fsyntax-only", "-x", "c", "-"])
+        {
+            Cmd::arg(&mut c, StringView::of(a));
+        }
+        off = match (Cmd::output(&c))
+        {
+            Ok(o)  : o.status == 0,
+            Err(_) : false,
+        };
+    }
+    Vec<String> v = cc_flags_base();
+    if (off)
+    {
+        Vec::push(&mut v, String::from_str("-fno-optimize-crc"));
+    }
+    CcFacts { .identity = identity, .flags = v, .version = version }
+}
+
+// D-0277 (cobc's `cc::part_count`): how many translation units a program's C
+// is compiled in, all at once: one a megabyte of its functions' C, at most
+// eight; the same program is always split alike, whatever the machine.
+export fn part_count(usize units_len) : usize
+{
+    usize n = units_len / 1000000;
+    if (n < 1) { 1 } else if (n > 8) { 8 } else { n }
+}
+
+// D-0277 (cobc's `cc::Lto`): link-time optimisation, which lets the link
+// inline across the parts as the C compiler inlines within one file. GCC's
+// (`--version` names the Free Software Foundation): `-flto` for each part,
+// `-flto=auto` for the link, and for a program in one part `-flto=auto`
+// alone, whose code generation GCC runs in parallel too. Clang's ThinLTO,
+// `-flto=thin`, for a program in parts, through the first linker of the
+// Clang's own `lld` and `gold` that links a probe against the runtime
+// (`LTO_PROBE`). None at `-O0`, or for `--lib`.
+export enum Lto
+{
+    Off,
+    Gcc,
+    Thin(str),
+}
+
+export fn Lto::part_flags(Lto l) : Vec<str>
+{
+    Vec<str> v = Vec::new();
+    match (l)
+    {
+        Lto::Off     : {},
+        Lto::Gcc     : Vec::push(&mut v, "-flto"),
+        Lto::Thin(_) : Vec::push(&mut v, "-flto=thin"),
+    }
+    v
+}
+
+export fn Lto::link_flags(Lto l) : Vec<str>
+{
+    Vec<str> v = Vec::new();
+    match (l)
+    {
+        Lto::Off      : {},
+        Lto::Gcc      : Vec::push(&mut v, "-flto=auto"),
+        Lto::Thin(ld) :
+        {
+            Vec::push(&mut v, "-flto=thin");
+            Vec::push(&mut v, ld);
+        },
+    }
+    v
+}
+
+// Whether the C compiler is Clang, and whether GCC.
+export fn is_clang(ref<CcFacts, shared> f) : bool
+{
+    String::contains(&f.identity, "clang")
+}
+
+export fn is_gcc(ref<CcFacts, shared> f) : bool
+{
+    !is_clang(f) && String::contains(&f.version, "Free Software Foundation")
+}
+
+// Whether `cc` (a Clang) has an `ld.lld` of its own LLVM: the one
+// `-print-prog-name` names, of the same major version.
+export fn own_lld(StringView cc, ref<CcFacts, shared> f) : bool
+{
+    Cmd c = Cmd::new(cc);
+    Cmd::arg(&mut c, "-print-prog-name=ld.lld");
+    String path = match (Cmd::output(&c))
+    {
+        Ok(o)  : String::from_view(StringView::trim(String::as_view(&lossy(&o.stdout[0..$])))),
+        Err(_) : return false,
+    };
+    if (!path_is_absolute(String::as_view(&path)))
+    {
+        return false;
+    }
+    Cmd v = Cmd::new(String::as_view(&path));
+    Cmd::arg(&mut v, "--version");
+    String lld = match (Cmd::output(&v))
+    {
+        Ok(o)  : lossy(&o.stdout[0..$]),
+        Err(_) : return false,
+    };
+    Option<StringView> want = major_after(String::as_view(&f.version), "clang version");
+    Option<StringView> have = major_after(String::as_view(&lld), "LLD");
+    match (want)
+    {
+        Some(a) : match (have)
+        {
+            Some(b) : StringView::len(a) > 0 && StringView::eq(a, b),
+            None    : false,
+        },
+        None : false,
+    }
+}
+
+// The digits after `after` in `text` (and white space), if it occurs.
+fn major_after(StringView text, StringView after) : Option<StringView>
+{
+    usize i = StringView::find(text, after)? + StringView::len(after);
+    StringView rest = StringView::trim_start(StringView::sub(text, i, StringView::len(text)));
+    slice<u8, shared> b = StringView::as_bytes(rest);
+    usize n = 0;
+    while (n < slice_len(b) && b[n] >= b'0' && b[n] <= b'9')
+    {
+        n += 1;
+    }
+    Some(StringView::sub(rest, 0, n))
+}
+
+// The probe `lto_mode` links (cobc's `cc::LTO_PROBE`): a program calling
+// into the runtime, with the definitions a generated program gives it.
+export const str LTO_PROBE =
+    "#include <stdint.h>\n__thread uint32_t cb_at_file, cb_at_line;\nvoid cb_where(uint32_t *file, uint32_t *line) { *file = cb_at_file; *line = cb_at_line; }\nvoid cb_set_where(uint32_t file, uint32_t line) { cb_at_file = file; cb_at_line = line; }\n__thread uintptr_t cb_stack_floor;\nvoid cb_set_stack_floor(uintptr_t floor) { cb_stack_floor = floor; }\nvoid cb_frame_push(void);\nint main(void) { cb_frame_push(); return 0; }\n";
+
+// The C compiler's `--version` text.
+fn cc_version(StringView cc) : String
+{
+    Cmd c = Cmd::new(cc);
+    Cmd::arg(&mut c, "--version");
+    match (Cmd::output(&c))
+    {
+        Ok(o)  : lossy(&o.stdout[0..$]),
+        Err(_) : String::new(),
+    }
+}
+
+// The C compiler's identity: the first line of `cc --version`.
+fn cc_identity(StringView cc, ref<String, shared> version) : String
+{
+    Vec<StringView> lines = String::lines(version);
+    StringView first = if (Vec::len(&lines) > 0) { lines[0] } else { StringView::of("") };
+    sprintf("%v %v", cc, first)
+}
+
+// One C file to an object (`--lib`'s archive is made of objects).
+export fn compile_one(
+    StringView cc,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    bool debug,
+    ref<CcFacts, shared> facts,
+    StringView c_path,
+    StringView obj,
+) : Result<void, String>
+{
+    Cmd cmd = Cmd::new(cc);
+    foreach (f in &facts.flags)
+    {
+        Cmd::arg(&mut cmd, String::as_view(f));
+    }
+    Cmd::arg(&mut cmd, opt);
+    match (arch)
+    {
+        Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+        None    : {},
+    }
+    if (debug)
+    {
+        Cmd::arg(&mut cmd, "-g");
+    }
+    Cmd::arg(&mut cmd, "-c");
+    Cmd::arg(&mut cmd, "-o");
+    Cmd::arg(&mut cmd, obj);
+    Cmd::arg(&mut cmd, c_path);
+    show(&cmd);
+    Output out = match (Cmd::output(&cmd))
+    {
+        Ok(o)  : o,
+        Err(e) : return Err(sprintf("cannot run the C compiler `%v`: %v", cc, io_text(&e))),
+    };
+    if (out.status != 0)
+    {
+        return Err(sprintf("%s%v failed on %v (kept for inspection)", &lossy(&out.stderr[0..$]), cc, c_path));
+    }
+    Ok(())
+}

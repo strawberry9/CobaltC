@@ -282,6 +282,8 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0273 — `x?` moves a binding that holds a resource
 - D-0274 — The bootstrap form: `cobc --bootstrap-form`, the C the CobaltC compiler reproduces
 - D-0275 — A reference to reference-free storage does not defer another binding's last-use end
+- D-0276 — `cbc`, the compiler written in CobaltC, replaces `cobc`
+- D-0277 — No object cache: a program's C is one file, compiled every time
 
 ---
 
@@ -8054,3 +8056,53 @@ crossing to C by value.
 - `selfhost/compare_c.sh` compares the default form unless `LEVEL=` says otherwise, and both drivers with
   `FLAGS=`; the layout queries of the code generator in CobaltC borrow the declarations instead of copying
   them (a fifth of its time on some programs).
+
+## P4: `cbc` compiles faster; no object cache (2026-10-24)
+
+- D-0277 (the owner's decision): the object cache is gone from both compilers. A program's C, the `std` it
+  reaches included, is one file (`--keep-c`, and `cobc --emit-c [--c-name NAME] FILE`, as `cbc` has it),
+  compiled every time; a large program's C is compiled in parts, a megabyte of its functions' C each and at
+  most eight, all at once, then linked, with GCC's LTO or Clang's ThinLTO (through Clang's own `lld` or
+  `gold`, whichever links a probe against the runtime). The C is unchanged, byte for byte. `COBC_CACHE`,
+  `cache.rs`, `cache_identity.rs` and `cbc/cache.cb` are removed; `cc.rs` and `cbc/cc.cb` keep the C
+  compiler helpers.
+- `CHG-0370`: `drop(reclaim<T>(p))` destroys the place, so `drop(v)` of a `Vec` whose element a live
+  reference points into faults `diag.destroy-while-aliased` under `cobc`, as under `coby` (it said
+  `diag.move-while-aliased`); in both compilers and the native `Vec` drops.
+  `conf.destroy-vec-while-element-referenced`.
+- `CHG-0371`: `replace`'s native bodies checked only that `r` was valid, not `[Write]`'s conflict
+  (D-0235): `replace(r, v)` beside a live shared reborrow of `*r` ran on under `cobc` for a `String` or a
+  `Vec` of plain data (D-0200's body), and for a number once P4 gave numbers a native body (the battery
+  found `conf.replace-passed-ref-beside-shared-reborrow` failing); `replace` on a struct of plain data
+  stopped the runtime (an object received that was never sent). Both compilers check `r`'s validity, then
+  its write, as `swap_places` does; plain data takes the body that receives nothing.
+  `conf.replace-string-passed-ref-beside-shared-reborrow`, `conf.replace-struct-beside-field-reborrow`,
+  `conf.replace-values`.
+- Both compilers, the same C from each: a read of plain data through `v[k].f…`, where the element holds a
+  resource but no reference, reads the element in place (bitstruct fields excepted); a shared borrow of a
+  place in a frozen parameter makes no borrow check; `String::replace` on plain data and `Vec::drop` of
+  elements holding a resource but no reference or function have native bodies.
+- `cbc` only: the reference-parameter analysis takes `std`'s part from `back/std_values.cb`, which
+  `back/gen_std_values.sh` writes from `cobc` (`COBALTC_STD_FN_VALUES`; `compare_c.sh` checks it is current),
+  instead of parsing every `std` body; the text passes work on byte positions; `fold_zero_tokens` moves lines
+  instead of copying them; the lexer skips blanks and comments without a `Result`.
+- `cbrt`: removing an entry searches from the end; pending paths drain in place; each type's reference
+  offsets are computed once (`TypeInfo::fixed_refs`); `cb_destroy` keeps the caller's location when a `std`
+  body gives none.
+- `cobc` copied the program's whole string-literal table and its name map at every type probe, about half
+  its time on a large program; a probe now marks where they end and undoes what it added, as `cbc` does
+  (`str_mark`/`str_restore`). `cbc`'s own C (92 MB) now takes `cobc` 26 s instead of 190 s; the C is the
+  same. `selfhost/build.sh` builds all three programs in 4 min 21 s (7 min 54 s before) and takes
+  `PROGRAMS=` to build some of them; `fixpoint.sh` takes `CBC1=`, a `cbc` just built, instead of building
+  one; `compare_c.sh` and `fixpoint.sh` take `cobc`'s C from `--emit-c`.
+- Measured (instructions, user space; `cbc --emit-c` against `cobc`'s C step):
+
+  | input | Update 133 | now | `cobc` now |
+  |---|---|---|---|
+  | `showcase/tier3/tinyos.cb` | 87.1 G, 22.9 s | 33.6 G, 9.0 s | 1.05 G, 0.6 s |
+  | `showcase/tier12/dns_over_http.cb` | 368 G, 100 s | 270 G, 77 s | 4.8 G, 1.8 s |
+  | `impl/selfhost/cobfmt/main.cb` | 1069 G, 293 s | 865 G, 244 s | 17.8 G, 6.1 s |
+
+  `cbc` writes its own C (110 MB) in 18 minutes, `cobc` in 26 s; the fixed point takes 44 minutes (65 before).
+  `cbc` is still 15 to 45 times slower than `cobc` (D-0276's working bound is 10): the runtime's tracking of
+  `StringView` copies is the largest remaining cost, a change of representation for a D-record of its own.

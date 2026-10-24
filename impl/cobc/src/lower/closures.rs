@@ -114,8 +114,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             let saved_uid = self.g.uid;
             let saved_names = self.snapshot_names();
             let saved_nstr = self.g.nstr;
-            let saved_strings = self.g.strings.clone();
-            let saved_str_names = self.g.str_names.clone();
+            let saved_strs = self.g.str_mark();
             // A closure's own parameters and its captures are its bindings.
             let bound: Vec<String> = params.iter().map(|p| p.name.clone()).chain(info.fields.iter().map(|(n, _)| n.clone())).collect();
             let confined_names = if self.g.boot(4) { HashSet::new() } else { self.g.confined_vecs(body, &bound, &[]) };
@@ -255,8 +254,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.g.uid = saved_uid;
                 self.restore_names(saved_names);
                 self.g.nstr = saved_nstr;
-                self.g.strings = saved_strings;
-                self.g.str_names = saved_str_names;
+                self.g.str_restore(saved_strs);
                 continue;
             }
             if matches!(v.ty, Type::Never) {

@@ -27,7 +27,8 @@ import host;
 import target;
 import diags;
 import link;
-import cache;
+import cc;
+import passes;
 import report;
 import frontend;
 
@@ -76,7 +77,8 @@ const str USAGE =
     "o OUT] FILE.cb [ARG...]\n"
     "       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n"
     "       cobc [--explain] [--warn-shadow] --check PATH...\n"
-    "       cobc --check-syntax [--origin PATH] (FILE | -)";
+    "       cobc --check-syntax [--origin PATH] (FILE | -)\n"
+    "       cobc --emit-c [--c-name NAME] FILE";
 
 const str HELP =
     "Compile a CobaltC program to a native executable.\n"
@@ -110,16 +112,6 @@ const str HELP =
     "               run that ended differently can be replayed. Setting\n"
     "               COBALTC_SCHEDULE_SEED=S in a compiled program's\n"
     "               environment does the same.\n"
-    "  COBC_CACHE   (environment) The object cache: `std` functions that do not\n"
-    "               depend on the program are compiled once and their objects\n"
-    "               kept, by default in `cobc-cache` beside this executable, and\n"
-    "               linked into every later program that uses them, so a program\n"
-    "               that uses much of `std` compiles in a few seconds instead of\n"
-    "               tens. `COBC_CACHE=off` compiles everything every time, as one\n"
-    "               C file; `COBC_CACHE=DIR` keeps the objects in DIR. A rebuilt\n"
-    "               cobc, another C compiler or other options use other objects;\n"
-    "               stale ones are never reused, only left behind (delete the\n"
-    "               directory to reclaim the space).\n"
     "  --lib        Build a library (D-0257): the program's `extern fn` definitions\n"
     "               as a static archive (default libNAME.a beside the source), the\n"
     "               runtime libcbrt.a copied beside it, and NAME.h with the C\n"
@@ -155,8 +147,8 @@ const str HELP =
     "               access through one is checked where it is made (D-0209). For\n"
     "               comparing against the elided forms; slower.\n"
     "  --bootstrap-form\n"
-    "               Emit the general checked form only: --all-checks, no object\n"
-    "               cache, no elisions (D-0274). The reference for the code\n"
+    "               Emit the general checked form only: --all-checks, no\n"
+    "               elisions (D-0274). The reference for the code\n"
     "               generator written in CobaltC; much slower.\n"
     "               COBALTC_BOOTSTRAP_UPTO=N switches off D-0274's stages 1..N\n"
     "               only (0 the default form, 10 this one; CHG-0368).\n"
@@ -214,6 +206,11 @@ const str HELP =
     "               as part of that program, not on its own. Nothing is printed\n"
     "               for an accepted program. `coby --check` does the same\n"
     "               without the `extern` files.\n"
+    "  --emit-c [--c-name NAME] FILE\n"
+    "               The program's C on standard output, nothing compiled or\n"
+    "               linked: the file `--keep-c` keeps, NAME the name its `#line`\n"
+    "               directives give it (default a.c). A program the static pass\n"
+    "               rejects gets its diagnostic and status 1.\n"
     "  --check-syntax [--origin PATH] (FILE | -)\n"
     "               Whether one text parses, and nothing else: FILE, or standard\n"
     "               input for `-`, its `module m \"./m.cb\";` files found\n"
@@ -836,23 +833,7 @@ export fn driver_main() : u8
         String text = report::report(String::as_view(&combined(&gen, "report.c")), String::as_view(&file));
         return if (print_out(String::as_view(&text))) { 0 } else { 1 };
     }
-    // `lower::bootstrap_form()`: a D-0274 stage switched off.
-    bool bootstrap_form = level > 0;
-    Option<String> cache_dir = cache::dir(bootstrap_form);
-    usize cacheable = 0;
-    foreach (u in &gen.units)
-    {
-        if (u.cacheable)
-        {
-            cacheable += 1;
-        }
-    }
-    note(String::as_view(&sprintf(
-        "lowered to C in %v ms (%v units, %v cacheable)",
-        ms_since(t_lower),
-        Vec::len(&gen.units),
-        cacheable,
-    )));
+    note(String::as_view(&sprintf("lowered to C in %v ms (%v units)", ms_since(t_lower), Vec::len(&gen.units))));
 
     Option<String> scratch = None;
     if (run)
@@ -901,16 +882,13 @@ export fn driver_main() : u8
         return 2;
     }
     String c_path = with_extension(String::as_view(&exe), "c");
-    // The single C file: compiled as it is without the cache, kept for
-    // inspection with `--keep-c`, written when something fails.
-    if (Option::is_none(&cache_dir) || keep_c)
-    {
-        Result::expect(
-            write_file(String::as_view(&c_path), String::as_view(&combined(&gen, String::as_view(&c_path)))),
-            "write C",
-        );
-        note(String::as_view(&sprintf("wrote the generated C to %s", &c_path)));
-    }
+    // D-0277: the program's single C file, compiled every time; kept for
+    // inspection with `--keep-c`, and when something fails.
+    Result::expect(
+        write_file(String::as_view(&c_path), String::as_view(&combined(&gen, String::as_view(&c_path)))),
+        "write C",
+    );
+    note(String::as_view(&sprintf("wrote the generated C to %s", &c_path)));
 
     String obj_dir = pjoin(
         String::as_view(&temp_dir()),
@@ -926,23 +904,13 @@ export fn driver_main() : u8
         debug,
         strip,
         lib,
-        &cache_dir,
         String::as_view(&obj_dir),
         String::as_view(&exe),
         String::as_view(&c_path),
         target,
         &facts,
-        bootstrap_form,
     );
-    bool cache_failed = Result::is_err(&linked) && Option::is_some(&cache_dir);
-    if (cache_failed && !exists(String::as_view(&c_path)))
-    {
-        _ = write_file(String::as_view(&c_path), String::as_view(&combined(&gen, String::as_view(&c_path))));
-    }
-    if (!cache_failed)
-    {
-        _ = remove_dir_all(String::as_view(&obj_dir));
-    }
+    _ = remove_dir_all(String::as_view(&obj_dir));
     Output output = match (linked)
     {
         Ok(o)  : o,
@@ -1195,8 +1163,8 @@ fn segment_after(StringView text, str sep) : Option<StringView>
 }
 
 // cobc's chain from the object directory to the linked output (`linked`):
-// the program's own C code compiled, then the cache's build and the link,
-// or the archive for `--lib`, or the one C file compiled.
+// the program's own C code compiled (`link_args`), then the one C file
+// compiled and linked, or compiled and archived for `--lib`.
 fn link_all(
     ref<Generated, shared> gen,
     ref<Vec<Code>, shared> code,
@@ -1206,13 +1174,11 @@ fn link_all(
     bool debug,
     bool strip,
     bool lib,
-    ref<Option<String>, shared> cache_dir,
     StringView obj_dir,
     StringView exe,
     StringView c_path,
     Target target,
     ref<CcFacts, shared> facts,
-    bool bootstrap_form,
 ) : Result<Output, String>
 {
     match (make_dir_all(obj_dir))
@@ -1221,64 +1187,21 @@ fn link_all(
         Err(e) : return Err(sprintf("cannot create %v: %v", obj_dir, io_text(&e))),
     }
     Vec<String> extra = link_args(code, cc, opt, arch, obj_dir, target)?;
-    match (cache_dir)
+    u64 t = monotonic_ns();
+    Result<Output, String> r = if (lib)
     {
-        Some(dir) :
-        {
-            Inputs inp = Inputs {
-                .cc = String::from_view(cc),
-                .opt = String::from_view(opt),
-                .arch = clone(arch),
-                .debug = debug,
-                .cache_dir = String::clone(dir),
-                .work_dir = String::from_view(obj_dir),
-                .facts = clone(facts),
-            };
-            u64 t = monotonic_ns();
-            Built built = build(gen, &inp, bootstrap_form)?;
-            note(String::as_view(&sprintf(
-                "object cache %s: %v unit(s) reused, %v compiled, in %v ms",
-                dir,
-                built.reused,
-                built.compiled,
-                ms_since(t),
-            )));
-            u64 t2 = monotonic_ns();
-            Result<Output, String> r = if (lib)
-            {
-                archive(cc, &built.objects, &extra, exe, target)
-            }
-            else
-            {
-                compile(cc, &built.objects, exe, opt, arch, &extra, strip, debug, obj_dir, target, facts)
-            };
-            note(String::as_view(&sprintf("linked in %v ms", ms_since(t2))));
-            r
-        },
-        None      :
-        {
-            if (lib)
-            {
-                Inputs inp = Inputs {
-                    .cc = String::from_view(cc),
-                    .opt = String::from_view(opt),
-                    .arch = clone(arch),
-                    .debug = debug,
-                    .cache_dir = String::from_view(obj_dir),
-                    .work_dir = String::from_view(obj_dir),
-                    .facts = clone(facts),
-                };
-                String obj = pjoin(obj_dir, "program.o");
-                compile_one(&inp, c_path, String::as_view(&obj))?;
-                Vec<String> objs = Vec::new();
-                Vec::push(&mut objs, obj);
-                return archive(cc, &objs, &extra, exe, target);
-            }
-            Vec<String> inputs = Vec::new();
-            Vec::push(&mut inputs, String::from_view(c_path));
-            compile(cc, &inputs, exe, opt, arch, &extra, strip, debug, obj_dir, target, facts)
-        },
+        String obj = pjoin(obj_dir, "program.o");
+        compile_one(cc, opt, arch, debug, facts, c_path, String::as_view(&obj))?;
+        Vec<String> objs = Vec::new();
+        Vec::push(&mut objs, obj);
+        archive(cc, &objs, &extra, exe, target)
     }
+    else
+    {
+        build_exe(gen, cc, c_path, exe, opt, arch, &extra, strip, debug, obj_dir, target, facts)
+    };
+    note(String::as_view(&sprintf("compiled and linked in %v ms", ms_since(t))));
+    r
 }
 
 // D-0255: the command that runs a built program: itself, or its target's
@@ -1870,24 +1793,13 @@ fn write_header(StringView out, StringView text, ref<Vec<Code>, shared> code, Ta
     }
 }
 
-// Compiles and links `inputs` (one C file, or the cache's objects and the
-// program's) into `exe`. `extra` links the program's own C code: after the
+// Compiles and links `inputs` (the program's C file) into `exe`. `extra` links the program's own C code: after the
 // generated program, before the runtime and the system libraries. Many
 // inputs go through a response file in `work_dir`: a command line has a
 // length limit (Windows: 32 K).
-fn compile(
-    StringView cc,
-    ref<Vec<String>, shared> inputs,
-    StringView exe,
-    StringView opt,
-    ref<Option<String>, shared> arch,
-    ref<Vec<String>, shared> extra,
-    bool strip,
-    bool debug,
-    StringView work_dir,
-    Target t,
-    ref<CcFacts, shared> facts,
-) : Result<Output, String>
+// The runtime's directory for `t`, checked present and current (cobc's
+// `runtime_dir`).
+fn checked_runtime_dir(Target t) : Result<String, String>
 {
     String home = runtime_home()?;
     String lib_dir = Target::runtime_dir(t, String::as_view(&home));
@@ -1903,6 +1815,216 @@ fn compile(
         ));
     }
     check_runtime(String::as_view(&runtime), t)?;
+    Ok(lib_dir)
+}
+
+// A part's compile, on a thread of its own (`build_exe`).
+fn run_part(Cmd c) : Result<Output, FileError>
+{
+    Cmd::output(&c)
+}
+
+// D-0277 (cobc's `build_exe`): the program's C compiled and linked into
+// `exe`. A large program's C is compiled in parts (`part_count`,
+// `split_parts`), all at once, each written into `work_dir` under its own
+// name, then linked; with link-time optimisation where the C compiler has it
+// (`Lto`). One part is the C file itself, compiled and linked in one command.
+fn build_exe(
+    ref<Generated, shared> gen,
+    StringView cc,
+    StringView c_path,
+    StringView exe,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<Vec<String>, shared> extra,
+    bool strip,
+    bool debug,
+    StringView work_dir,
+    Target t,
+    ref<CcFacts, shared> facts,
+) : Result<Output, String>
+{
+    String lib_dir = checked_runtime_dir(t)?;
+    usize units_len = 0;
+    foreach (u in &gen.units)
+    {
+        units_len += String::len(&u.text);
+    }
+    usize k = part_count(units_len);
+    Lto lto = Lto::Off;
+    if (!StringView::eq_str(opt, "-O0"))
+    {
+        if (is_gcc(facts))
+        {
+            lto = Lto::Gcc;
+        }
+        else if (is_clang(facts) && k > 1)
+        {
+            // `lld` only when it is the Clang installation's own.
+            Vec<str> lds = Vec::new();
+            if (own_lld(cc, facts))
+            {
+                Vec::push(&mut lds, "-fuse-ld=lld");
+            }
+            Vec::push(&mut lds, "-fuse-ld=gold");
+            foreach (ld in &lds)
+            {
+                if (lto_probe(cc, opt, arch, facts, *ld, String::as_view(&lib_dir), work_dir, t))
+                {
+                    lto = Lto::Thin(*ld);
+                    break;
+                }
+            }
+        }
+    }
+    Vec<str> link_lto = Lto::link_flags(lto);
+    if (k == 1)
+    {
+        Vec<String> inputs = Vec::new();
+        Vec::push(&mut inputs, String::from_view(c_path));
+        return compile(cc, &inputs, exe, opt, arch, extra, strip, debug, work_dir, t, facts, &link_lto);
+    }
+    Vec<str> part_lto = Lto::part_flags(lto);
+    Vec<String> parts_c = Vec::new();
+    Vec<String> objects = Vec::new();
+    Vec<handle<Result<Output, FileError>>> hs = Vec::new();
+    Vec<String> texts = split_parts(gen, k);
+    for (usize i = 0; i < Vec::len(&texts); i += 1)
+    {
+        String part = pjoin(work_dir, String::as_view(&sprintf("part%v.c", i)));
+        String obj = pjoin(work_dir, String::as_view(&sprintf("part%v.o", i)));
+        match (write_file(String::as_view(&part), String::as_view(&settle_lines(&texts[i], String::as_view(&part)))))
+        {
+            Ok(_)  : {},
+            Err(e) : return Err(sprintf("cannot write %s: %v", &part, io_text(&e))),
+        }
+        Cmd cmd = Cmd::new(cc);
+        foreach (f in &facts.flags)
+        {
+            Cmd::arg(&mut cmd, String::as_view(f));
+        }
+        Cmd::arg(&mut cmd, opt);
+        match (arch)
+        {
+            Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+            None    : {},
+        }
+        if (debug)
+        {
+            Cmd::arg(&mut cmd, "-g");
+        }
+        foreach (f in &part_lto)
+        {
+            Cmd::arg(&mut cmd, StringView::of(*f));
+        }
+        Cmd::arg(&mut cmd, "-c");
+        Cmd::arg(&mut cmd, "-o");
+        Cmd::arg(&mut cmd, String::as_view(&obj));
+        Cmd::arg(&mut cmd, String::as_view(&part));
+        show(&cmd);
+        Vec::push(&mut hs, spawn(run_part, cmd));
+        Vec::push(&mut parts_c, part);
+        Vec::push(&mut objects, obj);
+    }
+    Option<String> failed = None;
+    usize n = 0;
+    while (Vec::len(&hs) > 0)
+    {
+        handle<Result<Output, FileError>> h = Vec::remove(&mut hs, 0);
+        Result<Output, FileError> r = join(h);
+        match (r)
+        {
+            Ok(o)  :
+            {
+                if (o.status != 0 && Option::is_none(&failed))
+                {
+                    failed = Some(sprintf("%s%v failed on %s", &lossy(&o.stderr[0..$]), cc, &parts_c[n]));
+                }
+            },
+            Err(e) :
+            {
+                if (Option::is_none(&failed))
+                {
+                    failed = Some(sprintf("cannot run the C compiler `%v`: %v", cc, io_text(&e)));
+                }
+            },
+        }
+        n += 1;
+    }
+    match (failed)
+    {
+        Some(e) : return Err(e),
+        None    : {},
+    }
+    compile(cc, &objects, exe, opt, arch, extra, strip, debug, work_dir, t, facts, &link_lto)
+}
+
+// Whether the C compiler links a program calling into the runtime
+// (`LTO_PROBE`) with ThinLTO through `ld` (cobc's `build_exe` probe).
+fn lto_probe(
+    StringView cc,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<CcFacts, shared> facts,
+    str ld,
+    StringView lib_dir,
+    StringView work_dir,
+    Target t,
+) : bool
+{
+    String src = pjoin(work_dir, "lto-probe.c");
+    if (Result::is_err(&write_file(String::as_view(&src), LTO_PROBE)))
+    {
+        return false;
+    }
+    Cmd cmd = Cmd::new(cc);
+    foreach (f in &facts.flags)
+    {
+        Cmd::arg(&mut cmd, String::as_view(f));
+    }
+    Cmd::arg(&mut cmd, opt);
+    match (arch)
+    {
+        Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+        None    : {},
+    }
+    Cmd::arg(&mut cmd, "-flto=thin");
+    Cmd::arg(&mut cmd, StringView::of(ld));
+    Cmd::arg(&mut cmd, "-o");
+    Cmd::arg(&mut cmd, String::as_view(&pjoin(work_dir, "lto-probe")));
+    Cmd::arg(&mut cmd, String::as_view(&src));
+    Cmd::arg(&mut cmd, "-L");
+    Cmd::arg(&mut cmd, lib_dir);
+    Cmd::arg(&mut cmd, "-lcbrt");
+    Vec<str> sys = Target::link_libs(t);
+    foreach (l in &sys)
+    {
+        Cmd::arg(&mut cmd, String::as_view(&sprintf("-l%v", *l)));
+    }
+    show(&cmd);
+    match (Cmd::output(&cmd))
+    {
+        Ok(o)  : o.status == 0,
+        Err(_) : false,
+    }
+}
+
+fn compile(
+    StringView cc,
+    ref<Vec<String>, shared> inputs,
+    StringView exe,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<Vec<String>, shared> extra,
+    bool strip,
+    bool debug,
+    StringView work_dir,
+    Target t,
+    ref<CcFacts, shared> facts,
+    ref<Vec<str>, shared> lto,
+) : Result<Output, String>
+{
+    String lib_dir = checked_runtime_dir(t)?;
     // `-ffp-contract=off`: spec/06 rounds each operation on its own.
     // `-fno-optimize-sibling-calls`: every call stays one, so a recursion
     // too deep for the stack faults. The runtime's system libraries are the
@@ -1922,6 +2044,10 @@ fn compile(
     if (debug)
     {
         Cmd::arg(&mut cmd, "-g");
+    }
+    foreach (f in lto)
+    {
+        Cmd::arg(&mut cmd, StringView::of(*f));
     }
     Cmd::arg(&mut cmd, "-o");
     Cmd::arg(&mut cmd, exe);

@@ -10,7 +10,9 @@
 # (`COBALTC_BOOTSTRAP_UPTO=LEVEL`; 0 the default form, every optimisation on;
 # 10 the bootstrap form, which takes about two hours, its stage 2 running with
 # every check on). CC picks the C compiler (default gcc); OUT the directory
-# (default stress/selfhost/fixpoint-DATE). Exit status 0 at the fixed point.
+# (default stress/selfhost/fixpoint-DATE); CBC1 a cbc cobc has just built
+# from this source at level 0 (impl/selfhost/build.sh), used instead of
+# building it again. Exit status 0 at the fixed point.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -25,20 +27,25 @@ ulimit -t 40000
 main="$here/cbc/main.cb"
 cname="$OUT/stage.c"
 cd "$root"
-echo "== cbc1 (cobc -O 2, default form) $(date +%T)"
-env -u COBALTC_BOOTSTRAP_UPTO timeout -k 10 2400 "$cobc" -O 2 -o "$OUT/cbc1" "$main" || { echo "fixpoint.sh: building cbc failed"; exit 1; }
+if [ -n "${CBC1:-}" ]; then
+    echo "== cbc1 = $CBC1"
+    cp "$CBC1" "$OUT/cbc1" || exit 1
+else
+    echo "== cbc1 (cobc -O 2, default form) $(date +%T)"
+    env -u COBALTC_BOOTSTRAP_UPTO timeout -k 10 2400 "$cobc" -O 2 -o "$OUT/cbc1" "$main" || { echo "fixpoint.sh: building cbc failed"; exit 1; }
+fi
 echo "== stage 1 (level $level) $(date +%T)"
 timeout -k 10 14400 "$OUT/cbc1" --emit-c --c-name "$cname" "$main" > "$OUT/stage1.c" 2> "$OUT/stage1.err" \
     || { echo "fixpoint.sh: stage 1 failed"; tail -5 "$OUT/stage1.err"; exit 1; }
 # cobc's C at the same level, at the name cbc's `#line` directives give it.
-timeout -k 10 2400 "$cobc" --cc /bin/true --keep-c -o "$OUT/stage" "$main" > "$OUT/ref.log" 2>&1 \
+timeout -k 10 2400 "$cobc" --emit-c --c-name "$cname" "$main" > "$cname" 2> "$OUT/ref.log" \
     || { echo "fixpoint.sh: cobc failed"; exit 1; }
 if cmp -s "$cname" "$OUT/stage1.c"; then
     echo "stage 1 == cobc (level $level)"
 else
     echo "fixpoint.sh: stage 1 differs from cobc (level $level)"; cmp "$cname" "$OUT/stage1.c" | head -2; exit 1
 fi
-rm -f "$cname" "$OUT/stage"
+rm -f "$cname"
 # cbc's own C code (`extern "./host.c";`, cbc/host.cb) is linked with it.
 echo "== $cc $(date +%T)"
 libs=$(printf ' -l%s' pthread dl m)

@@ -347,8 +347,8 @@ export fn native_vec_index(
 
 // `Vec<String>::drop`: the body's loop `drop(reclaim<String>(…))` over the
 // elements, then the buffer's `deallocate`. An element with a live object
-// over its cells (`cb_live_at`) takes the body's own steps: `[Reclaim]`, the
-// move out, and its destruction. For any other, what is observable is the
+// over its cells (`cb_live_at`) takes the body's own steps: `[Reclaim]` and
+// `[Destroy]` of the place it makes. For any other, what is observable is the
 // destruction itself, the `String`'s `Vec<u8>` field dropped as its native
 // body does (`cb_vec_drop_plain` over the bytes, then their `deallocate`).
 // The reads of `self` go through one path that nothing in the loop writes,
@@ -375,10 +375,7 @@ export fn native_vec_drop_strings(
     String::appendf(&mut b, "        %s *e = v->ptr + i;\n", &sc);
     String::append(&mut b, "        if (cb_live_at(e)) {\n");
     String::appendf(&mut b, "            uint64_t root = cb_reclaim(e, %vu);\n", ty);
-    String::append(&mut b, "            uint64_t o = cb_take(root, CB_NOLOC, 0);\n");
-    String::appendf(&mut b, "            %s t = *e;\n", &sc);
-    String::append(&mut b, "            cb_move_to(o, &t);\n");
-    String::append(&mut b, "            cb_consume(o, CB_NOLOC, 0);\n");
+    String::append(&mut b, "            cb_destroy(root, CB_NOLOC, 0);\n");
     String::append(&mut b, "        } else {\n");
     // `Option<String>`: only `Some` (variant 0) holds bytes.
     str gd = if (opt) { "if (e->tag == 0u) " } else { "" };
@@ -414,6 +411,43 @@ export fn native_vec_drop_strings(
 // write in between and cannot fail where the first passed. A resource,
 // reference-holding, fn-valued or zero-sized element type keeps the
 // prelude body.
+// `Vec<T>::drop` for a `T` holding a resource but no reference and no `fn`
+// value (`native_vec_drop`): `native_vec_drop_strings`' loop, an element with
+// no live object over its cells destroyed in place (`cb_drop_local`).
+fn native_vec_drop_owned(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c, u64 size) : String
+{
+    String sc = ctype(g, elem);
+    u32 ty = type_id(g, elem);
+    String b = String::new();
+    String::append(&mut b, "    cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *v = (%s *)p_self.p;\n", vec_c, vec_c);
+    String::append(
+        &mut b,
+        "    if (v->len > 0) cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    for (uint64_t i = 0; i < v->len; i++) {\n");
+    String::appendf(&mut b, "        %s *e = v->ptr + i;\n", &sc);
+    String::append(&mut b, "        if (cb_live_at(e)) {\n");
+    String::appendf(&mut b, "            uint64_t root = cb_reclaim(e, %vu);\n", ty);
+    String::append(&mut b, "            cb_destroy(root, CB_NOLOC, 0);\n");
+    String::append(&mut b, "        } else {\n");
+    String::appendf(&mut b, "            cb_drop_local(e, %vu);\n", ty);
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 2u } }, 1, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    if (v->cap > 0) {\n");
+    String::append(&mut b, "        cb_read(p_self.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(
+        &mut b,
+        "        uint64_t n = ({ uint64_t _r; if (__builtin_mul_overflow(v->cap, (uint64_t)%vu, &_r)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); _r; });\n",
+        size
+    );
+    // Elements holding no reference: none in the cells (`cb_deallocate_plain`).
+    String::append(&mut b, "        cb_deallocate_plain((uint8_t *)v->ptr, n);\n");
+    String::append(&mut b, "    }\n");
+    b
+}
+
 export fn native_vec_drop(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<String, shared> vec_c) : Option<String>
 {
     if (is_string_ty(elem))
@@ -435,6 +469,15 @@ export fn native_vec_drop(ref<Gen, exclusive> g, ref<Type, shared> elem, ref<Str
         return Some(native_vec_drop_strings(g, elem, vec_c, true));
     }
     u64 size = size_align(g, elem).size;
+    // Any other element type holding a resource but no reference and no
+    // `fn` value: the same loop as `String`'s, an element no object lies
+    // over destroyed in place (`cb_drop_local`), as the destruction of the
+    // fresh object `[Reclaim]` would establish for it makes it.
+    if (size > 0 && !plain_data(g, elem) && is_resource(g, elem) && !has_refs(g, elem) && !holds_fn(g, elem)
+        && !is_closure(elem))
+    {
+        return Some(native_vec_drop_owned(g, elem, vec_c, size));
+    }
     if (size == 0 || !plain_data(g, elem))
     {
         return None;

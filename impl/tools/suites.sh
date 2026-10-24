@@ -56,7 +56,7 @@ if [ -n "${EXPLORE:-}" ] && [ -n "${EXPLORE_CASES:-}" ] && [ -z "$FAILED" ]; the
     mkdir -p "$D/explore"
     for c in $EXPLORE_CASES; do
         f="$c"; [ "${f#/}" = "$f" ] && f="$R/$c"
-        out=$(cd "$D/explore" && COBC_CACHE="$D/explore/cache" COBALTC_CPU_LIMIT=600 timeout -k 10 900 "$R/impl/target/release/cobc" --explore "$EXPLORE" --cc gcc "$f" </dev/null 2>&1)
+        out=$(cd "$D/explore" && COBALTC_CPU_LIMIT=600 timeout -k 10 900 "$R/impl/target/release/cobc" --explore "$EXPLORE" --cc gcc "$f" </dev/null 2>&1)
         echo "=== $c" >> "$D/explore.log"; echo "$out" | tail -8 >> "$D/explore.log"
         # A case the static pass rejects compiles to nothing to explore: one outcome.
         if echo "$out" | /usr/bin/env grep -q "distinct outcomes"; then EXPLORED=""; FAILED="$FAILED explore:$(basename "$c")"; fi

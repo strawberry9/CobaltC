@@ -95,13 +95,12 @@ fn report_tracking_lists_tracked_lines_and_compiles_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// Linkage under the object cache: the program's own functions are
-// `static` (the C compiler may inline them), `main` is not, and a program
-// whose loop calls cached `std` functions (`Vec::push`, `Vec::len`, the
-// element accessor, given inline-only copies) builds and runs through the
-// cache as without it.
+// Linkage: the program's own functions are `static` (the C compiler may
+// inline them), `main` is not, and a program whose loop calls pure-`std`
+// functions (`Vec::push`, `Vec::len`, the element accessor) builds and
+// runs.
 #[test]
-fn program_functions_are_static_and_cached_helpers_link() {
+fn program_functions_are_static_and_std_helpers_link() {
     let dir = std::env::temp_dir().join(format!("cobc-linkage-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -132,7 +131,7 @@ fn line_directives_name_the_program_lines() {
             let mut args = vec!["--keep-c", "--cc", cc, "-o", out];
             args.extend_from_slice(extra);
             args.push("prog.cb");
-            let o = Command::new(cobc_exe()).args(&args).env("COBC_CACHE", "off").current_dir(&dir).output().expect("run cobc");
+            let o = Command::new(cobc_exe()).args(&args).current_dir(&dir).output().expect("run cobc");
             assert!(o.status.success(), "{}: {}", cc, String::from_utf8_lossy(&o.stderr));
             let run = Command::new(dir.join(out)).output().expect("run prog");
             assert_eq!(String::from_utf8_lossy(&run.stdout), "3\n", "{}", cc);
@@ -404,7 +403,7 @@ fn contained_fault_frees_objectless_locals() {
     let coby = std::path::Path::new(env!("CARGO_BIN_EXE_cobc")).with_file_name(if cfg!(windows) { "coby.exe" } else { "coby" });
     let want = Command::new(&coby).arg("pool.cb").current_dir(&dir).output().expect("run coby");
     assert!(want.status.success(), "{}", String::from_utf8_lossy(&want.stderr));
-    let o = Command::new(cobc_exe()).args(["-O0", "-g", "--cc", wrapper, "-o", "pool", "pool.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
+    let o = Command::new(cobc_exe()).args(["-O0", "-g", "--cc", wrapper, "-o", "pool", "pool.cb"]).current_dir(&dir).output().expect("run cobc");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     // `setarch -R`: clang 14's sanitized binaries can fail at start under ASLR.
     let run = Command::new("setarch").args(["-R", "./pool"]).current_dir(&dir).output().expect("run pool");

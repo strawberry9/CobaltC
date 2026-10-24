@@ -21,6 +21,7 @@ impl<'a> Gen<'a> {
             desc_aux: String::new(),
             strings: String::new(),
             str_names: HashMap::new(),
+            str_log: Vec::new(),
             units: Vec::new(),
             nstr: 0,
             protos: String::new(),
@@ -66,9 +67,20 @@ impl<'a> Gen<'a> {
         }
     }
 
-    // The program's C, in parts: cache.rs compiles pure-`std` units in
-    // translation units of their own and keeps their objects.
+    // The program's C, in parts (`Generated::combined` joins them into the
+    // one C file the driver compiles, D-0277).
     pub fn generate(mut self) -> R<Generated> {
+        // The names `std`'s own bodies use as values (`used_as_value`), for
+        // impl/selfhost/back/std_values.cb (`gen_std_values.sh`): cbc parses
+        // a `std` body only when it reaches it, and takes this part as given.
+        if std::env::var_os("COBALTC_STD_FN_VALUES").is_some() {
+            let mut names: Vec<String> = self.value_names(|k| k.starts_with("std::")).into_iter().collect();
+            names.sort();
+            for n in names {
+                println!("{}", n);
+            }
+            std::process::exit(0);
+        }
         self.debug_lent();
         self.confining = if self.all_checks { HashMap::new() } else { self.confining_table() };
         // D-0257: a library has no `main`; its entry points (`extern fn`
@@ -94,7 +106,7 @@ impl<'a> Gen<'a> {
             // trampoline among the thunks, in the program's translation
             // unit: a function that spawns is compiled there too.
             let pure = pure && !text.contains("struct cb_env_");
-            self.units.push(Unit { text, cacheable: pure });
+            self.units.push(Unit { text, pure_std: pure });
         }
         // D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive`
         // twin where it has one, and the callee itself where it has none.
@@ -120,7 +132,7 @@ impl<'a> Gen<'a> {
         }
         // Last, when no pass reads the text line by line any more.
         if self.line_directives {
-            for u in self.units.iter_mut().filter(|u| !u.cacheable) {
+            for u in self.units.iter_mut().filter(|u| !u.pure_std) {
                 if u.text.contains("cb_at(") || u.text.contains(LINE_MARK) {
                     u.text = line_directives(&u.text, &self.files);
                 }
@@ -223,8 +235,8 @@ impl<'a> Gen<'a> {
     }
 
     // External linkage only where it is needed. A function defined in a
-    // unit the program's own translation unit compiles, and named by no
-    // cacheable unit (cache.rs), is `static`: nothing outside that
+    // unit that is not pure `std`, and named by no pure-`std` unit, is
+    // `static`: nothing outside the program's translation unit
     // translation unit calls it by name (the runtime reaches functions
     // through pointers, and foreign code is only called,
     // `rule.trust.extern-code`), so the C compiler may inline it wherever
@@ -232,7 +244,7 @@ impl<'a> Gen<'a> {
     // `cb_program`, which only C's `main` calls, GCC would compile the
     // whole program as code run once, for size (a `div` for a `%` by a
     // constant, say).
-    // `localize`, dumped (`dump_pass`): the units' flags (`1` cacheable)
+    // `localize`, dumped (`dump_pass`): the units' flags (`1` pure `std`)
     // and texts, the prototypes, the inlined signatures and `main`'s name,
     // before and after.
     fn dumped_localize(&mut self, main_c: &str) {
@@ -242,7 +254,7 @@ impl<'a> Gen<'a> {
         let mut sigs: Vec<&String> = self.inline_sigs.iter().collect();
         sigs.sort();
         let sigs: String = sigs.iter().map(|t| format!("{}\n", t)).collect();
-        let flags: String = self.units.iter().map(|u| if u.cacheable { "1\n" } else { "0\n" }).collect();
+        let flags: String = self.units.iter().map(|u| if u.pure_std { "1\n" } else { "0\n" }).collect();
         let before: Vec<String> = self.units.iter().map(|u| u.text.clone()).collect();
         let protos_in = self.protos.clone();
         self.localize(main_c);
@@ -256,19 +268,19 @@ impl<'a> Gen<'a> {
     }
 
     pub(super) fn localize(&mut self, main_c: &str) {
-        let mut cached: HashSet<String> = HashSet::new();
-        for u in self.units.iter().filter(|u| u.cacheable) {
-            cached.extend(crate::cache::identifiers(&u.text).into_iter().map(str::to_string));
+        let mut std_names: HashSet<String> = HashSet::new();
+        for u in self.units.iter().filter(|u| u.pure_std) {
+            std_names.extend(crate::cc::identifiers(&u.text).into_iter().map(str::to_string));
         }
         let mut local: HashSet<String> = HashSet::new();
         let inline_sigs = std::mem::take(&mut self.inline_sigs);
-        for u in self.units.iter_mut().filter(|u| !u.cacheable) {
+        for u in self.units.iter_mut().filter(|u| !u.pure_std) {
             let mut out = String::with_capacity(u.text.len() + 64);
             let mut lines = u.text.split('\n').peekable();
             while let Some(l) = lines.next() {
-                if crate::cache::is_definition(l, lines.peek().copied()) {
-                    if let Some(n) = crate::cache::name_before_paren(l) {
-                        if n != main_c && !cached.contains(n) {
+                if crate::cc::is_definition(l, lines.peek().copied()) {
+                    if let Some(n) = crate::cc::name_before_paren(l) {
+                        if n != main_c && !std_names.contains(n) {
                             local.insert(l.to_string());
                             // D-0209: a direct-parameter dispatcher is
                             // inlined at every call (`lower_fn_direct`).

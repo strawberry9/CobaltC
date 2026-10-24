@@ -50,8 +50,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         let saved_uid = self.g.uid;
         let saved_names = self.snapshot_names();
         let saved_nstr = self.g.nstr;
-        let saved_strings = self.g.strings.clone();
-        let saved_str_names = self.g.str_names.clone();
+        let saved_strs = self.g.str_mark();
         let saved_cleanup = self.cleanup.len();
         let saved_loops = self.loops.clone();
         let saved_scopes = self.scopes.len();
@@ -64,8 +63,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         self.g.uid = saved_uid;
         self.restore_names(saved_names);
         self.g.nstr = saved_nstr;
-        self.g.strings = saved_strings;
-        self.g.str_names = saved_str_names;
+        self.g.str_restore(saved_strs);
         self.cleanup.truncate(saved_cleanup);
         self.loops = saved_loops;
         self.scopes.truncate(saved_scopes);
@@ -107,8 +105,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         let saved_uid = self.g.uid;
         let saved_names = self.snapshot_names();
         let saved_nstr = self.g.nstr;
-        let saved_strings = self.g.strings.clone();
-        let saved_str_names = self.g.str_names.clone();
+        let saved_strs = self.g.str_mark();
         let saved_cleanup = self.cleanup.len();
         let saved_loops = self.loops.clone();
         let saved_scopes = self.scopes.len();
@@ -119,8 +116,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         self.g.uid = saved_uid;
         self.restore_names(saved_names);
         self.g.nstr = saved_nstr;
-        self.g.strings = saved_strings;
-        self.g.str_names = saved_str_names;
+        self.g.str_restore(saved_strs);
         self.cleanup.truncate(saved_cleanup);
         self.loops = saved_loops;
         self.scopes.truncate(saved_scopes);

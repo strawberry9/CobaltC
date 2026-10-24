@@ -160,7 +160,7 @@ impl<'a> Gen<'a> {
     // `Vec<String>::drop`: the body's loop `drop(reclaim<String>(…))` over
     // the elements, then the buffer's `deallocate`. An element with a live
     // object over its cells (`cb_live_at`) takes the body's own steps:
-    // `[Reclaim]`, the move out, and its destruction. For any other,
+    // `[Reclaim]` and `[Destroy]` of the place it makes. For any other,
     // `[Reclaim]` would establish a fresh object no path reaches, which
     // the destruction ends at once; what is observable of that is the
     // destruction itself, the `String`'s `Vec<u8>` field dropped as its
@@ -179,10 +179,7 @@ impl<'a> Gen<'a> {
         writeln!(b, "        {} *e = v->ptr + i;", sc).unwrap();
         writeln!(b, "        if (cb_live_at(e)) {{").unwrap();
         writeln!(b, "            uint64_t root = cb_reclaim(e, {}u);", ty).unwrap();
-        writeln!(b, "            uint64_t o = cb_take(root, CB_NOLOC, 0);").unwrap();
-        writeln!(b, "            {} t = *e;", sc).unwrap();
-        writeln!(b, "            cb_move_to(o, &t);").unwrap();
-        writeln!(b, "            cb_consume(o, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "            cb_destroy(root, CB_NOLOC, 0);").unwrap();
         writeln!(b, "        }} else {{").unwrap();
         // `Option<String>`: only `Some` (variant 0) holds bytes.
         let (guard, sb) = if opt { ("if (e->tag == 0u) ", "e->u.v0.bytes") } else { ("", "e->bytes") };
@@ -197,6 +194,36 @@ impl<'a> Gen<'a> {
         writeln!(b, "        cb_read(p_self.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, CB_NOLOC, 0);").unwrap();
         writeln!(b, "        uint64_t n = ({{ uint64_t _r; if (__builtin_mul_overflow(v->cap, (uint64_t){}u, &_r)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); _r; }});", size).unwrap();
         let _ = align;
+        writeln!(b, "        cb_deallocate_plain((uint8_t *)v->ptr, n);").unwrap();
+        writeln!(b, "    }}").unwrap();
+        Ok(b)
+    }
+
+    // `Vec<T>::drop` for a `T` holding a resource but no reference and no
+    // `fn` value (`native_vec_drop`): `native_vec_drop_strings`' loop, an
+    // element with no live object over its cells destroyed in place
+    // (`cb_drop_local`).
+    pub(super) fn native_vec_drop_owned(&mut self, elem: &Type, vec_c: &str, size: u64) -> R<String> {
+        let sc = self.ctype(elem)?;
+        let ty = self.type_id(elem)?;
+        let mut b = String::new();
+        writeln!(b, "    cb_read(p_self.tok, (cb_proj[]){{ {{ CB_FIELD, 1u }} }}, 1, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    {} *v = ({} *)p_self.p;", vec_c, vec_c).unwrap();
+        writeln!(b, "    if (v->len > 0) cb_read(p_self.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    for (uint64_t i = 0; i < v->len; i++) {{").unwrap();
+        writeln!(b, "        {} *e = v->ptr + i;", sc).unwrap();
+        writeln!(b, "        if (cb_live_at(e)) {{").unwrap();
+        writeln!(b, "            uint64_t root = cb_reclaim(e, {}u);", ty).unwrap();
+        writeln!(b, "            cb_destroy(root, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "        }} else {{").unwrap();
+        writeln!(b, "            cb_drop_local(e, {}u);", ty).unwrap();
+        writeln!(b, "        }}").unwrap();
+        writeln!(b, "    }}").unwrap();
+        writeln!(b, "    cb_read(p_self.tok, (cb_proj[]){{ {{ CB_FIELD, 2u }} }}, 1, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    if (v->cap > 0) {{").unwrap();
+        writeln!(b, "        cb_read(p_self.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "        uint64_t n = ({{ uint64_t _r; if (__builtin_mul_overflow(v->cap, (uint64_t){}u, &_r)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); _r; }});", size).unwrap();
+        // Elements holding no reference: none in the cells (`cb_deallocate_plain`).
         writeln!(b, "        cb_deallocate_plain((uint8_t *)v->ptr, n);").unwrap();
         writeln!(b, "    }}").unwrap();
         Ok(b)
@@ -219,6 +246,13 @@ impl<'a> Gen<'a> {
             return self.native_vec_drop_strings(elem, vec_c, true).map(Some);
         }
         let (size, align) = self.size_align(elem)?;
+        // Any other element type holding a resource but no reference and no
+        // `fn` value: the same loop as `String`'s, an element no object lies
+        // over destroyed in place (`cb_drop_local`), as the destruction of
+        // the fresh object `[Reclaim]` would establish for it makes it.
+        if size > 0 && !self.plain_data(elem) && self.is_resource(elem) && !self.has_refs(elem) && !self.holds_fn(elem) && !matches!(elem, Type::Closure(_)) {
+            return self.native_vec_drop_owned(elem, vec_c, size).map(Some);
+        }
         if size == 0 || !self.plain_data(elem) {
             return Ok(None);
         }

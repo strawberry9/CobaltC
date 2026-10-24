@@ -58,7 +58,6 @@ mod operators;
 mod passes;
 mod places;
 mod program;
-pub(crate) use program::bootstrap_form;
 mod simd;
 mod statics;
 mod stmts;
@@ -214,7 +213,7 @@ pub struct Gen<'a> {
     type_ids: HashMap<Type, u32>,
     // The descriptors in emission order, and each one's id: a 32-bit hash
     // of the type's mangled name, so the same type has the same id in
-    // every program (cached objects depend on it); `type_pos` finds a
+    // every program; `type_pos` finds a
     // descriptor's position from its id.
     descs: Vec<Option<String>>,
     desc_ids: Vec<u32>,
@@ -225,8 +224,11 @@ pub struct Gen<'a> {
     // String literals by their stable name (`cb_s_<hash>`), each defined
     // once; the bytes guard against two literals hashing alike.
     str_names: HashMap<String, Vec<u8>>,
+    // The names `str_names` was given, in order: a probe's additions are
+    // undone by `str_restore` (`strings` and `str_names` only grow).
+    str_log: Vec<String>,
     // The lowered functions, each with its text and whether it is pure
-    // `std` (cacheable across programs: see cobc/src/cache.rs).
+    // `std` (`Unit`).
     units: Vec<Unit>,
     protos: String,
     fns: String,
@@ -301,7 +303,7 @@ pub struct Gen<'a> {
     // (`closure_id`): a hash of its C name, so closures of different
     // functions, each numbered from 0 like their temporaries, never share
     // a C name, and each function's text stays independent of the rest of
-    // the program (cache.rs).
+    // the program.
     closure_base: u64,
     closures: HashMap<u64, ClosureInfo>,
     thunks: HashMap<Type, String>,
@@ -659,11 +661,12 @@ const C_RESERVED: &[&str] = &[
 
 // One lowered function (with the helpers emitted beside it): its C name,
 // its text, and whether it is pure `std` -- a `std` function instantiated
-// at `std` types only -- so that its text, and its object code, are the
-// same in every program.
+// at `std` types only -- whose text is the same in every program: it keeps
+// external linkage and gets no `#line` directives (`localize`,
+// `line_directives`). (D-0277: there was an object cache of these.)
 pub struct Unit {
     pub text: String,
-    pub cacheable: bool,
+    pub pure_std: bool,
 }
 
 // The generated C in parts (`Gen::generate`); `combined` is the single
@@ -682,14 +685,140 @@ pub struct Generated {
 }
 
 impl Generated {
-    pub fn header() -> &'static str {
-        HEADER
-    }
-
     // The single C file, `c_name` the name it is written under (for the
     // `#line` that returns to the C's own lines, `settle_lines`).
     pub fn combined(&self, c_name: &str) -> String {
         settle_lines(&self.combined_text(), c_name)
+    }
+
+    // D-0277: the program's C as `k` translation units, compiled at once
+    // (`cc.rs`), each written under its own name (`settle_lines`). Every part
+    // has the declarations. A function `localize` made `static` has external
+    // linkage instead, since it may be called from another part, but for the
+    // `static inline` ones, which every part defines; a static or addressed
+    // constant (`g_…`, `k_…`) is defined in part 0 and declared in the rest;
+    // a thunk is each part's own `static` copy, as the descriptors are. The
+    // units' definitions are dealt out by size, each part keeping their
+    // order, and the program's tail (`cb_program`, C's `main`) is part 0's.
+    // With `k` 1, the combined text.
+    pub fn parts(&self, k: usize) -> Vec<String> {
+        if k <= 1 {
+            return vec![self.combined_text()];
+        }
+        // The units' definitions: a definition's first line (at the start of
+        // a line, ending in `)`, `{` after it but for `#line`s), the lines
+        // before it since the last one ended, and its body to the `}` at the
+        // start of a line; lines after a unit's last definition go with it.
+        let mut defs: Vec<Vec<&str>> = Vec::new();
+        for u in &self.units {
+            let lines: Vec<&str> = u.text.split('\n').collect();
+            let mut pending: Vec<&str> = Vec::new();
+            let mut i = 0;
+            let first = defs.len();
+            while i < lines.len() {
+                if starts_definition(&lines, i) {
+                    let mut d = std::mem::take(&mut pending);
+                    let mut j = i;
+                    while j < lines.len() && lines[j] != "}" {
+                        d.push(lines[j]);
+                        j += 1;
+                    }
+                    if j < lines.len() {
+                        d.push(lines[j]);
+                    }
+                    defs.push(d);
+                    i = j + 1;
+                } else {
+                    pending.push(lines[i]);
+                    i += 1;
+                }
+            }
+            if !pending.is_empty() {
+                match defs.len() > first {
+                    true => defs.last_mut().unwrap().extend(pending),
+                    false => defs.push(pending),
+                }
+            }
+        }
+        let head = |d: &[&str]| -> String { d.iter().find(|l| starts_signature(l)).map_or(String::new(), |l| l.to_string()) };
+        let inline_names: std::collections::HashSet<String> = defs.iter().map(|d| head(d)).filter(|h| h.starts_with("static inline")).filter_map(|h| fn_name(&h).map(str::to_string)).collect();
+        let mut everywhere: Vec<String> = Vec::new();
+        let mut spread: Vec<String> = Vec::new();
+        for d in &defs {
+            let h = head(d);
+            if h.starts_with("static inline") {
+                everywhere.push(format!("{}\n", d.join("\n")));
+                continue;
+            }
+            let text: Vec<String> = d.iter().map(|l| if *l == h && h.starts_with("static ") { h["static ".len()..].to_string() } else { l.to_string() }).collect();
+            spread.push(format!("{}\n", text.join("\n")));
+        }
+        // Dealt out largest first to the smallest part, then each part in
+        // the units' order.
+        let mut order: Vec<usize> = (0..spread.len()).collect();
+        order.sort_by(|&a, &b| spread[b].len().cmp(&spread[a].len()).then(a.cmp(&b)));
+        let mut owner = vec![0usize; spread.len()];
+        let mut sizes = vec![0usize; k];
+        for i in order {
+            let p = (0..k).min_by_key(|&p| (sizes[p], p)).unwrap();
+            owner[i] = p;
+            sizes[p] += spread[i].len();
+        }
+        let mut protos = String::with_capacity(self.protos.len());
+        for l in self.protos.lines() {
+            match l.strip_prefix("static ") {
+                Some(rest) if !l.starts_with("static inline") && l.ends_with(");") && fn_name(l).map_or(false, |n| !inline_names.contains(n)) => protos.push_str(rest),
+                _ => protos.push_str(l),
+            }
+            protos.push('\n');
+        }
+        let mut thunks = String::with_capacity(self.thunks.len());
+        let tl: Vec<&str> = self.thunks.split('\n').collect();
+        for (i, l) in tl.iter().enumerate() {
+            if starts_definition(&tl, i) && !l.starts_with("static") {
+                thunks.push_str("static ");
+            }
+            thunks.push_str(l);
+            if i + 1 < tl.len() {
+                thunks.push('\n');
+            }
+        }
+        let mut out = Vec::new();
+        for p in 0..k {
+            let mut t = String::new();
+            t.push_str(HEADER);
+            t.push_str("\n/* ---- types ---- */\n");
+            t.push_str(&self.fwd);
+            t.push_str(&self.types);
+            t.push_str("\n/* ---- string literals ---- */\n");
+            for l in self.strings.lines() {
+                match global_decl(l) {
+                    Some((ty, name)) if p > 0 => t.push_str(&format!("extern {} {};", ty, name)),
+                    Some(_) => t.push_str(&l["static ".len()..]),
+                    None => t.push_str(l),
+                }
+                t.push('\n');
+            }
+            t.push_str("\n/* ---- functions ---- */\n");
+            t.push_str(&protos);
+            t.push_str("\n/* ---- call thunks for fn values ---- */\n");
+            t.push_str(&thunks);
+            t.push_str("\n/* ---- type descriptors ---- */\n");
+            t.push_str(&self.descs);
+            for e in &everywhere {
+                t.push_str(e);
+            }
+            for (i, d) in spread.iter().enumerate() {
+                if owner[i] == p {
+                    t.push_str(d);
+                }
+            }
+            if p == 0 {
+                t.push_str(&self.tail);
+            }
+            out.push(t);
+        }
+        out
     }
 
     fn combined_text(&self) -> String {
@@ -770,3 +899,52 @@ pub fn settle_lines(text: &str, c_name: &str) -> String {
 // D-0219: the marker a call site appends to its callee's name when an
 // argument is an existing reference passed on (`Fx::vouched_args`).
 const ARRIVE_MARK: &str = "__ARRIVE_MARK__";
+
+// `parts`' reading of the generated C. A function's signature line: at the
+// start of a line, not a directive or a brace, ending in `)`.
+fn starts_signature(l: &str) -> bool {
+    !l.is_empty() && !l.starts_with([' ', '{', '}', '#', '/']) && l.ends_with(')') && l.contains('(')
+}
+
+// A definition starts at line `i`: a signature with `{` after it, but for
+// `#line` directives.
+fn starts_definition(lines: &[&str], i: usize) -> bool {
+    if !starts_signature(lines[i]) {
+        return false;
+    }
+    let mut j = i + 1;
+    while j < lines.len() && lines[j].starts_with("#line") {
+        j += 1;
+    }
+    j < lines.len() && lines[j] == "{"
+}
+
+// The function a signature or prototype names: the word before its `(`, its
+// attributes (`__attribute__((always_inline))`) left out.
+fn fn_name(l: &str) -> Option<&str> {
+    let mut rest = l;
+    while let Some(i) = rest.find("__attribute__((") {
+        let after = &rest[i..];
+        let end = after.find("))").map_or(after.len(), |e| e + 2);
+        rest = &rest[i + end..];
+    }
+    let open = rest.find('(')?;
+    let head = rest[..open].trim_end();
+    let start = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |i| i + 1);
+    let name = &head[start..];
+    (!name.is_empty()).then_some(name)
+}
+
+// A static's or an addressed constant's definition (`statics.rs`):
+// `static [const ]T g_…/k_… = INIT;`, its type and name.
+fn global_decl(l: &str) -> Option<(&str, &str)> {
+    let rest = l.strip_prefix("static ")?;
+    let eq = rest.find(" = ")?;
+    let lhs = &rest[..eq];
+    let sp = lhs.rfind(' ')?;
+    let name = &lhs[sp + 1..];
+    if !(name.starts_with("g_") || name.starts_with("k_")) || !l.ends_with(';') {
+        return None;
+    }
+    Some((&lhs[..sp], name))
+}

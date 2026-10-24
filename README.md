@@ -6,7 +6,9 @@ CobaltC is a human-directed, AI-assisted, statically typed C-family systems prog
 
 CobaltC's design is guided by two central commitments: making safety-relevant facts explicit in the language, and grounding implementation behavior in stable, normative rules.
 
-It combines affine resource ownership, explicit shared and exclusive references, deterministic destruction, and a hybrid static/dynamic enforcement model. Rather than requiring programmers to express lifetime relationships through explicit lifetime annotations, it uses compile-time analysis where sufficient and runtime checks where necessary. Its design prioritizes a small, composable language, predictable low-level control, and defined failure over maximal static verification.
+CobaltC's safety rules are checked in two places. The compiler proves what it can (at compile time) and doesn't emit those checks. Whatever it can't prove is checked while the program runs, by cbrt (the CobaltC runtime).
+
+The language combines affine resource ownership, explicit shared and exclusive references, deterministic destruction, and a hybrid static/dynamic enforcement model. Its design prioritizes a small, composable language, predictable low-level control, and defined failure over maximal static verification.
 
 The central design principle: prove what you can, check what you can't. The language allows different mechanisms to discharge that obligation.
 
@@ -14,7 +16,7 @@ CobaltC is already well formed, but currently still in experimental stage.
 
 This project began on 19 September 2026, based on the instructions provided (to the AI) by the project owner (me), as set out in [CobaltC_Master_Instructions.md](CobaltC_Master_Instructions.md).
 
-Commit Update 133, 2026-10-24 00:11 UTC. Specification edition 2026.102301. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
+Commit Update 134, 2026-10-24 20:27 UTC. Specification edition 2026.102401. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
 The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 

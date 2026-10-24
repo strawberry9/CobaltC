@@ -100,6 +100,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 }
                 if !self.g.str_names.contains_key(&name) {
                     self.g.str_names.insert(name.clone(), bytes.to_vec());
+                    self.g.str_log.push(name.clone());
                     let mut lit = String::new();
                     for b in bytes {
                         write!(lit, "{},", b).unwrap();
@@ -419,6 +420,9 @@ impl<'g, 'a> Fx<'g, 'a> {
             if let Some(r) = r {
                 return self.lower_expr(&r, expected);
             }
+        }
+        if let Some(v) = self.elem_field_read(e)? {
+            return Ok(v);
         }
         if let ExprKind::Deref(inner) = &e.kind {
             if let ExprKind::Path(segs, _) = &inner.kind {

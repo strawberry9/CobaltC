@@ -251,6 +251,56 @@ fn scanned(Tok tok, usize end) : Result<Scanned, LexError>
 
 // The trivia at `pos` (spaces skipped, line breaks and comments recorded
 // when `keep`); the position after it.
+// `skip_trivia` keeping nothing, for the parser's tokens (`lex_tokens`):
+// the first position past the trivia at `from`, or `UNTERMINATED` plus the
+// start of a block comment that does not end. Its one parameter a shared
+// reference and its result a number, a call makes no runtime object (a
+// `Result` and a second reference made one each, at every token).
+const usize UNTERMINATED = 1 << 62;
+
+fn skip_quiet(ref<Vec<u8>, shared> b, usize from) : usize
+{
+    usize pos = from;
+    while (true)
+    {
+        u8 c = b[pos];
+        if (c == b'\n' || c == b' ' || c == b'\t' || c == b'\r')
+        {
+            pos += 1;
+        }
+        else if (c == b'/' && b[pos + 1] == b'/')
+        {
+            while (b[pos] != b'\n' && b[pos] != 0)
+            {
+                pos += 1;
+            }
+        }
+        else if (c == b'/' && b[pos + 1] == b'*')
+        {
+            usize start = pos;
+            pos += 2;
+            while (true)
+            {
+                if (b[pos] == 0)
+                {
+                    return UNTERMINATED + start;
+                }
+                if (b[pos] == b'*' && b[pos + 1] == b'/')
+                {
+                    pos += 2;
+                    break;
+                }
+                pos += 1;
+            }
+        }
+        else
+        {
+            return pos;
+        }
+    }
+    pos
+}
+
 fn skip_trivia(
     ref<Vec<u8>, shared> b,
     usize from,
@@ -351,7 +401,6 @@ export fn lex_tokens(ref<String, shared> src) : Result<Vec<PTok>, LexError>
     Vec<u8> padded_bytes = padded(src);
     ref<Vec<u8>, shared> b = &padded_bytes;
     Vec<PTok> toks = Vec::new();
-    Vec<Trivia> none = Vec::new();
     usize pos = 0;
     // The line and column of `at`, carried forward.
     usize at = 0;
@@ -359,7 +408,11 @@ export fn lex_tokens(ref<String, shared> src) : Result<Vec<PTok>, LexError>
     usize col = 1;
     while (true)
     {
-        pos = skip_trivia(b, pos, false, &mut none)?;
+        pos = skip_quiet(b, pos);
+        if (pos >= UNTERMINATED)
+        {
+            return Err(lex_error(b, "unterminated block comment", pos - UNTERMINATED));
+        }
         while (at < pos)
         {
             if (b[at] == b'\n')

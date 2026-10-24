@@ -56,9 +56,8 @@ def build(name, out):
     cc = {"gcc": "gcc", "clang": "clang", "asan": os.path.join(HERE, "clang-asan")}[name]
     exe = os.path.join(out, "bin", "fuzz_" + name + EXE)
     os.makedirs(os.path.dirname(exe), exist_ok=True)
-    env = dict(os.environ, COBC_CACHE=os.path.join(out, "cache_" + name))
     r = subprocess.run([os.path.join(REL, "cobc" + EXE), "--cc", cc, "-o", exe, os.path.join(HERE, "fuzz.cb")],
-                       capture_output=True, text=True, env=env)
+                       capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit("fuzz: build %s failed:\n%s%s" % (name, r.stdout, r.stderr))
     wrap = ["setarch", "-R"] if name == "asan" and shutil.which("setarch") else []

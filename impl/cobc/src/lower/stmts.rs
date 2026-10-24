@@ -391,8 +391,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 let saved_uid = self.g.uid;
                 let saved_names = self.snapshot_names();
                 let saved_nstr = self.g.nstr;
-                let saved_strings = self.g.strings.clone();
-                let saved_str_names = self.g.str_names.clone();
+                let saved_strs = self.g.str_mark();
                 let saved_cleanup = self.cleanup.len();
                 let saved_scopes = self.scopes.len();
                 let probe_ind = self.ind;
@@ -409,8 +408,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.g.uid = saved_uid;
                 self.restore_names(saved_names);
                 self.g.nstr = saved_nstr;
-                self.g.strings = saved_strings;
-                self.g.str_names = saved_str_names;
+                self.g.str_restore(saved_strs);
                 self.probes.insert(key, probe.ty.clone());
                 probe.ty
             }

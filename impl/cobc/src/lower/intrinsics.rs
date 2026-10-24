@@ -894,6 +894,24 @@ impl<'g, 'a> Fx<'g, 'a> {
         let targ = |i: usize, fx: &Self| targs.get(i).map(|t| fx.sub(t));
         match name {
             "drop" => {
+                // `drop(reclaim<T>(p))` of a resource `T`: `[Destroy]` of the
+                // place `[Reclaim]` makes, through its root (`spec/07` §3), as
+                // `coby` has it -- not a move out of it into a temporary,
+                // which a live reference into the object faulted as
+                // `diag.move-while-aliased` where `[Destroy-Not-Solitary]`'s
+                // `diag.destroy-while-aliased` is the rule's.
+                if let ExprKind::Call(c, _) = &args[0].kind {
+                    if let ExprKind::Path(s, ta) = &c.kind {
+                        if s.len() == 1 && s[0] == "reclaim" && self.lookup("reclaim").is_none() && ta.len() == 1 && self.is_res(&self.sub(&ta[0])) {
+                            let p = self.lower_place(&args[0])?;
+                            if let Some(root) = &p.base {
+                                self.emit(&format!("cb_destroy({}, {});", root, loc));
+                                return Ok(unit());
+                            }
+                            return internal("a reclaimed place with no root");
+                        }
+                    }
+                }
                 // `drop(e)` of a temporary: the value is destroyed at once
                 // (a plain one simply ends).
                 if !matches!(args[0].kind, ExprKind::Path(..) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Deref(..) | ExprKind::Paren(..)) {

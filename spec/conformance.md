@@ -1,7 +1,7 @@
 # CobaltC Conformance Cases
 
 Status: normative artifact
-Version: 3.269.0
+Version: 3.271.0
 Conforms to: `spec/02-schema.md` (Kind: Conformance case, `conf.<name>`)
 Governed by: `CobaltC_Master_Instructions.md` §1, §19, §20
 
@@ -1126,6 +1126,7 @@ Rows added for case files that had none (CHG-0265):
 | `conf.returned-parameter-reference-passed-on` | `impl/conformance/10-temporal-validity/returned_parameter_reference_passed_on_ok.cb` | ok; prints `40 8` | rule.temporal.elision (CHG-0358): `same` returns its one reference parameter itself; `peek(same(base))` ends the returned reference with its statement, and `base`, a parameter of the caller, is valid after it, read and (exclusive) written |
 | `conf.destroy-temporary-while-viewed` | `impl/conformance/07-resource-authority/destroy_temporary_while_viewed.cb` | ✗ `diag.destroy-while-aliased` (dynamic) | `[Stmt-Exit]` destroys the temporary `String` while the views held by `parts` still reach it |
 | `conf.destroy-local-while-viewed-outside` | `impl/conformance/07-resource-authority/destroy_local_while_viewed_outside.cb` | ✗ `diag.destroy-while-aliased` (dynamic) | `[Block-Exit]` destroys `s` while views of it are held outside its block |
+| `conf.destroy-vec-while-element-referenced` | `impl/conformance/07-resource-authority/destroy_vec_while_element_referenced.cb` | ✗ `diag.destroy-while-aliased` (dynamic) | `drop(v)` runs `Vec::drop`, whose `drop(reclaim<T>(…))` is `[Destroy]` of an element a live reference points into: `[Destroy-Not-Solitary]` (CHG-0370) |
 | `conf.closure-calls-borrowed-capture` | `impl/conformance/15-function-semantics/closure_calls_borrowed_capture_ok.cb` | ok | calling a `fn` value and a closure captured by borrow (`*self.f_i`) |
 | `conf.spawn-closure-capturing-reference` | `impl/conformance/19-concurrency/spawn_closure_capturing_reference_ok.cb` | ok | a spawned `move` closure's captured reference ends with its thread (CHG-0114) |
 | `conf.closure-borrowed-capture-operations` | `impl/conformance/15-function-semantics/closure_borrowed_capture_operations_ok.cb` | ok | indexes, fields, lengths and a match on values a closure captured by borrow |
@@ -1497,6 +1498,9 @@ Rows added for case files that had none (CHG-0265):
 | `conf.swap-place-with-itself` | `impl/conformance/21-standard-library-semantics/swap_place_with_itself_ok.cb` | ok | rule.stdlib.swap [Swap-Places] (p = q: unchanged); D-0022: `swap(&mut a, &mut a)` passes two exclusive references to one place; |
 | `conf.swap-passed-ref-beside-shared-reborrow` | `impl/conformance/21-standard-library-semantics/swap_passed_ref_beside_shared_reborrow_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | D-0235 `[Swap-Places-Conflict]`: `swap(r, &mut y)` with `r` passed on whole while `s = &*r` lives; `[Swap-Places]` requires `¬clash(a_r, exclusive)`, and `s`'s path, derived from `a_r`, is a live non-ancestor overlapping shared path (the review of 2026-10-15, F-02, Program C) |
 | `conf.replace-passed-ref-beside-shared-reborrow` | `impl/conformance/21-standard-library-semantics/replace_passed_ref_beside_shared_reborrow_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | D-0235: `replace(r, 9)` → `swap_places(r, &mut old)` → `[Swap-Places-Conflict]` on `a_r`, beside `s = &*r` |
+| `conf.replace-string-passed-ref-beside-shared-reborrow` | `impl/conformance/21-standard-library-semantics/replace_string_passed_ref_beside_shared_reborrow_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | as `conf.replace-passed-ref-beside-shared-reborrow`, for a `String`: `swap_places(r, &mut old)` → `[Swap-Places-Conflict]` on `a_r` beside `s = &*r` (D-0235, CHG-0371) |
+| `conf.replace-struct-beside-field-reborrow` | `impl/conformance/21-standard-library-semantics/replace_struct_field_borrowed_beside_whole_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | `replace(r, v)` writes the whole of `*r`, a struct of plain data; `s = &(*r).a` is a live path beneath it → `[Swap-Places-Conflict]` (D-0235, CHG-0371) |
+| `conf.replace-values` | `impl/conformance/21-standard-library-semantics/replace_values_ok.cb` | ✓ prints `1 2 3`, `3`, `1 2 3 4 5 6`, `x y`, `1 2` | `replace` on an `i32`, a plain struct, a `String` and a `Vec<i32>`, through a fresh borrow and through a reference passed on whole after the reborrow beside it ended: `[Swap-Places]` with no conflict returns the old value (CHG-0371) |
 | `conf.swap-forms` | `impl/conformance/21-standard-library-semantics/swap_forms_ok.cb` | ok; prints `7 1 2 2 1 b true` | D-0235 `[Swap-Places]`: two locals; the same place twice (no access, D-0022); two fields of one struct; `replace` through a reference with no other live path; `Vec::swap` of `String`s; `replace` of an `Option<String>` |
 | `conf.vec-built-locally-and-returned` | `impl/conformance/21-standard-library-semantics/vec_built_locally_and_returned_ok.cb` | ok | D-0023 rule.stdlib.vec: A vector filled only through push and returned as the function's result; |
 | `conf.vec-confined-through-helpers` | `impl/conformance/21-standard-library-semantics/vec_confined_through_helpers_ok.cb` | ok | rule.stdlib.vec rule.alias.borrow D-0018: Vectors used only through helpers that take them by reference: |
@@ -1981,6 +1985,8 @@ Rows added for case files that had none (CHG-0265):
 
 ## Change Log
 
+- 3.271.0 — `CHG-0371`: `conf.replace-string-passed-ref-beside-shared-reborrow`, `conf.replace-struct-beside-field-reborrow`, `conf.replace-values`.
+- 3.270.0 — `CHG-0370`: `conf.destroy-vec-while-element-referenced`.
 - 3.269.0 — `CHG-0369`: `conf.if-variant-else-branch-takes-sibling-type`.
 - 3.268.0 — `CHG-0365` (D-0275): `conf.ref-binding-end-not-deferred-by-plain-reference`, `conf.ref-binding-end-deferred-by-rebound-reference`; `conf.ref-holding-binding-end-deferred` now defers through a struct holding a reference; `conf.box-destroyed-while-contents-referenced` defers through a `ref<Vec<StringView>, exclusive>`. `CHG-0366`: `conf.text-compare-element-through-reference-result`.
 - 3.267.0 — `CHG-0364`: `conf.box-destroyed-while-contents-referenced`.

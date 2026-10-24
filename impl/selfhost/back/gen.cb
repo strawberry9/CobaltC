@@ -58,7 +58,7 @@ export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
         lower_fn(g, &r);
         String text = String::from_view(String::view(&g.fns, start, String::len(&g.fns)));
         pure = pure && !String::contains(&text, "struct cb_env_");
-        Vec::push(&mut g.units, Unit { .text = text, .cacheable = pure });
+        Vec::push(&mut g.units, Unit { .text = text, .pure_std = pure });
     }
     // D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive` twin
     // where it has one, and the callee itself where it has none.
@@ -77,14 +77,14 @@ export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
     {
         // A program function's dispatcher inlined at its calls (`localize`).
         Vec<String> texts = Vec::new();
-        Vec<bool> cacheable = Vec::new();
+        Vec<bool> pure_std = Vec::new();
         foreach (u in &g.units)
         {
             Vec::push(&mut texts, String::clone(&u.text));
-            Vec::push(&mut cacheable, u.cacheable);
+            Vec::push(&mut pure_std, u.pure_std);
         }
         HashSet<String> sigs = replace(&mut g.inline_sigs, HashSet::new());
-        localize(&mut texts, &cacheable, &mut g.protos, &sigs, String::as_view(&main_c));
+        localize(&mut texts, &pure_std, &mut g.protos, &sigs, String::as_view(&main_c));
         for (usize k = 0; k < Vec::len(&g.units); k += 1)
         {
             g.units[k].text = String::clone(&texts[k]);
@@ -95,7 +95,7 @@ export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
     {
         for (usize k = 0; k < Vec::len(&g.units); k += 1)
         {
-            if (!g.units[k].cacheable && (String::contains(
+            if (!g.units[k].pure_std && (String::contains(
                 &g.units[k].text,
                 "cb_at(",
             ) || String::contains(&g.units[k].text, "/*@line ")))
@@ -5846,6 +5846,150 @@ export fn probe_place_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr
     ty
 }
 
+// `v[k].f…` read as a value, plain data at the end of a chain of struct
+// fields: the element is reached as a reader's is (`elem_reader`, D-0192),
+// the `…_pre` body inline and its checks by `cb_elem_access`, where the
+// element type holds no reference and no function value, whatever resource it
+// holds. The call the ordinary lowering makes borrows the whole element
+// shared, which meets every exclusive path into it, and then reads the field
+// through that one fresh, unheld path, which meets nothing more;
+// `cb_elem_access` makes the borrow's check, and the path it no longer forms
+// would have ended with the statement unobserved (D-0018).
+fn elem_field_read(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<V>
+{
+    Vec<String> fields = Vec::new();
+    ref<Expr, shared> ix = e;
+    while (true)
+    {
+        match (&ix.kind)
+        {
+            ExprKind::EField(fe) :
+            {
+                Vec::push(&mut fields, String::clone(&Box::get(fe).name));
+                ix = &Box::get(fe).e;
+            },
+            ExprKind::EParen(b)  : ix = Box::get(b),
+            _                    : break,
+        }
+    }
+    bool indexed = match (&ix.kind)
+    {
+        ExprKind::EIndex(_) : true,
+        _                   : false,
+    };
+    if (Vec::len(&fields) == 0 || !indexed || boot(g, 5))
+    {
+        return None;
+    }
+    Type elem = probe_place_type(g, x, ix);
+    if (has_refs(g, &elem) || holds_fn(g, &elem) || is_closure(&elem) || is_ref_type(&elem))
+    {
+        return None;
+    }
+    // Struct fields all the way down (no reference, box or guard to see
+    // through), plain data at the end.
+    Type t = elem;
+    for (usize k = Vec::len(&fields); k > 0; k -= 1)
+    {
+        ref<NamedTy, shared> nt = match (&t)
+        {
+            Type::TNamed(n) : Box::get(n),
+            _               : return None,
+        };
+        StructDecl sd = match (struct_decl(g, &nt.name))
+        {
+            Some(s) : s,
+            None    : return None,
+        };
+        // A bitstruct's fields are bits of its backing integer, read by
+        // `lower_place_value`'s own case (D-0118).
+        if (Option::is_some(&sd.bits))
+        {
+            return None;
+        }
+        usize idx = 0;
+        while (idx < Vec::len(&sd.fields) && sd.fields[idx].name != fields[k - 1])
+        {
+            idx += 1;
+        }
+        if (idx == Vec::len(&sd.fields))
+        {
+            return None;
+        }
+        HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+        Type ft = apply(&sd.fields[idx].ty, &sub);
+        t = ft;
+    }
+    if (!plain_data(g, &t))
+    {
+        return None;
+    }
+    Expr call = match (vec_index_call(g, x, ix, false))
+    {
+        Some(c) : c,
+        None    : return None,
+    };
+    ref<Expr, shared> inner = match (&call.kind)
+    {
+        ExprKind::EDeref(d) : Box::get(d),
+        _                   : return None,
+    };
+    bool shared_index = match (&inner.kind)
+    {
+        ExprKind::ECall(c) : match (&Box::get(c).callee.kind)
+        {
+            ExprKind::EPath(p) : String::join(&Box::get(p).segs[0..$], "::") == "std::Vec::index_shared",
+            _                  : false,
+        },
+        _ : false,
+    };
+    if (!shared_index)
+    {
+        return None;
+    }
+    x.elem_reader = true;
+    Option<P> po = elem_access_place(g, x, inner, false, e.line);
+    x.elem_reader = false;
+    P p = match (po)
+    {
+        Some(pp) : pp,
+        None     : return None,
+    };
+    if (is_never(&p.ty))
+    {
+        return Some(never());
+    }
+    for (usize k = Vec::len(&fields); k > 0; k -= 1)
+    {
+        P { c, ty, base, projs, is_binding, raw } = p;
+        ref<NamedTy, shared> nt = match (&ty)
+        {
+            Type::TNamed(n) : Box::get(n),
+            _               :
+            {
+                assert(false, "cobc: a field of a non-struct element");
+                return None;
+            },
+        };
+        StructDecl sd = Option::expect(struct_decl(g, &nt.name), "a struct");
+        usize idx = 0;
+        while (sd.fields[idx].name != fields[k - 1])
+        {
+            idx += 1;
+        }
+        HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+        Type fty = apply(&sd.fields[idx].ty, &sub);
+        Vec::push(&mut projs, sprintf("{ CB_FIELD, %vu }", idx));
+        p = P { .c = sprintf(
+            "%s.%s",
+            &c,
+            &san(String::as_view(&fields[k - 1])),
+        ), .ty = fty, .base = base, .projs = projs, .is_binding = false, .raw = raw };
+    }
+    V v = read_place(g, x, p, e.line);
+    Some(into_temp(g, x, v, e.line))
+}
+
 // A place read as a value: a field, an element or a dereference.
 export fn lower_place_value(
     ref<Gen, exclusive> g,
@@ -5886,6 +6030,11 @@ export fn lower_place_value(
             }
         },
         _                   : {},
+    }
+    match (elem_field_read(g, x, e))
+    {
+        Some(v) : return v,
+        None    : {},
     }
     // `*x` for a `foreach` element aliased to `(*$c)[$i]` (`foreach_alias`).
     match (alias_of_deref(x, e))
@@ -12167,7 +12316,15 @@ export fn lower_vec_index_pre(
     };
     String lc0 = loc(g, x.std_body, a0.line);
     str m = if (bw.mode == Mode::Exclusive) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
-    if (!sugar)
+    // CHG-0237: a shared borrow of a place in a frozen parameter: its
+    // dispatcher found the path valid and no exclusive path overlapping it, and
+    // nothing the call does can form one or end the path, so neither the
+    // borrow's check nor the place's validity can fail.
+    bool frozen = bw.mode == Mode::Shared && frozen_root(g, x, &bw.e);
+    if (frozen)
+    {
+    }
+    else if (!sugar)
     {
         emit(x, String::as_view(&sprintf("cb_borrow_check(%s, %s, %s, %s);", &base, &projs_args(&p.projs), m, &lc0)));
     }
@@ -12182,7 +12339,7 @@ export fn lower_vec_index_pre(
         return Some(never());
     }
     V it = into_temp(g, x, i, a1.line);
-    if (sugar)
+    if (sugar && !frozen)
     {
         Vec<String> projs = clone(&p.projs);
         Vec::push(&mut projs, sprintf("{ CB_INDEX, %s }", &it.c));
@@ -19123,6 +19280,41 @@ export fn lower_intrinsic_more(
     }
     if (*name == "drop")
     {
+        // `drop(reclaim<T>(p))` of a resource `T`: `[Destroy]` of the place
+        // `[Reclaim]` makes, through its root (`spec/07` §3), as `coby` has it
+        // -- not a move out of it into a temporary, which a live reference into
+        // the object faulted as `diag.move-while-aliased` where
+        // `[Destroy-Not-Solitary]`'s `diag.destroy-while-aliased` is the rule's.
+        match (&args[0].kind)
+        {
+            ExprKind::ECall(ce) :
+            {
+                match (&Box::get(ce).callee.kind)
+                {
+                    ExprKind::EPath(cp) :
+                    {
+                        ref<PathExpr, shared> pe = Box::get(cp);
+                        if (Vec::len(&pe.segs) == 1 && String::eq_str(&pe.segs[0], "reclaim") && Option::is_none(
+                            &lookup(x, "reclaim"),
+                        ) && Vec::len(&pe.targs) == 1 && is_resource(g, &apply(&pe.targs[0], &x.subst)))
+                        {
+                            P rp = lower_place(g, x, &args[0]);
+                            match (&rp.base)
+                            {
+                                Some(root) :
+                                {
+                                    emit(x, String::as_view(&sprintf("cb_destroy(%s, %s);", root, lc)));
+                                    return Some(unit());
+                                },
+                                None       : assert(false, "cobc: a reclaimed place with no root"),
+                            }
+                        }
+                    },
+                    _                   : {},
+                }
+            },
+            _                   : {},
+        }
         // `drop(e)` of a temporary: the value is destroyed at once.
         if (!is_place_kind(&args[0]) && !is_paren(&args[0]))
         {
@@ -19604,6 +19796,366 @@ fn combined_text(ref<Generated, shared> gen) : String
     }
     String::append(&mut out, &gen.tail);
     out
+}
+
+// D-0277: the program's C as `k` translation units (cobc's
+// `Generated::parts`), compiled at once, each written under its own name
+// (`settle_lines`). Every part has the declarations. A function `localize`
+// made `static` has external linkage instead, but for the `static inline`
+// ones, which every part defines; a static or addressed constant (`g_…`,
+// `k_…`) is defined in part 0 and declared in the rest; a thunk is each
+// part's own `static` copy, as the descriptors are. The units' definitions
+// are dealt out by size, each part keeping their order, and the program's
+// tail is part 0's. With `k` 1, the combined text.
+export fn split_parts(ref<Generated, shared> gen, usize k) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    if (k <= 1)
+    {
+        Vec::push(&mut out, combined_text(gen));
+        return out;
+    }
+    // The units' definitions (cobc's reading): a definition's first line,
+    // the lines before it since the last one ended, and its body to the `}`
+    // at the start of a line; lines after a unit's last definition go with it.
+    Vec<String> defs = Vec::new();
+    foreach (u in &gen.units)
+    {
+        Vec<StringView> lines = StringView::split(String::as_view(&u.text), "\n");
+        String pending = String::new();
+        bool any_pending = false;
+        usize first = Vec::len(&defs);
+        usize i = 0;
+        while (i < Vec::len(&lines))
+        {
+            if (starts_definition(&lines, i))
+            {
+                String d = replace(&mut pending, String::new());
+                bool started = any_pending;
+                any_pending = false;
+                usize j = i;
+                while (j < Vec::len(&lines) && !StringView::eq_str(lines[j], "}"))
+                {
+                    if (started)
+                    {
+                        String::push_ascii(&mut d, b'\n');
+                    }
+                    String::append(&mut d, lines[j]);
+                    started = true;
+                    j += 1;
+                }
+                if (j < Vec::len(&lines))
+                {
+                    if (started)
+                    {
+                        String::push_ascii(&mut d, b'\n');
+                    }
+                    String::append(&mut d, lines[j]);
+                }
+                Vec::push(&mut defs, d);
+                i = j + 1;
+            }
+            else
+            {
+                if (any_pending)
+                {
+                    String::push_ascii(&mut pending, b'\n');
+                }
+                String::append(&mut pending, lines[i]);
+                any_pending = true;
+                i += 1;
+            }
+        }
+        if (any_pending)
+        {
+            if (Vec::len(&defs) > first)
+            {
+                usize last = Vec::len(&defs) - 1;
+                String::push_ascii(&mut defs[last], b'\n');
+                String::append(&mut defs[last], &pending);
+            }
+            else
+            {
+                Vec::push(&mut defs, pending);
+            }
+        }
+    }
+    HashSet<String> inline_names = HashSet::new();
+    Vec<String> everywhere = Vec::new();
+    Vec<String> spread = Vec::new();
+    foreach (d in &defs)
+    {
+        String h = def_head(d);
+        if (String::starts_with(&h, "static inline"))
+        {
+            match (fn_name(String::as_view(&h)))
+            {
+                Some(n) :
+                {
+                    _ = HashSet::insert(&mut inline_names, String::from_view(n));
+                },
+                None    : {},
+            }
+            Vec::push(&mut everywhere, sprintf("%s\n", d));
+            continue;
+        }
+        if (String::starts_with(&h, "static "))
+        {
+            String t = String::new();
+            Vec<StringView> dl = String::split(d, "\n");
+            for (usize m = 0; m < Vec::len(&dl); m += 1)
+            {
+                if (m > 0)
+                {
+                    String::push_ascii(&mut t, b'\n');
+                }
+                if (StringView::eq(dl[m], String::as_view(&h)))
+                {
+                    String::append(&mut t, StringView::sub(dl[m], 7, StringView::len(dl[m])));
+                }
+                else
+                {
+                    String::append(&mut t, dl[m]);
+                }
+            }
+            Vec::push(&mut spread, sprintf("%s\n", &t));
+        }
+        else
+        {
+            Vec::push(&mut spread, sprintf("%s\n", d));
+        }
+    }
+    // Dealt out largest first to the smallest part (cobc's order: by size
+    // down, then by position), then each part in the units' order.
+    Vec<usize> order = Vec::new();
+    for (usize i = 0; i < Vec::len(&spread); i += 1)
+    {
+        Vec::push(&mut order, i);
+    }
+    for (usize i = 1; i < Vec::len(&order); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && part_before(&spread, order[j], order[j - 1]))
+        {
+            Vec::swap(&mut order, j - 1, j);
+            j -= 1;
+        }
+    }
+    Vec<usize> owner = Vec::filled(Vec::len(&spread), 0);
+    Vec<usize> sizes = Vec::filled(k, 0);
+    foreach (i in &order)
+    {
+        usize p = 0;
+        for (usize q = 1; q < k; q += 1)
+        {
+            if (sizes[q] < sizes[p])
+            {
+                p = q;
+            }
+        }
+        owner[*i] = p;
+        sizes[p] += String::len(&spread[*i]);
+    }
+    String protos = String::new();
+    foreach (l in String::lines(&gen.protos))
+    {
+        bool make_extern = StringView::starts_with(l, "static ") && !StringView::starts_with(l, "static inline")
+            && StringView::ends_with(l, ");") && match (fn_name(l))
+            {
+                Some(n) : !HashSet::contains(&inline_names, &String::from_view(n)),
+                None    : false,
+            };
+        if (make_extern)
+        {
+            String::append(&mut protos, StringView::sub(l, 7, StringView::len(l)));
+        }
+        else
+        {
+            String::append(&mut protos, l);
+        }
+        String::push_ascii(&mut protos, b'\n');
+    }
+    String thunks = String::new();
+    Vec<StringView> tl = String::split(&gen.thunks, "\n");
+    for (usize i = 0; i < Vec::len(&tl); i += 1)
+    {
+        if (starts_definition(&tl, i) && !StringView::starts_with(tl[i], "static"))
+        {
+            String::append(&mut thunks, "static ");
+        }
+        String::append(&mut thunks, tl[i]);
+        if (i + 1 < Vec::len(&tl))
+        {
+            String::push_ascii(&mut thunks, b'\n');
+        }
+    }
+    for (usize p = 0; p < k; p += 1)
+    {
+        String t = String::from_str(HEADER);
+        String::append(&mut t, "\n/* ---- types ---- */\n");
+        String::append(&mut t, &gen.fwd);
+        String::append(&mut t, &gen.types);
+        String::append(&mut t, "\n/* ---- string literals ---- */\n");
+        foreach (l in String::lines(&gen.strings))
+        {
+            match (global_decl(l))
+            {
+                Some(gd) :
+                {
+                    if (p > 0)
+                    {
+                        String::appendf(&mut t, "extern %v %v;", gd.ty, gd.name);
+                    }
+                    else
+                    {
+                        String::append(&mut t, StringView::sub(l, 7, StringView::len(l)));
+                    }
+                },
+                None     : String::append(&mut t, l),
+            }
+            String::push_ascii(&mut t, b'\n');
+        }
+        String::append(&mut t, "\n/* ---- functions ---- */\n");
+        String::append(&mut t, &protos);
+        String::append(&mut t, "\n/* ---- call thunks for fn values ---- */\n");
+        String::append(&mut t, &thunks);
+        String::append(&mut t, "\n/* ---- type descriptors ---- */\n");
+        String::append(&mut t, &gen.descs);
+        foreach (e in &everywhere)
+        {
+            String::append(&mut t, e);
+        }
+        for (usize i = 0; i < Vec::len(&spread); i += 1)
+        {
+            if (owner[i] == p)
+            {
+                String::append(&mut t, &spread[i]);
+            }
+        }
+        if (p == 0)
+        {
+            String::append(&mut t, &gen.tail);
+        }
+        Vec::push(&mut out, t);
+    }
+    out
+}
+
+// `split_parts`' order: larger first, then the earlier.
+fn part_before(ref<Vec<String>, shared> spread, usize a, usize b) : bool
+{
+    usize la = String::len(&spread[a]);
+    usize lb = String::len(&spread[b]);
+    la > lb || (la == lb && a < b)
+}
+
+// A function's signature line (cobc's `starts_signature`): at the start of a
+// line, not a directive or a brace, ending in `)`.
+fn starts_signature(StringView l) : bool
+{
+    if (StringView::len(l) == 0 || !StringView::ends_with(l, ")") || !StringView::contains(l, "("))
+    {
+        return false;
+    }
+    u8 c = StringView::as_bytes(l)[0];
+    c != b' ' && c != b'{' && c != b'}' && c != b'#' && c != b'/'
+}
+
+// A definition starts at line `i`: a signature with `{` after it, but for
+// `#line` directives.
+fn starts_definition(ref<Vec<StringView>, shared> lines, usize i) : bool
+{
+    if (!starts_signature(lines[i]))
+    {
+        return false;
+    }
+    usize j = i + 1;
+    while (j < Vec::len(lines) && StringView::starts_with(lines[j], "#line"))
+    {
+        j += 1;
+    }
+    j < Vec::len(lines) && StringView::eq_str(lines[j], "{")
+}
+
+// A definition's signature line.
+fn def_head(ref<String, shared> d) : String
+{
+    foreach (l in String::lines(d))
+    {
+        if (starts_signature(l))
+        {
+            return String::from_view(l);
+        }
+    }
+    String::new()
+}
+
+// The function a signature or prototype names: the word before its `(`, its
+// attributes (`__attribute__((always_inline))`) left out.
+fn fn_name(StringView l) : Option<StringView>
+{
+    StringView rest = l;
+    while (true)
+    {
+        match (StringView::find(rest, "__attribute__(("))
+        {
+            Some(i) :
+            {
+                StringView after = StringView::sub(rest, i, StringView::len(rest));
+                usize end = match (StringView::find(after, "))"))
+                {
+                    Some(e) : e + 2,
+                    None    : StringView::len(after),
+                };
+                rest = StringView::sub(rest, i + end, StringView::len(rest));
+            },
+            None    : break,
+        }
+    }
+    usize open = StringView::find(rest, "(")?;
+    StringView head = StringView::trim_end(StringView::sub(rest, 0, open));
+    slice<u8, shared> b = StringView::as_bytes(head);
+    usize start = slice_len(b);
+    while (start > 0 && (ascii_is_alnum(b[start - 1]) || b[start - 1] == b'_'))
+    {
+        start -= 1;
+    }
+    if (start == slice_len(b))
+    {
+        return None;
+    }
+    Some(StringView::sub(head, start, slice_len(b)))
+}
+
+// A static's or an addressed constant's definition: `static [const ]T
+// g_…/k_… = INIT;`, its type and name (cobc's `global_decl`).
+struct GlobalDecl
+{
+    StringView ty;
+    StringView name;
+}
+
+fn global_decl(StringView l) : Option<GlobalDecl>
+{
+    StringView rest = StringView::strip_prefix(l, "static ")?;
+    usize eq = StringView::find(rest, " = ")?;
+    StringView lhs = StringView::sub(rest, 0, eq);
+    slice<u8, shared> b = StringView::as_bytes(lhs);
+    usize sp = slice_len(b);
+    while (sp > 0 && b[sp - 1] != b' ')
+    {
+        sp -= 1;
+    }
+    if (sp == 0)
+    {
+        return None;
+    }
+    StringView name = StringView::sub(lhs, sp, slice_len(b));
+    if (!(StringView::starts_with(name, "g_") || StringView::starts_with(name, "k_")) || !StringView::ends_with(l, ";"))
+    {
+        return None;
+    }
+    Some(GlobalDecl { .ty = StringView::sub(lhs, 0, sp - 1), .name = name })
 }
 
 // The parts, taken out of `g` (cobc's `generate` consumes its `Gen`).

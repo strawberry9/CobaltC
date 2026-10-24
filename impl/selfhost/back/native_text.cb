@@ -785,12 +785,27 @@ export fn append_substring_helper(ref<Gen, exclusive> g) : String
 }
 
 // D-0200: `replace(r, v)` natively for a value an objectless local may hold
-// (`objectless_type`): the body receives `v`, binds it as `old`, checks
-// that both places are still there (`[Swap-Places]`), exchanges them and
-// returns `old` -- with the object `v` came with, which is what the body's
-// bindings hand on. The same here, without the bindings.
+// (`objectless_type`): the body receives `v`, binds it as `old`, and
+// `swap_places(r, &mut old)` checks that both places are still there and
+// writes each by `[Write]` (`[Swap-Places]`, D-0235): of those only `r`'s
+// can fail (`r` may be passed on whole beside a live shared reborrow of
+// `*r`), so `r`'s validity and then its write are checked; it exchanges
+// them and returns `old` -- with the object `v` came with, which is what
+// the body's bindings hand on. The same here, without the bindings. Plain
+// data comes with no object: the same checks, nothing received or sent.
 export fn native_replace(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<String>
 {
+    if (plain_data(g, t))
+    {
+        String pc = ctype(g, t);
+        String pb = String::new();
+        String::append(&mut pb, "    cb_valid(p_r.tok, CB_NOLOC, 0);\n");
+        String::append(&mut pb, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+        String::appendf(&mut pb, "    %s old = *(%s *)p_r.p;\n", &pc, &pc);
+        String::appendf(&mut pb, "    *(%s *)p_r.p = p_v;\n", &pc);
+        String::append(&mut pb, "    return old;\n");
+        return Some(pb);
+    }
     if (!objectless_type(g, t))
     {
         return None;
@@ -799,6 +814,7 @@ export fn native_replace(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<St
     String b = String::new();
     String::append(&mut b, "    uint64_t o = cb_recv(&p_v);\n");
     String::append(&mut b, "    cb_valid(p_r.tok, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
     String::appendf(&mut b, "    %s old = *(%s *)p_r.p;\n", &tc, &tc);
     String::appendf(&mut b, "    *(%s *)p_r.p = p_v;\n", &tc);
     String::append(&mut b, "    cb_move_to(o, &old);\n");

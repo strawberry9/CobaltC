@@ -127,9 +127,12 @@ fn effects(StringView line, ref<NameSets, shared> sets, ref<Vec<Eff>, exclusive>
         {
             e += 1;
         }
-        StringView id = StringView::sub(line, i, e);
-        if (StringView::starts_with(id, StringView::of("cb_")) && !literal_name(&b[i .. e]))
+        // By bytes: a view and a name are made only for a `cb_` name.
+        usize len = e - i;
+        bool cb = len >= 3 && b[i] == b'c' && b[i + 1] == b'b' && b[i + 2] == b'_';
+        if (cb && !literal_name(&b[i .. e]))
         {
+            StringView id = StringView::sub(line, i, e);
             // A fn value's call thunk (`Gen::thunk`) records nothing in
             // the caller's scopes (`cb_call_self`), as a direct call.
             String key = String::from_view(id);
@@ -149,7 +152,8 @@ fn effects(StringView line, ref<NameSets, shared> sets, ref<Vec<Eff>, exclusive>
                 Vec::push(out, Eff::EAll);
             }
         }
-        else if (StringView::ends_with(id, StringView::of("_pre")) && e < n && b[e] == b'(')
+        else if (len >= 4 && b[e - 4] == b'_' && b[e - 3] == b'p' && b[e - 2] == b'r' && b[e - 1] == b'e' && e < n
+            && b[e] == b'(')
         {
             Vec::push(out, Eff::EScope);
         }
@@ -167,20 +171,27 @@ struct Marker
 // location after a `\u{2}` when it carries one.
 fn marker(StringView line) : Option<Marker>
 {
-    StringView t = StringView::trim_start(line);
-    slice<u8, shared> b = StringView::as_bytes(t);
-    if (slice_len(b) < 2 || b[0] != 1)
+    // By byte positions, past the white space `trim_start` would drop: most
+    // lines are not markers, and a view is a runtime object.
+    slice<u8, shared> b = StringView::as_bytes(line);
+    usize n = slice_len(b);
+    usize s = 0;
+    while (s < n && ascii_is_space(b[s]))
+    {
+        s += 1;
+    }
+    if (n - s < 2 || b[s] != 1)
     {
         return None;
     }
     u32 id = 0;
-    usize k = 2;
-    while (k < slice_len(b) && b[k] != 2)
+    usize k = s + 2;
+    while (k < n && b[k] != 2)
     {
         id = id * 10 + widen<u32>(b[k] - b'0');
         k += 1;
     }
-    Some(Marker { .kind = b[1], .id = id })
+    Some(Marker { .kind = b[s + 1], .id = id })
 }
 
 // A frame marker's location, when it carries one.
@@ -378,6 +389,11 @@ fn parse_uu(StringView s) : Option<usize>
 
 export fn at_of(StringView t) : Option<At>
 {
+    // Most lines are not `cb_at(…);`: tested first by a call that makes no view.
+    if (!StringView::starts_with(t, StringView::of("cb_at(")))
+    {
+        return None;
+    }
     StringView rest = match (StringView::strip_prefix(t, StringView::of("cb_at(")))
     {
         Some(r) : r,
@@ -535,6 +551,11 @@ fn starts_with_any(StringView t, str cs) : bool
 // `/*@line F L*/`: a dropped location (`drop_dead_locations`).
 fn line_mark(StringView t) : Option<At>
 {
+    // Tested first by a call that makes no view: most lines are not marks.
+    if (!StringView::starts_with(t, StringView::of(LINE_MARK)))
+    {
+        return None;
+    }
     StringView m = match (StringView::strip_prefix(t, StringView::of(LINE_MARK)))
     {
         Some(r) : r,
@@ -680,15 +701,20 @@ fn scan(ref<Vec<String>, shared> lines) : Scan
                 {
                     i += 1;
                 }
+                // By bytes: the name is made only for a name that counts.
+                bool addr = st > 0 && b[st - 1] == b'&' && (st < 2 || b[st - 2] != b'&');
+                bool assign = (i + 3 <= n && b[i] == b' ' && b[i + 1] == b'=' && b[i + 2] == b' ')
+                    || (i < n && b[i] == b'=' && !(i + 1 < n && b[i + 1] == b'='));
+                if (!addr && !assign)
+                {
+                    continue;
+                }
                 String id = String::from_view(StringView::sub(l, st, i));
-                if (st > 0 && b[st - 1] == b'&' && (st < 2 || b[st - 2] != b'&'))
+                if (addr)
                 {
                     HashSet::insert(&mut addressed, String::clone(&id));
                 }
-                StringView rest = StringView::sub(l, i, n);
-                if (StringView::starts_with(rest, " = ")
-                    || (StringView::starts_with(rest, "=")
-                        && !StringView::starts_with(rest, "==")))
+                if (assign)
                 {
                     usize count = match (HashMap::get(&assigned, &id))
                     {
@@ -730,32 +756,30 @@ fn balanced(StringView inner) : bool
 }
 
 // `name(args…)` exactly (with `;` after when `stmt`): the arguments.
+// By byte positions: the one view made is the arguments', when they are
+// there (most lines are not such a call, and a view is a runtime object).
 fn call_args(StringView t0, StringView name, bool stmt) : Option<StringView>
 {
-    StringView t = t0;
+    if (!StringView::starts_with(t0, name))
+    {
+        return None;
+    }
+    slice<u8, shared> b = StringView::as_bytes(t0);
+    usize end = slice_len(b);
     if (stmt)
     {
-        t = match (StringView::strip_suffix(t, ";"))
+        if (end == 0 || b[end - 1] != b';')
         {
-            Some(r) : r,
-            None    : return None,
-        };
+            return None;
+        }
+        end -= 1;
     }
-    StringView inner = match (StringView::strip_prefix(t, name))
+    usize open = StringView::len(name);
+    if (end < open + 2 || b[open] != b'(' || b[end - 1] != b')')
     {
-        Some(r) : r,
-        None    : return None,
-    };
-    inner = match (StringView::strip_prefix(inner, "("))
-    {
-        Some(r) : r,
-        None    : return None,
-    };
-    inner = match (StringView::strip_suffix(inner, ")"))
-    {
-        Some(r) : r,
-        None    : return None,
-    };
+        return None;
+    }
+    StringView inner = StringView::sub(t0, open + 1, end - 1);
     if (balanced(inner)) { Some(inner) } else { None }
 }
 
@@ -923,16 +947,20 @@ struct Decl
 // `<prefix>X = E;`: the name and the initializer.
 fn decl_of(StringView t, str prefix) : Option<Decl>
 {
-    StringView r = match (StringView::strip_prefix(t, StringView::of(prefix)))
+    // By byte positions: one view made, for a line that is such a declaration.
+    StringView p = StringView::of(prefix);
+    if (!StringView::starts_with(t, p))
     {
-        Some(v) : v,
-        None    : return None,
-    };
-    r = match (StringView::strip_suffix(r, ";"))
+        return None;
+    }
+    slice<u8, shared> b = StringView::as_bytes(t);
+    usize n = slice_len(b);
+    usize pl = StringView::len(p);
+    if (n < pl + 1 || b[n - 1] != b';')
     {
-        Some(v) : v,
-        None    : return None,
-    };
+        return None;
+    }
+    StringView r = StringView::sub(t, pl, n - 1);
     match (StringView::find(r, " = "))
     {
         Some(k) : Some(Decl { .x = StringView::sub(r, 0, k), .e = StringView::sub(r, k + 3, StringView::len(r)) }),
@@ -981,138 +1009,149 @@ export fn fold_zero_tokens(ref<String, shared> out) : String
         bool changed = false;
         Vec<String> keep = Vec::new();
         Vec::reserve(&mut keep, Vec::len(&lines));
-        foreach (ls in &lines)
+        for (usize li = 0; li < Vec::len(&lines); li += 1)
         {
-            StringView l = String::as_view(ls);
-            StringView t = StringView::trim(l);
-            // A check through a token known 0: the statement goes.
-            bool dropped = false;
-            foreach (d in &drop_names)
+            // Whether the line stays as it is: moved into `keep` once the
+            // block, and every view of it, has ended (a clone of each line
+            // each round cost as much as the round's own work).
+            bool as_is = false;
             {
-                if (!dropped)
+                ref<String, shared> ls = &lines[li];
+                StringView l = String::as_view(ls);
+                StringView t = StringView::trim(l);
+                // A check through a token known 0: the statement goes.
+                bool dropped = false;
+                foreach (d in &drop_names)
                 {
-                    match (call_args(t, *d, true))
+                    if (!dropped && StringView::starts_with(t, *d))
                     {
-                        Some(args) :
-                        {
-                            Vec<StringView> parts = arg_parts(args);
-                            dropped = is_zero(parts[0], &zero, &zref) && rest_inert(&parts);
-                        },
-                        None       : {},
-                    }
-                }
-            }
-            if (dropped)
-            {
-                // After anything but a statement's or block's end (a
-                // braceless `if`'s condition, a label) an empty statement
-                // stands in its place.
-                StringView prev = "{";
-                usize k = Vec::len(&keep);
-                while (k > 0)
-                {
-                    k -= 1;
-                    StringView kt = String::trim(&keep[k]);
-                    if (StringView::len(kt) > 0)
-                    {
-                        prev = kt;
-                        break;
-                    }
-                }
-                if (!(StringView::ends_with(prev, ";") || StringView::ends_with(prev, "{")
-                    || StringView::ends_with(prev, "}")))
-                {
-                    Vec::push(&mut keep, sprintf("%v;", indent_of(l)));
-                }
-                changed = true;
-                continue;
-            }
-            match (decl_of(t, "uint64_t "))
-            {
-                Some(dc) :
-                {
-                    StringView xv = StringView::trim(dc.x);
-                    String x = String::from_view(xv);
-                    if (all_ident(xv) && once(&sc, &x))
-                    {
-                        StringView e = StringView::trim(dc.e);
-                        // `cb_borrow(0, …)` and `cb_borrow_range(0, …)` are 0.
-                        Option<StringView> got = call_args(e, "cb_borrow", false);
-                        match (got)
-                        {
-                            Some(_) : {},
-                            None    :
-                            {
-                                match (call_args(e, "cb_borrow_range", false))
-                                {
-                                    Some(a) :
-                                    {
-                                        Vec<StringView> parts = arg_parts(a);
-                                        if (rest_inert(&parts))
-                                        {
-                                            got = Some(a);
-                                        }
-                                    },
-                                    None    : {},
-                                }
-                            },
-                        }
-                        match (got)
+                        match (call_args(t, *d, true))
                         {
                             Some(args) :
                             {
-                                if (is_zero(first_arg(args), &zero, &zref))
-                                {
-                                    Vec::push(&mut keep, sprintf("%vuint64_t %s = 0;", indent_of(l), &x));
-                                    HashSet::insert(&mut zero, x);
-                                    changed = true;
-                                    continue;
-                                }
+                                Vec<StringView> parts = arg_parts(args);
+                                dropped = is_zero(parts[0], &zero, &zref) && rest_inert(&parts);
                             },
                             None       : {},
                         }
-                        if (!HashSet::contains(&zero, &x) && is_zero(e, &zero, &zref))
-                        {
-                            HashSet::insert(&mut zero, x);
-                            changed = true;
-                        }
                     }
-                },
-                None     : {},
-            }
-            // `cb_ref R = ((cb_ref){ p, tok });` with the token known 0.
-            match (decl_of(t, "cb_ref "))
-            {
-                Some(dc) :
+                }
+                if (dropped)
                 {
-                    StringView xv = StringView::trim(dc.x);
-                    String x = String::from_view(xv);
-                    if (all_ident(xv) && once(&sc, &x) && !HashSet::contains(&zref, &x))
+                    // After anything but a statement's or block's end (a
+                    // braceless `if`'s condition, a label) an empty statement
+                    // stands in its place.
+                    StringView prev = "{";
+                    usize k = Vec::len(&keep);
+                    while (k > 0)
                     {
-                        match (StringView::strip_prefix(StringView::trim(dc.e), "((cb_ref){"))
+                        k -= 1;
+                        StringView kt = String::trim(&keep[k]);
+                        if (StringView::len(kt) > 0)
                         {
-                            Some(r) :
-                            {
-                                match (StringView::strip_suffix(r, "})"))
-                                {
-                                    Some(inner) :
-                                    {
-                                        if (is_zero(last_arg(inner), &zero, &zref))
-                                        {
-                                            HashSet::insert(&mut zref, x);
-                                            changed = true;
-                                        }
-                                    },
-                                    None        : {},
-                                }
-                            },
-                            None    : {},
+                            prev = kt;
+                            break;
                         }
                     }
-                },
-                None     : {},
+                    if (!(StringView::ends_with(prev, ";") || StringView::ends_with(prev, "{")
+                        || StringView::ends_with(prev, "}")))
+                    {
+                        Vec::push(&mut keep, sprintf("%v;", indent_of(l)));
+                    }
+                    changed = true;
+                    continue;
+                }
+                match (if (StringView::starts_with(t, "uint64_t ")) { decl_of(t, "uint64_t ") } else { None })
+                {
+                    Some(dc) :
+                    {
+                        StringView xv = StringView::trim(dc.x);
+                        String x = String::from_view(xv);
+                        if (all_ident(xv) && once(&sc, &x))
+                        {
+                            StringView e = StringView::trim(dc.e);
+                            // `cb_borrow(0, …)` and `cb_borrow_range(0, …)` are 0.
+                            Option<StringView> got = call_args(e, "cb_borrow", false);
+                            match (got)
+                            {
+                                Some(_) : {},
+                                None    :
+                                {
+                                    match (call_args(e, "cb_borrow_range", false))
+                                    {
+                                        Some(a) :
+                                        {
+                                            Vec<StringView> parts = arg_parts(a);
+                                            if (rest_inert(&parts))
+                                            {
+                                                got = Some(a);
+                                            }
+                                        },
+                                        None    : {},
+                                    }
+                                },
+                            }
+                            match (got)
+                            {
+                                Some(args) :
+                                {
+                                    if (is_zero(first_arg(args), &zero, &zref))
+                                    {
+                                        Vec::push(&mut keep, sprintf("%vuint64_t %s = 0;", indent_of(l), &x));
+                                        HashSet::insert(&mut zero, x);
+                                        changed = true;
+                                        continue;
+                                    }
+                                },
+                                None       : {},
+                            }
+                            if (!HashSet::contains(&zero, &x) && is_zero(e, &zero, &zref))
+                            {
+                                HashSet::insert(&mut zero, x);
+                                changed = true;
+                            }
+                        }
+                    },
+                    None     : {},
+                }
+                // `cb_ref R = ((cb_ref){ p, tok });` with the token known 0.
+                match (if (StringView::starts_with(t, "cb_ref ")) { decl_of(t, "cb_ref ") } else { None })
+                {
+                    Some(dc) :
+                    {
+                        StringView xv = StringView::trim(dc.x);
+                        String x = String::from_view(xv);
+                        if (all_ident(xv) && once(&sc, &x) && !HashSet::contains(&zref, &x))
+                        {
+                            match (StringView::strip_prefix(StringView::trim(dc.e), "((cb_ref){"))
+                            {
+                                Some(r) :
+                                {
+                                    match (StringView::strip_suffix(r, "})"))
+                                    {
+                                        Some(inner) :
+                                        {
+                                            if (is_zero(last_arg(inner), &zero, &zref))
+                                            {
+                                                HashSet::insert(&mut zref, x);
+                                                changed = true;
+                                            }
+                                        },
+                                        None        : {},
+                                    }
+                                },
+                                None    : {},
+                            }
+                        }
+                    },
+                    None     : {},
+                }
+                as_is = true;
             }
-            Vec::push(&mut keep, String::clone(ls));
+            if (as_is)
+            {
+                Vec::push(&mut keep, replace(&mut lines[li], String::new()));
+            }
         }
         lines = keep;
         if (!changed)
@@ -1678,7 +1717,7 @@ export fn resolve_arrive(ref<String, shared> text, ref<HashSet<String>, shared> 
     out
 }
 
-// The identifiers in `text` (`cache::identifiers`): each run of letters,
+// The identifiers in `text` (cobc's `cc::identifiers`): each run of letters,
 // digits and `_` that starts with a letter or `_`.
 fn identifiers(StringView text, ref<HashSet<String>, exclusive> out)
 {
@@ -1704,7 +1743,7 @@ fn identifiers(StringView text, ref<HashSet<String>, exclusive> out)
     }
 }
 
-// A function definition's first line (`cache::is_definition`): at the
+// A function definition's first line (cobc's `cc::is_definition`): at the
 // start of a line, not a declaration, and followed by the line `{`.
 fn is_definition(StringView line, Option<StringView> next) : bool
 {
@@ -1717,7 +1756,7 @@ fn is_definition(StringView line, Option<StringView> next) : bool
         && !StringView::starts_with(line, "static ")
 }
 
-// The name before a line's first `(` (`cache::name_before_paren`).
+// The name before a line's first `(` (cobc's `cc::name_before_paren`).
 fn name_before_paren(StringView line) : Option<StringView>
 {
     usize open = match (StringView::find(line, "("))
@@ -1736,18 +1775,18 @@ fn name_before_paren(StringView line) : Option<StringView>
     if (start == end) { None } else { Some(StringView::sub(head, start, end)) }
 }
 
-// Every function defined in the program's own translation unit, which no
-// `std` unit compiled apart (`cacheable`) names, gets `static`
+// Every function defined in a unit that is not pure `std`, and named by no
+// pure-`std` unit (`pure_std`), gets `static`
 // (`Gen::localize`), so the C compiler may inline it wherever it is called
 // and drop it where it is not; not `main`'s C name (`main_c`). `texts` and
-// `cacheable` are the units' texts and flags; a signature in `inline_sigs`
+// `pure_std` are the units' texts and flags; a signature in `inline_sigs`
 // (D-0209: a direct-parameter dispatcher) is made
 // `static inline __attribute__((always_inline))`. The prototype of each
 // function made `static` gets `static` too. (cobc also empties its
 // `inline_sigs` here; nothing reads them after.)
 export fn localize(
     ref<Vec<String>, exclusive> texts,
-    ref<Vec<bool>, shared> cacheable,
+    ref<Vec<bool>, shared> pure_std,
     ref<String, exclusive> protos,
     ref<HashSet<String>, shared> inline_sigs,
     StringView main_c,
@@ -1756,7 +1795,7 @@ export fn localize(
     HashSet<String> cached = HashSet::new();
     for (usize u = 0; u < Vec::len(texts); u += 1)
     {
-        if (cacheable[u])
+        if (pure_std[u])
         {
             identifiers(String::as_view(&texts[u]), &mut cached);
         }
@@ -1764,7 +1803,7 @@ export fn localize(
     HashSet<String> local = HashSet::new();
     for (usize u = 0; u < Vec::len(texts); u += 1)
     {
-        if (cacheable[u])
+        if (pure_std[u])
         {
             continue;
         }

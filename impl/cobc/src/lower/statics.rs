@@ -10,6 +10,21 @@
 use super::*;
 
 impl<'a> Gen<'a> {
+    // Where a probe starts in the string literals (`strings`, `str_names`),
+    // which only grow: `str_restore` undoes what the probe added, as cbc's
+    // `str_mark`/`str_restore` do, instead of copying both tables at every
+    // probe (that copy was half of cobc's time on a large program).
+    pub(super) fn str_mark(&self) -> (usize, usize) {
+        (self.strings.len(), self.str_log.len())
+    }
+
+    pub(super) fn str_restore(&mut self, m: (usize, usize)) {
+        self.strings.truncate(m.0);
+        for k in self.str_log.drain(m.1..) {
+            self.str_names.remove(&k);
+        }
+    }
+
     // The C expression of `&NAME`, and the static's type.
     pub(super) fn static_ref(&mut self, key: &str) -> R<(String, Type)> {
         let Some(decl) = self.items.statics.get(key).cloned() else { return internal("a borrow of an unknown static") };

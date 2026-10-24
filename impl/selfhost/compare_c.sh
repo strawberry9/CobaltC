@@ -7,7 +7,8 @@
 # `--no-line-directives`, `--lib`) runs both drivers with those options and
 # `--keep-c`, the C compiler replaced by /bin/true, and compares the C each
 # keeps under the same name. A program cobc rejects is skipped. Also checks
-# that impl/selfhost/back/header.cb is what gen_header.py makes of cbrt.h now.
+# that impl/selfhost/back/header.cb is what gen_header.py makes of cbrt.h now,
+# and back/std_values.cb what gen_std_values.sh makes of cobc now.
 #
 #   impl/selfhost/compare_c.sh [-j JOBS] [FILE...]
 #
@@ -46,6 +47,11 @@ else
     echo "DIFF header (regenerate: python3 -I impl/selfhost/back/gen_header.py)" >> "$OUT/results"
 fi
 rm -f "$OUT/run/header.cb"
+if COBC="$cobc" "$here/back/gen_std_values.sh" --check; then
+    echo "same std_values" >> "$OUT/results"
+else
+    echo "DIFF std_values (regenerate: impl/selfhost/back/gen_std_values.sh)" >> "$OUT/results"
+fi
 
 one() {
     local f=$1 tag d
@@ -62,7 +68,7 @@ one() {
         (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 3600 "$cbc" --cc /bin/true --keep-c $FLAGS -o "$d/p" "$f" > "$d/cbc.log" 2>&1)
         mv "$d/p.c" "$d/b.c" 2> /dev/null
     else
-        if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --cc /bin/true --keep-c -o "$d/a" "$f" > "$d/cobc.log" 2>&1); then
+        if ! (cd "$root" && COBALTC_BOOTSTRAP_UPTO=$LEVEL timeout -k 5 600 "$cobc" --emit-c --c-name "$d/a.c" "$f" > "$d/a.c" 2> "$d/cobc.log"); then
             rm -rf "$d"
             echo "skip $f"
             return

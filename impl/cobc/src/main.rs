@@ -3,6 +3,7 @@
 //   cobc [--run] [--keep-c] [-v] [-s] [-O LEVEL] [-march=CPU] [--cc COMPILER] [-o OUT] FILE.cb
 //   cobc --check PATH...
 //   cobc --check-syntax [--origin PATH] (FILE | -)
+//   cobc --emit-c [--c-name NAME] FILE
 //   cobc --help
 //
 // Front end: `coby`'s (loader, parser, resolver, static pass) — a
@@ -14,7 +15,7 @@
 // A construct this stage does not compile yet exits 3 with
 // `unsupported: …`, which the runners count as skipped, not failed.
 
-mod cache;
+mod cc;
 mod link;
 mod lower;
 mod report;
@@ -106,7 +107,7 @@ const ABOUT: &str = concat!(
     "  coby --about          the interpreter\n",
 );
 
-const USAGE: &str = "usage: cobc [--explain] [--warn-shadow] [--unittest [--unittest-filter TEXT] [--unittest-std]] [--run] [--explore N] [--schedule-seed S] [--keep-c] [--no-line-directives] [-g] [--report-tracking] [--all-checks] [--bootstrap-form] [-v] [-s] [-O LEVEL] [-march=CPU] [--target TRIPLE] [--cc COMPILER] [-o OUT] FILE.cb [ARG...]\n       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n       cobc [--explain] [--warn-shadow] --check PATH...\n       cobc --check-syntax [--origin PATH] (FILE | -)";
+const USAGE: &str = "usage: cobc [--explain] [--warn-shadow] [--unittest [--unittest-filter TEXT] [--unittest-std]] [--run] [--explore N] [--schedule-seed S] [--keep-c] [--no-line-directives] [-g] [--report-tracking] [--all-checks] [--bootstrap-form] [-v] [-s] [-O LEVEL] [-march=CPU] [--target TRIPLE] [--cc COMPILER] [-o OUT] FILE.cb [ARG...]\n       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n       cobc [--explain] [--warn-shadow] --check PATH...\n       cobc --check-syntax [--origin PATH] (FILE | -)\n       cobc --emit-c [--c-name NAME] FILE";
 
 const HELP: &str = "\
 Compile a CobaltC program to a native executable.
@@ -140,16 +141,6 @@ Options:
                run that ended differently can be replayed. Setting
                COBALTC_SCHEDULE_SEED=S in a compiled program's
                environment does the same.
-  COBC_CACHE   (environment) The object cache: `std` functions that do not
-               depend on the program are compiled once and their objects
-               kept, by default in `cobc-cache` beside this executable, and
-               linked into every later program that uses them, so a program
-               that uses much of `std` compiles in a few seconds instead of
-               tens. `COBC_CACHE=off` compiles everything every time, as one
-               C file; `COBC_CACHE=DIR` keeps the objects in DIR. A rebuilt
-               cobc, another C compiler or other options use other objects;
-               stale ones are never reused, only left behind (delete the
-               directory to reclaim the space).
   --lib        Build a library (D-0257): the program's `extern fn` definitions
                as a static archive (default libNAME.a beside the source), the
                runtime libcbrt.a copied beside it, and NAME.h with the C
@@ -185,8 +176,8 @@ Options:
                access through one is checked where it is made (D-0209). For
                comparing against the elided forms; slower.
   --bootstrap-form
-               Emit the general checked form only: --all-checks, no object
-               cache, no elisions (D-0274). The reference for the code
+               Emit the general checked form only: --all-checks, no
+               elisions (D-0274). The reference for the code
                generator written in CobaltC; much slower.
                COBALTC_BOOTSTRAP_UPTO=N switches off D-0274's stages 1..N
                only (0 the default form, 10 this one; CHG-0368).
@@ -244,6 +235,11 @@ Options:
                as part of that program, not on its own. Nothing is printed
                for an accepted program. `coby --check` does the same
                without the `extern` files.
+  --emit-c [--c-name NAME] FILE
+               The program's C on standard output, nothing compiled or
+               linked: the file `--keep-c` keeps, NAME the name its `#line`
+               directives give it (default a.c). A program the static pass
+               rejects gets its diagnostic and status 1.
   --check-syntax [--origin PATH] (FILE | -)
                Whether one text parses, and nothing else: FILE, or standard
                input for `-`, its `module m \"./m.cb\";` files found
@@ -371,6 +367,22 @@ fn real_main() -> ExitCode {
         };
         return ExitCode::from(coby::check::run(&paths, "cobc", &externs));
     }
+    // `--emit-c [--c-name NAME] FILE`, as `cbc` has it: the C on standard
+    // output, nothing compiled; NAME is the name its `#line` directives
+    // give the C file (default `a.c`; with `-o OUT` the C is `OUT.c`).
+    let mut emit_c: Option<(String, PathBuf)> = None;
+    if all.first().map_or(false, |a| a == "--emit-c") {
+        let rest: Vec<String> = all[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let (name, file) = match rest.as_slice() {
+            [n, c, f] if n == "--c-name" => (c.clone(), f.clone()),
+            [f] if !f.starts_with('-') => ("a.c".to_string(), f.clone()),
+            _ => {
+                eprintln!("usage: cobc --emit-c [--c-name NAME] FILE");
+                return ExitCode::from(2);
+            }
+        };
+        emit_c = Some((name, PathBuf::from(file)));
+    }
     let mut run = false;
     let mut explore: Option<u64> = None;
     let mut seed: Option<u64> = None;
@@ -388,8 +400,12 @@ fn real_main() -> ExitCode {
     let mut out: Option<PathBuf> = None;
     let mut file: Option<PathBuf> = None;
     let mut prog_args: Vec<std::ffi::OsString> = Vec::new();
-    // Bytes, not text: a program's argument need not be UTF-8.
-    let mut args = std::env::args_os().skip(1);
+    if let Some((_, f)) = &emit_c {
+        file = Some(f.clone());
+    }
+    // Bytes, not text: a program's argument need not be UTF-8. (`--emit-c`'s
+    // command line was read above: none is left.)
+    let mut args = std::env::args_os().skip(if emit_c.is_some() { usize::MAX } else { 1 });
     while let Some(os) = args.next() {
         // With --run, everything after FILE.cb is the program's.
         if run && file.is_some() {
@@ -556,8 +572,13 @@ fn real_main() -> ExitCode {
         print!("{}", report::report(&gen.combined("report.c"), &file));
         return ExitCode::SUCCESS;
     }
-    let cache_dir = cache::dir();
-    note(&format!("lowered to C in {} ms ({} units, {} cacheable)", t_lower.elapsed().as_millis(), gen.units.len(), gen.units.iter().filter(|u| u.cacheable).count()));
+    note(&format!("lowered to C in {} ms ({} units)", t_lower.elapsed().as_millis(), gen.units.len()));
+    if let Some((name, _)) = &emit_c {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let ok = out.write_all(gen.combined(name).as_bytes()).and_then(|_| out.flush()).is_ok();
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
 
     let scratch = if run {
         let d = std::env::temp_dir().join(format!("cobc-{}-{}", std::process::id(), unique()));
@@ -584,47 +605,28 @@ fn real_main() -> ExitCode {
         return ExitCode::from(2);
     }
     let c_path = exe.with_extension("c");
-    // The single C file: compiled as it is without the cache, kept for
-    // inspection with `--keep-c`, written when something fails.
-    if cache_dir.is_none() || keep_c {
-        std::fs::write(&c_path, gen.combined(&c_path.display().to_string())).expect("write C");
-        note(&format!("wrote the generated C to {}", c_path.display()));
-    }
+    // D-0277: the program's single C file, compiled every time; kept for
+    // inspection with `--keep-c`, and when something fails.
+    std::fs::write(&c_path, gen.combined(&c_path.display().to_string())).expect("write C");
+    note(&format!("wrote the generated C to {}", c_path.display()));
 
     let obj_dir = std::env::temp_dir().join(format!("cobc-obj-{}-{}", std::process::id(), unique()));
     let linked = std::fs::create_dir_all(&obj_dir)
         .map_err(|e| format!("cannot create {}: {}", obj_dir.display(), e))
         .and_then(|_| link::link_args(&code, &cc, &opt, arch.as_deref(), &obj_dir, target))
-        .and_then(|extra| match &cache_dir {
-            Some(dir) => {
-                let inp = cache::Inputs { cc: &cc, opt: &opt, arch: arch.as_deref(), debug, cache_dir: dir.clone(), work_dir: &obj_dir };
-                let t = std::time::Instant::now();
-                let built = cache::build(&gen, &inp)?;
-                note(&format!("object cache {}: {} unit(s) reused, {} compiled, in {} ms", dir.display(), built.reused, built.compiled, t.elapsed().as_millis()));
-                let t = std::time::Instant::now();
-                let r = if lib {
-                    archive(&cc, &built.objects, &extra, &exe, target)
-                } else {
-                    compile(&cc, &built.objects, &exe, &opt, arch.as_deref(), &extra, strip, debug, &obj_dir, target)
-                };
-                note(&format!("linked in {} ms", t.elapsed().as_millis()));
-                r
-            }
-            None if lib => {
-                let inp = cache::Inputs { cc: &cc, opt: &opt, arch: arch.as_deref(), debug, cache_dir: obj_dir.clone(), work_dir: &obj_dir };
+        .and_then(|extra| {
+            let t = std::time::Instant::now();
+            let r = if lib {
                 let obj = obj_dir.join("program.o");
-                cache::compile_one(&inp, &c_path, &obj)?;
+                cc::compile_one(&cc, &opt, arch.as_deref(), debug, &c_path, &obj)?;
                 archive(&cc, std::slice::from_ref(&obj), &extra, &exe, target)
-            }
-            None => compile(&cc, std::slice::from_ref(&c_path), &exe, &opt, arch.as_deref(), &extra, strip, debug, &obj_dir, target),
+            } else {
+                build_exe(&gen, &cc, &c_path, &exe, &opt, arch.as_deref(), &extra, strip, debug, &obj_dir, target)
+            };
+            note(&format!("compiled and linked in {} ms", t.elapsed().as_millis()));
+            r
         });
-    let cache_failed = linked.is_err() && cache_dir.is_some();
-    if cache_failed && !c_path.exists() {
-        let _ = std::fs::write(&c_path, gen.combined(&c_path.display().to_string()));
-    }
-    if !cache_failed {
-        let _ = std::fs::remove_dir_all(&obj_dir);
-    }
+    let _ = std::fs::remove_dir_all(&obj_dir);
     let output = match linked {
         Ok(o) => o,
         Err(e) => {
@@ -1048,8 +1050,7 @@ fn link_trim(strip: bool, debug: bool, _target: target::Target) -> &'static [&'s
 // generated program, before the runtime and the system libraries.
 // `strip` (`-s`): the symbol table left out as well; `debug` (`-g`):
 // debug information compiled in and kept (unless `-s`).
-// Compiles and links `inputs` (one C file, or the cache's objects and the
-// program's) into `exe`. Many inputs go through a response file in
+// Compiles and links `inputs` (the program's C file) into `exe`. Many inputs go through a response file in
 // `work_dir`: a command line has a length limit (Windows: 32 K).
 #[allow(clippy::too_many_arguments)]
 // D-0257 (`--lib`): the program's objects, and the objects of its own C
@@ -1124,13 +1125,71 @@ fn write_header(out: &Path, text: &str, code: &[link::Code], target: target::Tar
     Ok(path)
 }
 
-fn compile(cc: &str, inputs: &[PathBuf], exe: &Path, opt: &str, arch: Option<&str>, extra: &[std::ffi::OsString], strip: bool, debug: bool, work_dir: &Path, target: target::Target) -> Result<std::process::Output, String> {
+// The runtime's directory for `target`, checked present and current.
+fn runtime_dir(target: target::Target) -> Result<PathBuf, String> {
     let here = std::env::current_exe().map_err(|e| e.to_string())?;
     let lib_dir = target.runtime_dir(here.parent().ok_or("no parent dir")?);
     if !lib_dir.join(target.lib_file()).exists() {
         return Err(format!("the runtime for {}, {}, is not in {} (build it: {})", target.triple(), target.lib_file(), lib_dir.display(), target.runtime_build()));
     }
     check_runtime(&lib_dir.join(target.lib_file()), target)?;
+    Ok(lib_dir)
+}
+
+// D-0277: the program's C compiled and linked into `exe`. A large program's
+// C is compiled in parts (`cc::part_count`, `Generated::parts`), all at once,
+// each written into `work_dir` under its own name, then linked; with
+// link-time optimisation where the C compiler has it (`cc::Lto`). One part
+// is the C file itself, compiled and linked in one command.
+#[allow(clippy::too_many_arguments)]
+fn build_exe(gen: &lower::Generated, cc: &str, c_path: &Path, exe: &Path, opt: &str, arch: Option<&str>, extra: &[std::ffi::OsString], strip: bool, debug: bool, work_dir: &Path, target: target::Target) -> Result<std::process::Output, String> {
+    let lib_dir = runtime_dir(target)?;
+    let k = cc::part_count(gen.units.iter().map(|u| u.text.len()).sum());
+    // A program calling into the runtime, linked as the program will be.
+    let probe = |flags: &[&str]| -> bool {
+        let src = work_dir.join("lto-probe.c");
+        if std::fs::write(&src, cc::LTO_PROBE).is_err() {
+            return false;
+        }
+        let mut cmd = Command::new(cc);
+        cmd.args(cc::cc_flags(cc)).arg(opt).args(arch).args(flags).arg("-o").arg(work_dir.join("lto-probe")).arg(&src).arg("-L").arg(&lib_dir).arg("-lcbrt").args(target.link_libs().iter().map(|l| format!("-l{}", l)));
+        show(&cmd);
+        cmd.output().map_or(false, |o| o.status.success())
+    };
+    let lto = cc::lto(cc, opt, k, &probe);
+    if k == 1 {
+        return compile(cc, &[c_path.to_path_buf()], exe, opt, arch, extra, strip, debug, work_dir, target, &lto.link_flags());
+    }
+    let mut children = Vec::new();
+    let mut objects = Vec::new();
+    for (i, text) in gen.parts(k).into_iter().enumerate() {
+        let part = work_dir.join(format!("part{}.c", i));
+        let obj = work_dir.join(format!("part{}.o", i));
+        std::fs::write(&part, lower::settle_lines(&text, &part.display().to_string())).map_err(|e| format!("cannot write {}: {}", part.display(), e))?;
+        let mut cmd = Command::new(cc);
+        cmd.args(cc::cc_flags(cc)).arg(opt).args(arch).args(debug.then_some("-g")).args(lto.part_flags()).arg("-c").arg("-o").arg(&obj).arg(&part);
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        show(&cmd);
+        let child = cmd.spawn().map_err(|e| format!("cannot run the C compiler `{}`: {}", cc, e))?;
+        children.push((part, child));
+        objects.push(obj);
+    }
+    let mut failed: Option<String> = None;
+    for (part, child) in children {
+        let out = child.wait_with_output().map_err(|e| format!("cannot run the C compiler `{}`: {}", cc, e))?;
+        if !out.status.success() && failed.is_none() {
+            failed = Some(format!("{}{} failed on {}", String::from_utf8_lossy(&out.stderr), cc, part.display()));
+        }
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    compile(cc, &objects, exe, opt, arch, extra, strip, debug, work_dir, target, &lto.link_flags())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile(cc: &str, inputs: &[PathBuf], exe: &Path, opt: &str, arch: Option<&str>, extra: &[std::ffi::OsString], strip: bool, debug: bool, work_dir: &Path, target: target::Target, lto: &[&str]) -> Result<std::process::Output, String> {
+    let lib_dir = runtime_dir(target)?;
     // `-ffp-contract=off`: gnu11 lets the compiler fuse `a*b + c` into one FMA
     // with a single rounding wherever the target has FMA (any -march
     // since Haswell); spec/06 rounds each operation on its own.
@@ -1142,7 +1201,7 @@ fn compile(cc: &str, inputs: &[PathBuf], exe: &Path, opt: &str, arch: Option<&st
     // (`cbrt/src/link_info.rs`), so this driver holds no per-platform list.
     // `link_trim`: the executable without what nothing in it uses.
     let mut cmd = Command::new(cc);
-    cmd.args(cache::cc_flags(cc)).arg(opt).args(arch).args(debug.then_some("-g")).arg("-o").arg(exe);
+    cmd.args(cc::cc_flags(cc)).arg(opt).args(arch).args(debug.then_some("-g")).args(lto).arg("-o").arg(exe);
     if inputs.len() == 1 {
         cmd.arg(&inputs[0]);
     } else {

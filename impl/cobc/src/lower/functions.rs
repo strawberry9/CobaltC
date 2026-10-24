@@ -16,7 +16,7 @@ impl<'a> Gen<'a> {
             }
         }
         // Temporaries are numbered per function, so a function's text is
-        // the same whatever else the program contains (cache.rs).
+        // the same whatever else the program contains.
         self.uid = 0;
         let cname = if mask == 0 {
             self.fn_names[&(name.to_string(), targs.to_vec())].clone()
@@ -39,8 +39,8 @@ impl<'a> Gen<'a> {
         // Not `main`: inlined into `cb_program`, which only C's `main`
         // calls, GCC would compile the whole program as code run once,
         // for size (a `div` for a `%` by a constant, say).
-        // External linkage: a function may be compiled in a translation
-        // unit of its own and reused from the object cache (cache.rs).
+        // External linkage here; `localize` makes the function `static`
+        // where nothing outside the program's own code names it.
         let sig = format!("{} {}({})", ret_c, cname, if params_c.is_empty() { "void".to_string() } else { params_c.join(", ") });
         writeln!(self.protos, "{};", sig).unwrap();
 

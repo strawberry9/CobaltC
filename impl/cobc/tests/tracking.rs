@@ -119,13 +119,12 @@ fn string_literals_keep_no_scopes() {
     for cc in oracle::c_compilers() {
         let dir = scratch(&format!("lit-{}", cc));
         fs::write(dir.join("prog.cb"), src).unwrap();
-        let out = Command::new(oracle::cobc_exe()).args(["--cc", cc, "--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).env("COBC_CACHE", "off").output().expect("run cobc");
+        let out = Command::new(oracle::cobc_exe()).args(["--cc", cc, "--keep-c", "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
         let c = fs::read_to_string(dir.join("prog.c")).unwrap();
         // The definition's body: the line naming the function that is not
         // its prototype (which ends in `;`), to the closing brace. A
-        // program's own function is `static` since the object cache's
-        // `Gen::localize`.
+        // program's own function is `static` (`Gen::localize`).
         let body = |name: &str| -> String {
             let head = c
                 .lines()

@@ -98,6 +98,75 @@ impl<'g, 'a> Fx<'g, 'a> {
         Ok(Some(x))
     }
 
+    // `v[k].f…` read as a value, plain data at the end of a chain of struct
+    // fields: the element is reached as a reader's is (`elem_reader`,
+    // D-0192), the `…_pre` body inline and its checks by `cb_elem_access`,
+    // where the element type holds no reference and no function value,
+    // whatever resource it holds. The call the ordinary lowering makes
+    // borrows the whole element shared, which meets every exclusive path
+    // into it, and then reads the field through that one fresh, unheld path,
+    // which meets nothing more; `cb_elem_access` makes the borrow's check,
+    // and the path it no longer forms would have ended with the statement
+    // unobserved (D-0018).
+    pub(super) fn elem_field_read(&mut self, e: &Expr) -> R<Option<V>> {
+        let mut fields: Vec<&str> = Vec::new();
+        let mut x = e;
+        loop {
+            match &x.kind {
+                ExprKind::Field(b, f) => {
+                    fields.push(f);
+                    x = b;
+                }
+                ExprKind::Paren(b) => x = b,
+                _ => break,
+            }
+        }
+        if fields.is_empty() || !matches!(x.kind, ExprKind::Index(..)) || self.g.boot(5) {
+            return Ok(None);
+        }
+        let elem = self.probe_place_type(x)?;
+        if self.has_refs(&elem) || self.holds_fn(&elem) || matches!(elem, Type::Closure(_) | Type::Ref(..)) {
+            return Ok(None);
+        }
+        // Struct fields all the way down (no reference, box or guard to see
+        // through), plain data at the end.
+        let mut t = elem;
+        for f in fields.iter().rev() {
+            let Type::Named(n, a) = &t else { return Ok(None) };
+            // A bitstruct's fields are bits of its backing integer, read by
+            // `lower_place_value`'s own case (D-0118).
+            let Some(sd) = self.g.struct_decl(n).filter(|sd| sd.bits.is_none()) else { return Ok(None) };
+            let Some(fd) = sd.fields.iter().find(|x| x.name == *f) else { return Ok(None) };
+            t = apply(&fd.ty, &subst_of(&sd.type_params, a));
+        }
+        if !self.g.plain_data(&t) {
+            return Ok(None);
+        }
+        let Some(call) = self.vec_index_call(x, false)? else { return Ok(None) };
+        let ExprKind::Deref(inner) = &call.kind else { return Ok(None) };
+        if !matches!(&inner.kind, ExprKind::Call(c, _) if matches!(&c.kind, ExprKind::Path(s, _) if s.join("::") == "std::Vec::index_shared")) {
+            return Ok(None);
+        }
+        self.elem_reader = true;
+        let p = self.elem_access_place(inner, false, e.line);
+        self.elem_reader = false;
+        let Some(mut p) = p? else { return Ok(None) };
+        if matches!(p.ty, Type::Never) {
+            return Ok(Some(never()));
+        }
+        for f in fields.iter().rev() {
+            let Type::Named(n, a) = p.ty.clone() else { return internal("a field of a non-struct element") };
+            let sd = self.g.struct_decl(&n).expect("struct");
+            let idx = sd.fields.iter().position(|x| x.name == *f).expect("field");
+            p.projs.push(format!("{{ CB_FIELD, {}u }}", idx));
+            p.ty = apply(&sd.fields[idx].ty, &subst_of(&sd.type_params, &a));
+            p.c = format!("{}.{}", p.c, san(f));
+            p.is_binding = false;
+        }
+        let v = self.read_place(p, e.line)?;
+        Ok(Some(self.into_temp(v, e.line)?))
+    }
+
     // `$` for the index argument of `Vec::index_*` (only `vec_index_call`
     // writes one there: `$` anywhere else is rejected statically).
     pub(super) fn lower_index_arg(&mut self, len: String, a: &Expr) -> R<V> {
@@ -140,7 +209,13 @@ impl<'g, 'a> Fx<'g, 'a> {
         };
         let loc = self.loc(a0.line);
         let m = if *mode == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
-        if !sugar {
+        // CHG-0237: a shared borrow of a place in a frozen parameter: its
+        // dispatcher found the path valid and no exclusive path overlapping
+        // it, and nothing the call does can form one or end the path, so
+        // neither the borrow's check nor the place's validity can fail.
+        let frozen = *mode == Mode::Shared && self.frozen_root(inner);
+        if frozen {
+        } else if !sugar {
             self.emit(&format!("cb_borrow_check({}, {}, {}, {});", base, Self::projs_args(&p.projs), m, loc));
         } else if !stateless {
             // The index may read `$` or run code: the place is valid first.
@@ -151,7 +226,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             return Ok(Some(never()));
         }
         let it = self.into_temp(i, a1.line)?;
-        if sugar {
+        if sugar && !frozen {
             let mut projs = p.projs.clone();
             projs.push(format!("{{ CB_INDEX, {} }}", it.c));
             self.emit(&format!("cb_borrow_check({}, {}, {}, {});", base, Self::projs_args(&projs), m, loc));

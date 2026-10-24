@@ -4,7 +4,8 @@
 # into impl/target/selfhost/. CC picks the C compiler (cobc --cc); COBC
 # another cobc, or a cbc; OUT another directory; CBRT_DIR the directory of
 # the runtime cbc links against (default: the one beside COBC, which a cbc
-# in impl/target/selfhost/ has not, so give impl/target/release there).
+# in impl/target/selfhost/ has not, so give impl/target/release there);
+# PROGRAMS the ones to build (default "cobfmt-cb cbparse cbc").
 #
 # cbc's build-time constants (cbc/build_info.cb, as cobc's build.rs gives
 # cobc its own): the stamp of the runtime beside the cobc that builds it
@@ -35,8 +36,16 @@ if [ -z "$stamp" ]; then
     echo "build.sh: $cbrt_dir/libcbrt.a carries no CBRT-STAMP" >&2
     exit 1
 fi
-"$cobc" "${cc[@]}" -O 2 -o "$out/cobfmt-cb" "$here/cobfmt/main.cb"
-"$cobc" "${cc[@]}" -O 2 -o "$out/cbparse" "$here/cbparse/main.cb"
+programs=" ${PROGRAMS:-cobfmt-cb cbparse cbc} "
+for p in $programs; do
+    case $p in
+        cobfmt-cb|cbparse|cbc) ;;
+        *) echo "build.sh: unknown program $p in PROGRAMS (cobfmt-cb, cbparse, cbc)" >&2; exit 1 ;;
+    esac
+done
+case $programs in *" cobfmt-cb "*) "$cobc" "${cc[@]}" -O 2 -o "$out/cobfmt-cb" "$here/cobfmt/main.cb" ;; esac
+case $programs in *" cbparse "*) "$cobc" "${cc[@]}" -O 2 -o "$out/cbparse" "$here/cbparse/main.cb" ;; esac
+case $programs in *" cbc "*) ;; *) exit 0 ;; esac
 # The two constants are written with sed rather than gen_build_info.py, so
 # the build needs no Python; the committed file is put back on exit.
 info=$here/cbc/build_info.cb

@@ -68,9 +68,9 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.
-- **The object cache.** Each pure-`std` function is compiled once and its object kept in `cobc-cache`
-  beside the executable, so a program's build compiles only its own code; `COBC_CACHE=off` disables
-  this.
+- **One C file.** A program's C, the `std` it reaches included, is one file, compiled every time (D-0277:
+  the object cache that compiled pure-`std` functions once and reused their objects is gone); a large
+  program's C is compiled in parts, at most eight, all at once, and linked with GCC's LTO or Clang's ThinLTO.
 - **Diagnostics and status** as for `coby`: the same static diagnostics. A compiled program's fault is
   the same diagnostic at the same line, with exit status 1.
 - **Limits.**
@@ -103,17 +103,17 @@ about 20 times slower than coby's on large inputs (the runtime's object tracking
 operation).
 
 `cbc` (`selfhost/cbc/`, with `selfhost/back/`) is `cobc` written in CobaltC, over that front end
-(D-0276): the same command line (`cbc [options] FILE.cb`, every option `cobc` takes, the object cache, the
+(D-0276): the same command line (`cbc [options] FILE.cb`, every option `cobc` takes, the
 stale-runtime check, `--lib`, `--unittest`, `--run`, `--target`), the same C compiler invocation and linking
 against `cbrt`, and the same C, byte for byte, as `cobc` writes in every form (the default, `--all-checks`,
 `-g`, `--no-line-directives`, `--lib`, and each level of D-0274's bootstrap form, `COBALTC_BOOTSTRAP_UPTO=N`).
 `cbc --emit-c [--c-name NAME] FILE` prints the C alone. `selfhost/build.sh` builds it with `cobc`;
 `selfhost/compare_c.sh` compares the two compilers' C on any set of files (`LEVEL=`, `FLAGS=`);
 `selfhost/fixpoint.sh` checks the fixed point: `cbc` built by `cobc` writes its own C, which is `cobc`'s; the
-C compiler builds a second `cbc` from that C, which writes the same C again (about 65 minutes at the default
+C compiler builds a second `cbc` from that C, which writes the same C again (about 45 minutes at the default
 level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the compiler under test. `cbc` compiles about
-15 to 25 times slower than `cobc` (its own source: about 25 minutes against 75 seconds; the runtime's
-object tracking, as in the front end); the programs it builds
+15 to 45 times slower than `cobc` (its own C: about 18 minutes against 26 seconds; the runtime's
+object tracking, as in the front end, chiefly of `StringView` copies); the programs it builds
 are the same programs. `cobc` stays in the tree as the Rust reference and the oracle.
 
 ## `std`

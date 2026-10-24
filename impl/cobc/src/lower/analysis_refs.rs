@@ -165,39 +165,50 @@ impl<'a> Gen<'a> {
         Ok(out)
     }
 
+    // The names `used_as_value` collects from the functions whose keys
+    // `which` admits: every path not a call's callee nor a bound
+    // one-segment name, by its last segment and, for `Type::f`, its last two.
+    pub(super) fn value_names(&self, which: impl Fn(&str) -> bool) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for (key, f) in self.items.fns.iter() {
+            if !which(key) {
+                continue;
+            }
+            // A one-segment name bound in the function (a local, a
+            // parameter, a binder) names that binding, never a function:
+            // it shadows any (`std`'s locals called `total` or `len` made
+            // every function of that name look used as a value).
+            let bound: HashSet<String> = bound_names(&f.body).into_iter().chain(f.params.iter().map(|p| p.name.clone())).collect();
+            let mut callees: HashSet<*const Expr> = HashSet::new();
+            visit_exprs(&f.body, &mut |e| {
+                if let ExprKind::Call(c, _) = &e.kind {
+                    if matches!(c.kind, ExprKind::Path(..)) {
+                        callees.insert(&**c as *const Expr);
+                    }
+                }
+            });
+            visit_exprs(&f.body, &mut |e| {
+                if let ExprKind::Path(segs, _) = &e.kind {
+                    if !callees.contains(&(e as *const Expr)) && !(segs.len() == 1 && bound.contains(&segs[0])) {
+                        if let Some(l) = segs.last() {
+                            names.insert(l.clone());
+                        }
+                        // `Type::f`, which only such a path can name.
+                        if segs.len() >= 2 {
+                            names.insert(format!("{}::{}", segs[segs.len() - 2], segs[segs.len() - 1]));
+                        }
+                    }
+                }
+            });
+        }
+        names
+    }
+
     // Whether a function item is named anywhere but as a call's callee
     // (by its last segment: a coarse, safe answer).
     pub(super) fn used_as_value(&self, key: &str) -> bool {
         if self.fn_values.borrow().is_none() {
-            let mut names = HashSet::new();
-            for f in self.items.fns.values() {
-                // A one-segment name bound in the function (a local, a
-                // parameter, a binder) names that binding, never a function:
-                // it shadows any (`std`'s locals called `total` or `len` made
-                // every function of that name look used as a value).
-                let bound: HashSet<String> = bound_names(&f.body).into_iter().chain(f.params.iter().map(|p| p.name.clone())).collect();
-                let mut callees: HashSet<*const Expr> = HashSet::new();
-                visit_exprs(&f.body, &mut |e| {
-                    if let ExprKind::Call(c, _) = &e.kind {
-                        if matches!(c.kind, ExprKind::Path(..)) {
-                            callees.insert(&**c as *const Expr);
-                        }
-                    }
-                });
-                visit_exprs(&f.body, &mut |e| {
-                    if let ExprKind::Path(segs, _) = &e.kind {
-                        if !callees.contains(&(e as *const Expr)) && !(segs.len() == 1 && bound.contains(&segs[0])) {
-                            if let Some(l) = segs.last() {
-                                names.insert(l.clone());
-                            }
-                            // `Type::f`, which only such a path can name.
-                            if segs.len() >= 2 {
-                                names.insert(format!("{}::{}", segs[segs.len() - 2], segs[segs.len() - 1]));
-                            }
-                        }
-                    }
-                });
-            }
+            let names = self.value_names(|_| true);
             *self.fn_values.borrow_mut() = Some(names);
         }
         // An associated function (`Type::f`, the type's name capitalized)

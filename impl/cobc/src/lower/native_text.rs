@@ -568,12 +568,27 @@ impl<'a> Gen<'a> {
 
     // D-0200: `replace(r, v)` natively for a value an objectless local may
     // hold (`objectless_type`): the body receives `v`, binds it as `old`,
-    // checks that both places are still there (`[Swap-Places]`: `r`'s; the
-    // fresh `old` is), exchanges them and returns `old` -- with the object
-    // `v` came with, which is what the body's bindings hand on (`cb_take`
-    // of a binding nothing borrowed cannot fail). The same here, without
-    // the bindings.
+    // and `swap_places(r, &mut old)` checks that both places are still
+    // there and writes each by `[Write]` (`[Swap-Places]`, D-0235): of
+    // those only `r`'s can fail (`r` may be passed on whole beside a live
+    // shared reborrow of `*r`; the fresh `old` has none), so `r`'s validity
+    // and then its write are checked; it exchanges them and returns `old`
+    // -- with the object `v` came with, which is what the body's bindings
+    // hand on (`cb_take` of a binding nothing borrowed cannot fail). The
+    // same here, without the bindings. Plain data (a number, a struct of
+    // numbers) comes with no object: the same checks, nothing received or
+    // sent.
     pub(super) fn native_replace(&mut self, t: &Type) -> R<Option<String>> {
+        if self.plain_data(t) {
+            let tc = self.ctype(t)?;
+            let mut b = String::new();
+            writeln!(b, "    cb_valid(p_r.tok, CB_NOLOC, 0);").unwrap();
+            writeln!(b, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);").unwrap();
+            writeln!(b, "    {} old = *({} *)p_r.p;", tc, tc).unwrap();
+            writeln!(b, "    *({} *)p_r.p = p_v;", tc).unwrap();
+            writeln!(b, "    return old;").unwrap();
+            return Ok(Some(b));
+        }
         if !self.objectless_type(t) {
             return Ok(None);
         }
@@ -581,6 +596,7 @@ impl<'a> Gen<'a> {
         let mut b = String::new();
         writeln!(b, "    uint64_t o = cb_recv(&p_v);").unwrap();
         writeln!(b, "    cb_valid(p_r.tok, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);").unwrap();
         writeln!(b, "    {} old = *({} *)p_r.p;", tc, tc).unwrap();
         writeln!(b, "    *({} *)p_r.p = p_v;", tc).unwrap();
         writeln!(b, "    cb_move_to(o, &old);").unwrap();
