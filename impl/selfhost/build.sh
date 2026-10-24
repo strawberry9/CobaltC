@@ -2,7 +2,9 @@
 # Builds the programs written in CobaltC with cobc: cobfmt-cb (cobfmt),
 # cbparse (coby's parser) and cbc (the code generator and cobc's driver),
 # into impl/target/selfhost/. CC picks the C compiler (cobc --cc); COBC
-# another cobc; OUT another directory.
+# another cobc, or a cbc; OUT another directory; CBRT_DIR the directory of
+# the runtime cbc links against (default: the one beside COBC, which a cbc
+# in impl/target/selfhost/ has not, so give impl/target/release there).
 #
 # cbc's build-time constants (cbc/build_info.cb, as cobc's build.rs gives
 # cobc its own): the stamp of the runtime beside the cobc that builds it
@@ -18,15 +20,23 @@ out=${OUT:-$impl/target/selfhost}
 mkdir -p "$out"
 cc=()
 [ -n "${CC:-}" ] && cc=(--cc "$CC")
-"$cobc" "${cc[@]}" -O 2 -o "$out/cobfmt-cb" "$here/cobfmt/main.cb"
-"$cobc" "${cc[@]}" -O 2 -o "$out/cbparse" "$here/cbparse/main.cb"
-cbrt_dir=$(cd "$(dirname "$cobc")" && pwd)
+cbrt_dir=$(cd "${CBRT_DIR:-$(dirname "$cobc")}" && pwd)
 # Under MSYS2 `pwd` gives /e/..., which a native cbc cannot open: take the
 # E:/... form.
 if command -v cygpath > /dev/null 2>&1; then
     cbrt_dir=$(cygpath -m "$cbrt_dir")
 fi
+if [ ! -f "$cbrt_dir/libcbrt.a" ]; then
+    echo "build.sh: no libcbrt.a in $cbrt_dir (set CBRT_DIR to the runtime's directory, e.g. $impl/target/release)" >&2
+    exit 1
+fi
 stamp=$(LC_ALL=C grep -aoE 'CBRT-STAMP:[0-9a-f]{16}' "$cbrt_dir/libcbrt.a" | head -n 1 | cut -d: -f2 || true)
+if [ -z "$stamp" ]; then
+    echo "build.sh: $cbrt_dir/libcbrt.a carries no CBRT-STAMP" >&2
+    exit 1
+fi
+"$cobc" "${cc[@]}" -O 2 -o "$out/cobfmt-cb" "$here/cobfmt/main.cb"
+"$cobc" "${cc[@]}" -O 2 -o "$out/cbparse" "$here/cbparse/main.cb"
 # The two constants are written with sed rather than gen_build_info.py, so
 # the build needs no Python; the committed file is put back on exit.
 info=$here/cbc/build_info.cb

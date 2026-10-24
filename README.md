@@ -14,7 +14,7 @@ CobaltC is already well formed, but currently still in experimental stage.
 
 This project began on 19 September 2026, based on the instructions provided (to the AI) by the project owner (me), as set out in [CobaltC_Master_Instructions.md](CobaltC_Master_Instructions.md).
 
-Commit Update 132, 2026-10-23 23:12 UTC. Specification edition 2026.102301. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
+Commit Update 133, 2026-10-24 00:11 UTC. Specification edition 2026.102301. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
 The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 
