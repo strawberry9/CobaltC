@@ -8106,3 +8106,21 @@ crossing to C by value.
   `cbc` writes its own C (110 MB) in 18 minutes, `cobc` in 26 s; the fixed point takes 44 minutes (65 before).
   `cbc` is still 15 to 45 times slower than `cobc` (D-0276's working bound is 10): the runtime's tracking of
   `StringView` copies is the largest remaining cost, a change of representation for a D-record of its own.
+
+## CHG-0372: a sent datum's temporary stops naming its storage (2026-10-25)
+
+- Found by fault probes of a prototype for the view representation the P4 section above left for a D-record
+  of its own (views and shared slices bound to locals and parameters without a runtime object, their slot
+  forgotten by the frame): the prototype cut a view copy from 2,689 to 1,070 instructions but `cbc` by only
+  2.3 to 4.1% (tinyos 33.6 → 32.2 G, dns_over_http 270 → 260 G, cobfmt 865 → 845 G; the text programs
+  not at all, their remaining views being `foreach` and `match` binders and fields), under the 5% the plan
+  set for keeping it. Reverted; the patch is kept outside the tree, to be measured again once the scope
+  costs (`cb_stmt_pop`, `cb_frame_pop`) are cut and the frame list it builds on has settled.
+- `CHG-0372`: the temporary the sender makes for reference data a function returns (or an argument's
+  copy) kept naming its storage until the caller's statement ended, and its end forgot the slots there.
+  GCC at `-O1`, and with LTO above `-O0` since D-0277, inlines the callee and gives its dead local's
+  storage to a live local of the caller: a returned `StringView` lost its holder and `String::append` on
+  its root beside it went unreported (`probes/p4_returned_view.cb` at bootstrap levels 1–10 at `-O2`, and
+  the default form at `-O1`; Clang kept the storage apart). `cb_send_datum` now makes that temporary stop
+  naming the storage (`unname_sent`); the C is unchanged. `conf.returned-view-beside-write` (3.272.0) and
+  `impl/cobc/tests/returned_view_inlined.rs` (the case at `-O1` and `-O2`, GCC and Clang).

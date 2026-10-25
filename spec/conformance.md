@@ -1,7 +1,7 @@
 # CobaltC Conformance Cases
 
 Status: normative artifact
-Version: 3.271.0
+Version: 3.272.0
 Conforms to: `spec/02-schema.md` (Kind: Conformance case, `conf.<name>`)
 Governed by: `CobaltC_Master_Instructions.md` §1, §19, §20
 
@@ -1501,6 +1501,7 @@ Rows added for case files that had none (CHG-0265):
 | `conf.replace-string-passed-ref-beside-shared-reborrow` | `impl/conformance/21-standard-library-semantics/replace_string_passed_ref_beside_shared_reborrow_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | as `conf.replace-passed-ref-beside-shared-reborrow`, for a `String`: `swap_places(r, &mut old)` → `[Swap-Places-Conflict]` on `a_r` beside `s = &*r` (D-0235, CHG-0371) |
 | `conf.replace-struct-beside-field-reborrow` | `impl/conformance/21-standard-library-semantics/replace_struct_field_borrowed_beside_whole_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | `replace(r, v)` writes the whole of `*r`, a struct of plain data; `s = &(*r).a` is a live path beneath it → `[Swap-Places-Conflict]` (D-0235, CHG-0371) |
 | `conf.replace-values` | `impl/conformance/21-standard-library-semantics/replace_values_ok.cb` | ✓ prints `1 2 3`, `3`, `1 2 3 4 5 6`, `x y`, `1 2` | `replace` on an `i32`, a plain struct, a `String` and a `Vec<i32>`, through a fresh borrow and through a reference passed on whole after the reborrow beside it ended: `[Swap-Places]` with no conflict returns the old value (CHG-0371) |
+| `conf.returned-view-beside-write` | `impl/conformance/21-standard-library-semantics/returned_subview_beside_write_rejected.cb` | ✗ `diag.aliasing-conflict` (dynamic) | `head(v)` returns `&v[0 .. 1]`, a sub-view of `s` formed in the callee: `[Return]` gives the result's path to the caller, whose `h` holds it after the callee's frame is gone; `String::append(&mut s, "!")` is a `[Write]` of its root beside that live path → `diag.aliasing-conflict`, however the C compiler lays out the callee's storage (CHG-0372) |
 | `conf.swap-forms` | `impl/conformance/21-standard-library-semantics/swap_forms_ok.cb` | ok; prints `7 1 2 2 1 b true` | D-0235 `[Swap-Places]`: two locals; the same place twice (no access, D-0022); two fields of one struct; `replace` through a reference with no other live path; `Vec::swap` of `String`s; `replace` of an `Option<String>` |
 | `conf.vec-built-locally-and-returned` | `impl/conformance/21-standard-library-semantics/vec_built_locally_and_returned_ok.cb` | ok | D-0023 rule.stdlib.vec: A vector filled only through push and returned as the function's result; |
 | `conf.vec-confined-through-helpers` | `impl/conformance/21-standard-library-semantics/vec_confined_through_helpers_ok.cb` | ok | rule.stdlib.vec rule.alias.borrow D-0018: Vectors used only through helpers that take them by reference: |
@@ -1985,6 +1986,7 @@ Rows added for case files that had none (CHG-0265):
 
 ## Change Log
 
+- 3.272.0 — `CHG-0372`: `conf.returned-view-beside-write`.
 - 3.271.0 — `CHG-0371`: `conf.replace-string-passed-ref-beside-shared-reborrow`, `conf.replace-struct-beside-field-reborrow`, `conf.replace-values`.
 - 3.270.0 — `CHG-0370`: `conf.destroy-vec-while-element-referenced`.
 - 3.269.0 — `CHG-0369`: `conf.if-variant-else-branch-takes-sibling-type`.

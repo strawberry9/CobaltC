@@ -7302,7 +7302,11 @@ pub extern "C" fn cb_result_ref(tok: u64) {
 
 #[no_mangle]
 pub extern "C" fn cb_send_datum(src: *const u8, ty: u32) {
-    let _e = enter_planned(|p, r| p.slots_of(r, src as usize, ty));
+    let _e = enter_planned(|p, r| {
+        p.slots_of(r, src as usize, ty);
+        // `unname_sent`'s temporary: this thread's, in its own heap.
+        p.heap(cur_heap());
+    });
     let r = rt();
     let mut offs = take_vec(&mut r.pool);
     ref_offsets(r, src as usize, ty, 0, &mut offs);
@@ -7328,7 +7332,32 @@ pub extern "C" fn cb_send_datum(src: *const u8, ty: u32) {
         }
     }
     give_vec(&mut r.pool, offs);
+    unname_sent(r, src as usize);
     ts().inflight.push_back(Inflight::Datum(toks));
+}
+
+// CHG-0372. The temporary the sender made for the datum it sends, if any:
+// a result built in a callee (`cb_result` gave it to the caller's
+// statement) or an argument's copy. It holds none of the datum's slots
+// now, but it lasts until that statement ends, and the storage it names
+// may end first: a callee's local is gone at the return, and a C compiler
+// that inlines the callee (GCC at -O1, and with LTO, D-0277) gives that
+// storage to a later local of the caller, whose slot the temporary's end
+// then forgot (a returned `StringView`'s path lost its holder and a
+// conflicting write went unreported). So it no longer names that storage,
+// and its end forgets nothing there. Plain data only: a resource is moved
+// by its receiver (`cb_recv`), and reclaimed cells keep their own entries.
+fn unname_sent(r: &mut Rt, a: usize) {
+    let Some(&si) = ts().scopes.last() else { return };
+    let Some(Entry::Scope(s)) = ts().stack.get(si) else { return };
+    for &o in s.temps.iter().rev() {
+        if let Some(ob) = r.objs.get_mut(&o) {
+            if ob.alive && ob.addr == a && !ob.is_resource && !ob.reclaimed {
+                ob.addr = 0;
+                return;
+            }
+        }
+    }
 }
 
 // A native body returning `Some(r)` for an element reference `r`
