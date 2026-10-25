@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.29.0
+Version: 1.30.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -593,7 +593,8 @@ that may have been moved or dropped (`temporally-valid(a_x)` with
 lexical rule, not an instance of this analysis.
 
 **Scope.** Intraprocedural and syntactic: a call is opaque except for
-its declared signature and the D-0011 elision; no value-range
+its declared signature and the D-0011 elision (`rule.control.frame-references`,
+below, adds the callee's access summary, and its refutations to these); no value-range
 reasoning beyond literals and literal-bound locals. A conforming implementation must reject
 exactly the refuted instances and must not reject any proven or
 unknown instance; it may report additional *warnings* from stronger
@@ -628,8 +629,144 @@ rule.value-object.write, rule.alias.borrow, rule.resauth.transfer,
 rule.resauth.destroy, rule.agg.index, rule.arith.checked,
 rule.arith.div, rule.arith.shift, rule.arith.neg, rule.arith.convert
 
+### `rule.control.frame-references`
+**Status:** ACCEPTED (D-0282)
+
+`rule.control.flow-analysis` refutes a conflict only when one function
+body shows it, and leaves to the run every conflict that passes through a
+call or through a reference the analysis gave no fact. This rule refutes,
+before the program runs, the conflicts among **frame-held references**
+(D-0281 tier S) that the program text decides, including those across
+calls. It runs over the same CFG and state, after
+`rule.control.flow-analysis`, and only refutes: it proves nothing, and
+every dynamic check stays as the rules that name it say. A refuted
+instance is ill-formed with the diagnostic named below, marked *static*.
+
+**Holders.** A *frame-held reference* is a binding of a reference, slice
+or `StringView` type, of `Option`/`Result` of one, or of a closure or
+`fn` type (D-0281: a closure passed and called is tier S). The other
+bindings §6 gives `deriv` facts, a spawn's handle among them, are holders
+with those facts. A binding of any other type that holds a reference (a
+struct, an array, an enum other than `Option`/`Result` of a reference)
+keeps it inside data (tier D): this rule gives it no facts and never
+refutes on its account; the run checks it.
+
+**Inherited facts.** Where a declaration, assignment or `match` binder of
+a frame-held reference `r = e` forms no `deriv` fact by §6's rows, `r`
+inherits the facts of `e`:
+
+| `e` | facts of `e` |
+|---|---|
+| a frame-held reference `q` | `q`'s facts; for a reference or slice `q` with none, `*q` whole, in `q`'s mode |
+| an owner `x` of this frame | `x` whole, shared |
+| `*b`, and `b.f` for a frame-held `b` | the facts of `b` |
+| `&_m p` or a slice of `p` | the fact §6 forms for it (`p`'s place, literal indices and ranges included) where it forms one; otherwise the facts of `p`'s root, extended by `p`'s fields up to its first index, in mode `m`; when `p`'s root is the result of a call that is not a reference, holds none and is not a constant: the temporary of that statement |
+| `String::view(s, lo, hi)`, `StringView::sub(s, lo, hi)` | the facts of `s`, each extended by the range `[lo, hi)` |
+| a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088); none when no parameter is; tier D when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them) |
+| a hidden `foreach` binding | the facts of the collection it walks; over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap |
+| `if`, a block, `match` | the facts of the results of the branches that complete (a `match` arm's binder stands for the scrutinee); facts from two or more branches are `?` |
+| an element of a container, or a reference read out of a field of an aggregate that holds references | tier D: no facts |
+| a name of no local, a literal | none: static data |
+
+A binding whose inherited facts name a temporary, and which is live
+after its statement, is refuted: `diag.destroy-while-aliased` (D-0135).
+
+**Liveness.** A frame-held reference `h` is *live* at a point `P` when
+the binding of that name in scope at `P` is mentioned (read, borrowed,
+passed, captured or assigned) after `P` in the source, or anywhere in a loop that encloses `P` and that its declaration
+precedes; also while another live binding holds a fact rooted at `*h`.
+A mention resolves to the binding in scope where it is written, so a
+later binding of the same name does not keep `h` live. A holder that is not live has
+ended (`[Ref-Binding-Last-Use]`, D-0111) and conflicts with nothing.
+
+**Access summaries.** Each function `F` with a body has, for each of
+its reference parameters `p` (a reference, a slice, a `StringView`), two
+sets of *projections* (field paths from `p`'s referent, cut at the first
+index or range; the empty path is the whole referent): `reads(F, p)` and
+`writes(F, p)`. They are the least sets such that, in `F`'s body:
+
+- a read of a place rooted in `p` at path `π`, or a shared borrow or
+  slice of it, puts `π` in `reads`; a write, an exclusive borrow or an
+  exclusive slice puts `π` in `writes`;
+- a local reference bound from a `p`-rooted borrow, or from a call on
+  one that returns a reference, is rooted where that is;
+- passing a `p`-rooted reference at `π` to `G`'s reference parameter `q`
+  puts `π·ρ` in `reads` for each `ρ` in `reads(G, q)`, and likewise for
+  `writes`; to a function with no body, `π` in `reads`, and in `writes`
+  when the parameter is exclusive; to a parameter of a type parameter's
+  type, or to a call through a `fn` value, `π` in `reads`, and in
+  `writes` unless the argument is a shared borrow or a shared binding;
+- a closure that captures a `p`-rooted reference puts `π` in both.
+
+A function of `std`, and one whose body contains `unsafe`, has
+`reads(F, p) = {ε}` for every reference parameter and `writes(F, p) =
+{ε}` for every exclusive one. The summaries are computed over the whole
+program to a fixed point.
+
+**The call-site rule.** At a call `F(a1, …, an)` to a named function,
+for each argument `ai` whose parameter is or holds a reference, in the
+parameter's mode `m`: its *reach* `W(ai)` is, for a frame-held
+reference binding, its referent and its facts, and otherwise the facts
+`ai` inherits (an argument of a type parameter's type counts, shared,
+when its value is or holds a reference: a generic body can keep or copy
+the value but not reach through it); its *effect* `E(ai)` is, when `F`
+has a body (an empty one included) and the parameter is a reference or
+slice, `W(ai)` extended by each
+projection of `reads(F, pi)` (shared) and of `writes(F, pi)` (exclusive
+for an exclusive parameter, shared for a shared one: a write through a
+shared reference is interior mutability), and otherwise `W(ai)`. Two
+keys *certainly overlap* when their roots are equal, their paths agree
+step by step (fields equal; literal indices equal; a literal index
+inside a literal range; literal ranges that intersect) and the longer
+path's remainder holds no range that may be empty; they *may overlap*
+when they meet only for some values (a computed index, a computed range
+bound). The call is refuted, `diag.aliasing-conflict`, when, for modes
+not `permitted` together (`spec/08`):
+
+1. a key of some `E(ai)` certainly overlaps a fact `T` of a live binding
+   other than the arguments' own and other than a copy of a reference
+   argument (a copy of a reference carries the same path): a binding
+   passed whole as a reference argument, or one a reference argument is
+   formed through
+   (the root of its place, through fields, dereferences, indexes and the
+   reference arguments of a call on it, as `r` in `&mut r.x` or
+   `Vec::index_shared(&*r, 0)`); a binding named only in an index or in
+   an argument passed by value is a holder like any other; or
+2. for `i ≠ j`, a key of `E(ai)` certainly overlaps a key of `W(aj)`,
+   both from facts `T`: `aj`'s referent lives for the whole call. `swap`
+   and `swap_places` of one place written the same way twice are not
+   refuted (`[Swap-Places]`), nor is one reference binding passed twice,
+   or beside a copy of itself: one path.
+
+A pair that may overlap, and a certain overlap through a fact `?` (one
+that holds on some paths to the call only), are left to the run: the
+dynamic check decides them.
+
+**Element accesses.** A read or borrow of a `Vec`'s element `v[k]` is
+an access to `v` at element `k`: refuted, `diag.aliasing-conflict`,
+when a live frame-held reference not used to reach it holds a fact `T`
+on `v` that certainly overlaps it in a mode not `permitted`.
+
+**Evaluation order.** In an assignment whose place is reached through a
+container's element (`v[0].x = e`, `*Vec::index_exclusive(&mut v, 0) =
+e`), the place is found before `e` is evaluated (D-0007). When `e`
+contains an exclusive borrow whose facts reach that container, the place
+may be moved before it is written: refuted, `diag.stale-binding`.
+
+**Moving out through a reference.** `*r`, for a reference binding `r`,
+used where its value is moved (a resource, an `Atomic`, a `Vec`, a
+`String`: an argument, an initializer, an assigned value, a function's
+result) is refuted, `diag.move-while-aliased`, at the `*r`: `r` still
+refers to the place.
+
+**Depends on:** rule.control.flow-analysis, D-0011, D-0018, D-0088,
+D-0111, D-0135, D-0281
+**Affects:** rule.alias.borrow, rule.fn.call,
+rule.agg.index, rule.resauth.transfer
+
 ## Change Log
 
+- 1.30.0 — `CHG-0373` (D-0282): §6 `rule.control.frame-references`, the conflicts of frame-held references refuted before the run (inherited facts, liveness, access summaries, the call-site rule, element accesses, evaluation order, moving out through a reference, views of temporaries); `rule.control.flow-analysis`'s Scope names it.
 - 1.29.0 — `CHG-0365` (D-0275): `[Ref-Binding-Last-Use]`: a reference, slice or `StringView` to reference-free storage defers another binding's end only through a statement that may rebind it; the prose after the rule.
 - 1.28.0 — `CHG-0300` (D-0247): the spawn row's tracked binding is a `ref`, not a slice; `CHG-0295` (D-0243): the closure row marks a captured reference binding escaped, and a row for a closure anywhere else; `CHG-0296` (D-0244): the consumption row forgets the consumed binding's own facts, and "Forgetting" says so; `CHG-0297` (D-0245): "A closure call" after the discharge table.
 - 1.27.0 — `CHG-0285` (D-0236): §6 "Forgetting": a fact cleared because its holder ends, is reassigned or moved marks its root `escaped`; the `escaped` definition and five rows; §1's prose after `[Ref-Binding-Last-Use]`.

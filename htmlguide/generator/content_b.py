@@ -809,14 +809,18 @@ the outcome is one of three:""")
 b += table(["Outcome", "When", "Effect"], [
     ["proven", "the tracked facts guarantee the condition", "no run-time check"],
     ["refuted", "the tracked facts guarantee it fails", "the program is rejected (a <em>static</em> diagnostic)"],
-    ["unknown", "the facts do not decide (the value came from a call, a loop merged two states, a reference passed through a parameter)", "the run-time check runs, and faults if it fails (a <em>dynamic</em> diagnostic)"],
+    ["unknown", "the facts do not decide (a value computed at run time, a loop merged two states, a reference kept inside a data structure)", "the run-time check runs, and faults if it fails (a <em>dynamic</em> diagnostic)"],
 ])
-b += p("""The analysis looks only at the current function and only at literals for value ranges.
-So `2147483647 + 1` is refuted statically, `add(2147483647, 1)` is checked when `add` runs, and
-borrowing `x` twice exclusively in one function is refuted while doing so through two reference
-parameters is checked at the use. Three exceptions are stricter: definite assignment (§11), a use
-of a variable that may have been moved (§7), and reference escape (§10) reject on "unknown" rather
-than deferring.""")
+b += p("""For values, the analysis looks only at literals. So `2147483647 + 1` is refuted statically
+and `add(2147483647, 1)` is checked when `add` runs. For references a function holds in its own
+variables and parameters, the checker also knows what every function does through each reference
+parameter: which fields it may read and which it may write. So a call that hands a function `&mut x`
+and `&x`, where the function writes through the first, is refuted at the call, and so is a call that
+writes what a live reference of the caller still borrows. The diagnostic names the function and what
+it does through which argument. Two references chosen by computed indexes into one array are told apart
+only by their values, so they are checked when used, and so are references kept inside data structures.
+Three exceptions are stricter: definite assignment (§11), a use of a variable that may have been moved
+(§7), and reference escape (§10) reject on "unknown" rather than deferring.""")
 
 b += rules([
     "Let scopes do your cleanup. Open a block to bound a borrow or a lock; close it to release.",

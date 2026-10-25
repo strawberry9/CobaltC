@@ -3,8 +3,8 @@
 Status: ACCEPTED IN DIRECTION (2026-10-25: the owner handed the proposal to the assistant "to manage autonomously,
 with authorisation given to make all necessary decisions to push CobaltC in the direction it needs to go in order
 for it to be considered a serious systems programming language"). Adopted: the review's verdict in §12, and the
-order measurement (`cobc --cost`), invariant map and per-operation cost contract, rule text, prototypes. The tier
-rules are not yet normative; each phase takes its own change records. D-0278 (the Rust toolchain leads) and D-0279
+order measurement (`cobc --cost`), invariant map and per-operation cost contract, rule text, prototypes. The tier-S
+rules are normative since D-0282 (`rule.control.frame-references`, Update 137); each phase takes its own change records. D-0278 (the Rust toolchain leads) and D-0279
 (no untracked build) were decided first. Drafted PROPOSED 2026-10-25 at the owner's request ("put all options on
 the table … so that sentence does not become the main criticism of CobaltC").
 Kind: Decision (`spec/02-schema.md`)
@@ -405,3 +405,253 @@ What the review did not weigh: keeping the path table beside owner counts means 
 that engineering cost is the strongest reason for deciding D-0278 before phase 2. Verdict adopted: approve the
 measurement; endorse O2 and O3 in direction; write the invariant map and the per-operation cost contract before
 any normative text; keep O5 alive and test it on the readers.
+
+## 13. The invariant map (2026-10-25, the review's first precondition)
+
+What the runtime enforces today, what tier S needs to enforce it, and the least metadata tier D needs. The dynamic
+tracking faults are five diagnostics (103 conformance cases); the map adds the two services the runtime gives
+every fault (its position) and thread lending.
+
+| # | invariant | faults | tier S enforces it by | least tier-D metadata | today |
+|---|---|---|---|---|---|
+| 1 | no write or exclusive access beside a live conflicting path | `aliasing-conflict` | the call-site rule (the roots and projections of a call's arguments, the caller's other live references) and local liveness; a variable index or range is a **point check** (`i != j`, ranges disjoint) with no state | fine-grained: a holder list with paths per owner; coarse: a holder count and an exclusive flag per owner | a table keyed by address; an object per value; paths per object |
+| 2 | a reference is used only while its referent is unchanged in place | `stale-binding` | liveness: an invalidating operation while the reference is live is a conflict under 1, decided statically | a generation per owner storage, carried in the reference and compared at use, or the count of 3 (which forbids the invalidating operation) | the same table |
+| 3 | an owner is not destroyed or moved while a holder lives | `destroy-while-aliased`, `move-while-aliased` | liveness, statically | a holder count per owner: exact | the same table |
+| 4 | a place holding a live resource is not overwritten | `overwrite-of-live-resource` | definite-initialisation flow; a place whose state depends on data (an `Option` in a loop) is a discriminant **point check** | none beyond the value: this is resource authority, not reference tracking | objects for resource places |
+| 5 | a fault names its source position | every dynamic fault | a static table from code address to source line, read only when a fault is raised (as debuggers' line tables) | the same | a store per statement (`cb_at`, 2% of csvstat) |
+| 6 | a reference lent to another thread is respected by the lender | `aliasing-conflict` across threads; containment (D-0204) | scoped lending: a reference may be passed to a thread only if the thread is joined in the lender's frame, which makes the lent paths a static fact | a lent-path record per thread | lent paths in the table |
+
+The review asked whether a third invariant, container invalidation, needs its own mechanism: it does not. A
+reallocation is a write to the container (row 1) and a reference into the old storage is stale only if it was
+live across that write (row 2), so either a conflict or a generation settles it.
+
+**What the map says about tier S:** none of rows 1–6 needs run-time state for a frame-held reference. The 42
+tier-S cases among the 103 (read one by one, `stress/d0281/cost/NOTES.md`) are each decided by the call-site rule
+and liveness, or in general by a stateless point check. So tier S can promise **no reference state at run time**:
+no objects, paths, holders, scopes or frames as runtime entries, and no allocation for them. Point checks, bounds,
+overflow and the stack check remain; they are the language's semantics and cost a compare each.
+
+## 14. The per-operation cost contract
+
+Promised by the specification as properties, not instruction counts (the review's second precondition). An
+implementation may do better; it may not do worse.
+
+**Tier S** (a reference held by a frame, §7):
+
+| operation | promise |
+|---|---|
+| form, copy, pass, return, end | no run-time state; no allocation; no call into a runtime |
+| access through it | the access itself, plus a bounds check where an index is involved |
+| call with two or more reference arguments into one root | at most one point check per pair of arguments whose overlap depends on data, O(1) each |
+| any fault it can cause | decided at compile time, or by a point check; the fault's position from a static table |
+
+**Tier D** (a reference kept in data: a `tracked` aggregate, a container of references, a lent reference):
+
+| operation | promise |
+|---|---|
+| form a tracked reference into an owner | O(1); no allocation; updates metadata in that owner only |
+| copy a tracked aggregate holding k references | O(k); no allocation |
+| move a tracked aggregate | O(1); no metadata changes (metadata is not keyed by address) |
+| read through a stored reference | O(1): one validity compare |
+| write to an owner that has tracked holders | coarse granularity O(1); fine-grained O(h) in the owner's live holders |
+| end a tracked holder | O(1) |
+| destroy or move an owner | O(1) check |
+| no operation | performs a global lookup (an address-keyed table) |
+
+Today's runtime meets none of the tier-D lines (it allocates objects and paths, and every operation is a table
+lookup). Meeting them is phase 3. Under phase 3's path (a) (the path table kept for conflicts among tier-D
+holders), the write line is "O(h), amortised, may allocate" until counts and holder lists in the owner replace it;
+the contract is published with that line marked provisional.
+
+## 15. Where the tiers meet (the review's first risk, made concrete)
+
+A frame-held reference and a reference kept in data can point into the same owner: a `tracked` parser holds a view
+of `s`, and a tier-S function is then passed `&mut s`. The tier-S promise survives only if the boundary is drawn
+so that tier-S code never maintains state and checks at most a word. The rule:
+
+1. **Escape is visible in signatures.** A reference reaches tier D only by a store into a tier-D place: a field of
+   a `tracked` aggregate, an element of a container of references, a captured-and-kept closure, a lent thread. A
+   function may store a reference *parameter* into such a place only if the parameter is declared `tracked`
+   (`fn Parser::reset(ref<Parser, exclusive> p, tracked StringView text)`). So a call site knows, from the callee's
+   signature alone, which of its arguments escape: the check stays modular (the review's demand), and a function
+   that keeps your reference says so, as C#'s `scoped` says the opposite.
+2. **An owner records only that tier-D holders exist.** When a reference rooted in an owner escapes into tier D,
+   the owner's storage is marked (one word in the owner's heap block, so `sizeof` is unchanged; phase 3 turns the
+   mark into the holder count of §13 row 3). Tier-S operations never write the mark.
+3. **Tier S checks the mark only where the frame cannot know it is clear.** The static pass knows, for every root
+   in a frame, whether a reference rooted in it may have escaped: a local owner none of whose references was
+   passed to a `tracked` parameter or stored into tier D is clear by construction, and an exclusive reference is
+   clear by definition (forming it checked). The remaining case, forming a borrow from an owner reached through a
+   shared reference or through tier-D data, reads the mark: one load and one compare, then the tier-D slow path if
+   set. Writes go through a borrow or the owner's own binding, so they are covered by the same check.
+4. **Within a frame, an escaped root is tier D for the rest of the frame.** After `Parser::reset(&mut p,
+   as_view(&s))`, accesses to `s` in that frame that could conflict with `p`'s view are checked dynamically (the
+   static pass cannot see `p`'s later ends), at tier D's price. This is the one place a frame-held access pays
+   tier-D cost, and the source shows why: `s` was given to a `tracked` parameter in that frame.
+
+What this keeps: csvstat and most of cbc never pass a reference to a `tracked` parameter, so they pay nothing.
+What it costs: a keyword on the few parameters that store references (`std`'s readers' constructors, cbc's
+`Decl` builders), and a load and compare on borrows formed through shared references to owners whose state is not
+known. Both are visible in the source.
+
+Open, to settle in the rule text: a shared reference parameter that the callee only reads cannot let a reference
+escape, so the check in point 3 is needed only when the owner was reached through tier-D data or through a
+shared reference whose callee is not known to be read-only; whether `shared` parameters should be read-only
+toward tier D by rule (as D-0218 made shared references read-only) would remove the check for every ordinary
+`ref<T, shared>` parameter.
+
+## 16. Step 1 results (2026-10-25) and the decisions they settle
+
+Measured with `stress/d0281/cost/tiers.py` (each generated function classified by the types it names; runtime cost
+from callgrind, callbacks into generated code excluded) and `rows.py` (the conformance cases expecting a dynamic
+tracking fault). Details in `stress/d0281/cost/NOTES.md`.
+
+| program | bookkeeping, share of all instructions | of which tier S | generated code itself |
+|---|---|---|---|
+| `cbc` compiling tinyos | 76.8% | 65.8% | 3.9% |
+| csvstat | 66.2% | 66.2% | 15.2% |
+| extsort | 68.1% | 68.1% | 14.5% |
+| wordpar | 76.9% | 60.9% (76.9% under scoped lending) | 11.5% |
+
+- The runtime's bookkeeping is two-thirds to three-quarters of every program measured, and the code the program
+  itself compiles to is 4–15%. This is the cost the sentence in §1 describes, quantified.
+- **Tier S is almost all of it.** The text programs name no tier-D type at all. `cbc`'s tier D (11% of its
+  instructions, 155 of 7,250 functions) is mostly `Vec<StringView>` and `Drain<StringView>` from `lines`/`split`,
+  then two declaration records holding views.
+- **Phase 2's bound:** without tier-S bookkeeping `cbc` needs 2.9 times fewer instructions on tinyos (11 times
+  `cobc` instead of 15–45); without all bookkeeping 4.4 times (7.4 times `cobc`, inside D-0276's working bound of
+  10). The text programs gain about 3 times.
+- **Conformance:** of 103 dynamic tracking-fault cases, 42 are tier S, each decided by the call-site rule and
+  liveness or by a stateless point check (§13); 61 are tier D and stay dynamic.
+
+Decisions (the owner delegated them, 2026-10-25):
+
+1. **Phase 2 is the work, first.** The tier-S/tier-D model of §7 with the boundary of §15 is the design basis.
+2. **Scoped lending** (§13 row 6): a reference passed to a spawned thread is tier S when the thread's handle is
+   joined in the lending frame; otherwise the lending makes its root tier D.
+3. **Closures** passed and called are tier S; a closure kept in data is tier D through the type that keeps it.
+4. **Lazy `lines`/`split`/`chars`** (their own change record, phase 1): they remove most of `cbc`'s tier D.
+5. **Granularity:** element granularity is kept (phase 3 path (a)); coarser exclusivity is not proposed.
+6. **O5** (no stored references) stays open, to be decided on phase 1's `tracked` counts.
+7. **Next step: the static tier-S checker as a report** in the shared Rust front end (D-0278): it classifies each
+   reference binding by §7 and reports, without rejecting anything, every program the tier-S rules would reject.
+   Run over the positive conformance cases, `std`, the showcase and the self-hosted tools, it measures the
+   expressiveness cost (the review's hidden risk) before any rule is normative.
+
+## 17. Step 2 results (2026-10-25): the static pass as a tier-S checker, and access summaries
+
+The shared front end's static pass was given a report mode (`COBALTC_TIER_REPORT`, nothing rejected or changed
+otherwise) and, in that mode, the rules a tier-S checker needs beyond its refutation-only model: origins inherited
+for every reference binding (97% of 8,728 bindings that had none), copied views keeping their borrows, and the
+call-site rule of §7. Results (`stress/d0281/cost/NOTES.md`):
+
+- **Undecided checks: none** in 15,700 function bodies. Branch-dependent borrows do not occur in the corpus.
+- **The acceptance test:** of the 42 tier-S fault cases, 29 are now rejected statically. The 13 left are other
+  rules, not the call-site rule: resource overwrite (3, definite-initialisation and a discriminant point check),
+  index- and range-dependent overlap (3, point checks), an `Atomic` copied out through a shared reference (1, a
+  type rule), evaluation order and stale element writes (3), and destroy or move while a reference lives (3,
+  liveness at the destroying operation).
+- **False rejections: 15 functions.** Three are exemptions the dynamic rules already make and the static rule must
+  copy (`swap` of a place with itself; an empty view of the string appended to it). Twelve, all in `cbc`, are one
+  pattern: a shared reference into one part of `*g` lives while `g` is passed exclusively to a callee that never
+  touches that part. CobaltC checks conflicts at use (D-0018), so these are correct programs; Rust would reject them.
+
+**Decision: access summaries.** A modular rule that sees only parameter types must treat an exclusive argument as
+reaching all of its referent, which rejects correct programs that CobaltC's use-time semantics accepts. Each
+function therefore gets an **access summary**: for each reference parameter, the projections it may read and may
+write (directly or through calls), computed bottom-up over the call graph to a fixed point (recursion converges:
+the summaries are finite sets of field paths, cut at indices). The call-site rule checks a live holder against the
+callee's summary instead of the whole referent. This keeps CobaltC's use-time semantics statically, which is an
+advantage over borrow-time checking, at the cost of modularity of the *rule* (a change in a callee's body can change
+what its callers may hold across the call). Mitigations: the whole program is compiled together already; the
+summaries are printed by a tool (`cobc --explain-access FN`) and named in the diagnostic ("`ctype` may write
+`g.types`, `g.defined`; `sd` borrows `g.prog`"); for `--lib` (D-0257) an exported function's summary is part of its
+interface and is written beside its header.
+
+**Next (step 3):** the tier-S checker proper, as its own module over the static pass's facts, proof-sound by
+construction (every way a fact may end is justified for proof, not only for refutation): access summaries; the
+point-check forms (index, range, discriminant) emitted where overlap depends on data; the self-swap and empty-range
+exemptions; liveness at destroy and move. Its tests: the 42 cases rejected or point-checked, the corpus accepted
+with no false rejection, and the 529 static and 225 dynamic conformance rows unchanged in outcome.
+
+## 18. Step 3 results (2026-10-26): the tier-S checker passes its tests in report mode
+
+The rules of §7, §13 and §17 were built into the shared static pass behind `COBALTC_TIER_REPORT` (nothing
+changes otherwise; verified by the coby suites and the compiled conformance suite). Against its two fixed tests:
+
+- **All 42 tier-S fault cases are handled:** 36 rejected at compile time, 6 decided by point checks (4 value-state
+  tests, 2 range/index compares). None needs tracking state.
+- **No false rejection** across the positive conformance cases, `std`, the showcase, the examples and the
+  self-hosted tools (15,709 function bodies, 265,000 conflict checks), and no undecided check.
+- **Point checks are cheap and rare where they are about aliasing:** about 16 sites in the corpus compare two
+  indices or ranges. The other 2,714 are value-state tests the generated code makes on the value itself (the old
+  value of a resource place when it is overwritten; whether a `fn` value was moved from), which need no tracking.
+
+The rules that made the difference, beyond §7: access summaries (§17); a callee's unused exclusive parameter still
+lives for the call (pairwise arguments meet the other's whole referent); `std` types and trusted code are opaque
+(their functions reach a parameter whole, in its declared mode); writes through a shared parameter are interior
+mutability and stay shared; a non-exclusive match binder is shared; liveness follows D-0111's last use, with
+loop-declared bindings fresh each iteration; a call's result is rooted in its first reference argument (D-0011,
+D-0088); an assignment's place is found before its value (D-0007); moving out through a reference and keeping a
+view of a temporary are always errors.
+
+**Decision:** the checker is the basis for the rule text and for phase 2. Next (step 4): (a) write the tier-S rules
+as normative text (`spec/08`, `spec/10`, `spec/14` §6, new `conf.` rows: the 36 tier-S faults become static
+`diag.*` rows, the 6 point checks stay dynamic); (b) make the checker a real pass (not report-only) for functions
+in tier S, with the diagnostics naming both accesses and the callee's summary; (c) in `cobc`, lower a tier-S
+function with no bookkeeping (no objects, paths, scopes, frames), emitting only point checks, and measure
+csvstat, extsort, wordpar and `cbc`; (d) the `cost.` rows of §9. The self-hosted toolchain follows at the phase
+boundary (D-0278).
+
+## 19. Step 4, first part (2026-10-25): the tier-S rules are normative (D-0282, CHG-0373)
+
+The checker of §18 is on in both tools, not only in report mode: `rule.control.frame-references` (`spec/14` §6)
+states it (holders, inherited facts, liveness, access summaries, the call-site rule, element accesses,
+evaluation order, moving out through a reference, views of temporaries). The access summaries are kept in
+`Items` (no address-keyed cache) and computed to convergence (no round limit). Diagnostics name the callee and
+what it does: "`set` writes `*r` through argument 1 while `s` still borrows `*r`".
+
+- Conformance: 38 cases rejected statically that faulted at run time (the 36 of §18 and two that the report
+  counted as tier D: a thread-lent `Vec` and a `Box` moved while its contents are borrowed); four new cases keep
+  the run-time mechanisms (unwinding, growth fault, dual-body entry test, overlapping slices) with
+  value-dependent overlap. No positive case changed.
+- Book chapter 7 and the guide (§08, §14, the Rust chapter) now say that conflicts across calls are found before
+  the run, and show the run-time form with computed indexes.
+
+Open before step 4c (the lowering without tracking), recorded in `stress/d0281/cost/NOTES.md`: the `through`
+exclusion in the call-site rule is wider than it must be (a hole once tracking is gone), and a point check at a
+call decides at the call what the runtime decides at the callee's use (fault position and eagerness).
+
+## 20. Step 4c plan: lowering tier S with no tracking
+
+What cobc does today (mapped 2026-10-25, `impl/cobc/src/lower/`): every body opens a root frame. Statement and
+block scopes are marker lines that `resolve_scopes` (`passes.rs`) turns into runtime calls only when something
+records into them. Objects get `cb_new`/`cb_bind`, references carry tokens, accesses call `cb_read`/`cb_write`.
+Destructors run only from the runtime, through the per-type descriptor table (`CbType.drop`), when a frame or
+statement scope pops. Objectless locals (D-0199/D-0200, `analysis_strings.rs`) are dropped by generated code at
+scope exits and early exits (`Cleanup::Drop`), with `mvN` flags for moves, but still through `cb_drop_local`.
+They are cleaned up after a fault only on contained (spawned-thread) faults, via `cb_nt` notes. Borrows of an
+objectless local are token 0. The dual, frozen and direct bodies (D-0188, CHG-0237, D-0209) drop parameter
+checks only.
+
+The form to build (`untracked` body), in order, each step measured on csvstat, extsort, wordpar and `cbc`:
+
+1. **Eligibility.** A program whose reachable functions name no tier-D type (the three text programs) is lowered
+   whole with the untracked form. That needs no boundary: the §15 mark comes with the mixed case, step 5.
+2. **Locals.** Every local is objectless. A reference is a bare pointer with token 0, which the natives already
+   accept. A move clears an `mv` flag. The uses the objectless analysis now refuses (bare paths, captures, `&x[i]`,
+   `drop(x)`) are fine: D-0282 has decided their conflicts.
+3. **Destruction.** Generated code calls the type's drop function directly at scope exits, early exits and
+   overwrites, in `[Block-Exit]` order. Statement temporaries get the same at their statement's end. A fault
+   unwinds through the `cb_nt` notes, made unconditional (the main thread too), so `[Fault-Unwind]` still runs
+   destructors.
+4. **Checks kept.** Bounds, overflow, stack and fault positions (`cb_at`) stay as they are. The point checks:
+   index/range compares at calls and element accesses, a value test for a resource overwrite or an emptied `fn`
+   value, and a local flag for a fact `?`. Open question, to be decided with coby: a point check at a call
+   decides at the call, using the callee's summary, what the runtime decides at the callee's first use (§19).
+5. **Mixed programs.** Tier D stays tracked. An owner a tier-D reference may reach is marked (§15), and a
+   tier-S function checks the mark only where its frame cannot know it is clear.
+
+Soundness gate before any of it ships: run the generated corpora (77k model programs, the fuzz corpus) under
+coby with full tracking, and require that no fault occurs at an access D-0282 left unchecked in tier S, apart
+from the point checks it counted.

@@ -667,9 +667,11 @@ fn conf_temp_borrow_argument() {
 
 #[test]
 fn conf_temp_borrow_escape_stale() {
-    expect_diag_dynamic_only(
+    // D-0282: a reference into a temporary kept past its statement is
+    // refuted before the run, as D-0135 names it.
+    expect_diag_static(
         "fn first(ref<Vec<i32>, shared> v) : Option<ref<i32, shared>> { if (Vec::len(v) == 0) { None } else { Some(Vec::index_shared(v, 0)) } } fn make() : Vec<i32> { Vec<i32> v = Vec::new(); Vec::push(&mut v, 42); v } fn main() { Option<ref<i32, shared>> o = first(&make()); match (o) { Some(r) : { i32 k = *r; }, None : {}, } }",
-        "diag.stale-binding",
+        "diag.destroy-while-aliased",
     );
 }
 
@@ -855,11 +857,12 @@ fn conf_move_through_reference_rejected() {
 
 #[test]
 fn conf_move_through_param_rejected() {
-    expect_diag_dynamic_only(
+    // D-0282: moving out through a reference is refuted before the run.
+    expect_diag_static(
         "fn take(ref<String, exclusive> r) : String { *r } fn main() { String x = String::from_str(\"a\"); String y = take(&mut x); }",
         "diag.move-while-aliased",
     );
-    expect_diag_dynamic_only("fn dup<T>(ref<T, shared> r) : T { *r } fn main() { String x = String::from_str(\"a\"); String y = dup(&x); }", "diag.move-while-aliased");
+    expect_diag_static("fn dup<T>(ref<T, shared> r) : T { *r } fn main() { String x = String::from_str(\"a\"); String y = dup(&x); }", "diag.move-while-aliased");
     // A plain value through a reference is copied, as ever.
     expect_true_with("fn get<T>(ref<T, shared> r) : T { *r }", "{ i32 x = 4; i32 y = get(&x); x + y == 8 }");
 }
@@ -1629,18 +1632,25 @@ fn ex_e2e_vec_realloc_stale_ref() {
     // reallocating `push` reached through a reference *parameter* --
     // invisible to `rule.control.flow-analysis`/`rule.temporal.ref-
     // escape` (their facts are defined only over a plain binding's own
-    // projections), so this is a genuinely dynamic-only rejection; no
-    // static assertion is expected or attempted here.
-    expect_diag(
+    // projections). D-0282 relates them at the call (`Vec::push` writes
+    // `*v` while `r` borrows it), so the frame-held form is refuted before
+    // the run; kept in a struct (tier D), the reference is the run's to
+    // check, and the reallocation makes it stale.
+    expect_diag_static(
+        "fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32 { auto r = Vec::index_shared(&*v, 0); Vec::push(v, 20); *r } fn main() { Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); hold_across_grow(&mut v); }",
+        "diag.aliasing-conflict",
+    );
+    expect_diag_dynamic_only(
         r#"
+        struct Held { ref<i32, shared> r; }
         fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32
         {
-            auto r = Vec::index_shared(&*v, 0);
+            Held h = Held { .r = Vec::index_shared(&*v, 0) };
             Vec::push(v, 20);
             Vec::push(v, 30);
             Vec::push(v, 40);
             Vec::push(v, 50);
-            *r
+            *h.r
         }
         fn main()
         {
@@ -1751,14 +1761,21 @@ fn ex_e2e_vec_pop_push_reuse_stale_ref() {
     // → `conf.e2e-vec-pop-push-reuse-stale-ref` (closes finding F-05,
     // `CHG-0019`: `Vec::pop` releases its slot for every element type,
     // so the reused slot's hazard is caught dynamically, never silent).
-    expect_diag(
+    // D-0282: kept in a struct (tier D), as the frame-held form is refuted
+    // before the run.
+    expect_diag_static(
+        "fn hazard(ref<Vec<i32>, exclusive> v) : i32 { auto r = Vec::index_shared(&*v, 2); Vec::pop(v); *r } fn main() { Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); hazard(&mut v); }",
+        "diag.aliasing-conflict",
+    );
+    expect_diag_dynamic_only(
         r#"
+        struct Held { ref<i32, shared> r; }
         fn hazard(ref<Vec<i32>, exclusive> v) : i32
         {
-            auto r = Vec::index_shared(&*v, 2);
+            Held h = Held { .r = Vec::index_shared(&*v, 2) };
             Vec::pop(v);
             Vec::push(v, 99);
-            *r
+            *h.r
         }
         fn main()
         {
@@ -4104,8 +4121,11 @@ fn flow_merge_and_loop_unknowns() {
         "fn f(ref<i32, exclusive> r, bool c) { i32 z = 0; ref<i32, shared> a = &z; if (c) { a = &*r; } *r = 1; i32 y = *a; } fn main() { i32 x = 1; f(&mut x, true); }",
         "diag.aliasing-conflict",
     );
-    // Two paths the body cannot relate (D-0022): never refuted.
-    expect_diag_dynamic_only("fn f(ref<i32, exclusive> a, ref<i32, shared> b) : i32 { *a = 1; *b } fn main() { i32 x = 0; f(&mut x, &x); }", "diag.aliasing-conflict");
+    // Two paths the body cannot relate (D-0022) are related at the call by
+    // `f`'s access summary (D-0282): refuted before the run.
+    expect_diag_static("fn f(ref<i32, exclusive> a, ref<i32, shared> b) : i32 { *a = 1; *b } fn main() { i32 x = 0; f(&mut x, &x); }", "diag.aliasing-conflict");
+    // Two computed elements: only the values relate them.
+    expect_diag_dynamic_only("fn f(ref<i32, exclusive> a, ref<i32, shared> b) : i32 { *a = 1; *b } fn main() { array<i32, 2> v = [0, 0]; usize i = 1; usize j = i * 1; f(&mut v[i], &v[j]); }", "diag.aliasing-conflict");
 }
 
 // D-0071: `deriv` through referent roots, match-by-reference binders,
@@ -4335,7 +4355,8 @@ fn raw_write_through_rawptr_of_local_is_visible() {
 
 #[test]
 fn drop_through_reference_rejected() {
-    expect_diag_body("Vec<i32> v = Vec::new(); auto r = &mut v; drop(*r);", "diag.destroy-while-aliased");
+    // D-0282: moved out through a reference, refuted before the run.
+    expect_diag_static("fn main() { Vec<i32> v = Vec::new(); auto r = &mut v; drop(*r); }", "diag.move-while-aliased");
 }
 
 #[test]

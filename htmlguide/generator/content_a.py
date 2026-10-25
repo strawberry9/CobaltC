@@ -657,27 +657,48 @@ fn main()
     *r1 = 2;
 }
 """, title="An exclusive borrow excludes everything", expect="diag.aliasing-conflict", section="s08", slug="excl-blocks-shared")
-b += p("""Borrows in one argument list are all formed before the call holds any of them, so passing
-two conflicting references to the same storage is accepted at the call. The conflict is reported at
-the first access inside the function that meets both, the point where it actually matters.""")
+b += p("""The checker knows what each function does through each of its reference parameters: which
+fields it may read and which it may write, worked out from the function's body and the functions it
+calls. So a call that passes two references to the same storage, where the function writes through
+one while the other is in use, is rejected at the call, and the diagnostic says what the function
+does through which argument.""")
 b += code("""
 fn set_then_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
 {
-    *a = 1;                           // ✗ diag.aliasing-conflict (dynamic): b reaches the same i32
+    *a = 1;
     *b
 }
 
 fn main()
 {
     i32 x = 0;
-    set_then_read(&mut x, &x);        // accepted here; each borrow formed while the other was not yet held
+    set_then_read(&mut x, &x);        // ✗ diag.aliasing-conflict: set_then_read writes x through argument 1
 }
 """, title="Two references to one variable in a call", expect="diag.aliasing-conflict", section="s08", slug="overlapping-args")
 b += p("""Most conflicts are reported before the program runs, marked `(static)`: whenever the
-function body itself shows that a conflicting reference is certainly live. That covers a borrow held
-in a variable, a reborrow through a reference or a guard (`&*r`, `&r.f`), the binder of a
-`match (&e)` arm, and the arguments a thread was spawned with, until `join`. What one body cannot
-see, like the call above, is reported when the conflicting access runs, marked `(dynamic)`.""")
+program's text shows that a conflicting reference is live. That covers a borrow held in a variable, a
+reborrow through a reference or a guard (`&*r`, `&r.f`), the binder of a `match (&e)` arm, the
+arguments a thread was spawned with, until `join`, and what a called function does through its
+parameters. What only the values decide (two elements of one array chosen by computed indexes) and
+references kept inside data structures are checked when the conflicting access runs, marked
+`(dynamic)`.""")
+b += code("""
+import std;
+
+fn set_then_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
+{
+    *a = 1;                           // ✗ diag.aliasing-conflict (dynamic) when i == j
+    *b
+}
+
+fn main()
+{
+    array<i32, 2> v = [0, 0];
+    usize i = 1;
+    usize j = i * 1;
+    set_then_read(&mut v[i], &v[j]);  // accepted: only the values say whether they meet
+}
+""", title="Two elements chosen at run time", expect="diag.aliasing-conflict", section="s08", slug="overlapping-elements")
 b += code("""
 struct Counter
 {

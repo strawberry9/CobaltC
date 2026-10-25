@@ -10,6 +10,7 @@ mod ast;
 mod compare;
 mod enumerate;
 mod explore;
+mod frames;
 mod machine;
 mod parse;
 mod print;
@@ -18,7 +19,7 @@ mod statics;
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: cobmodel check [--literal-dead] [--as-licensed [--pre-d0236] [--pre-d0243]] [--witness] FILE...\n       cobmodel enum --size N --out DIR [--max K]\n       cobmodel compare DIR --coby PATH --cobc PATH [--explore N] [--cc CC]... [--jobs J]");
+    eprintln!("usage: cobmodel check [--literal-dead] [--as-licensed [--pre-d0236] [--pre-d0243]] [--pre-d0282] [--witness] FILE...\n       cobmodel statics [--pre-d0282] FILE...\n       cobmodel enum --size N --out DIR [--max K]\n       cobmodel compare DIR --coby PATH --cobc PATH [--explore N] [--cc CC]... [--jobs J]");
     ExitCode::from(2)
 }
 
@@ -43,6 +44,10 @@ fn main() -> ExitCode {
                 }
                 if f == "--pre-d0236" {
                     statics::PRE_D0236.store(true, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                if f == "--pre-d0282" {
+                    statics::PRE_D0282.store(true, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 if f == "--pre-d0243" {
@@ -99,10 +104,37 @@ fn main() -> ExitCode {
             ExitCode::from(status)
         }
         "trace" => trace_main(&args[1..]),
+        "statics" => statics_main(&args[1..]),
         "enum" => enumerate::main(&args[1..]),
         "compare" => compare::main(&args[1..]),
         _ => usage(),
     }
+}
+
+// `cobmodel statics [--pre-d0282] FILE...`: each program's static verdict
+// alone, `ok` or the first finding (`diag (static) line N`), without the
+// exploration -- for comparing with `coby --check` over a large corpus.
+fn statics_main(args: &[String]) -> ExitCode {
+    let mut status = 0;
+    for f in args {
+        if f == "--pre-d0282" {
+            statics::PRE_D0282.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let prog = match std::fs::read_to_string(f).map_err(|e| e.to_string()).and_then(|s| parse::parse(&s).map_err(|e| e.to_string())) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}: {}", f, e);
+                status = 2;
+                continue;
+            }
+        };
+        match statics::check(&prog).first() {
+            Some(e) => println!("{}: {} (static) line {}", f, e.diag, e.line),
+            None => println!("{}: ok", f),
+        }
+    }
+    ExitCode::from(status)
 }
 
 // D-0270: `cobmodel trace FILE [--out TRACE] [--max N]`: one run of the

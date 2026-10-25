@@ -63,7 +63,11 @@ shared path, out of a function.
   the transfer table (with D-0236's forgetting) and the discharge table as
   written, recording for each statement which bindings' accesses it proves
   as well as which it refutes; `rule.temporal.ref-escape`;
-  `[Ref-Binding-Last-Use]`. The first finding in source order is the outcome.
+  `[Ref-Binding-Last-Use]`; and `rule.control.frame-references` (D-0282,
+  `src/frames.rs`): access summaries to a fixed point, inherited facts,
+  lexical liveness, the call-site rule, element accesses, evaluation order
+  and moving out through a reference, refuting only. The first finding in
+  source order is the outcome.
 - **Dynamic rules** (`src/machine.rs`): `Σ` as `spec/04` gives it — objects,
   access paths with base, mode, thread, frame and statement scope, holders
   derived from storage (D-0215); `[Read]`, `[Write]`, `[Borrow]`, `clash` with
@@ -122,6 +126,11 @@ the tools; the model follows the text on each.
         unescaped). Over `sample/` --as-licensed reports none; with
         --pre-d0236 eleven (nine enumerated programs and the fourth
         review's two hand-written ones), with --pre-d0243 one (`hand-k02`).
+
+    cobmodel statics [--pre-d0282] FILE...
+        Each program's static verdict alone (`ok`, or the first finding),
+        without the exploration; --pre-d0282 leaves out
+        `rule.control.frame-references` (also accepted by `check`).
 
     cobmodel enum --size N --out DIR [--max K] [--random M --len L --seed S]
         Every well-scoped program of up to N statements over the alphabet in

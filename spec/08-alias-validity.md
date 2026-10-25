@@ -1,7 +1,7 @@
 # CobaltC Alias-Validity and Concurrent Access
 
 Status: normative artifact
-Version: 1.7.2
+Version: 1.8.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.alias.*`)
 Governed by: `CobaltC_Master_Instructions.md` §6, §17 (Aliasing and
 Concurrent Access), §23
@@ -47,7 +47,7 @@ and (with authority) destroy. A path's mode is fixed at formation.
         side-conditions:
             ⟦ temporally-valid(a0, Σ) ⟧ discharge: static (rule.control.flow-analysis; dynamic where unknown)
             ⟦ m = exclusive ⇒ mode(a0,Σ) = exclusive ⟧ discharge: static
-            ⟦ ¬clash(a0, m, Σ) ⟧ discharge: static (rule.control.flow-analysis; dynamic where unknown)
+            ⟦ ¬clash(a0, m, Σ) ⟧ discharge: static (rule.control.flow-analysis, rule.control.frame-references; dynamic where unknown)
 
     [Borrow-Stale]            disposition: checked   ¬temporally-valid(a0, Σ)                    ⟨borrow(a0, m), Σ⟩ ↛ diag.stale-binding
     [Borrow-Exceeds-Source]   disposition: rejected  m = exclusive ∧ mode(a0,Σ) = shared         ill-formed; diag.borrow-exceeds-source
@@ -295,6 +295,7 @@ did not hold.
 
 ## Change Log
 
+- 1.8.0 — `CHG-0373` (D-0282): `[Borrow]`'s `¬clash` side-condition is also discharged by `rule.control.frame-references` (spec/14 §6), which refutes conflicts of frame-held references across calls before the run.
 - 1.7.2 — `CHG-0342`: §4's closing paragraph: the arrival test is made at the entry, after every argument. Clarification.
 - 1.7.1 — `CHG-0306` (D-0249): `rule.alias.read-through-shared`'s prose names `Atomic` as the second route. Clarification.
 - 1.7.0 — `CHG-0294` (D-0242): §1's `pending` and §4's projection bullet: a path formed for one access is pending until it.

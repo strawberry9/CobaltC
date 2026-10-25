@@ -8,13 +8,18 @@
 //   written, for the constructs of the fragment;
 // - `rule.temporal.ref-escape` (`spec/10`);
 // - `[Ref-Binding-Last-Use]` (`spec/14` §1, D-0111, D-0133): which
-//   statement each local holding a reference ends after.
+//   statement each local holding a reference ends after;
+// - `rule.control.frame-references` (`spec/14` §6, D-0282): inherited
+//   facts, the call-site rule with the access summaries of `frames.rs`,
+//   element accesses, evaluation order and moving out through a reference,
+//   over the same state, after the flow analysis; it only refutes.
 //
 // Where two static diagnostics apply, the first in source order is the one
 // reported (D-0110). The analysis is intraprocedural; each function body
 // is analysed on its own, helpers included.
 
 use crate::ast::*;
+use crate::frames::{self, Positions, Summaries, PK};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +52,8 @@ pub static PRE_D0236: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 // `--pre-d0243`: the closure row as it stood before D-0243, a captured
 // reference binding left unescaped.
 pub static PRE_D0243: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// `--pre-d0282`: without `rule.control.frame-references`.
+pub static PRE_D0282: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Statics {
     pub fn first(&self) -> Option<&StaticErr> {
@@ -116,6 +123,10 @@ struct Flow {
     valid: BTreeMap<String, Tri>,
     escaped: BTreeMap<Root, Tri>,
     deriv: BTreeMap<(String, SPlace, Mode), Tri>,
+    // D-0282: the facts a frame-held reference inherits where the rows
+    // above form none. They join and end as `deriv` facts do; no discharge
+    // of the flow analysis reads them.
+    inh: BTreeMap<(String, SPlace, Mode), Tri>,
     // No path reaches this point: it follows a `break` or `continue` in its
     // block, and a join ignores it.
     dead: bool,
@@ -142,6 +153,10 @@ impl Flow {
         for k in keys {
             r.deriv.insert(k.clone(), join_tri(*self.deriv.get(&k).unwrap_or(&Tri::F), *o.deriv.get(&k).unwrap_or(&Tri::F)));
         }
+        let keys: BTreeSet<_> = self.inh.keys().chain(o.inh.keys()).cloned().collect();
+        for k in keys {
+            r.inh.insert(k.clone(), join_tri(*self.inh.get(&k).unwrap_or(&Tri::F), *o.inh.get(&k).unwrap_or(&Tri::F)));
+        }
         r
     }
     // D-0236 "Forgetting": a holder's facts cleared because it ends, is
@@ -167,24 +182,30 @@ impl Flow {
         self.clear_holder(h);
     }
     fn clear_holder(&mut self, h: &str) {
-        for (k, v) in self.deriv.iter_mut() {
+        for (k, v) in self.deriv.iter_mut().chain(self.inh.iter_mut()) {
             if k.0 == h {
                 *v = Tri::F;
             }
         }
     }
     fn clear_referent(&mut self, q: &str) {
-        for (k, v) in self.deriv.iter_mut() {
+        for (k, v) in self.deriv.iter_mut().chain(self.inh.iter_mut()) {
             if k.1.root == Root::Deref(q.to_string()) {
                 *v = Tri::F;
             }
         }
+    }
+    // A holder's facts for D-0282: its `deriv` facts and those it inherited,
+    // each with its value where not F.
+    fn holder_facts(&self, h: &str) -> Vec<(SPlace, Mode, Tri)> {
+        self.deriv.iter().chain(self.inh.iter()).filter(|(k, v)| k.0 == h && **v != Tri::F).map(|(k, v)| (k.1.clone(), k.2, *v)).collect()
     }
 }
 
 struct Binding {
     ty: Ty,
     block: usize, // the declaring block's number
+    id: usize,    // its number in `Positions` (usize::MAX: none)
 }
 
 struct Cx<'a> {
@@ -219,6 +240,13 @@ struct Cx<'a> {
     // body's entry, and the facts at each `break` and `continue` joined
     // (§5's edges to the loop's exit and its test).
     loops: Vec<(usize, Flow, Flow)>,
+    // D-0282: the program's access summaries, this body's source positions,
+    // and each frame-held reference bound as a copy of another: the one it
+    // copies, followed back to the first (`a copy of a reference carries the
+    // same path`).
+    sums: &'a Summaries,
+    pos: Positions,
+    copies: HashMap<String, String>,
 }
 
 // How an expression is used: read for its value, or as a place to write
@@ -512,8 +540,12 @@ impl<'a> Cx<'a> {
                 }
             }
             // `v[k]` is not a call (D-0238): an element access, which the
-            // analysis does not check (D-0221); the binding is used.
-            Expr::Index(v, _) => self.use_binding(fl, v, line),
+            // flow analysis does not check (D-0221); the binding is used.
+            // D-0282 checks it against the frame-held references.
+            Expr::Index(v, k) => {
+                self.use_binding(fl, v, line);
+                self.element_access(fl, e, v, *k, u, line);
+            }
             Expr::Deref(a) => self.rvalue(fl, a, line),
             Expr::Field(a) => {
                 if matches!(self.place_ty(a, Use::Read), Some((Ty::Hold, _))) && !matches!(&**a, Expr::Deref(_)) {
@@ -638,8 +670,12 @@ impl<'a> Cx<'a> {
                     if let Some(pt) = params.get(i) {
                         self.check_arg(pt, a, line);
                         self.consume_resource(fl, pt, a, line);
+                        if pt.is_resource() {
+                            self.move_out(a, line);
+                        }
                     }
                 }
+                self.call_site(fl, e, f, args, line, holder);
             }
             Expr::Spawn(f, args) => {
                 let Some(func) = self.prog.func(f) else {
@@ -687,6 +723,9 @@ impl<'a> Cx<'a> {
                     if let Some(pt) = params.get(i) {
                         self.check_arg(pt, a, line);
                         self.consume_resource(fl, pt, a, line);
+                        if pt.is_resource() {
+                            self.move_out(a, line);
+                        }
                     }
                 }
                 if let Some(h) = holder {
@@ -718,6 +757,7 @@ impl<'a> Cx<'a> {
                 self.rvalue(fl, a, line);
                 self.check_arg(&ht, a, line);
                 self.consume_resource(fl, &ht, a, line);
+                self.move_out(a, line);
             }
             Expr::Slice(m, v, lo, hi) => {
                 // `[Slice-Form]`: `&_m v[lo .. hi]` borrows v's range; through
@@ -850,14 +890,16 @@ impl<'a> Cx<'a> {
         let mut parents = HashMap::new();
         let mut next = 0;
         number_blocks(&c.body, None, &mut next, &mut parents);
-        let mut cx = Cx::new(self.prog, format!("$clo{}", c.id), parents, c.ret.clone());
+        let pos = Positions::of(&c.caps, &c.body);
+        let mut cx = Cx::new(self.prog, self.sums, pos, format!("$clo{}", c.id), parents, c.ret.clone());
         let mut fl = Flow::default();
         for x in &c.caps {
             let Some(t) = self.ty_of(x) else { continue };
             if let Ty::Ref(..) = t {
                 cx.referent.insert(x.clone(), None);
             }
-            cx.binds.entry(x.clone()).or_default().push(Binding { ty: t, block: 0 });
+            let id = cx.binds.len();
+            cx.binds.entry(x.clone()).or_default().push(Binding { ty: t, block: 0, id });
             cx.regions[0].insert(x.clone());
             cx.caps.insert(x.clone());
             fl.valid.insert(x.clone(), Tri::T);
@@ -882,7 +924,7 @@ impl<'a> Cx<'a> {
         if fl.deriv.iter().any(|(k, v)| *v == Tri::T && k.1.root == root) {
             self.err(line, "diag.move-while-aliased", format!("`{}` is moved while borrowed", x));
         }
-        for (k, v) in fl.deriv.iter_mut() {
+        for (k, v) in fl.deriv.iter_mut().chain(fl.inh.iter_mut()) {
             if k.1.root == root {
                 *v = Tri::F;
             }
@@ -931,6 +973,7 @@ impl<'a> Cx<'a> {
                     self.err(line, "diag.duplicate-local", format!("`{}` is declared twice in one block", name));
                 }
                 self.rvalue_into(fl, init, line, Some(name));
+                self.move_out(init, line);
                 let it = self.value_ty(init);
                 let t = match (ty, it) {
                     (Some(t), Some(it)) => {
@@ -971,7 +1014,13 @@ impl<'a> Cx<'a> {
                 if matches!(t, Ty::Ref(..) | Ty::Slice(_)) && !matches!(init, Expr::Borrow(..) | Expr::Slice(..)) && !self.is_elided(init) {
                     self.escape_copied(fl, init);
                 }
-                self.binds.entry(name.clone()).or_default().push(Binding { ty: t, block });
+                let id = self.pos.decl.get(&(s as *const Stmt)).copied().unwrap_or(usize::MAX);
+                if self.d0282() {
+                    let inh = self.inherit(fl, init);
+                    let end = self.pos.stmt_end.get(&(s as *const Stmt)).copied().unwrap_or(0);
+                    self.bind_frame_held(fl, name, &t, init, inh, id, end, line);
+                }
+                self.binds.entry(name.clone()).or_default().push(Binding { ty: t, block, id });
                 if let Some(r) = self.regions.last_mut() {
                     r.insert(name.clone());
                 }
@@ -991,6 +1040,8 @@ impl<'a> Cx<'a> {
                     self.place(fl, place, Use::Write, line);
                 }
                 self.rvalue_into(fl, value, line, whole.as_deref());
+                self.move_out(value, line);
+                let inh = if self.d0282() && whole.is_some() { Some(self.inherit(fl, value)) } else { None };
                 if let (Some((pt, _)), Some(vt)) = (&pty, self.value_ty(value)) {
                     let ok = *pt == vt || matches!((pt, &vt), (Ty::Ref(a, Mode::Shared), Ty::Ref(b, _)) if a == b) || matches!((pt, &vt), (Ty::Slice(Mode::Shared), Ty::Slice(_)));
                     if !ok {
@@ -1041,7 +1092,15 @@ impl<'a> Cx<'a> {
                             }
                         }
                     }
+                    if let (Some(inh), Some(t)) = (inh, self.ty_of(&n)) {
+                        let id = self.binds.get(&n).and_then(|v| v.last()).map_or(usize::MAX, |b| b.id);
+                        let end = self.pos.stmt_end.get(&(s as *const Stmt)).copied().unwrap_or(0);
+                        self.bind_frame_held(fl, &n, &t, value, inh, id, end, line);
+                    }
                     fl.valid.insert(n, Tri::T);
+                }
+                if self.d0282() {
+                    self.eval_order(fl, place, value, line);
                 }
             }
             StmtKind::Expr(e) | StmtKind::Print(e) => {
@@ -1080,7 +1139,20 @@ impl<'a> Cx<'a> {
                         }
                     }
                 }
-                self.block(&mut a, some, Some((binder.clone(), bt, facts)));
+                // D-0282: a frame-held binder the row forms no fact for
+                // inherits the scrutinee's ("a `match` arm's binder stands for
+                // the scrutinee").
+                let mut inh = Vec::new();
+                self.copies.remove(binder);
+                if self.d0282() && facts.is_empty() && frame_held(&bt) {
+                    inh = self.inherit(fl, scrut).0;
+                    if let Expr::Var(o) = scrut {
+                        let root = self.copy_root(o);
+                        self.copies.insert(binder.clone(), root);
+                    }
+                }
+                let id = self.pos.decl.get(&(s as *const Stmt)).copied().unwrap_or(usize::MAX);
+                self.block(&mut a, some, Some(Pre { name: binder.clone(), ty: bt, facts, inh, id }));
                 let mut b = fl.clone();
                 self.block(&mut b, none, None);
                 *fl = a.join(&b);
@@ -1214,21 +1286,24 @@ impl<'a> Cx<'a> {
 
     // A block; `pre` is a pattern binder the block's region declares (a
     // `match` arm's), with the deriv facts it starts with.
-    fn block(&mut self, fl: &mut Flow, b: &Block, pre: Option<(String, Ty, Vec<(SPlace, Mode)>)>) {
+    fn block(&mut self, fl: &mut Flow, b: &Block, pre: Option<Pre>) {
         let me = self.next_block;
         self.next_block += 1;
         self.block_in(fl, b, me, pre);
     }
 
-    fn block_in(&mut self, fl: &mut Flow, b: &Block, me: usize, pre: Option<(String, Ty, Vec<(SPlace, Mode)>)>) {
+    fn block_in(&mut self, fl: &mut Flow, b: &Block, me: usize, pre: Option<Pre>) {
         self.regions.push(BTreeSet::new());
         let mut declared = Vec::new();
-        if let Some((n, t, facts)) = pre {
-            self.binds.entry(n.clone()).or_default().push(Binding { ty: t, block: me });
+        if let Some(Pre { name: n, ty: t, facts, inh, id }) = pre {
+            self.binds.entry(n.clone()).or_default().push(Binding { ty: t, block: me, id });
             self.regions.last_mut().unwrap().insert(n.clone());
             fl.valid.insert(n.clone(), Tri::T);
             for (sp, m) in facts {
                 fl.deriv.insert((n.clone(), sp, m), Tri::T);
+            }
+            for (sp, m, v) in inh {
+                fl.inh.insert((n.clone(), sp, m), v);
             }
             declared.push(n);
         }
@@ -1281,6 +1356,10 @@ impl<'a> Cx<'a> {
         }
         if let Some(t) = &b.tail {
             self.rvalue(fl, t, b.tail_line);
+            if me == 0 {
+                // a function's (or closure's) result
+                self.move_out(t, b.tail_line);
+            }
             if let Some(tt) = self.value_ty(t) {
                 let want = self.ret.clone();
                 let ok = tt == want || matches!((&want, &tt), (Ty::Ref(a, Mode::Shared), Ty::Ref(b, _)) if a == b);
@@ -1450,7 +1529,7 @@ fn number_blocks(b: &Block, parent: Option<usize>, next: &mut usize, parents: &m
 }
 
 impl<'a> Cx<'a> {
-    fn new(prog: &'a Program, fname: String, parents: HashMap<usize, Option<usize>>, ret: Ty) -> Cx<'a> {
+    fn new(prog: &'a Program, sums: &'a Summaries, pos: Positions, fname: String, parents: HashMap<usize, Option<usize>>, ret: Ty) -> Cx<'a> {
         Cx {
             prog,
             fname,
@@ -1469,6 +1548,9 @@ impl<'a> Cx<'a> {
             clo_owns: BTreeSet::new(),
             sub_types: HashMap::new(),
             loops: Vec::new(),
+            sums,
+            pos,
+            copies: HashMap::new(),
         }
     }
 }
@@ -1509,14 +1591,18 @@ fn free_names(c: &Clo, prog: &Program) -> BTreeSet<String> {
 
 pub fn check(prog: &Program) -> Statics {
     let mut all = Statics { errors: Vec::new(), ends: HashMap::new(), types: HashMap::new(), proven: HashMap::new() };
+    let sums = frames::summaries(prog);
     for f in &prog.funcs {
         let mut parents = HashMap::new();
         let mut next = 0;
         number_blocks(&f.body, None, &mut next, &mut parents);
-        let mut cx = Cx::new(prog, f.name.clone(), parents, f.ret.clone());
+        let names: Vec<String> = f.params.iter().map(|p| p.1.clone()).collect();
+        let pos = Positions::of(&names, &f.body);
+        let mut cx = Cx::new(prog, &sums, pos, f.name.clone(), parents, f.ret.clone());
         let mut fl = Flow::default();
         for (t, n) in &f.params {
-            cx.binds.entry(n.clone()).or_default().push(Binding { ty: t.clone(), block: 0 });
+            let id = cx.binds.len();
+            cx.binds.entry(n.clone()).or_default().push(Binding { ty: t.clone(), block: 0, id });
             cx.regions[0].insert(n.clone());
             fl.valid.insert(n.clone(), Tri::T);
             if let Ty::Ref(..) = t {
@@ -1531,4 +1617,500 @@ pub fn check(prog: &Program) -> Statics {
         all.proven.extend(cx.proven);
     }
     all
+}
+
+// A pattern binder a block's region declares (a `match` arm's), with the
+// deriv facts it starts with, those it inherits (D-0282), and its number in
+// `Positions`.
+struct Pre {
+    name: String,
+    ty: Ty,
+    facts: Vec<(SPlace, Mode)>,
+    inh: Vec<(SPlace, Mode, Tri)>,
+    id: usize,
+}
+
+// D-0282 "Holders": a binding of a reference, slice or `StringView` type, of
+// `Option`/`Result` of one, or of a closure or `fn` type. (The other bindings
+// §6 gives `deriv` facts, a spawn's handle among them, are holders with those
+// facts: `Cx::is_holder`.) Any other binding that holds a reference (a `Hold`,
+// a `Vec<ref<…>>`, a `Job`) keeps it in data.
+fn frame_held(t: &Ty) -> bool {
+    match t {
+        Ty::Ref(..) | Ty::Slice(_) | Ty::Fn(_) => true,
+        Ty::Opt(x) | Ty::Res(x) => matches!(**x, Ty::Ref(..) | Ty::Slice(_)),
+        _ => false,
+    }
+}
+
+fn permitted(a: Mode, b: Mode) -> bool {
+    a == Mode::Shared && b == Mode::Shared
+}
+
+fn extend(p: &SPlace, steps: &[StepK]) -> SPlace {
+    let mut q = p.clone();
+    q.steps.extend(steps.iter().cloned());
+    q
+}
+
+// Inherited facts: the facts themselves, and whether they name the
+// statement's temporary.
+type Inh = (Vec<(SPlace, Mode, Tri)>, bool);
+
+// `rule.control.frame-references` (`spec/14` §6, D-0282).
+impl<'a> Cx<'a> {
+    fn d0282(&self) -> bool {
+        !PRE_D0282.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // A holder: a frame-held reference, or another binding §6 gives `deriv`
+    // facts (a spawn's handle).
+    fn is_holder(&self, fl: &Flow, n: &str, t: &Ty) -> bool {
+        frame_held(t) || fl.deriv.iter().any(|(k, v)| k.0 == n && *v != Tri::F)
+    }
+
+    fn copy_root(&self, n: &str) -> String {
+        self.copies.get(n).cloned().unwrap_or_else(|| n.to_string())
+    }
+
+    // "Inherited facts": the facts of `e`, by the rule's table.
+    fn inherit(&self, fl: &Flow, e: &Expr) -> Inh {
+        match e {
+            // A capture's place is the closure's field, a static's is static
+            // data: neither is a place of this frame.
+            Expr::Var(q) if self.caps.contains(q) || self.is_static_var(e) => (vec![], false),
+            Expr::Var(q) => match self.ty_of(q) {
+                // "a frame-held reference q: q's facts; for a reference or slice
+                // q with none, *q whole, in q's mode"
+                Some(t) if frame_held(&t) => {
+                    let f = fl.holder_facts(q);
+                    match t {
+                        Ty::Ref(_, m) | Ty::Slice(m) if f.is_empty() => (vec![(SPlace { root: Root::Deref(q.clone()), steps: vec![] }, m, Tri::T)], false),
+                        _ => (f, false),
+                    }
+                }
+                // "an owner x of this frame: x whole, shared"
+                Some(_) => (vec![(SPlace { root: Root::Var(q.clone()), steps: vec![] }, Mode::Shared, Tri::T)], false),
+                None => (vec![], false),
+            },
+            // "an element of a container, or a reference read out of a field of
+            // an aggregate that holds references: tier D". The fragment's one
+            // field is `Hold.r`, a reference in an aggregate that holds
+            // references, so a value read out of it is tier D; "`b.f` for a
+            // frame-held b" counts as a place's projection (under `&_m`, in
+            // `place_base`).
+            Expr::Field(_) | Expr::Index(..) => (vec![], false),
+            // "`*b`: the facts of b"
+            Expr::Deref(b) => self.inherit(fl, b),
+            // "`&_m p` or a slice of p: the facts of p's root, extended by p's
+            // fields up to its first index, in mode m"
+            // where it forms one; otherwise …": the fact §6 forms for it (`p`'s
+            // place, literal indices and ranges included) comes first.
+            Expr::Borrow(m, p) => {
+                if let Some(sp) = self.deriv_place(p) {
+                    return (vec![(sp, *m, Tri::T)], false);
+                }
+                let (fs, temp) = self.place_base(fl, p);
+                (fs.into_iter().map(|(sp, v)| (sp, *m, v)).collect(), temp)
+            }
+            Expr::Slice(m, v, lo, hi) => {
+                if let Some(sp) = self.slice_place(v, *lo, *hi) {
+                    return (vec![(sp, *m, Tri::T)], false);
+                }
+                let (fs, temp) = self.place_base(fl, &Expr::Var(v.clone()));
+                (fs.into_iter().map(|(sp, t)| (sp, *m, t)).collect(), temp)
+            }
+            Expr::Call(f, args) => {
+                // "a call f(a1, …, an) whose result is or holds a reference:
+                // the facts of the first argument whose parameter is or holds a
+                // reference; none when no parameter is; tier D when the result
+                // holds a reference only through a type argument, or when that
+                // argument reaches storage that keeps references"
+                if !self.value_ty(e).map_or(false, |t| frame_held(&t)) {
+                    return (vec![], false);
+                }
+                if matches!(f.as_str(), "Vec::pop" | "Channel::recv" | "Channel::send") {
+                    return (vec![], false);
+                }
+                let pks = self.param_kinds(f);
+                let Some(i) = (0..args.len()).find(|&i| matches!(pks.get(i), Some(PK::Ref(_)) | Some(PK::Holds) | Some(PK::TyParam))) else { return (vec![], false) };
+                if let Some(Ty::Ref(inner, _)) = self.value_ty(&args[i]) {
+                    if may_hold_ref(&inner) {
+                        return (vec![], false);
+                    }
+                }
+                self.inherit(fl, &args[i])
+            }
+            // a literal, an arithmetic result, and what holds no reference
+            _ => (vec![], false),
+        }
+    }
+
+    // A place's root facts, extended by its fields up to its first index;
+    // and whether the root is a temporary ("the result of a call that is not
+    // a reference, holds none and is not a constant").
+    fn place_base(&self, fl: &Flow, p: &Expr) -> (Vec<(SPlace, Tri)>, bool) {
+        let (fs, _, temp) = self.place_base_cut(fl, p);
+        (fs, temp)
+    }
+
+    fn place_base_cut(&self, fl: &Flow, p: &Expr) -> (Vec<(SPlace, Tri)>, bool, bool) {
+        match p {
+            Expr::Var(x) if self.caps.contains(x) || self.is_static_var(p) => (vec![], false, false),
+            Expr::Var(x) => match self.ty_of(x) {
+                Some(_) => (vec![(SPlace { root: Root::Var(x.clone()), steps: vec![] }, Tri::T)], false, false),
+                None => (vec![], false, false),
+            },
+            Expr::Field(a) => {
+                // `h.r` of a Hold binding, or of a reference to one
+                // (auto-deref: the facts of the reference).
+                let (fs, cut, temp) = match &**a {
+                    Expr::Var(q) if matches!(self.ty_of(q), Some(Ty::Ref(..))) => {
+                        let (f, t) = self.inherit(fl, a);
+                        (f.into_iter().map(|(sp, _, v)| (sp, v)).collect(), false, t)
+                    }
+                    other => self.place_base_cut(fl, other),
+                };
+                if cut {
+                    (fs, cut, temp)
+                } else {
+                    (fs.into_iter().map(|(sp, v)| (extend(&sp, &[StepK::Field]), v)).collect(), false, temp)
+                }
+            }
+            // An index cuts the path: the facts of the indexed binding's root
+            // (a slice's: the slice's facts).
+            Expr::Index(v, _) => {
+                let ve = Expr::Var(v.clone());
+                let (fs, _, temp) = match self.ty_of(v) {
+                    Some(Ty::Slice(_)) => {
+                        let (f, t) = self.inherit(fl, &ve);
+                        (f.into_iter().map(|(sp, _, v)| (sp, v)).collect(), false, t)
+                    }
+                    _ => self.place_base_cut(fl, &ve),
+                };
+                (fs, true, temp)
+            }
+            Expr::Deref(b) => {
+                let (f, t) = self.inherit(fl, b);
+                (f.into_iter().map(|(sp, _, v)| (sp, v)).collect(), false, t)
+            }
+            Expr::Call(..) => {
+                let r = self.value_ty(p);
+                let temp = !matches!(r, Some(Ty::Ref(..)) | Some(Ty::Slice(_))) && !r.map_or(false, |t| t.holds_ref());
+                (vec![], false, temp)
+            }
+            _ => (vec![], false, false),
+        }
+    }
+
+    // A frame-held binding `n` bound (declared or assigned) from `e`: where
+    // the flow analysis' rows formed no fact, it inherits `e`'s. A binding
+    // whose inherited facts name a temporary and which is live after its
+    // statement is refuted.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_frame_held(&mut self, fl: &mut Flow, n: &str, t: &Ty, e: &Expr, inh: Inh, id: usize, end: usize, line: usize) {
+        self.copies.remove(n);
+        if !frame_held(t) {
+            return;
+        }
+        for (k, v) in fl.inh.iter_mut() {
+            if k.0 == n {
+                *v = Tri::F;
+            }
+        }
+        if fl.deriv.iter().any(|(k, v)| k.0 == n && *v != Tri::F) {
+            return;
+        }
+        let (facts, temp) = inh;
+        for (sp, m, v) in facts {
+            fl.inh.insert((n.to_string(), sp, m), v);
+        }
+        if let Expr::Var(q) = e {
+            if self.ty_of(q).map_or(false, |t| frame_held(&t)) {
+                let root = self.copy_root(q);
+                self.copies.insert(n.to_string(), root);
+            }
+        }
+        if temp && self.pos.live_after(id, end) {
+            self.err(line, "diag.destroy-while-aliased", format!("`{}` borrows a temporary that ends with its statement", n));
+        }
+    }
+
+    fn param_kinds(&self, f: &str) -> Vec<PK> {
+        match self.prog.func(f) {
+            Some(func) => func.params.iter().map(|p| frames::ty_pk(&p.0)).collect(),
+            None => frames::std_params(f).unwrap_or_default(),
+        }
+    }
+
+    // The frame-held bindings in scope that are live at position `p`, other
+    // than those in `skip`: by mention, and "while another live binding
+    // holds a fact rooted at *h".
+    fn live_holders(&self, fl: &Flow, p: usize, skip: &BTreeSet<String>) -> Vec<String> {
+        let held: Vec<(String, usize)> = self
+            .binds
+            .iter()
+            .filter_map(|(n, v)| v.last().map(|b| (n, b)))
+            .filter(|(n, b)| self.is_holder(fl, n, &b.ty) && !skip.contains(*n) && !self.caps.contains(*n))
+            .map(|(n, b)| (n.clone(), b.id))
+            .collect();
+        let mut live: BTreeSet<String> = held.iter().filter(|(_, id)| self.pos.live_after(*id, p)).map(|(n, _)| n.clone()).collect();
+        loop {
+            let more: Vec<String> = held
+                .iter()
+                .filter(|(h, _)| !live.contains(h))
+                .filter(|(h, _)| live.iter().any(|g| fl.holder_facts(g).iter().any(|(sp, _, _)| sp.root == Root::Deref(h.clone()))))
+                .map(|(h, _)| h.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            live.extend(more);
+        }
+        live.into_iter().collect()
+    }
+
+    // The bindings an argument is formed through: "the root of its place,
+    // through fields, dereferences, indexes and the reference arguments of a
+    // call on it".
+    fn formed_through(&self, a: &Expr, out: &mut BTreeSet<String>) {
+        match a {
+            Expr::Var(n) | Expr::Index(n, _) | Expr::Slice(_, n, ..) => {
+                out.insert(n.clone());
+            }
+            Expr::Deref(b) | Expr::Field(b) | Expr::Borrow(_, b) => self.formed_through(b, out),
+            Expr::Call(g, args) => {
+                let pks = self.param_kinds(g);
+                for (i, x) in args.iter().enumerate() {
+                    if matches!(pks.get(i), Some(PK::Ref(_))) {
+                        self.formed_through(x, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // "The call-site rule": at a call of a named function, each argument
+    // whose parameter is or holds a reference has a reach W and an effect E;
+    // the call is refuted when a key of some E certainly overlaps a fact T
+    // of a live binding other than the arguments' own (1), or a key of
+    // another argument's W (2), in modes not permitted together.
+    fn call_site(&mut self, fl: &Flow, e: &Expr, f: &str, args: &[Expr], line: usize, holder: Option<&str>) {
+        if !self.d0282() {
+            return;
+        }
+        let Some(&p) = self.pos.at.get(&(e as *const Expr)) else { return };
+        let pks = self.param_kinds(f);
+        let body = self.prog.func(f).is_some();
+        // (argument index, W, E)
+        let mut reach: Vec<(usize, Vec<(SPlace, Mode)>, Vec<(SPlace, Mode)>)> = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let m = match pks.get(i) {
+                Some(PK::Ref(m)) => *m,
+                Some(PK::Holds) => Mode::Shared,
+                // "an argument of a type parameter's type counts, shared, when
+                // its value is or holds a reference"
+                Some(PK::TyParam) => match self.value_ty(a) {
+                    Some(t) if t.holds_ref() || frame_held(&t) => Mode::Shared,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let mut w: Vec<(SPlace, Mode)> = Vec::new();
+            match a {
+                // "for a frame-held reference binding, its referent and its facts"
+                Expr::Var(r) if self.ty_of(r).map_or(false, |t| frame_held(&t)) && !self.caps.contains(r) => {
+                    if matches!(self.ty_of(r), Some(Ty::Ref(..)) | Some(Ty::Slice(_))) {
+                        w.push((SPlace { root: Root::Deref(r.clone()), steps: vec![] }, m));
+                    }
+                    w.extend(fl.holder_facts(r).into_iter().filter(|x| x.2 == Tri::T).map(|(sp, _, _)| (sp, m)));
+                }
+                // "otherwise the facts ai inherits"
+                _ => w.extend(self.inherit(fl, a).0.into_iter().filter(|x| x.2 == Tri::T).map(|(sp, _, _)| (sp, m))),
+            }
+            // "when F has a body and the parameter is a reference or slice,
+            // W(ai) extended by each projection of reads(F, pi) (shared) and
+            // of writes(F, pi) (exclusive for an exclusive parameter, shared
+            // for a shared one); otherwise W(ai)". A function of `std` is not
+            // in the program: its summary {ε} gives back W.
+            let ef = match (body, pks.get(i), self.sums.get(f).and_then(|v| v.get(i).cloned().flatten())) {
+                (true, Some(PK::Ref(_)), Some(s)) => {
+                    let mut ef = Vec::new();
+                    for (k, _) in &w {
+                        for pi in &s.reads {
+                            ef.push((extend(k, pi), Mode::Shared));
+                        }
+                        for pi in &s.writes {
+                            ef.push((extend(k, pi), m));
+                        }
+                    }
+                    ef
+                }
+                _ => w.clone(),
+            };
+            reach.push((i, w, ef));
+        }
+        if reach.is_empty() {
+            return;
+        }
+        // 1. Against the live holders other than the arguments' own and the
+        // copies of a reference argument.
+        let mut own = BTreeSet::new();
+        for (i, _, _) in &reach {
+            self.formed_through(&args[*i], &mut own);
+        }
+        if let (Some(h), true) = (holder, self.is_elided(e)) {
+            // Not a rule of the text but the model's order: §6's row for
+            // `r = f(&_m x…)` (D-0011) is applied as the first argument is
+            // evaluated, so at the call the facts under `r`'s name are the
+            // result's, not those of the value `r` still holds (which §6
+            // checked the borrow against). Without this, `r = touch(&mut x)`
+            // would clash with itself. A `let`'s binding is not in scope at
+            // the call and needs nothing.
+            own.insert(h.to_string());
+        }
+        let roots: BTreeSet<String> = own.iter().map(|n| self.copy_root(n)).collect();
+        let copies: Vec<String> = self.binds.keys().filter(|n| roots.contains(&self.copy_root(n))).cloned().collect();
+        own.extend(copies);
+        for h in self.live_holders(fl, p, &own) {
+            for (q, m2, v) in fl.holder_facts(&h) {
+                if v != Tri::T {
+                    continue;
+                }
+                for (i, _, ef) in &reach {
+                    if let Some((_, m)) = ef.iter().find(|(k, m)| k.root == q.root && frames::certain(&k.steps, &q.steps) && !permitted(*m, m2)) {
+                        let why = format!("`{}` {} through argument {} while `{}` still holds a {} borrow of it", f, if *m == Mode::Excl { "writes" } else { "reads" }, i + 1, h, m2.word());
+                        self.err(line, "diag.aliasing-conflict", why);
+                        return;
+                    }
+                }
+            }
+        }
+        // 2. Between two arguments.
+        for (i, _, ef) in &reach {
+            for (j, w, _) in &reach {
+                if i == j || self.one_path(f, &args[*i], &args[*j]) {
+                    continue;
+                }
+                for (k, m) in ef {
+                    if w.iter().any(|(k2, m2)| k2.root == k.root && frames::certain(&k.steps, &k2.steps) && !permitted(*m, *m2)) {
+                        let why = format!("`{}` {} through argument {} what argument {} also reaches", f, if *m == Mode::Excl { "writes" } else { "reads" }, i + 1, j + 1);
+                        self.err(line, "diag.aliasing-conflict", why);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // "`swap` and `swap_places` of one place written the same way twice are
+    // not refuted, nor is one reference binding passed twice, or beside a
+    // copy of itself: one path."
+    fn one_path(&self, f: &str, a: &Expr, b: &Expr) -> bool {
+        if (f == "swap" || f == "swap_places") && a == b {
+            return true;
+        }
+        match (a, b) {
+            (Expr::Var(x), Expr::Var(y)) => self.copy_root(x) == self.copy_root(y),
+            _ => false,
+        }
+    }
+
+    // "Element accesses": a read or borrow of a `Vec`'s element `v[k]` is an
+    // access to `v` at element `k`, refuted when a live frame-held reference
+    // holds a fact T on `v` that certainly overlaps it in a mode not
+    // permitted. (No frame-held reference reaches an element in the
+    // fragment: `v` is always a binding.)
+    fn element_access(&mut self, fl: &Flow, e: &Expr, v: &str, k: i64, u: Use, line: usize) {
+        if !self.d0282() || self.caps.contains(v) || !matches!(self.ty_of(v), Some(Ty::Vec) | Some(Ty::VecR)) {
+            return;
+        }
+        let m = match u {
+            Use::Read => Mode::Shared,
+            Use::Borrow(m) => m,
+            // The text names a read or a borrow; a write `v[k] = e` is
+            // neither (finding, see the report).
+            Use::Write => return,
+        };
+        let Some(&p) = self.pos.at.get(&(e as *const Expr)) else { return };
+        let key = [StepK::Idx(k)];
+        for h in self.live_holders(fl, p, &BTreeSet::new()) {
+            for (q, m2, val) in fl.holder_facts(&h) {
+                if val == Tri::T && q.root == Root::Var(v.to_string()) && frames::certain(&key, &q.steps) && !permitted(m, m2) {
+                    self.err(line, "diag.aliasing-conflict", format!("`{}` still holds a {} borrow of `{}`, whose element this {}", h, m2.word(), v, if m == Mode::Excl { "borrows exclusively" } else { "reads" }));
+                    return;
+                }
+            }
+        }
+    }
+
+    // "Evaluation order": an assignment whose place is reached through a
+    // container's element, and whose value "contains an exclusive borrow
+    // whose facts reach that container", may move the place before it is
+    // written.
+    fn eval_order(&mut self, fl: &Flow, place: &Expr, value: &Expr, line: usize) {
+        // The container's keys: `v` for `v[k]`; for `*Vec::index_exclusive(a, k)`
+        // the facts of `a` (and `*r` itself for a reference binding `r`).
+        fn container(cx: &Cx, fl: &Flow, e: &Expr) -> Vec<SPlace> {
+            match e {
+                Expr::Index(v, _) if matches!(cx.ty_of(v), Some(Ty::Vec) | Some(Ty::VecR)) => vec![SPlace { root: Root::Var(v.clone()), steps: vec![] }],
+                Expr::Deref(a) | Expr::Field(a) => container(cx, fl, a),
+                Expr::Call(f, args) if f == "Vec::index_exclusive" => {
+                    let Some(a) = args.first() else { return vec![] };
+                    let mut keys: Vec<SPlace> = cx.inherit(fl, a).0.into_iter().filter(|x| x.2 == Tri::T).map(|x| x.0).collect();
+                    if let Expr::Var(r) = a {
+                        keys.push(SPlace { root: Root::Deref(r.clone()), steps: vec![] });
+                    }
+                    keys
+                }
+                _ => vec![],
+            }
+        }
+        // The facts of every exclusive borrow (or exclusive slice) in `e`.
+        fn borrows(cx: &Cx, fl: &Flow, e: &Expr, out: &mut Vec<SPlace>) {
+            match e {
+                Expr::Borrow(Mode::Excl, b) => {
+                    out.extend(cx.inherit(fl, e).0.into_iter().filter(|x| x.2 == Tri::T).map(|x| x.0));
+                    borrows(cx, fl, b, out);
+                }
+                Expr::Slice(Mode::Excl, ..) => out.extend(cx.inherit(fl, e).0.into_iter().filter(|x| x.2 == Tri::T).map(|x| x.0)),
+                Expr::Call(_, xs) | Expr::Spawn(_, xs) | Expr::ArrLit(xs) => xs.iter().for_each(|a| borrows(cx, fl, a, out)),
+                Expr::Deref(a) | Expr::Field(a) | Expr::Borrow(_, a) | Expr::HoldLit(a) | Expr::JobLit(a) | Expr::CallVal(a) | Expr::SpawnClo(a) => borrows(cx, fl, a, out),
+                Expr::Add(a, b) | Expr::Gt(a, b) => {
+                    borrows(cx, fl, a, out);
+                    borrows(cx, fl, b, out);
+                }
+                _ => {}
+            }
+        }
+        let keys = container(self, fl, place);
+        if keys.is_empty() {
+            return;
+        }
+        let mut facts = Vec::new();
+        borrows(self, fl, value, &mut facts);
+        if facts.iter().any(|f| keys.iter().any(|k| k.root == f.root && frames::certain(&k.steps, &f.steps))) {
+            self.err(line, "diag.stale-binding", "the element this assigns to is found before the value, which borrows its container exclusively and may move it".into());
+        }
+    }
+
+    // "Moving out through a reference": `*r`, for a reference binding `r`,
+    // used where its value is moved (a resource: an argument, an
+    // initializer, an assigned value, a function's result) is refuted, at
+    // the `*r` (its statement's line in the fragment).
+    fn move_out(&mut self, e: &Expr, line: usize) {
+        if !self.d0282() {
+            return;
+        }
+        if let Expr::Deref(a) = e {
+            if let Expr::Var(r) = &**a {
+                if let Some(Ty::Ref(t, _)) = self.ty_of(r) {
+                    if t.is_resource() {
+                        self.err(line, "diag.move-while-aliased", format!("`*{}` would move the value out of the place `{}` still refers to", r, r));
+                    }
+                }
+            }
+        }
+    }
 }

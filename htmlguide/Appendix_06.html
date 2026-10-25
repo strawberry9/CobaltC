@@ -166,7 +166,7 @@ figure.code pre { margin: 0; padding: 12px 16px; overflow-x: auto; font-size: 0.
 <aside class="sidebar">
 <div class="brand">Cobalt<span>C</span></div>
 <div class="sub">Language guide &amp; reference</div>
-<div class="sub">Specification edition 2026.102502</div>
+<div class="sub">Specification edition 2026.102503</div>
 <ol>
 <li><a href="#preface">Preface</a></li>
 <li class="group">Start here</li>
@@ -339,7 +339,7 @@ are disjoint, and the underlying storage remains owned by <code>values</code>.
 
 </section>
 
-<p class="edition">This guide describes the CobaltC specification, edition <strong>2026.102502</strong>.</p>
+<p class="edition">This guide describes the CobaltC specification, edition <strong>2026.102503</strong>.</p>
 <section id="intro">
 <h2>Introduction</h2>
 <p class="blurb">Why CobaltC exists, what it promises, and which features were chosen to keep those promises.</p>
@@ -1600,8 +1600,9 @@ is a path no check has run. The payoff is that no annotation is needed and no co
 refused for lack of a proof. Both languages are in fact hybrids. Rust keeps run-time checks for
 the cases its static rule cannot express (<code>RefCell</code>, <code>Mutex</code>, <code>Rc</code>, bounds, and overflow in debug
 builds); CobaltC rejects at compile time what its checker can see without running the program
-(<a href="#s10">§10</a>, <a href="#s14">§14</a>). The difference is the default, and what each asks
-of the programmer where the default fails.</p>
+(<a href="#s10">§10</a>, <a href="#s14">§14</a>), which includes every conflict among the references a
+function holds in its own variables and parameters that the program's text decides. The difference is
+the default, and what each asks of the programmer where the default fails.</p>
 <figure class="code"><div class="code-head"><span class="code-title">Accepted here, refused by Rust: disjointness decided at run time</span><span class="badge ok">runs</span></div><pre><code><span class="k">import</span> std;
 
 <span class="k">fn</span> main()
@@ -1669,8 +1670,11 @@ because there the checker can see it:</p>
 }</code></pre></figure>
 <p>Moving or destroying a value while a reference to it is live, and writing to a vector while
 a reference into it is live, are likewise compile-time errors in both languages when the two uses
-are in one function (<a href="#s08">§08</a>, <a href="#s10">§10</a>); Rust also catches them across
-functions, through signatures; CobaltC catches those at run time.</p>
+are in one function (<a href="#s08">§08</a>, <a href="#s10">§10</a>). Both also catch them across
+functions: Rust through signatures and lifetimes, CobaltC through what each function does with its
+reference parameters, which its checker works out from the function bodies (<a href="#s14">§14</a>).
+Where the conflict goes through a reference kept inside a data structure, as with <code>Holder</code> above,
+CobaltC catches it at run time.</p>
 <figure class="code"><div class="code-head"><span class="code-title">A move under a live borrow: rejected before running, as in Rust</span><span class="badge bad">rejected: diag.move-while-aliased</span></div><pre><code><span class="k">import</span> std;
 
 <span class="k">fn</span> main()
@@ -2442,25 +2446,44 @@ this one (the thing it was borrowed from). Forming a conflicting borrow is repor
     <span class="k">auto</span> r2 = &amp;x;                     <span class="c">// <span class="bad">✗</span> <span class="dg">diag.aliasing-conflict</span>: r1 is exclusive and still live</span>
     *r1 = <span class="n">2</span>;
 }</code></pre></figure>
-<p>Borrows in one argument list are all formed before the call holds any of them, so passing
-two conflicting references to the same storage is accepted at the call. The conflict is reported at
-the first access inside the function that meets both, the point where it actually matters.</p>
+<p>The checker knows what each function does through each of its reference parameters: which
+fields it may read and which it may write, worked out from the function's body and the functions it
+calls. So a call that passes two references to the same storage, where the function writes through
+one while the other is in use, is rejected at the call, and the diagnostic says what the function
+does through which argument.</p>
 <figure class="code"><div class="code-head"><span class="code-title">Two references to one variable in a call</span><span class="badge bad">rejected: diag.aliasing-conflict</span></div><pre><code><span class="k">fn</span> set_then_read(<span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">exclusive</span>&gt; a, <span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">shared</span>&gt; b) : <span class="t">i32</span>
 {
-    *a = <span class="n">1</span>;                           <span class="c">// <span class="bad">✗</span> <span class="dg">diag.aliasing-conflict</span> (dynamic): b reaches the same i32</span>
+    *a = <span class="n">1</span>;
     *b
 }
 
 <span class="k">fn</span> main()
 {
     <span class="t">i32</span> x = <span class="n">0</span>;
-    set_then_read(&amp;<span class="k">mut</span> x, &amp;x);        <span class="c">// accepted here; each borrow formed while the other was not yet held</span>
+    set_then_read(&amp;<span class="k">mut</span> x, &amp;x);        <span class="c">// <span class="bad">✗</span> <span class="dg">diag.aliasing-conflict</span>: set_then_read writes x through argument 1</span>
 }</code></pre></figure>
 <p>Most conflicts are reported before the program runs, marked <code>(static)</code>: whenever the
-function body itself shows that a conflicting reference is certainly live. That covers a borrow held
-in a variable, a reborrow through a reference or a guard (<code>&amp;*r</code>, <code>&amp;r.f</code>), the binder of a
-<code>match (&amp;e)</code> arm, and the arguments a thread was spawned with, until <code>join</code>. What one body cannot
-see, like the call above, is reported when the conflicting access runs, marked <code>(dynamic)</code>.</p>
+program's text shows that a conflicting reference is live. That covers a borrow held in a variable, a
+reborrow through a reference or a guard (<code>&amp;*r</code>, <code>&amp;r.f</code>), the binder of a <code>match (&amp;e)</code> arm, the
+arguments a thread was spawned with, until <code>join</code>, and what a called function does through its
+parameters. What only the values decide (two elements of one array chosen by computed indexes) and
+references kept inside data structures are checked when the conflicting access runs, marked
+<code>(dynamic)</code>.</p>
+<figure class="code"><div class="code-head"><span class="code-title">Two elements chosen at run time</span><span class="badge bad">rejected: diag.aliasing-conflict</span></div><pre><code><span class="k">import</span> std;
+
+<span class="k">fn</span> set_then_read(<span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">exclusive</span>&gt; a, <span class="t">ref</span>&lt;<span class="t">i32</span>, <span class="t">shared</span>&gt; b) : <span class="t">i32</span>
+{
+    *a = <span class="n">1</span>;                           <span class="c">// <span class="bad">✗</span> <span class="dg">diag.aliasing-conflict</span> (dynamic) when i == j</span>
+    *b
+}
+
+<span class="k">fn</span> main()
+{
+    <span class="t">array</span>&lt;<span class="t">i32</span>, <span class="n">2</span>&gt; v = [<span class="n">0</span>, <span class="n">0</span>];
+    <span class="t">usize</span> i = <span class="n">1</span>;
+    <span class="t">usize</span> j = i * <span class="n">1</span>;
+    set_then_read(&amp;<span class="k">mut</span> v[i], &amp;v[j]);  <span class="c">// accepted: only the values say whether they meet</span>
+}</code></pre></figure>
 <figure class="code"><div class="code-head"><span class="code-title">A conflict through a reference, found before running</span><span class="badge bad">rejected: diag.aliasing-conflict</span></div><pre><code><span class="k">struct</span> Counter
 {
     <span class="t">i32</span> hits;
@@ -4053,15 +4076,19 @@ the outcome is one of three:</p>
 <tbody>
 <tr><td>proven</td><td>the tracked facts guarantee the condition</td><td>no run-time check</td></tr>
 <tr><td>refuted</td><td>the tracked facts guarantee it fails</td><td>the program is rejected (a <em>static</em> diagnostic)</td></tr>
-<tr><td>unknown</td><td>the facts do not decide (the value came from a call, a loop merged two states, a reference passed through a parameter)</td><td>the run-time check runs, and faults if it fails (a <em>dynamic</em> diagnostic)</td></tr>
+<tr><td>unknown</td><td>the facts do not decide (a value computed at run time, a loop merged two states, a reference kept inside a data structure)</td><td>the run-time check runs, and faults if it fails (a <em>dynamic</em> diagnostic)</td></tr>
 </tbody>
 </table>
-<p>The analysis looks only at the current function and only at literals for value ranges.
-So <code>2147483647 + 1</code> is refuted statically, <code>add(2147483647, 1)</code> is checked when <code>add</code> runs, and
-borrowing <code>x</code> twice exclusively in one function is refuted while doing so through two reference
-parameters is checked at the use. Three exceptions are stricter: definite assignment (§11), a use
-of a variable that may have been moved (§7), and reference escape (§10) reject on "unknown" rather
-than deferring.</p>
+<p>For values, the analysis looks only at literals. So <code>2147483647 + 1</code> is refuted statically
+and <code>add(2147483647, 1)</code> is checked when <code>add</code> runs. For references a function holds in its own
+variables and parameters, the checker also knows what every function does through each reference
+parameter: which fields it may read and which it may write. So a call that hands a function <code>&amp;mut x</code>
+and <code>&amp;x</code>, where the function writes through the first, is refuted at the call, and so is a call that
+writes what a live reference of the caller still borrows. The diagnostic names the function and what
+it does through which argument. Two references chosen by computed indexes into one array are told apart
+only by their values, so they are checked when used, and so are references kept inside data structures.
+Three exceptions are stricter: definite assignment (§11), a use of a variable that may have been moved
+(§7), and reference escape (§10) reject on "unknown" rather than deferring.</p>
 <div class="callout rule"><div class="callout-title">Rules of thumb</div><ul>
 <li>Let scopes do your cleanup. Open a block to bound a borrow or a lock; close it to release.</li>
 <li>A <code>while</code> body is re-entered fresh each iteration; declare per-iteration variables inside it.</li>

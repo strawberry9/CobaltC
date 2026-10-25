@@ -21,6 +21,7 @@ pub mod fxhash;
 pub mod numtext;
 pub mod parser;
 pub mod prelude;
+pub mod tier;
 pub mod typecheck;
 pub mod unittest;
 pub mod value;
@@ -100,6 +101,7 @@ pub fn new_items() -> interp::Items {
         any_early_ends: std::sync::atomic::AtomicBool::new(false),
         closure_types: std::sync::Mutex::new(HashMap::default()),
         number_literals: std::sync::Mutex::new(crate::fxhash::HashSet::default()),
+        tier_summaries: std::sync::OnceLock::new(),
     }
 }
 

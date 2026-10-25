@@ -1,7 +1,7 @@
 # CobaltC Value and Object Semantics
 
 Status: normative artifact
-Version: 1.8.1
+Version: 1.8.2
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.value-object.*`)
 Governed by: `CobaltC_Master_Instructions.md` §17, §23
 Realizes: D-0003 (establishment grants authority), D-0018 (use-time
@@ -189,7 +189,7 @@ rule.control.flow-analysis, rule.module.resolve
             ⟦ init-state(of(a,Σ), Σ) = valid ⟧
                 discharge: static (rule.init.definite-assignment; dynamic where unknown)
             ⟦ ¬clash(a, shared, Σ) ⟧
-                discharge: static (rule.control.flow-analysis; dynamic where unknown)
+                discharge: static (rule.control.flow-analysis, rule.control.frame-references; dynamic where unknown)
             ⟦ ¬is-resource(type(a,Σ)) ⟧ discharge: static
             ⟦ mode(a,Σ) ∈ {shared, exclusive} ⟧ discharge: static   -- always true
 
@@ -452,6 +452,7 @@ state.access-paths
 
 ## Change Log
 
+- 1.8.2 — `CHG-0373` (D-0282): `[Read]`'s `¬clash` side-condition cites `rule.control.frame-references` beside `rule.control.flow-analysis`. Clarification.
 - 1.8.1 — `CHG-0279` (D-0233): the address choice: observable through `rawptr_of` and `==` on raw pointers, still `unspecified`.
 - 1.8.0 — `CHG-0258` (D-0219): `[Object-End]`'s `Dead` leaves out the
   references a block's exit spares (its result's), so a function may return

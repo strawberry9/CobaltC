@@ -140,6 +140,9 @@ pub struct Items {
     // address) written where a `number` type parameter is expected; at a
     // floating-point instantiation such a literal is that value as a float.
     pub number_literals: Mutex<HashSet<usize>>,
+    // D-0282: the access summaries of the program's functions, computed
+    // when the static pass first needs them (`tier::summaries`).
+    pub tier_summaries: std::sync::OnceLock<Arc<crate::tier::Summaries>>,
 }
 
 impl Items {

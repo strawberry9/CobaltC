@@ -52,8 +52,9 @@ is a path no check has run. The payoff is that no annotation is needed and no co
 refused for lack of a proof. Both languages are in fact hybrids. Rust keeps run-time checks for
 the cases its static rule cannot express (`RefCell`, `Mutex`, `Rc`, bounds, and overflow in debug
 builds); CobaltC rejects at compile time what its checker can see without running the program
-(<a href="#s10">§10</a>, <a href="#s14">§14</a>). The difference is the default, and what each asks
-of the programmer where the default fails.""")
+(<a href="#s10">§10</a>, <a href="#s14">§14</a>), which includes every conflict among the references a
+function holds in its own variables and parameters that the program's text decides. The difference is
+the default, and what each asks of the programmer where the default fails.""")
 b += code("""
 import std;
 
@@ -129,8 +130,11 @@ fn main()
      section="rust", slug="escape-static")
 b += p("""Moving or destroying a value while a reference to it is live, and writing to a vector while
 a reference into it is live, are likewise compile-time errors in both languages when the two uses
-are in one function (<a href="#s08">§08</a>, <a href="#s10">§10</a>); Rust also catches them across
-functions, through signatures; CobaltC catches those at run time.""")
+are in one function (<a href="#s08">§08</a>, <a href="#s10">§10</a>). Both also catch them across
+functions: Rust through signatures and lifetimes, CobaltC through what each function does with its
+reference parameters, which its checker works out from the function bodies (<a href="#s14">§14</a>).
+Where the conflict goes through a reference kept inside a data structure, as with `Holder` above,
+CobaltC catches it at run time.""")
 b += code("""
 import std;
 

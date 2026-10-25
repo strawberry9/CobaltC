@@ -116,7 +116,9 @@ level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the compiler unde
 object tracking, as in the front end, chiefly of `StringView` copies); the programs it builds
 are the same programs. `cobc` stays in the tree as the Rust reference and the oracle. Since D-0278 the Rust
 toolchain leads: `cbc`, `cbparse` and `cobfmt-cb` accept the language of edition 2026.102501 and are ported
-forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port.
+forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port. Edition 2026.102503 (D-0282) makes the conflicts of frame-held references compile-time errors; until the port,
+`cbc` accepts those programs and finds the conflicts at run time, so the conformance rows D-0282 made static are
+`cobc`'s alone.
 
 ## `std`
 

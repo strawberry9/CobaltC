@@ -229,17 +229,17 @@ chapter 13 uses to let two threads fill one vector at once.
 
 ## What the checker sees, and what the run checks
 
-So far every conflict was found before the program ran. That is the common
-case: wherever a function's own body shows a conflicting reference to be
-live, the program is rejected. But a function cannot see what its caller
-passed in:
+So far every conflict was found before the program ran. That holds across
+calls too. The checker knows what each function does through each reference
+parameter (whether it reads or writes, and which fields), so a call that
+hands a function two references that meet is rejected where it is written:
 
 ```
 import std;
 
 fn set_and_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
 {
-    *a = 1;                           // ✗ at run time: b reaches the same i32
+    *a = 1;
     *b
 }
 
@@ -248,34 +248,71 @@ fn main()
     i32 x = 0;
     i32 y = 0;
     printf("%v\n", set_and_read(&mut x, &y));    // fine: two different variables
-    printf("%v\n", set_and_read(&mut x, &x));    // accepted here; found at the first write
+    printf("%v\n", set_and_read(&mut x, &x));    // ✗ rejected: both reach x
+}
+```
+
+```
+error[diag.aliasing-conflict]: `set_and_read` writes `x` through argument 1, which argument 2 also reaches
+  --> call_conflict.cb:14:20
+   |
+14 |     printf("%v\n", set_and_read(&mut x, &x));    // ✗ rejected: both reach x
+   |                    ^^^^^^^^^^^^
+   = repair: end the conflicting reference (let its holder go out of scope) before this access, or use `shared` on both sides
+```
+
+`set_and_read` writes through its first parameter while its second is in
+use, and both arguments reach `x`. The program is rejected, and the first call
+never runs either.
+
+Only the values can decide some questions. Two elements of one array, chosen
+by indexes the program computes, are the same element only when the indexes
+are equal:
+
+```
+import std;
+
+fn set_and_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
+{
+    *a = 1;                           // ✗ at run time when i == j
+    *b
+}
+
+fn main()
+{
+    array<i32, 3> v = [0, 0, 0];
+    usize i = 0;
+    while (i < 3)
+    {
+        usize j = 2 - i;
+        printf("%v\n", set_and_read(&mut v[i], &v[j]));    // decided by i and j
+        i = i + 1;
+    }
 }
 ```
 
 ```
 0
 fault[diag.aliasing-conflict]: this access conflicts with a live reference
- --> dynamic_conflict.cb:5:5
+ --> index_conflict.cb:5:5
   |
-5 |     *a = 1;                           // ✗ at run time: b reaches the same i32
+5 |     *a = 1;                           // ✗ at run time when i == j
   |     ^
   = repair: end the conflicting reference (let its holder go out of scope) before this access, or use `shared` on both sides
 ```
 
-The first call is fine. The second passes two references to the same
-variable, one exclusive. The call itself is accepted: the references are
-formed one after another and neither is in use yet. Inside the function, the
-checker sees two parameters and cannot know whether they overlap, so the
-write through `a` is checked when it runs, and it faults, because `b` reaches
-the same storage. The rule is the same one as before; only the moment it is
-applied differs.
+The first call passes elements 0 and 2, which are different. The second passes
+element 1 twice, and the write through `a` faults, because `b` reaches the same
+storage. The rule is the same one as before; only the moment it is applied
+differs.
 
 This is the pattern for the whole language. Every rule is checked. Where the
-text of the function decides the question, it is decided before the run;
-where only the values can decide it, it is decided during the run. A
-conforming compiler may prove more and leave out checks it has proved
-unnecessary, which is what `cobc` does, but it may never accept a program
-the language rejects or run a check the language does not require.
+text of the program decides the question, it is decided before the run; where
+only the values can decide it, such as two indexes or a reference kept inside a
+data structure, it is decided during the run. A conforming compiler may prove
+more and leave out checks it has proved unnecessary, which is what `cobc` does,
+but it may never accept a program the language rejects or run a check the
+language does not require.
 
 ## Returning a reference
 

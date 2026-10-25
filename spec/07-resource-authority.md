@@ -1,7 +1,7 @@
 # CobaltC Resource Authority and Destruction
 
 Status: normative artifact
-Version: 1.3.0
+Version: 1.3.1
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.resauth.*`)
 Governed by: `CobaltC_Master_Instructions.md` §5, §17 (Resource
 Authority), §23
@@ -60,7 +60,7 @@ denotes the built-in rule — `[Handle-Destructor]`, the mutex's
             ⟦ temporally-valid(a1,Σ) ∧ authority(ℓ, destroy, o, Σ) ⟧
                 discharge: static (rule.control.flow-analysis; dynamic where unknown)
             ⟦ solitary(a1, Σ) ⟧
-                discharge: static (rule.control.flow-analysis; dynamic where unknown)
+                discharge: static (rule.control.flow-analysis, rule.control.frame-references; dynamic where unknown)
 
     [Authority-Transfer-Unauthorized]   disposition: checked
         ¬temporally-valid(a1,Σ) ∨ ¬authority(ℓ, destroy, o, Σ)
@@ -107,7 +107,7 @@ rule.control.flow-analysis
             ⟦ temporally-valid(a,Σ) ∧ authority(ℓ, destroy, o, Σ) ⟧
                 discharge: static (rule.control.flow-analysis; dynamic where unknown)
             ⟦ solitary(a, Σ) ⟧
-                discharge: static (rule.control.flow-analysis; dynamic where unknown)
+                discharge: static (rule.control.flow-analysis, rule.control.frame-references; dynamic where unknown)
 
     [Run-Destructor-None]     destructor(τ) = None          ⟨run-destructor(a, τ), Σ⟩ →^ℓ ⟨(), Σ⟩
     [Run-Destructor]
@@ -277,6 +277,7 @@ does not exist because the state it would report is unreachable.
 
 ## Change Log
 
+- 1.3.1 — `CHG-0373` (D-0282): `[Authority-Transfer]`'s and `[Destroy]`'s `solitary` side-conditions cite `rule.control.frame-references` beside `rule.control.flow-analysis`. Clarification.
 - 1.3.0 — `CHG-0088` (D-0075): a type with a destructor is a resource
   (`diag.destructor-on-plain-type`).
 - 1.2.0 — `CHG-0010`: `destructor(τ)` defined for the built-in resource

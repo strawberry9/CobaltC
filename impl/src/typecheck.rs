@@ -661,6 +661,10 @@ struct Body<'a> {
     // resource: passed or stored by value it is copied (`[Fn-Value-Read]`),
     // and keeps its borrows (CHG-0299).
     closure_copied: HashSet<String>,
+    // D-0282: reference bindings that are copies of another (`auto r2 =
+    // r1;`): a copy of a reference carries the same path, so the two never
+    // conflict with each other.
+    ref_copies: HashMap<String, String>,
     // Locals initialized directly from a `move` closure literal that captured
     // a resource: resource-typed by derivation (`rule.type.is-resource`), so
     // passed or stored by value it is consumed (CHG-0302).
@@ -818,6 +822,7 @@ impl<'a> Ck<'a> {
                 closure_moves: HashMap::default(),
                 closure_self_writes: HashSet::default(),
                 closure_copied: HashSet::default(),
+                ref_copies: HashMap::default(),
                 closure_owning: HashSet::default(),
                 closure_arity: HashMap::default(),
                 move_captures: HashMap::default(),
@@ -857,7 +862,13 @@ impl<'a> Ck<'a> {
             for p in &f.params {
                 body.declare(&p.name, true);
             }
-            let bt = match body.check_fn_body(&f.body, &ret) {
+            tier_report::begin(if targs.is_empty() { name.clone() } else { format!("{}<{}>", name, targs.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")) }, &f.body);
+            let checked = body.check_fn_body(&f.body, &ret);
+            if let Err(d) = &checked {
+                tier_report::with(|r| r.error = Some(d.clone()));
+            }
+            tier_report::end();
+            let bt = match checked {
                 Ok(bt) => bt,
                 Err(d) => {
                     if crate::interp::trace_on_pub() {
@@ -994,6 +1005,301 @@ enum Tri {
     U,
 }
 
+// D-0282 (`rule.control.frame-references`): the state the rules for
+// frame-held references keep per function body (its uses, for liveness by
+// last use), and the report D-0281's measurements read: with
+// COBALTC_TIER_REPORT=FILE the static pass appends to FILE, for each body,
+// the conflict checks it made, those it could decide neither way, the
+// point checks left to the run, and the reference bindings it gave no
+// origin. The report changes nothing.
+mod tier_report {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    // A binding as liveness sees it: its name, where it is declared and
+    // where its scope ends (D-0111's last use, by lexical scope).
+    pub struct Decl {
+        pub name: String,
+        pub pos: (usize, usize),
+        pub end: (usize, usize),
+    }
+
+    // A use of a name, by position, and the declaration it resolves to
+    // (`PARAM` for a parameter or anything declared outside the body).
+    pub const PARAM: usize = usize::MAX;
+
+    #[derive(Default)]
+    pub struct Rep {
+        pub uses: Vec<(String, usize, usize, usize)>,
+        pub decls: Vec<Decl>,
+        // The extents of the body's loops (first and last line).
+        pub loops: Vec<(usize, usize)>,
+        pub func: String,
+        pub checks: usize,
+        pub undecided: usize,
+        pub unknown_origin: usize,
+        pub inherited: usize,
+        pub tier_d: usize,
+        pub point_checks: usize,
+        pub error: Option<String>,
+        pub events: Vec<String>,
+    }
+
+    thread_local! {
+        pub static CUR: RefCell<Option<Rep>> = RefCell::new(None);
+    }
+
+    pub fn kind_of(e: &crate::ast::Expr) -> String {
+        use crate::ast::ExprKind as K;
+        match &e.kind {
+            K::Paren(i) => kind_of(i),
+            K::Call(c, _) => match &c.kind {
+                K::Path(segs, _) => format!("call {}", segs.join("::")),
+                _ => "call (value)".to_string(),
+            },
+            K::Path(segs, _) => format!("name {}", segs.join("::")),
+            K::Field(_, f) => format!("field .{}", f),
+            K::Index(..) => "index".to_string(),
+            K::Deref(_) => "deref".to_string(),
+            K::Borrow(..) => "borrow".to_string(),
+            K::SliceOf(..) => "slice-of".to_string(),
+            K::If(..) => "if".to_string(),
+            K::Match(..) => "match".to_string(),
+            K::Block(_) => "block".to_string(),
+            K::StrLit(_) => "literal".to_string(),
+            _ => "other".to_string(),
+        }
+    }
+
+    // The rules are always on (D-0282); the report is written only when
+    // COBALTC_TIER_REPORT names a file.
+    pub fn on() -> bool {
+        true
+    }
+
+    pub fn begin(func: String, body: &crate::ast::Block) {
+        let mut w = Walker { rep: Rep { func, ..Rep::default() }, visible: HashMap::new() };
+        w.block(body);
+        CUR.with(|c| *c.borrow_mut() = Some(w.rep));
+    }
+
+    // Whether the binding `name` visible at (line, col) is used after that
+    // point, or anywhere in a loop that contains the point and that its
+    // declaration precedes (a binding declared in a loop's body is a new
+    // binding each time round).
+    pub fn live_after(name: &str, line: usize, col: usize) -> bool {
+        CUR.with(|c| {
+            let c = c.borrow();
+            let Some(r) = c.as_ref() else { return true };
+            let at = (line, col);
+            let decl = r
+                .decls
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.name == name && d.pos <= at && at <= d.end)
+                .max_by_key(|(_, d)| d.pos)
+                .map(|(i, _)| i)
+                .unwrap_or(PARAM);
+            let decl_line = if decl == PARAM { 0 } else { r.decls[decl].pos.0 };
+            let in_loops: Vec<&(usize, usize)> = r.loops.iter().filter(|(a, b)| *a <= line && line <= *b && decl_line < *a).collect();
+            r.uses.iter().any(|(n, l, k, d)| *d == decl && n == name && ((*l, *k) > at || in_loops.iter().any(|(a, b)| a <= l && l <= b)))
+        })
+    }
+
+    // The last position inside an expression or a block: a scope's end.
+    fn end_e(e: &crate::ast::Expr, m: &mut (usize, usize)) {
+        let mut w = Walker { rep: Rep::default(), visible: HashMap::new() };
+        w.expr(e);
+        *m = (*m).max((e.line, e.col));
+        for (_, l, c, _) in &w.rep.uses {
+            *m = (*m).max((*l, *c));
+        }
+        for (_, b) in &w.rep.loops {
+            *m = (*m).max((*b, usize::MAX));
+        }
+        for d in &w.rep.decls {
+            *m = (*m).max(d.pos);
+        }
+    }
+
+    fn end_b(b: &crate::ast::Block) -> (usize, usize) {
+        use crate::ast::Stmt;
+        let mut m = (0, 0);
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { init, line, col, .. } => {
+                    m = m.max((*line, *col));
+                    if let Some(e) = init {
+                        end_e(e, &mut m);
+                    }
+                }
+                Stmt::Destructure { init, .. } => end_e(init, &mut m),
+                Stmt::Expr(e) | Stmt::BlockLike(e) => end_e(e, &mut m),
+            }
+        }
+        if let Some(t) = &b.tail {
+            end_e(t, &mut m);
+        }
+        m
+    }
+
+    struct Walker {
+        rep: Rep,
+        // The declarations in scope, innermost last, by name.
+        visible: HashMap<String, Vec<usize>>,
+    }
+
+    impl Walker {
+        fn declare(&mut self, name: &str, pos: (usize, usize), end: (usize, usize), scope: &mut Vec<String>) {
+            self.rep.decls.push(Decl { name: name.to_string(), pos, end });
+            self.visible.entry(name.to_string()).or_default().push(self.rep.decls.len() - 1);
+            scope.push(name.to_string());
+        }
+
+        fn close(&mut self, scope: Vec<String>) {
+            for n in scope {
+                if let Some(v) = self.visible.get_mut(&n) {
+                    v.pop();
+                }
+            }
+        }
+
+        fn use_name(&mut self, name: &str, line: usize, col: usize) {
+            let d = self.visible.get(name).and_then(|v| v.last().copied()).unwrap_or(PARAM);
+            self.rep.uses.push((name.to_string(), line, col, d));
+        }
+
+        fn block(&mut self, b: &crate::ast::Block) {
+            use crate::ast::Stmt;
+            let end = end_b(b);
+            let mut scope = Vec::new();
+            for s in &b.stmts {
+                match s {
+                    Stmt::Let { init, name, line, col, .. } => {
+                        if let Some(e) = init {
+                            self.expr(e);
+                        }
+                        self.declare(name, (*line, *col), end, &mut scope);
+                    }
+                    Stmt::Destructure { init, names, .. } => {
+                        self.expr(init);
+                        for n in names {
+                            self.declare(n, (init.line, init.col), end, &mut scope);
+                        }
+                    }
+                    Stmt::Expr(e) | Stmt::BlockLike(e) => self.expr(e),
+                }
+            }
+            if let Some(t) = &b.tail {
+                self.expr(t);
+            }
+            self.close(scope);
+        }
+
+        fn expr(&mut self, e: &crate::ast::Expr) {
+            use crate::ast::ExprKind as K;
+            match &e.kind {
+                K::Path(segs, _) if segs.len() == 1 => self.use_name(&segs[0], e.line, e.col),
+                K::Paren(x) | K::Unary(_, x) | K::Propagate(x) | K::Deref(x) | K::Borrow(_, x) | K::Field(x, _) | K::ArrayRepeat(x, _) => self.expr(x),
+                K::Binary(_, a, b) | K::Index(a, b) | K::Assign(a, b) => {
+                    self.expr(a);
+                    self.expr(b);
+                }
+                K::SliceOf(_, a, b, c) => {
+                    self.expr(a);
+                    self.expr(b);
+                    self.expr(c);
+                }
+                K::Call(c, xs) => {
+                    self.expr(c);
+                    for x in xs {
+                        self.expr(x);
+                    }
+                }
+                K::StructLit(_, _, fs) => {
+                    for (_, x) in fs {
+                        self.expr(x);
+                    }
+                }
+                K::ArrayLit(xs) => {
+                    for x in xs {
+                        self.expr(x);
+                    }
+                }
+                K::Block(b) | K::Unsafe(b) => self.block(b),
+                K::If(c, t, x) => {
+                    self.expr(c);
+                    self.block(t);
+                    if let Some(x) = x {
+                        self.expr(x);
+                    }
+                }
+                K::While(c, b, x) => {
+                    let mut end = (e.line, e.col);
+                    end_e(c, &mut end);
+                    end = end.max(end_b(b));
+                    if let Some(x) = x {
+                        end_e(x, &mut end);
+                    }
+                    self.rep.loops.push((e.line, end.0));
+                    self.expr(c);
+                    self.block(b);
+                    if let Some(x) = x {
+                        self.expr(x);
+                    }
+                }
+                K::Match(c, arms) => {
+                    self.expr(c);
+                    for a in arms {
+                        // A binder is declared for its arm's body.
+                        let mut scope = Vec::new();
+                        if let Some(b) = &a.binder {
+                            let mut end = (a.body.line, a.body.col);
+                            end_e(&a.body, &mut end);
+                            self.declare(b, (a.body.line, 0), end, &mut scope);
+                        }
+                        self.expr(&a.body);
+                        self.close(scope);
+                    }
+                }
+                K::Return(Some(x)) => self.expr(x),
+                K::Closure { captures, body, .. } => {
+                    for c in captures {
+                        self.use_name(c, e.line, e.col);
+                    }
+                    self.block(body);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn with(f: impl FnOnce(&mut Rep)) {
+        CUR.with(|c| {
+            if let Some(r) = c.borrow_mut().as_mut() {
+                f(r)
+            }
+        });
+    }
+
+    pub fn end() {
+        let Some(path) = std::env::var_os("COBALTC_TIER_REPORT").filter(|v| !v.is_empty()) else { return };
+        let Some(r) = CUR.with(|c| c.borrow_mut().take()) else { return };
+        let mut out = format!("F\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", r.func, r.checks, r.undecided, r.unknown_origin, r.inherited, r.tier_d, r.point_checks);
+        if let Some(e) = &r.error {
+            out.push_str(&format!("E\t{}\n", e.replace('\n', " ")));
+        }
+        for e in &r.events {
+            out.push_str(e);
+            out.push('\n');
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(out.as_bytes());
+        }
+    }
+}
+
 fn tri_join(a: Tri, b: Tri) -> Tri {
     if a == b {
         a
@@ -1020,6 +1326,84 @@ fn range_elem(lo: &Expr, hi: &Expr) -> PElem {
         (Some(a), Some(b)) if a >= 0 && b >= a => PElem::Range(Some((a as u128, b as u128))),
         _ => PElem::Range(None),
     }
+}
+
+// D-0282: overlap for the rules of frame-held references. `Yes` when the two paths certainly
+// meet (equal fields and literal indices, one a prefix of the other, every
+// element in the longer one's remainder present); `Maybe` when they meet
+// only for some values (an index or a range bound that is not a literal, a
+// range in the remainder that may be empty): a point check at run time;
+// `No` when they cannot meet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Ov {
+    No,
+    Maybe,
+    Yes,
+}
+
+// Two place (or borrow) expressions that name the same place, written the
+// same way: a name, fields, literal or same-name indices, dereferences.
+fn same_place(a: &Expr, b: &Expr) -> bool {
+    match (&strip_parens_tc(a).kind, &strip_parens_tc(b).kind) {
+        (ExprKind::Path(x, _), ExprKind::Path(y, _)) => x == y,
+        (ExprKind::Borrow(m, x), ExprKind::Borrow(n, y)) => m == n && same_place(x, y),
+        (ExprKind::Field(x, f), ExprKind::Field(y, g)) => f == g && same_place(x, y),
+        (ExprKind::Deref(x), ExprKind::Deref(y)) => same_place(x, y),
+        (ExprKind::Index(x, i), ExprKind::Index(y, j)) => {
+            same_place(x, y)
+                && match (&strip_parens_tc(i).kind, &strip_parens_tc(j).kind) {
+                    (ExprKind::IntLit(u, _), ExprKind::IntLit(v, _)) => u == v,
+                    (ExprKind::Path(p, _), ExprKind::Path(q, _)) => p == q,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+fn overlap3(a: &[PElem], b: &[PElem]) -> Ov {
+    let mut ov = Ov::Yes;
+    for (x, y) in a.iter().zip(b.iter()) {
+        match (x, y) {
+            (PElem::Field(f), PElem::Field(g)) => {
+                if f != g {
+                    return Ov::No;
+                }
+            }
+            (PElem::Index(Some(i)), PElem::Index(Some(j))) => {
+                if i != j {
+                    return Ov::No;
+                }
+            }
+            (PElem::Index(_), PElem::Index(_)) => ov = Ov::Maybe,
+            (PElem::Range(Some((l, h))), PElem::Index(Some(i))) | (PElem::Index(Some(i)), PElem::Range(Some((l, h)))) => {
+                if !(l <= i && i < h) {
+                    return Ov::No;
+                }
+            }
+            (PElem::Range(Some((l1, h1))), PElem::Range(Some((l2, h2)))) => {
+                if l1.max(l2) >= h1.min(h2) {
+                    return Ov::No;
+                }
+            }
+            (PElem::Range(_), _) | (_, PElem::Range(_)) | (PElem::Index(_), _) | (_, PElem::Index(_)) => ov = Ov::Maybe,
+        }
+    }
+    // The longer path's remainder: a literal empty range touches nothing;
+    // any other range may be empty.
+    let rest = if a.len() > b.len() { &a[b.len()..] } else { &b[a.len()..] };
+    for e in rest {
+        match e {
+            // An empty range still meets its container's fields
+            // (`conf.empty-slice-meets-vec-fields`) but not always its
+            // elements: the run decides.
+            PElem::Range(Some((l, h))) if l >= h => ov = Ov::Maybe,
+            PElem::Range(Some(_)) => {}
+            PElem::Range(None) => ov = Ov::Maybe,
+            _ => {}
+        }
+    }
+    ov
 }
 
 // "two paths π1, π2 overlap iff one is a prefix of the other, with
@@ -1334,6 +1718,17 @@ fn holds_ref(items: &Items, ty: &Type) -> bool {
     }
 }
 
+// D-0282: whether storage of type `ty` keeps references: in itself, or
+// as a container's elements (`Vec<ref<T>>`, whose cells sit behind a raw
+// pointer `holds_ref` does not follow).
+fn stores_refs(items: &Items, ty: &Type) -> bool {
+    match ty {
+        Type::Named(_, args) => holds_ref(items, ty) || args.iter().any(|a| stores_refs(items, a)),
+        Type::Array(inner, _) => stores_refs(items, inner),
+        t => is_borrow_ty(t) || holds_ref(items, t),
+    }
+}
+
 // D-0218: whether a value of `ty` holds an exclusive reference or slice in
 // itself (a field, an element of an array, a payload); what a reference or
 // raw pointer reaches is not part of the value.
@@ -1617,6 +2012,41 @@ fn shown_name(x: &str) -> &str {
 // bindings are the loop.
 fn is_loop_holder(h: &str) -> bool {
     h.starts_with("$c") || h.starts_with("$d") || h.starts_with("$e")
+}
+
+// A place as a message names it: its root and fields, an element as `[…]`.
+fn shown_place(root: &str, path: &[PElem]) -> String {
+    let mut out = shown_name(root).to_string();
+    // `(*r)[0 .. 1]`, not `*r[0 .. 1]`.
+    if out.starts_with('*') && matches!(path.first(), Some(PElem::Index(_) | PElem::Range(_))) {
+        out = format!("({})", out);
+    }
+    for e in path {
+        match e {
+            PElem::Field(f) => {
+                out.push('.');
+                out.push_str(f);
+            }
+            PElem::Index(Some(i)) => out.push_str(&format!("[{}]", i)),
+            PElem::Index(None) => out.push_str("[…]"),
+            PElem::Range(Some((l, h))) => out.push_str(&format!("[{} .. {}]", l, h)),
+            PElem::Range(None) => out.push_str("[… .. …]"),
+        }
+    }
+    out
+}
+
+// What a callee does through a reference, as a message says it.
+// A callee as a message names it: without `std::`.
+fn shown_callee(key: &str) -> &str {
+    key.strip_prefix("std::").unwrap_or(key)
+}
+
+fn shown_access(m: &Mode) -> &'static str {
+    match m {
+        Mode::Exclusive => "writes",
+        Mode::Shared => "reads",
+    }
 }
 
 fn holder_text(h: &str) -> String {
@@ -2280,6 +2710,39 @@ impl<'a> Body<'a> {
                 }
             }
         }
+        if self.report && !self.flow.unreachable && tier_report::on() {
+            let mut undecided: Vec<String> = Vec::new();
+            for (h, facts) in self.flow.deriv.iter() {
+                for (k, v) in facts {
+                    if *v == Tri::U && k.root == x && paths_overlap(&k.path, path) && !permitted(mode.clone(), k.mode.clone()) && tier_report::live_after(h, self.current_line, self.current_col) {
+                        undecided.push(format!("U\t{}\t{}\t{:?}\t{}", self.current_line, x, k.mode, h));
+                    }
+                }
+            }
+            undecided.sort();
+            let line = self.current_line;
+            let mut maybe = false;
+            for (h, facts) in self.flow.deriv.iter() {
+                for (k, v) in facts {
+                    if *v != Tri::F && k.root == x && !permitted(mode.clone(), k.mode.clone()) && overlap3(&k.path, path) == Ov::Maybe && tier_report::live_after(h, self.current_line, self.current_col) {
+                        maybe = true;
+                    }
+                }
+            }
+            if maybe {
+                tier_report::with(|r| {
+                    r.point_checks += 1;
+                    r.events.push(format!("P\t{}\t{}\taccess", line, x));
+                });
+            }
+            tier_report::with(|r| {
+                r.checks += 1;
+                if !undecided.is_empty() {
+                    r.undecided += 1;
+                    r.events.push(format!("{}\t{}", undecided[0], line));
+                }
+            });
+        }
         // The first holder by name, so the message is the same every run.
         if let Some((h, k)) = holders.into_iter().min_by(|a, b| a.0.cmp(b.0)) {
             let need = match (need, diag, &mode) {
@@ -2499,6 +2962,21 @@ impl<'a> Body<'a> {
     // (`[Store-Binding-Place-Transfer-Sub]`); anything else is an
     // ordinary value-position expression.
     fn check_store_operand(&mut self, e: &Expr, expected: Option<&Type>) -> TResult {
+        // D-0282: a value moved out through a reference
+        // (`drop(*r)`, `Atomic<u64> c = *r`): the reference still holds the
+        // place, so the move conflicts with it, always.
+        if tier_report::on() && self.report && !self.flow.unreachable {
+            if let ExprKind::Deref(inner) = &strip_parens_tc(e).kind {
+                if let ExprKind::Path(segs, _) = &strip_parens_tc(inner).kind {
+                    let moves = self.static_place_type(e).map_or(false, |t| is_resource_ty(self.items, &t) || matches!(&t, Type::Named(n, _) if n == "std::Atomic" || n == "std::Vec" || n == "std::String"));
+                    if segs.len() == 1 && moves && matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..))) {
+                        let msg = format!("`*{}` cannot be moved out: `{}` still refers to it", segs[0], segs[0]);
+                        let diag = format!("{}{}", crate::modres::named("diag.move-while-aliased", msg), crate::diagnostics::at(e.line, e.col));
+                        self.refute(&diag)?;
+                    }
+                }
+            }
+        }
         // Tagged with the operand's line, as `check_expr` tags its own: a
         // refutation raised here (a move out of a field) is not inside one.
         let t = match self.check_store_operand_inner(e, expected) {
@@ -2510,7 +2988,15 @@ impl<'a> Body<'a> {
         // closure that owns no resource is copied, not moved, and keeps
         // them (CHG-0299, `[Fn-Value-Read]`).
         if let ExprKind::Path(segs, _) = &strip_parens_tc(e).kind {
-            if segs.len() == 1 && !self.flow.unreachable && self.flow.deriv.contains_key(&segs[0]) && !matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..) | Type::Slice(..))) && !self.closure_copied.contains(&segs[0]) {
+            // D-0282: a view (or an `Option`/`Result` of a
+            // reference) is copied, not moved, and keeps its borrow.
+            let copied_view = tier_report::on()
+                && match self.lookup_local(&segs[0]) {
+                    Some(Type::Named(n, a)) if n == "std::StringView" => a.is_empty(),
+                    Some(Type::Named(n, a)) if n == "std::Option" || n == "std::Result" => a.first().map_or(false, |x| matches!(x, Type::Ref(..) | Type::Slice(..)) || matches!(x, Type::Named(m, _) if m == "std::StringView")),
+                    _ => false,
+                };
+            if segs.len() == 1 && !copied_view && !self.flow.unreachable && self.flow.deriv.contains_key(&segs[0]) && !matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..) | Type::Slice(..))) && !self.closure_copied.contains(&segs[0]) {
                 self.flow.deriv.remove(&segs[0]);
             }
         }
@@ -2760,11 +3246,368 @@ impl<'a> Body<'a> {
     // `&v[i]` on a `Vec` is `Vec::index_shared(&v, i)` (`[Index-Vec]`), an
     // elided call on a borrow of `v`: derived from `v` as that call is.
     fn vec_element_root(&self, e: &Expr) -> Option<(String, Vec<PElem>)> {
-        let ExprKind::Index(base, _) = &strip_parens_tc(e).kind else { return None };
+        let ExprKind::Index(base, idx) = &strip_parens_tc(e).kind else { return None };
         match self.static_place_type(base)? {
-            Type::Named(n, _) if n == "std::Vec" => self.place_of(base),
+            Type::Named(n, _) if n == "std::Vec" => self.place_of(base).map(|(r, mut p)| {
+                // D-0282: the element, so two of them are told apart.
+                if tier_report::on() {
+                    p.push(PElem::Index(literal_value(idx).filter(|v| *v >= 0).map(|v| v as u128)));
+                }
+                (r, p)
+            }),
             _ => None,
         }
+    }
+
+    // D-0282: the facts a reference value inherits
+    // from where it came from when it is not a visible borrow -- another
+    // reference binding (its facts, or its referent `*r` when it has
+    // none), a field or a dereference of one, a single-reference call on
+    // one (D-0011), `foreach`'s hidden helpers, a `match`/`if`/block's
+    // results. `None` when the value comes from nothing that can hold a
+    // reference of this frame (a call with no reference argument: static
+    // data), `Some(empty)` when its source is unknown (tier D: a
+    // reference read out of a container or a struct).
+    fn inherited_facts(&self, e: &Expr, depth: usize) -> Option<Vec<(DerivKey, Tri)>> {
+        self.inherited_facts_in(e, depth, None)
+    }
+
+    // `inherited_facts` inside a `match` arm: `binder` stands for what the
+    // scrutinee holds.
+    fn inherited_facts_in(&self, e: &Expr, depth: usize, binder: Option<(&str, &Expr)>) -> Option<Vec<(DerivKey, Tri)>> {
+        const TIER_D: &str = "<tier D>";
+        let tier_d = || Some(vec![(DerivKey { root: TIER_D.to_string(), path: Vec::new(), mode: Mode::Shared }, Tri::T)]);
+        if depth > 12 {
+            return Some(Vec::new());
+        }
+        let e = strip_parens_tc(e);
+        // A sub-view (`String::view(&s, lo, hi)`, `StringView::sub`): the
+        // range of its source it covers.
+        if let ExprKind::Call(callee, args) = &e.kind {
+            if let ExprKind::Path(segs, _) = &callee.kind {
+                let k = segs.join("::");
+                if (k == "std::String::view" || k == "std::StringView::sub") && args.len() == 3 {
+                    let r = range_elem(&args[1], &args[2]);
+                    return self.inherited_facts_in(&args[0], depth + 1, binder).map(|v| {
+                        v.into_iter()
+                            .map(|(mut k, t)| {
+                                k.path.push(r.clone());
+                                (k, t)
+                            })
+                            .collect()
+                    });
+                }
+            }
+        }
+        if let Some(k) = self.deriv_facts_of(e) {
+            return Some(vec![(k, Tri::T)]);
+        }
+        match &e.kind {
+            ExprKind::Path(segs, _) if segs.len() == 1 && binder.map_or(false, |(b, _)| b == segs[0]) => {
+                let (_, scrut) = binder.unwrap();
+                self.inherited_facts_in(scrut, depth + 1, None)
+            }
+            // A name that is no local of this frame (`None`, a constant):
+            // static data.
+            ExprKind::Path(segs, _) if segs.len() != 1 || self.lookup_local(&segs[0]).is_none() => None,
+            ExprKind::Path(segs, _) if segs.len() == 1 => {
+                let r = &segs[0];
+                // Through a reference binding: a reborrow of its referent
+                // `*r` (D-0071), which keeps `r` itself alive; a copied
+                // view or `Option` of a reference holds what it holds.
+                if !matches!(self.lookup_local(r), Some(Type::Ref(..)) | Some(Type::Slice(..))) {
+                    if let Some(f) = self.flow.deriv.get(r) {
+                        return Some(f.iter().map(|(k, v)| (k.clone(), *v)).collect());
+                    }
+                }
+                match self.lookup_local(r) {
+                    Some(Type::Ref(_, m)) | Some(Type::Slice(_, m)) => Some(vec![(DerivKey { root: referent_root(r), path: Vec::new(), mode: m }, Tri::T)]),
+                    Some(t) if holds_ref(self.items, &t) => Some(vec![(DerivKey { root: referent_root(r), path: Vec::new(), mode: Mode::Shared }, Tri::T)]),
+                    // An owner of this frame (`&v[0].f` reaches `v`).
+                    Some(_) if self.flow.is_tracked(r) => Some(vec![(DerivKey { root: r.clone(), path: Vec::new(), mode: Mode::Shared }, Tri::T)]),
+                    _ => Some(Vec::new()),
+                }
+            }
+            // A reference read out of a field of an aggregate that holds
+            // references (`h.r` of a `struct Hold`): a stored reference.
+            ExprKind::Field(base, _) if self.value_shape(base).or_else(|| self.static_place_type(base)).map_or(false, |t| self.tier_d_type(&t)) => tier_d(),
+            ExprKind::Field(base, _) | ExprKind::Deref(base) => self.inherited_facts_in(base, depth + 1, binder),
+            ExprKind::Borrow(m, inner) | ExprKind::SliceOf(m, inner, _, _) => {
+                // The projection down to the reference it goes through:
+                // its fields, cut at the first index (an element is
+                // inside the container the path names so far).
+                let mut b: &Expr = inner;
+                let mut fields: Vec<String> = Vec::new();
+                loop {
+                    match &strip_parens_tc(b).kind {
+                        ExprKind::Field(x, f) => {
+                            fields.push(f.clone());
+                            b = x;
+                        }
+                        ExprKind::Index(x, _) => {
+                            fields.clear();
+                            b = x;
+                        }
+                        ExprKind::Deref(x) => b = x,
+                        _ => break,
+                    }
+                }
+                fields.reverse();
+                // A borrow of a temporary (`&padded()[0 .. $]`): it ends
+                // with the statement (D-0135).
+                if let ExprKind::Call(cal, _) = &strip_parens_tc(b).kind {
+                    // A constant (`&HALF`) is static data, not a temporary.
+                    let is_const = self.resolve_fn_path(cal).map_or(false, |f| f.is_const);
+                    if !is_const && self.value_shape(b).map_or(false, |t| !is_borrow_ty(&t) && !holds_ref(self.items, &t)) {
+                        return Some(vec![(DerivKey { root: "<temporary>".to_string(), path: Vec::new(), mode: m.clone() }, Tri::T)]);
+                    }
+                }
+                self.inherited_facts_in(b, depth + 1, binder).map(|v| v.into_iter().map(|(mut k, t)| {
+                    k.mode = m.clone();
+                    k.path.extend(fields.iter().map(|f| PElem::Field(f.clone())));
+                    (k, t)
+                }).collect())
+            }
+            ExprKind::Call(callee, args) => {
+                if let ExprKind::Path(segs, _) = &callee.kind {
+                    if segs.len() == 1 && segs[0].starts_with("$each") {
+                        // What the loop walks: its reference arguments (a
+                        // hidden index is a number, not a source). Over a
+                        // `HashMap`, a key binder reaches its `keys` and a
+                        // value binder its `values`.
+                        let map_field = match (segs[0].as_str(), args.first().and_then(|a| self.value_shape(a).or_else(|| self.static_place_type(a)))) {
+                            ("$each_take_key" | "$each_key", Some(Type::Ref(t, _))) if matches!(&*t, Type::Named(n, _) if n == "std::HashMap") => Some("keys"),
+                            ("$each_take" | "$each_at" | "$each_at_mut", Some(Type::Ref(t, _))) if matches!(&*t, Type::Named(n, _) if n == "std::HashMap") => Some("values"),
+                            _ => None,
+                        };
+                        let mut out = Vec::new();
+                        for a in args {
+                            let is_value = match &strip_parens_tc(a).kind {
+                                ExprKind::Path(ps, _) if ps.len() == 1 => self.lookup_local(&ps[0]).map_or(false, |t| !is_borrow_ty(&t) && !holds_ref(self.items, &t) && !matches!(t, Type::Named(..))),
+                                ExprKind::IntLit(..) | ExprKind::Binary(..) => true,
+                                _ => false,
+                            };
+                            if !is_value {
+                                out.extend(self.inherited_facts_in(a, depth + 1, binder).unwrap_or_default());
+                            }
+                        }
+                        if let Some(fl) = map_field {
+                            for (k, _) in out.iter_mut() {
+                                k.path.push(PElem::Field(fl.to_string()));
+                            }
+                        }
+                        return Some(out);
+                    }
+                }
+                let f = self.resolve_fn_path(callee)?;
+                // A sub-view (`String::view(&s, lo, hi)`, `StringView::sub`):
+                // the range of its source it covers.
+                if let ExprKind::Path(segs, _) = &callee.kind {
+                    let k = segs.join("::");
+                    if (k == "std::String::view" || k == "std::StringView::sub") && args.len() == 3 {
+                        let r = range_elem(&args[1], &args[2]);
+                        return self.inherited_facts_in(&args[0], depth + 1, binder).map(|v| v.into_iter().map(|(mut k, t)| {
+                            k.path.push(r.clone());
+                            (k, t)
+                        }).collect());
+                    }
+                }
+                // A generic whose declared result holds a reference only
+                // through a type argument (`Vec::pop` of a `Vec<ref<T>>`)
+                // gives back a reference that was stored: tier D.
+                if !is_borrow_ty(&f.ret) && !holds_ref(self.items, &f.ret) {
+                    return tier_d();
+                }
+                let refs: Vec<&Expr> = f.params.iter().zip(args.iter()).filter(|(p, _)| is_borrow_ty(&p.ty) || holds_ref(self.items, &p.ty)).map(|(_, a)| a).collect();
+                if refs.is_empty() {
+                    return None;
+                }
+                // Through a reference to storage that itself holds
+                // references (a `Vec<ref<T>>`, a struct with a reference
+                // field), the result may be one of those stored references,
+                // which reaches what it reaches, not that storage: tier D.
+                let referent = match &strip_parens_tc(refs[0]).kind {
+                    ExprKind::Borrow(_, inner) | ExprKind::SliceOf(_, inner, _, _) => self.static_place_type(inner),
+                    ExprKind::Path(segs, _) if segs.len() == 1 => match self.lookup_local(&segs[0]) {
+                        Some(Type::Ref(inner, _) | Type::Slice(inner, _)) => Some(*inner),
+                        _ => None,
+                    },
+                    _ => match self.value_shape(refs[0]) {
+                        Some(Type::Ref(inner, _) | Type::Slice(inner, _)) => Some(*inner),
+                        _ => None,
+                    },
+                };
+                let reaches_stored = referent.map_or(false, |t| stores_refs(self.items, &t));
+                if reaches_stored {
+                    return tier_d();
+                }
+                let mut out = Vec::new();
+                // The result borrows from the first reference argument
+                // (D-0011; D-0088 for a result that holds one), not from the
+                // others (a key, a needle).
+                for a in refs.iter().take(1) {
+                    match self.inherited_facts_in(a, depth + 1, binder) {
+                        Some(v) if v.is_empty() => return Some(Vec::new()),
+                        Some(v) => out.extend(v),
+                        None => {}
+                    }
+                }
+                Some(out)
+            }
+            ExprKind::If(_, then_b, else_e) => {
+                // A branch that does not complete (or holds nothing of this
+                // frame) adds nothing; the facts are certain when one branch
+                // gives them all, unknown when branches differ.
+                let mut parts: Vec<Vec<(DerivKey, Tri)>> = Vec::new();
+                for t in then_b.tail.iter().map(|b| &**b).chain(else_e.iter().map(|b| &**b)) {
+                    match self.inherited_facts_in(t, depth + 1, binder) {
+                        Some(v) if v.is_empty() => return Some(Vec::new()),
+                        Some(v) => parts.push(v),
+                        None => {}
+                    }
+                }
+                let single = parts.len() == 1;
+                Some(parts.into_iter().flatten().map(|(k, t)| (k, if single { t } else { Tri::U })).collect())
+            }
+            ExprKind::Block(b) => b.tail.as_ref().and_then(|t| self.inherited_facts_in(t, depth + 1, binder)),
+            ExprKind::Match(scrut, arms) => {
+                let mut out: Vec<Vec<(DerivKey, Tri)>> = Vec::new();
+                for a in arms {
+                    // An arm whose result is its binder gives what the
+                    // scrutinee holds.
+                    let binder_result = match (&a.binder, &strip_parens_tc(&a.body).kind) {
+                        (Some(b), ExprKind::Path(segs, _)) => segs.len() == 1 && &segs[0] == b,
+                        (Some(b), ExprKind::Block(blk)) => blk.stmts.is_empty() && blk.tail.as_ref().map_or(false, |t| matches!(&strip_parens_tc(t).kind, ExprKind::Path(segs, _) if segs.len() == 1 && &segs[0] == b)),
+                        _ => false,
+                    };
+                    let got = if binder_result {
+                        self.inherited_facts_in(scrut, depth + 1, binder)
+                    } else {
+                        self.inherited_facts_in(&a.body, depth + 1, a.binder.as_deref().map(|b| (b, &**scrut)).or(binder))
+                    };
+                    match got {
+                        Some(v) if v.is_empty() => return Some(Vec::new()),
+                        Some(v) => out.push(v),
+                        None => {}
+                    }
+                }
+                let single = out.len() == 1;
+                Some(out.into_iter().flatten().map(|(k, t)| (k, if single { t } else { Tri::U })).collect())
+            }
+            // A branch that does not complete gives nothing.
+            ExprKind::Return(_) | ExprKind::Break | ExprKind::Continue => None,
+            ExprKind::StrLit(_) => None,
+            // An element read out of a container of references, or a
+            // reference out of a struct's field (a value, not a binding of
+            // this frame): a stored reference, tier D.
+            ExprKind::Index(..) => tier_d(),
+            _ => Some(Vec::new()),
+        }
+    }
+
+    // D-0281 §7: a type that holds a reference without being one (a view,
+    // an `Option`/`Result` of a reference, a closure): an aggregate kept in
+    // data, tier D, whose conflicts are checked when the program runs.
+    fn tier_d_type(&self, t: &Type) -> bool {
+        let frame_ref = match t {
+            Type::Ref(..) | Type::Slice(..) | Type::Closure(_) | Type::Fn(..) => true,
+            Type::Named(n, a) if n == "std::StringView" => a.is_empty(),
+            Type::Named(n, a) if n == "std::Option" || n == "std::Result" => a.first().map_or(false, |x| matches!(x, Type::Ref(..) | Type::Slice(..)) || matches!(x, Type::Named(m, _) if m == "std::StringView")),
+            _ => false,
+        };
+        !frame_ref && holds_ref(self.items, t)
+    }
+
+    // The binding whose path a reference binding carries: itself, or what
+    // it was copied from.
+    fn path_id(&self, r: &str) -> String {
+        let mut cur = r.to_string();
+        for _ in 0..64 {
+            match self.ref_copies.get(&cur) {
+                Some(n) if *n != cur => cur = n.clone(),
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    // `set_deriv` with facts of any truth value (inherited facts).
+    fn set_deriv_tri(&mut self, r: &str, facts: Vec<(DerivKey, Tri)>) {
+        if self.flow.unreachable {
+            return;
+        }
+        self.flow.deriv.remove(r);
+        self.flow.clear_rooted(&referent_root(r));
+        if !facts.is_empty() {
+            let mut m: HashMap<DerivKey, Tri> = HashMap::default();
+            for (k, v) in facts {
+                let e = m.entry(k).or_insert(v);
+                if *e != v {
+                    *e = Tri::U;
+                }
+            }
+            self.flow.deriv.insert(r.to_string(), m);
+        }
+    }
+
+    // D-0282: at a binding `set_deriv` gave no fact: inherit,
+    // or record the binding as of unknown (or static) origin.
+    fn tier_inherit(&mut self, r: &str, e: Option<&Expr>) -> Result<(), String> {
+        if !tier_report::on() || !self.report || self.flow.unreachable || self.flow.deriv.contains_key(r) {
+            return Ok(());
+        }
+        if let Some(ExprKind::Path(segs, _)) = e.map(|e| &strip_parens_tc(e).kind) {
+            let is_ref = |t: Option<Type>| matches!(t, Some(Type::Ref(..) | Type::Slice(..)));
+            if segs.len() == 1 && segs[0] != r && is_ref(self.lookup_local(&segs[0])) && is_ref(self.lookup_local(r)) {
+                let id = self.path_id(&segs[0]);
+                self.ref_copies.insert(r.to_string(), id);
+            }
+        }
+        let line = self.current_line;
+        let ty = self.lookup_local(r).map(|t| t.to_string()).unwrap_or_default();
+        let kind = e.map(tier_report::kind_of).unwrap_or_else(|| "binder".to_string());
+        // A binding whose type is an aggregate holding a reference (a
+        // struct, an array, an enum other than `Option`/`Result` of one)
+        // is tier D by its type (D-0281 §7), whatever it was made from.
+        if let Some(t) = self.lookup_local(r) {
+            if self.tier_d_type(&t) {
+                tier_report::with(|rep| {
+                    rep.tier_d += 1;
+                    rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
+                });
+                return Ok(());
+            }
+        }
+        // `r = pass(r)`: what the old `r` reached is not a fact rooted at
+        // the new `r`'s own referent (the old facts were cleared when `r`
+        // was assigned, so `r` here is known only as `*r`).
+        let own = referent_root(r);
+        let inherited = e.map(|e| self.inherited_facts(e, 0).map(|v| v.into_iter().filter(|(k, _)| k.root != own).collect::<Vec<_>>()));
+        match inherited {
+            Some(None) => tier_report::with(|rep| rep.events.push(format!("S\t{}\t{}\t{}\t{}", line, r, ty, kind))),
+            Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<tier D>") => tier_report::with(|rep| {
+                rep.tier_d += 1;
+                rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
+            }),
+            Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<temporary>") => {
+                if tier_report::live_after(r, self.current_line, self.current_col) {
+                    let msg = format!("`{}` holds a view of a temporary that ends with this statement, and is used later (D-0135)", r);
+                    let diag = format!("{}{}", crate::modres::named("diag.destroy-while-aliased", msg), crate::diagnostics::at(self.current_line, self.current_col));
+                    self.refute(&diag)?;
+                }
+            }
+            Some(Some(v)) if !v.is_empty() => {
+                tier_report::with(|rep| {
+                    rep.inherited += 1;
+                });
+                self.set_deriv_tri(r, v);
+            }
+            _ => tier_report::with(|rep| {
+                rep.unknown_origin += 1;
+                rep.events.push(format!("O\t{}\t{}\t{}\t{}", line, r, ty, kind));
+            }),
+        }
+        Ok(())
     }
 
     // `auto r = e;` / `r = e;` for a reference-typed `r`: a visible
@@ -2774,6 +3617,8 @@ impl<'a> Body<'a> {
         if self.flow.unreachable {
             return;
         }
+        self.ref_copies.remove(r);
+
         self.flow.deriv.remove(r);
         // What was borrowed through `r`'s old referent is not borrowed
         // through its new one (D-0071).
@@ -3015,6 +3860,7 @@ impl<'a> Body<'a> {
                         None => init.as_deref().map(|e| self.contained_ref_facts(e)).unwrap_or_default(),
                     };
                     self.set_deriv(name, facts);
+                    self.tier_inherit(name, init.as_deref())?;
                     let origin = init.as_ref().and_then(|e| self.referent_of(e));
                     self.ref_origin.insert(name.clone(), origin);
                 } else if let Some(e) = init.as_deref().filter(|_| final_ty.as_ref().map_or(false, |t| holds_ref(self.items, t))) {
@@ -3022,6 +3868,7 @@ impl<'a> Body<'a> {
                     // reference) from a call borrows from its arguments.
                     let facts = self.contained_ref_facts(e);
                     self.set_deriv(name, facts);
+                    self.tier_inherit(name, Some(e))?;
                 } else if let Some(e) = init.as_ref().filter(|e| is_spawn_call(e)) {
                     let facts = self.spawn_facts_of(e);
                     self.set_deriv(name, facts);
@@ -3299,6 +4146,7 @@ impl<'a> Body<'a> {
             ExprKind::Unary(op, inner) => self.check_unary(*op, inner, expected),
             ExprKind::Binary(op, a, b) => self.check_binary(*op, a, b, e, expected),
             ExprKind::Borrow(m, inner) => {
+                self.tier_elem_access(inner, m.clone())?;
                 // D-0258 `[Ref-Form-Static]`: `&NAME` of a static is a shared
                 // reference to one object with program extent; it never
                 // ends, so it is never tracked. `&mut NAME` is refused: the
@@ -3573,6 +4421,7 @@ impl<'a> Body<'a> {
                 Ok(t)
             }
             ExprKind::Index(base, idx) => {
+                self.tier_elem_access(e, Mode::Shared)?;
                 self.place_pos = true;
                 let bt = self.check_expr(base, None)?;
                 // D-0064: `g[i]` through a guard is `(*g)[i]`.
@@ -3730,6 +4579,7 @@ impl<'a> Body<'a> {
                 Ok(t.or(elem_expected).map(|t| Type::Array(Box::new(t), *n)))
             }
             ExprKind::Assign(lhs, rhs) => {
+                self.tier_assign_rules(lhs, rhs)?;
                 // `[Write-Not-Exclusive]` (spec/08): a write through a
                 // shared reference, direct (`*r = ..`) or by auto-deref
                 // (`r.f = ..`).
@@ -3807,6 +4657,7 @@ impl<'a> Body<'a> {
                             None => self.contained_ref_facts(rhs),
                         };
                         self.set_deriv(&name, facts);
+                        self.tier_inherit(&name, Some(rhs))?;
                         let origin = self.referent_of(rhs);
                         self.ref_origin.insert(name, origin);
                     } else if self.flow.is_tracked(&name) && is_spawn_call(rhs) && matches!(strip_parens_tc(lhs).kind, ExprKind::Path(..)) {
@@ -4825,7 +5676,420 @@ impl<'a> Body<'a> {
         Ok(None)
     }
 
+    // D-0282: an access to `root.path` in `mode` (a `Vec`
+    // element read or borrowed), against the live holders other than
+    // those the access goes through.
+    fn tier_access(&mut self, root: &str, path: &[PElem], mode: Mode, through: &HashSet<String>) -> Result<(), String> {
+        let mut point = false;
+        for (h, facts) in self.flow.deriv.iter() {
+            if through.contains(h) || self.lookup_local(h).map_or(false, |t| self.tier_d_type(&t)) {
+                continue;
+            }
+            if !tier_report::live_after(h, self.current_line, self.current_col) {
+                continue;
+            }
+            for (k, v) in facts {
+                if *v == Tri::F || k.root != root || permitted(mode.clone(), k.mode.clone()) {
+                    continue;
+                }
+                match overlap3(&k.path, path) {
+                    Ov::No => {}
+                    Ov::Maybe => point = true,
+                    Ov::Yes if *v != Tri::T => point = true,
+                    Ov::Yes => {
+                        let msg = format!("{} still borrows `{}`, so it cannot be {} here", holder_text(h), shown_place(&k.root, &k.path), if mode == Mode::Exclusive { "written or borrowed `mut`" } else { "read" });
+                        return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
+                    }
+                }
+            }
+        }
+        if point {
+            let line = self.current_line;
+            tier_report::with(|r| {
+                r.point_checks += 1;
+                r.events.push(format!("P\t{}\t{}\telement", line, root));
+            });
+        }
+        Ok(())
+    }
+
+    // An element of a `Vec` read (`v[i]`, `v[i].f`) or borrowed: what it
+    // reaches, for `tier_access`.
+    fn tier_elem_access(&mut self, e: &Expr, mode: Mode) -> Result<(), String> {
+        if !tier_report::on() || !self.report || self.flow.unreachable {
+            return Ok(());
+        }
+        let mut b: &Expr = e;
+        loop {
+            match &strip_parens_tc(b).kind {
+                ExprKind::Field(x, _) => b = x,
+                _ => break,
+            }
+        }
+        if let Some((root, path)) = self.vec_element_root(b) {
+            let mut through = HashSet::default();
+            if let ExprKind::Index(base, _) = &strip_parens_tc(b).kind {
+                let mut x: &Expr = base;
+                loop {
+                    match &strip_parens_tc(x).kind {
+                        ExprKind::Field(y, _) | ExprKind::Deref(y) | ExprKind::Index(y, _) => x = y,
+                        ExprKind::Path(segs, _) if segs.len() == 1 => {
+                            through.insert(segs[0].clone());
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            return self.tier_access(&root, &path, mode, &through);
+        }
+        Ok(())
+    }
+
+    // D-0282: rules at an assignment. (1) Its place is found
+    // before its value is computed (D-0007): a value that takes the place's
+    // container exclusively (`v[0].x = grow(&mut v)`) may move the place,
+    // which is a conflict decided here. (2) A place that holds a resource
+    // is checked, when written, for the value it holds: a test of that
+    // value (a discriminant), with no tracking state: a point check.
+    fn tier_assign_rules(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        if !tier_report::on() || !self.report || self.flow.unreachable {
+            return Ok(());
+        }
+        let line = self.current_line;
+        let through_elem = {
+            let mut b: &Expr = lhs;
+            let mut elem = false;
+            loop {
+                match &strip_parens_tc(b).kind {
+                    ExprKind::Field(x, _) | ExprKind::Deref(x) => b = x,
+                    ExprKind::Index(x, _) => {
+                        elem = true;
+                        b = x;
+                    }
+                    ExprKind::Call(c, xs) => {
+                        // `*Vec::index_exclusive(&mut v, i) = …`
+                        if matches!(&c.kind, ExprKind::Path(segs, _) if segs.last().map_or(false, |l| l.starts_with("index"))) && !xs.is_empty() {
+                            elem = true;
+                            b = &xs[0];
+                        } else {
+                            break;
+                        }
+                    }
+                    ExprKind::Borrow(_, x) => b = x,
+                    _ => break,
+                }
+            }
+            if elem {
+                self.inherited_facts(b, 0).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        };
+        if !through_elem.is_empty() {
+            let mut excl: Vec<DerivKey> = Vec::new();
+            fn borrows_in(e: &Expr, out: &mut Vec<Expr>) {
+                match &e.kind {
+                    ExprKind::Borrow(Mode::Exclusive, _) => out.push(e.clone()),
+                    ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Deref(x) | ExprKind::Field(x, _) => borrows_in(x, out),
+                    ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(a, b) => {
+                        borrows_in(a, out);
+                        borrows_in(b, out);
+                    }
+                    ExprKind::Call(c, xs) => {
+                        borrows_in(c, out);
+                        for x in xs {
+                            borrows_in(x, out);
+                        }
+                    }
+                    ExprKind::Block(b) => {
+                        for s in &b.stmts {
+                            if let Stmt::Expr(x) | Stmt::BlockLike(x) = s {
+                                borrows_in(x, out);
+                            }
+                        }
+                        if let Some(t) = &b.tail {
+                            borrows_in(t, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut bs = Vec::new();
+            borrows_in(rhs, &mut bs);
+            for b in &bs {
+                if let Some(v) = self.inherited_facts(b, 0) {
+                    excl.extend(v.into_iter().map(|(k, _)| k));
+                }
+            }
+            for (k, _) in &through_elem {
+                if excl.iter().any(|x| x.root == k.root && overlap3(&x.path, &k.path) != Ov::No) {
+                    let msg = format!("the place is found before the value is computed, and the value takes `{}` exclusively, which may move the place (evaluation order, D-0007)", shown_name(&k.root));
+                    return self.refute(&crate::modres::named("diag.stale-binding", msg));
+                }
+            }
+        }
+        if self.static_place_type(lhs).map_or(false, |t| is_resource_ty(self.items, &t)) {
+            tier_report::with(|r| {
+                r.point_checks += 1;
+                r.events.push(format!("P\t{}\tresource place written: its value is tested", line));
+            });
+        }
+        Ok(())
+    }
+
+    // D-0282: the call-site rule. Each argument that is or
+    // holds a reference reaches places of this frame (its *whole* keys, in
+    // its parameter's mode). The callee's access summary says what it does
+    // through that parameter (its *projected* keys). A live holder of the
+    // caller conflicts with what the callee does (use-time, D-0018); two
+    // arguments conflict when what is done through one meets the other's
+    // whole referent, which lives for the call. A certain conflict is
+    // reported as the static pass reports one; one that depends on values
+    // (an index, a range) is a point check.
+    fn tier_call_rule(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), String> {
+        if !tier_report::on() || !self.report || self.flow.unreachable {
+            return Ok(());
+        }
+        // A call through a local `fn` value: whether it was emptied (moved
+        // from) is a test of the value itself, a point check.
+        if let ExprKind::Path(segs, _) = &callee.kind {
+            if segs.len() == 1 && matches!(self.lookup_local(&segs[0]), Some(Type::Fn(..)) | Some(Type::Closure(_))) {
+                let line = self.current_line;
+                tier_report::with(|r| {
+                    r.point_checks += 1;
+                    r.events.push(format!("P\t{}\tfn value called: its state is tested", line));
+                });
+            }
+        }
+        // `drop(*r)` and the like: moved out through a reference.
+        for a in args {
+            if let ExprKind::Deref(inner) = &strip_parens_tc(a).kind {
+                if let ExprKind::Path(segs, _) = &strip_parens_tc(inner).kind {
+                    let moves = self.static_place_type(a).map_or(false, |t| is_resource_ty(self.items, &t) || matches!(&t, Type::Named(n, _) if n == "std::Atomic" || n == "std::Vec" || n == "std::String"));
+                    if segs.len() == 1 && moves && matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..))) {
+                        let msg = format!("`*{}` cannot be moved out: `{}` still refers to it", segs[0], segs[0]);
+                        return self.refute(&format!("{}{}", crate::modres::named("diag.move-while-aliased", msg), crate::diagnostics::at(a.line, a.col)));
+                    }
+                }
+            }
+        }
+        let Some(f) = self.resolve_fn_path(callee) else { return Ok(()) };
+        let key = match &callee.kind {
+            ExprKind::Path(segs, _) => segs.join("::"),
+            _ => String::new(),
+        };
+        // The bindings a reference argument is formed through (`r` in
+        // `&mut r.x`, `Vec::index_shared(&*r, 0)`, `r` itself): reaching
+        // through them is not a conflict with them. A binding named only
+        // in an index or a value argument is checked as any other holder.
+        fn roots_in(e: &Expr, out: &mut HashSet<String>) {
+            match &e.kind {
+                ExprKind::Path(segs, _) if segs.len() == 1 => {
+                    out.insert(segs[0].clone());
+                }
+                ExprKind::Paren(x) | ExprKind::Deref(x) | ExprKind::Field(x, _) | ExprKind::Borrow(_, x) | ExprKind::Index(x, _) | ExprKind::SliceOf(_, x, _, _) => roots_in(x, out),
+                // A call on a reference (D-0011): its reference arguments,
+                // not its values (`String::view(&s, h.lo, h.hi)` reaches
+                // through `s`, not `h`).
+                ExprKind::Call(_, xs) => {
+                    for x in xs {
+                        if matches!(&strip_parens_tc(x).kind, ExprKind::Borrow(..) | ExprKind::SliceOf(..) | ExprKind::Path(..) | ExprKind::Call(..)) {
+                            roots_in(x, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut through: HashSet<String> = HashSet::default();
+        for (p, a) in f.params.iter().zip(args.iter()) {
+            // A type parameter's argument counts only when its value is
+            // or holds a reference (`*r` given to `Vec::push` is a copy).
+            let generic_ref = matches!(&p.ty, Type::Named(n, ta) if ta.is_empty() && f.type_params.iter().any(|tp| tp == n))
+                && self.value_shape(a).or_else(|| self.static_place_type(a)).map_or(false, |t| is_borrow_ty(&t) || holds_ref(self.items, &t));
+            if is_borrow_ty(&p.ty) || holds_ref(self.items, &p.ty) || generic_ref {
+                roots_in(a, &mut through);
+            }
+        }
+        struct Access {
+            idx: usize,
+            holder: Option<String>,
+            whole: Vec<DerivKey>,
+            proj: Vec<DerivKey>,
+            // The whole keys whose facts hold on some paths only (`?`): a
+            // conflict through them is the run's to decide.
+            unsure: Vec<(String, Vec<PElem>)>,
+        }
+        let sums = crate::tier::summaries(self.items);
+        let mut accesses: Vec<Access> = Vec::new();
+        for (i, (p, a)) in f.params.iter().zip(args.iter()).enumerate() {
+            let mode = match &p.ty {
+                Type::Ref(_, m) | Type::Slice(_, m) => m.clone(),
+                t if holds_ref(self.items, t) => Mode::Shared,
+                // A type parameter: the argument's own value, when it is
+                // or holds a reference (a number is copied).
+                Type::Named(n, ta) if ta.is_empty() && f.type_params.iter().any(|tp| tp == n) => {
+                    let at = self.value_shape(a).or_else(|| self.static_place_type(a));
+                    match at {
+                        Some(t) if is_borrow_ty(&t) || holds_ref(self.items, &t) => Mode::Shared,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let a = strip_parens_tc(a);
+            let holder = match &a.kind {
+                ExprKind::Path(segs, _) if segs.len() == 1 && self.flow.is_tracked(&segs[0]) => Some(segs[0].clone()),
+                _ => None,
+            };
+            let mut whole: Vec<DerivKey> = Vec::new();
+            let mut unsure: Vec<(String, Vec<PElem>)> = Vec::new();
+            if let Some(h) = &holder {
+                let ht = self.lookup_local(h);
+                if matches!(ht, Some(Type::Ref(..)) | Some(Type::Slice(..))) || ht.as_ref().map_or(false, |t| holds_ref(self.items, t)) {
+                    whole.push(DerivKey { root: referent_root(h), path: Vec::new(), mode: mode.clone() });
+                    if let Some(fs) = self.flow.deriv.get(h) {
+                        whole.extend(fs.keys().map(|k| DerivKey { mode: mode.clone(), ..k.clone() }));
+                        unsure.extend(fs.iter().filter(|(_, v)| **v == Tri::U).map(|(k, _)| (k.root.clone(), k.path.clone())));
+                    }
+                } else {
+                    continue; // a value passed by copy or move
+                }
+            } else if let Some(v) = self.inherited_facts(a, 0) {
+                for (k, t) in v.into_iter().filter(|(k, _)| k.root != "<tier D>") {
+                    if t == Tri::U {
+                        unsure.push((k.root.clone(), k.path.clone()));
+                    }
+                    whole.push(DerivKey { mode: mode.clone(), ..k });
+                }
+            }
+            if whole.is_empty() {
+                continue;
+            }
+            // What the callee does through this parameter.
+            let proj = match sums.param(&key, i).filter(|_| matches!(&p.ty, Type::Ref(..) | Type::Slice(..))) {
+                Some(acc) => {
+                    let shared_param = matches!(&p.ty, Type::Ref(_, Mode::Shared) | Type::Slice(_, Mode::Shared));
+                    let mut out = Vec::new();
+                    for k in &whole {
+                        for w in &acc.writes {
+                            let mut q = k.clone();
+                            // Through a shared parameter a write is interior
+                            // mutability (`Atomic`, a guard): still shared.
+                            q.mode = if shared_param { Mode::Shared } else { Mode::Exclusive };
+                            q.path.extend(w.iter().map(|x| PElem::Field(x.clone())));
+                            out.push(q);
+                        }
+                        for r in &acc.reads {
+                            let mut q = k.clone();
+                            q.mode = Mode::Shared;
+                            q.path.extend(r.iter().map(|x| PElem::Field(x.clone())));
+                            out.push(q);
+                        }
+                    }
+                    out
+                }
+                None => whole.clone(),
+            };
+            accesses.push(Access { idx: i, holder, whole, proj, unsure });
+        }
+        let mut point_checks: Vec<String> = Vec::new();
+        // What the callee does, against the caller's live holders. An
+        // argument that is a visible borrow is checked against them where
+        // it is formed (`rule.control.flow-analysis`), which refutes every
+        // conflict this would, and names the borrow.
+        for acc in &accesses {
+            if matches!(&strip_parens_tc(&args[acc.idx]).kind, ExprKind::Borrow(..) | ExprKind::SliceOf(..)) {
+                continue;
+            }
+            for k in &acc.proj {
+                for (h, facts) in self.flow.deriv.iter() {
+                    let same_path = acc.holder.as_ref().map_or(false, |a| self.path_id(a) == self.path_id(h));
+                    if Some(h) == acc.holder.as_ref() || same_path || through.contains(h) || accesses.iter().any(|x| x.holder.as_ref() == Some(h)) {
+                        continue;
+                    }
+                    // A tier-D holder's conflicts are the run's to check.
+                    if self.lookup_local(h).map_or(false, |t| self.tier_d_type(&t)) {
+                        continue;
+                    }
+                    // A holder past its last use has ended (D-0111) -- as
+                    // are the holders only it keeps alive: one rooted at
+                    // its referent is checked through it.
+                    if !tier_report::live_after(h, self.current_line, self.current_col) && !self.flow.deriv.iter().any(|(o, fs)| o != h && tier_report::live_after(o, self.current_line, self.current_col) && fs.keys().any(|k| k.root == referent_root(h))) {
+                        continue;
+                    }
+                    for (hk, v) in facts {
+                        if *v == Tri::F || hk.root != k.root || permitted(k.mode.clone(), hk.mode.clone()) {
+                            continue;
+                        }
+                        let sure = *v == Tri::T && !acc.unsure.iter().any(|(r, p)| *r == k.root && k.path.starts_with(p));
+                        match overlap3(&hk.path, &k.path) {
+                            Ov::No => {}
+                            Ov::Maybe => point_checks.push(format!("P\t{}\t{}\t{}", self.current_line, shown_name(&k.root), h)),
+                            Ov::Yes if !sure => point_checks.push(format!("P\t{}\t{}\t{} (on some paths)", self.current_line, shown_name(&k.root), h)),
+                            Ov::Yes => {
+                                let msg = format!("`{}` {} `{}` through argument {} while {} still borrows `{}`; end that borrow first", shown_callee(&key), shown_access(&k.mode), shown_place(&k.root, &k.path), acc.idx + 1, holder_text(h), shown_place(&hk.root, &hk.path));
+                                return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Between the arguments.
+        for (ai, a) in accesses.iter().enumerate() {
+            for b in accesses.iter().skip(ai + 1) {
+                // `[Swap-Places]`: a place swapped with itself is no conflict.
+                if (key == "std::swap" || key == "std::swap_places") && args.len() == 2 && same_place(&args[0], &args[1]) {
+                    continue;
+                }
+                // One reference passed twice, or a copy of it beside it:
+                // one path, which does not conflict with itself.
+                if let (Some(x), Some(y)) = (&a.holder, &b.holder) {
+                    let refs = matches!(self.lookup_local(x), Some(Type::Ref(..) | Type::Slice(..))) && matches!(self.lookup_local(y), Some(Type::Ref(..) | Type::Slice(..)));
+                    if refs && self.path_id(x) == self.path_id(y) {
+                        continue;
+                    }
+                }
+                let pairs = a.proj.iter().flat_map(|x| b.whole.iter().map(move |y| (x, y))).chain(b.proj.iter().flat_map(|y| a.whole.iter().map(move |x| (y, x))));
+                for (x, y) in pairs {
+                    if x.root != y.root || permitted(x.mode.clone(), y.mode.clone()) {
+                        continue;
+                    }
+                    let is_unsure = |k: &DerivKey| a.unsure.iter().chain(b.unsure.iter()).any(|(r, p)| *r == k.root && k.path.starts_with(p));
+                    match overlap3(&x.path, &y.path) {
+                        Ov::No => {}
+                        Ov::Maybe => point_checks.push(format!("P\t{}\t{}\targuments {} and {}", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1)),
+                        Ov::Yes if is_unsure(x) || is_unsure(y) => point_checks.push(format!("P\t{}\t{}\targuments {} and {} (on some paths)", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1)),
+                        Ov::Yes => {
+                            // `x` is what the callee does through one argument,
+                            // `y` the other argument's whole referent.
+                            let (through, other) = if a.proj.iter().any(|k| std::ptr::eq(k, x)) { (a.idx, b.idx) } else { (b.idx, a.idx) };
+                            let msg = if x.mode == Mode::Exclusive {
+                                format!("`{}` writes `{}` through argument {}, which argument {} also reaches", shown_callee(&key), shown_place(&x.root, &x.path), through + 1, other + 1)
+                            } else {
+                                format!("`{}` reads `{}` through argument {}, which argument {} reaches exclusively", shown_callee(&key), shown_place(&x.root, &x.path), through + 1, other + 1)
+                            };
+                            return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
+                        }
+                    }
+                }
+            }
+        }
+        if !point_checks.is_empty() {
+            point_checks.sort();
+            point_checks.dedup();
+            tier_report::with(|r| {
+                r.point_checks += point_checks.len();
+                r.events.extend(point_checks);
+            });
+        }
+        Ok(())
+    }
+
     fn check_call(&mut self, callee: &Expr, args: &[Expr], expected: Option<&Type>) -> TResult {
+        self.tier_call_rule(callee, args)?;
         // enum variant construction, `Vi(e)`
         if let ExprKind::Path(segs, targs) = &callee.kind {
             if args.len() == 1 {
@@ -6672,11 +7936,13 @@ impl<'a> Body<'a> {
                         }
                     }
                     self.set_deriv(bn, facts);
+                    self.tier_inherit(bn, Some(scrut))?;
                 } else if let Some(m) = &by_ref {
                 // D-0071: a binder of a match by reference is a reference
                 // into the scrutinee's place for the arm.
                     let fact = self.match_referent(scrut).map(|(root, path)| DerivKey { root, path, mode: m.clone() });
                     self.set_deriv(bn, fact.into_iter().collect());
+                    self.tier_inherit(bn, Some(scrut))?;
                 } else if self.gamma.get(bn).map_or(false, |t| holds_ref(self.items, t)) {
                     // D-0088: a reference out of a call's `Option<ref<V>>`
                     // borrows from the call's reference arguments.
@@ -6684,6 +7950,7 @@ impl<'a> Body<'a> {
                     if !facts.is_empty() {
                         self.set_deriv(bn, facts);
                     }
+                    self.tier_inherit(bn, Some(scrut))?;
                 }
             }
             let at = self.check_store_operand(&arm.body, arm_expected.as_ref());

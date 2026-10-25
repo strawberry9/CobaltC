@@ -1,7 +1,7 @@
 # CobaltC Examples
 
 Status: normative artifact (illustrative; examples carry no normative force, Master Instructions §19)
-Version: 3.18.0
+Version: 3.19.0
 Conforms to: `spec/02-schema.md` (Kind: Example, `ex.<name>`)
 
 Every fragment is grammatical per `spec/22` and is derived in
@@ -474,15 +474,19 @@ non-ancestor competitor is the other thread's shared reference, exempted by `syn
 ### `ex.e2e-vec-realloc-stale-ref` — feature interaction (end-to-end)
     import std;
 
+    struct Held
+    {
+        ref<i32, shared> r;                        // a reference kept in data (D-0281 tier D)
+    }
+
     fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32
     {
-        auto r = Vec::index_shared(&*v, 0);       // shared reborrow of *v: v is a parameter, so
-                                                    // rule.control.flow-analysis names no referent for it
+        Held h = Held { .r = Vec::index_shared(&*v, 0) };   // shared reborrow of *v, stored in h
         Vec::push(v, 20);                          // v already ref<Vec<i32>,exclusive>: passed by value, no new borrow
         Vec::push(v, 30);
         Vec::push(v, 40);
         Vec::push(v, 50);                          // len = cap = 4 here: grow reallocates and releases element 0
-        *r                                          // ✗ diag.stale-binding (dynamic): r's reclaimed object ended at [Release]
+        *h.r                                        // ✗ diag.stale-binding (dynamic): h.r's reclaimed object ended at [Release]
     }
     fn main()
     {
@@ -497,9 +501,13 @@ reached through a reference *parameter* is invisible to
 over a plain binding's own field/index projections, and `&*v`'s place root
 is a dereferenced reference, not one. Nothing rejects the program; the
 fourth `push` inside `hold_across_grow` reallocates, `[Release]` ends the
-reclaimed element `r` still names, and the later `*r` faults dynamically —
+reclaimed element `h.r` still names, and the later `*h.r` faults dynamically —
 confirming `spec/21`'s own account of this hazard and closing the first
-`CHG-0011` revisit condition with no rule change needed.
+`CHG-0011` revisit condition with no rule change needed. (Since D-0282
+the reference is kept in a struct here: held in a local, `auto r =
+Vec::index_shared(&*v, 0);`, it is a frame-held reference, and
+`rule.control.frame-references` refutes the first `push`, whose summary
+writes `*v` while `r` borrows it, before the run.)
 → `conf.e2e-vec-realloc-stale-ref`.
 
 ### `ex.e2e-mutex-vec-resource-interior` — feature interaction (end-to-end)
@@ -593,12 +601,17 @@ authority re-keyed to the thread now doing the destroying, which
 ### `ex.e2e-vec-pop-push-reuse-stale-ref` — feature interaction (end-to-end)
     import std;
 
+    struct Held
+    {
+        ref<i32, shared> r;
+    }
+
     fn hazard(ref<Vec<i32>, exclusive> v) : i32
     {
-        auto r = Vec::index_shared(&*v, 2);       // shared ref into element 2 (value 30)
+        Held h = Held { .r = Vec::index_shared(&*v, 2) };   // shared ref into element 2 (value 30), kept in h
         Vec::pop(v);                               // releases element 2's reclaimed object (F-05 fix, CHG-0019)
         Vec::push(v, 99);                          // reuses the same slot — no reclaimed object survives to alias
-        *r                                          // ✗ diag.stale-binding (dynamic)
+        *h.r                                        // ✗ diag.stale-binding (dynamic)
     }
     fn main()
     {
@@ -613,7 +626,9 @@ reclaimed object alive, so the second statement's `push` would have
 silently overwritten the value `r` observes with no diagnostic at all
 (`spec/AUDIT-STATUS.md` finding F-05). `Vec::pop` now `release`s the
 popped slot, so this hazard is caught exactly like a reallocation:
-dynamically, at `r`'s next use, never silently.
+dynamically, at `h.r`'s next use, never silently. (Kept in a struct since
+D-0282, as in `ex.e2e-vec-realloc-stale-ref`: a frame-held `r` is
+refuted at `Vec::pop` before the run.)
 → `conf.e2e-vec-pop-push-reuse-stale-ref`.
 
 ### `ex.e2e-hello-print` — feature interaction (end-to-end)
@@ -645,6 +660,7 @@ none of those uses is a move.
 
 ## Change Log
 
+- 3.19.0 — `CHG-0373` (D-0282): `ex.e2e-vec-realloc-stale-ref` and `ex.e2e-vec-pop-push-reuse-stale-ref` keep the element reference in a struct (tier D), since held in a local it is refuted before the run.
 - 3.18.0 — `CHG-0257` (D-0218): `ex.shared-is-read-only` shows a write
   through an exclusive reference reached through a shared one.
 - 3.17.0 — `CHG-0177` (D-0149): the `String` example writes its literal short

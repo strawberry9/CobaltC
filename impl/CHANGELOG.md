@@ -288,6 +288,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0279 — No untracked build: every binary the tools write is a conforming execution
 - D-0280 — Views and slices carry their tokens: frame-held reference data (deferred)
 - D-0281 — A cost model for references: which are free, which are checked, and what a check costs
+- D-0282 — Frame-held references: their conflicts are found before the run
 
 ---
 
@@ -8145,3 +8146,17 @@ crossing to C by value.
 - D-0281 (accepted in direction; the owner delegated it): a cost model for references made part of the
   language, frame-held references free by rule and references kept in data visible in their types and priced.
   Its first step is a measurement; no rule changes yet.
+
+## CHG-0373: conflicts of frame-held references are compile-time errors (2026-10-25)
+
+- D-0282 (D-0281 phase 2, first part; decided under the owner's delegation): `rule.control.frame-references`
+  (`spec/14` §6) refutes before the run the conflicts among frame-held references the text decides: through
+  calls, by each callee's access summary (the field paths it may read and write through each reference
+  parameter, over the whole program to a fixed point), through references inherited from other references,
+  fields, calls and branches, with liveness by last use; and an element place found before a value that
+  borrows its container exclusively, a value moved out through a reference, and a view of a temporary used
+  after its statement. In the shared static pass (`impl/src/tier.rs`, `impl/src/typecheck.rs`), so `coby`
+  and `cobc` both apply it; the runtime is unchanged and still checks everything.
+- 38 conformance cases are static now (3.273.0); four new cases keep the run-time forms with value-dependent
+  overlap. The book's chapter 7 shows a call rejected for its callee's write, and a run-time conflict between
+  two computed indexes.
