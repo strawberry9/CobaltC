@@ -114,7 +114,9 @@ C compiler builds a second `cbc` from that C, which writes the same C again (abo
 level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the compiler under test. `cbc` compiles about
 15 to 45 times slower than `cobc` (its own C: about 18 minutes against 26 seconds; the runtime's
 object tracking, as in the front end, chiefly of `StringView` copies); the programs it builds
-are the same programs. `cobc` stays in the tree as the Rust reference and the oracle.
+are the same programs. `cobc` stays in the tree as the Rust reference and the oracle. Since D-0278 the Rust
+toolchain leads: `cbc`, `cbparse` and `cobfmt-cb` accept the language of edition 2026.102501 and are ported
+forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port.
 
 ## `std`
 

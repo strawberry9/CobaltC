@@ -284,6 +284,10 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0275 — A reference to reference-free storage does not defer another binding's last-use end
 - D-0276 — `cbc`, the compiler written in CobaltC, replaces `cobc`
 - D-0277 — No object cache: a program's C is one file, compiled every time
+- D-0278 — The Rust toolchain leads; the CobaltC toolchain follows at milestones
+- D-0279 — No untracked build: every binary the tools write is a conforming execution
+- D-0280 — Views and slices carry their tokens: frame-held reference data (deferred)
+- D-0281 — A cost model for references: which are free, which are checked, and what a check costs
 
 ---
 
@@ -8124,3 +8128,20 @@ crossing to C by value.
   the default form at `-O1`; Clang kept the storage apart). `cb_send_datum` now makes that temporary stop
   naming the storage (`unname_sent`); the C is unchanged. `conf.returned-view-beside-write` (3.272.0) and
   `impl/cobc/tests/returned_view_inlined.rs` (the case at `-O1` and `-O2`, GCC and Clang).
+
+## D-0278, D-0279, D-0280 decided (2026-10-25)
+
+- D-0278 (the owner's decision, option 5): while D-0281's reference cost model is designed and built, every
+  language and runtime change lands in `coby`, `cobc` and `cbrt` only. `impl/selfhost/` stays at edition
+  2026.102501 (Update 135): it builds with `cobc` and its fixed point holds at that edition; it is ported
+  forward at each of D-0281's phase boundaries, never more than one phase behind. Retiring `cobc` is decided
+  again after D-0281's phase 3.
+- D-0279 (the owner's decision, option A): no compiler writes a binary without the tracking the alias and
+  temporal invariants require, as a public option or as the toolchain's own release build.
+- D-0280 (deferred, the decision delegated by the owner): the prototype that gave views and shared slices bound
+  to locals and parameters no runtime object gained 2.3–4.1% on `cbc`, under the 5% set for keeping it; the
+  lowering was reverted and CHG-0372 shipped from it. It is to be measured again only after the scope costs are
+  cut, and D-0281 now governs the question.
+- D-0281 (accepted in direction; the owner delegated it): a cost model for references made part of the
+  language, frame-held references free by rule and references kept in data visible in their types and priced.
+  Its first step is a measurement; no rule changes yet.

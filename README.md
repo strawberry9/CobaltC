@@ -16,7 +16,7 @@ CobaltC is already well formed, but currently still in experimental stage.
 
 This project began on 19 September 2026, based on the instructions provided (to the AI) by the project owner (me), as set out in [CobaltC_Master_Instructions.md](CobaltC_Master_Instructions.md).
 
-Commit Update 135, 2026-10-25 05:18 UTC. Specification edition 2026.102501. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
+Commit Update 136, 2026-10-25 05:22 UTC. Specification edition 2026.102502. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
 The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 
@@ -48,7 +48,7 @@ Another good place to begin learning is viewing the many showcase examples (see 
 
 Everything is a standard Rust Cargo workspace with no dependencies outside the Rust standard library; the compiler additionally needs a C compiler (`cc`) on the path.
 
-NOTE: CobaltC is self-hosting - see impl/selfhost: `cbc`, the compiler written in CobaltC, takes the same options as `cobc`, writes the same C byte for byte, and compiles itself (`impl/STATUS.md` says how it is built and checked).
+NOTE: CobaltC is self-hosting - see impl/selfhost: `cbc`, the compiler written in CobaltC, takes the same options as `cobc`, writes the same C byte for byte, and compiles itself (`impl/STATUS.md` says how it is built and checked). While the reference cost model is built, the Rust toolchain leads and the CobaltC one follows at milestones (D-0278); it accepts the language of edition 2026.102501.
 
 The Rust Cargo workspace has been developed and verified on:
 
