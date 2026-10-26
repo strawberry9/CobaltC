@@ -73,6 +73,12 @@ impl Interp {
     // token (spec/15 §3), so the caller's and callee's copies must both be
     // excluded together, not just whichever one is lexically "in scope".
     pub(super) fn clash(&self, target: u64, path: &[Proj], mode: Mode, excludes: &[u64]) -> bool {
+        self.clash_with(target, path, mode, excludes, false)
+    }
+
+    // `clash`; with `point` (D-0283's point check at a call), a reference
+    // whose path ends in an empty range reaches nothing and meets nothing.
+    pub(super) fn clash_with(&self, target: u64, path: &[Proj], mode: Mode, excludes: &[u64], point: bool) -> bool {
         if self.verify_due() {
             self.verify_refs_to(target);
         }
@@ -95,6 +101,9 @@ impl Interp {
         let this_access_is_guard_derived = (target_is_mutex && !path.is_empty()) || excludes.iter().any(|&e| lock_derived(e));
         for (tpath, m, token, is_guard) in refs.iter().cloned() {
             if self.excluded(excludes, token) {
+                continue;
+            }
+            if point && empty_range(&tpath) {
                 continue;
             }
             if !overlap(path, &tpath) {

@@ -679,15 +679,16 @@ b += p("""Most conflicts are reported before the program runs, marked `(static)`
 program's text shows that a conflicting reference is live. That covers a borrow held in a variable, a
 reborrow through a reference or a guard (`&*r`, `&r.f`), the binder of a `match (&e)` arm, the
 arguments a thread was spawned with, until `join`, and what a called function does through its
-parameters. What only the values decide (two elements of one array chosen by computed indexes) and
-references kept inside data structures are checked when the conflicting access runs, marked
-`(dynamic)`.""")
+parameters. What only the values decide is checked at run time, marked `(dynamic)`: two arguments
+that meet only for some values (two elements of one array chosen by computed indexes) when the call
+is made, from what the function may do with them; references kept inside data structures when the
+conflicting access runs.""")
 b += code("""
 import std;
 
 fn set_then_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
 {
-    *a = 1;                           // ✗ diag.aliasing-conflict (dynamic) when i == j
+    *a = 1;
     *b
 }
 
@@ -696,7 +697,7 @@ fn main()
     array<i32, 2> v = [0, 0];
     usize i = 1;
     usize j = i * 1;
-    set_then_read(&mut v[i], &v[j]);  // accepted: only the values say whether they meet
+    set_then_read(&mut v[i], &v[j]);  // ✗ diag.aliasing-conflict (dynamic), at the call, when i == j
 }
 """, title="Two elements chosen at run time", expect="diag.aliasing-conflict", section="s08", slug="overlapping-elements")
 b += code("""

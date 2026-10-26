@@ -10,6 +10,7 @@ enum DirectArg {
 
 impl<'g, 'a> Fx<'g, 'a> {
     pub(super) fn lower_user_call(&mut self, name: &str, f: &FnDecl, targs: &[Type], args: &[Expr], expected: Option<&Type>, line: usize, access: Option<bool>) -> R<V> {
+        let site = self.pc_site.take();
         if in_prelude(f) {
             self.at(line);
         }
@@ -316,6 +317,9 @@ impl<'g, 'a> Fx<'g, 'a> {
             put_arg(&mut argv, j, t);
         }
         self.at_after_arg_calls(f, args, line);
+        if let Some(pcs) = site.and_then(|s| coby::tier::point_checks_at(self.g.items, s)) {
+            self.emit_point_checks(&pcs, &argv, line)?;
+        }
         let inst: Vec<Type> = f.type_params.iter().map(|p| m.get(p).cloned()).collect::<Option<_>>().unwrap_or_default();
         if inst.len() != f.type_params.len() {
             return internal(&format!("cannot infer type arguments of `{}`", name));
@@ -805,5 +809,48 @@ pub(super) fn sibling_names_root(args: &[Expr], j: usize, place: &Expr) -> bool 
             ExprKind::Path(segs, _) if segs.len() == 1 => return args.iter().enumerate().any(|(k, b)| k != j && mentions(b, &segs[0])),
             _ => return true,
         }
+    }
+}
+
+impl<'g, 'a> Fx<'g, 'a> {
+    // D-0283: a call's point checks, its arguments lowered: each access the
+    // callee's summary declares through an argument a point check names is
+    // checked here, as if made at the call, through the argument's path.
+    fn emit_point_checks(&mut self, pcs: &[coby::tier::PointCheck], argv: &[V], line: usize) -> R<()> {
+        let loc = self.loc(line);
+        // The path of each argument the callee will hold.
+        let tok_of = |v: &V| -> Option<String> {
+            match &v.ty {
+                Type::Ref(..) => Some(format!("({}).tok", v.c)),
+                Type::Slice(..) => Some(format!("cb_load_ref(&({}).src)", v.c)),
+                Type::Named(n, a) if n == "std::StringView" && a.is_empty() => Some(format!("cb_load_ref(&({}).bytes.src)", v.c)),
+                _ => None,
+            }
+        };
+        let held: Vec<String> = argv.iter().filter_map(tok_of).collect();
+        let held_c = if held.is_empty() { "NULL, 0".to_string() } else { format!("(uint64_t[]){{ {} }}, {}", held.join(", "), held.len()) };
+        for pc in pcs {
+            let Some(v) = argv.get(pc.arg) else { continue };
+            let Some(tok) = tok_of(v) else { continue };
+            let mut projs = Vec::new();
+            if let Type::Ref(inner, _) = &v.ty {
+                let mut t = (**inner).clone();
+                for fname in &pc.fields {
+                    let Type::Named(n, _) = &t else { break };
+                    let Some(sd) = self.g.items.structs.get(n) else { break };
+                    if !sd.type_params.is_empty() {
+                        break;
+                    }
+                    let Some(i) = sd.fields.iter().position(|fd| &fd.name == fname) else { break };
+                    projs.push(format!("{{ CB_FIELD, {}u }}", i));
+                    t = sd.fields[i].ty.clone();
+                }
+            }
+            let ps = if projs.is_empty() { "NULL, 0".to_string() } else { format!("(cb_proj[]){{ {} }}, {}", projs.join(", "), projs.len()) };
+            let excl = if pc.mode == Mode::Exclusive && matches!(v.ty, Type::Ref(..) | Type::Slice(..)) { 1 } else { 0 };
+            let msg = pc.message();
+            self.emit(&format!("cb_point_check({}, {}, {}, {}u, (const uint8_t *)\"{}\", {}u, {});", held_c, tok, ps, excl, super::passes::c_escape(&msg), msg.len(), loc));
+        }
+        Ok(())
     }
 }

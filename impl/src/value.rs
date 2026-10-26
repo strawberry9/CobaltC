@@ -135,6 +135,11 @@ pub fn overlap(a: &[Proj], b: &[Proj]) -> bool {
     true
 }
 
+// Whether a path holds an empty range (`s[k .. k]`): it reaches nothing.
+pub fn empty_range(p: &[Proj]) -> bool {
+    p.iter().any(|x| matches!(x, Proj::Range(l, h) if l >= h))
+}
+
 pub fn permitted(m1: Mode, m2: Mode) -> bool {
     m1 == Mode::Shared && m2 == Mode::Shared
 }

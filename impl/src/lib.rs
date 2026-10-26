@@ -102,6 +102,8 @@ pub fn new_items() -> interp::Items {
         closure_types: std::sync::Mutex::new(HashMap::default()),
         number_literals: std::sync::Mutex::new(crate::fxhash::HashSet::default()),
         tier_summaries: std::sync::OnceLock::new(),
+        point_checks: std::sync::Mutex::new(HashMap::default()),
+        any_point_checks: std::sync::atomic::AtomicBool::new(false),
     }
 }
 

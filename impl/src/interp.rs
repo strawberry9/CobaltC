@@ -46,6 +46,7 @@ mod matching;
 mod memory;
 mod native_vec;
 mod objects;
+mod point_checks;
 mod operators;
 mod refs;
 mod threads;
@@ -143,6 +144,12 @@ pub struct Items {
     // D-0282: the access summaries of the program's functions, computed
     // when the static pass first needs them (`tier::summaries`).
     pub tier_summaries: std::sync::OnceLock<Arc<crate::tier::Summaries>>,
+    // D-0283: the point checks at calls (by the callee's line and column)
+    // whose conflict depends on values: the run compares the places the
+    // arguments reach when the call is made. `any_point_checks` spares
+    // programs with none the lookup.
+    pub point_checks: Mutex<HashMap<(usize, usize), Arc<Vec<crate::tier::PointCheck>>>>,
+    pub any_point_checks: std::sync::atomic::AtomicBool,
 }
 
 impl Items {
@@ -978,6 +985,9 @@ pub struct Interp {
     // several real CobaltC threads share one `Interp`: only one OS
     // thread ever holds `&mut Interp` at a time.
     pub current_line: usize,
+    // D-0283: the site (the callee's line and column) of the call
+    // `eval_call` is making, for its point checks; taken as the call starts.
+    pub pc_site: Option<(usize, usize)>,
     // The last line of the program's own code this thread ran (`std`'s lines
     // are not one): where a fault raised by a block's exit is reported when
     // the exit began inside a call into `std` (D-0219).
@@ -1054,6 +1064,7 @@ impl Interp {
             capture_writeback: Default::default(),
             binding_thread_params: false,
             current_line: 0,
+            pc_site: None,
             last_user_line: 0,
             return_ty_by_thread: HashMap::default(),
         }

@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.30.0
+Version: 1.31.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -630,7 +630,7 @@ rule.resauth.destroy, rule.agg.index, rule.arith.checked,
 rule.arith.div, rule.arith.shift, rule.arith.neg, rule.arith.convert
 
 ### `rule.control.frame-references`
-**Status:** ACCEPTED (D-0282)
+**Status:** ACCEPTED (D-0282, D-0283)
 
 `rule.control.flow-analysis` refutes a conflict only when one function
 body shows it, and leaves to the run every conflict that passes through a
@@ -638,8 +638,10 @@ call or through a reference the analysis gave no fact. This rule refutes,
 before the program runs, the conflicts among **frame-held references**
 (D-0281 tier S) that the program text decides, including those across
 calls. It runs over the same CFG and state, after
-`rule.control.flow-analysis`, and only refutes: it proves nothing, and
-every dynamic check stays as the rules that name it say. A refuted
+`rule.control.flow-analysis`, and refutes: it proves nothing, and every
+dynamic check stays as the rules that name it say, except that the
+overlaps at a call it leaves to the run are checked when the call is
+made (below, D-0283). A refuted
 instance is ill-formed with the diagnostic named below, marked *static*.
 
 **Holders.** A *frame-held reference* is a binding of a reference, slice
@@ -738,9 +740,23 @@ not `permitted` together (`spec/08`):
    refuted (`[Swap-Places]`), nor is one reference binding passed twice,
    or beside a copy of itself: one path.
 
-A pair that may overlap, and a certain overlap through a fact `?` (one
-that holds on some paths to the call only), are left to the run: the
-dynamic check decides them.
+**Point checks at the call.** A pair that may overlap, and a certain
+overlap through a fact `?` (one that holds on some paths to the call
+only), are decided by the run **when the call is made** (D-0283): once
+the arguments are evaluated and bound to the parameters (an exclusive
+argument for a shared parameter reborrowed, D-0049), and before the body
+runs, each key of `E(ai)` such a pair names is checked as an access
+through `ai`'s path at that projection, in that key's mode: `[Read]`'s
+or `[Write]`'s `¬clash` premise (`spec/08`), `ai`'s own path and its
+ancestors excluded, every live path counted, the other arguments'
+included. A clash faults there, `diag.aliasing-conflict`, located at the
+call, whether or not the body would make the access: the callee's
+summary decides, not the path its body takes on this run. A path whose
+range is empty (`s[k .. k]`) reaches nothing and meets nothing here; the
+two arguments of `swap` and `swap_places`, of one type, are one place or
+disjoint, and are not checked against each other (`[Swap-Places]`). A conflict
+the run finds otherwise (through a reference kept in data, tier D, or
+through a `fn` value) is found where its rule says, at the access.
 
 **Element accesses.** A read or borrow of a `Vec`'s element `v[k]` is
 an access to `v` at element `k`: refuted, `diag.aliasing-conflict`,
@@ -759,13 +775,14 @@ used where its value is moved (a resource, an `Atomic`, a `Vec`, a
 result) is refuted, `diag.move-while-aliased`, at the `*r`: `r` still
 refers to the place.
 
-**Depends on:** rule.control.flow-analysis, D-0011, D-0018, D-0088,
-D-0111, D-0135, D-0281
+**Depends on:** rule.control.flow-analysis, D-0011, D-0018, D-0049,
+D-0088, D-0111, D-0135, D-0281, D-0283
 **Affects:** rule.alias.borrow, rule.fn.call,
 rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.31.0 — `CHG-0374` (D-0283): §6 `rule.control.frame-references`, point checks at the call: a value-dependent overlap at a call is checked when the call is made, from the callee's access summary, not at the callee's first conflicting access.
 - 1.30.0 — `CHG-0373` (D-0282): §6 `rule.control.frame-references`, the conflicts of frame-held references refuted before the run (inherited facts, liveness, access summaries, the call-site rule, element accesses, evaluation order, moving out through a reference, views of temporaries); `rule.control.flow-analysis`'s Scope names it.
 - 1.29.0 — `CHG-0365` (D-0275): `[Ref-Binding-Last-Use]`: a reference, slice or `StringView` to reference-free storage defers another binding's end only through a statement that may rebind it; the prose after the rule.
 - 1.28.0 — `CHG-0300` (D-0247): the spawn row's tracked binding is a `ref`, not a slice; `CHG-0295` (D-0243): the closure row marks a captured reference binding escaped, and a row for a closure anywhere else; `CHG-0296` (D-0244): the consumption row forgets the consumed binding's own facts, and "Forgetting" says so; `CHG-0297` (D-0245): "A closure call" after the discharge table.

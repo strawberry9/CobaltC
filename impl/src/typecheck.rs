@@ -5917,6 +5917,9 @@ impl<'a> Body<'a> {
             holder: Option<String>,
             whole: Vec<DerivKey>,
             proj: Vec<DerivKey>,
+            // The summary's field path of each `proj` key (D-0283's point
+            // check extends the argument's place by it).
+            fields: Vec<Vec<String>>,
             // The whole keys whose facts hold on some paths only (`?`): a
             // conflict through them is the run's to decide.
             unsure: Vec<(String, Vec<PElem>)>,
@@ -5968,10 +5971,11 @@ impl<'a> Body<'a> {
                 continue;
             }
             // What the callee does through this parameter.
-            let proj = match sums.param(&key, i).filter(|_| matches!(&p.ty, Type::Ref(..) | Type::Slice(..))) {
+            let (proj, fields) = match sums.param(&key, i).filter(|_| matches!(&p.ty, Type::Ref(..) | Type::Slice(..))) {
                 Some(acc) => {
                     let shared_param = matches!(&p.ty, Type::Ref(_, Mode::Shared) | Type::Slice(_, Mode::Shared));
                     let mut out = Vec::new();
+                    let mut fields = Vec::new();
                     for k in &whole {
                         for w in &acc.writes {
                             let mut q = k.clone();
@@ -5980,21 +5984,25 @@ impl<'a> Body<'a> {
                             q.mode = if shared_param { Mode::Shared } else { Mode::Exclusive };
                             q.path.extend(w.iter().map(|x| PElem::Field(x.clone())));
                             out.push(q);
+                            fields.push(w.clone());
                         }
                         for r in &acc.reads {
                             let mut q = k.clone();
                             q.mode = Mode::Shared;
                             q.path.extend(r.iter().map(|x| PElem::Field(x.clone())));
                             out.push(q);
+                            fields.push(r.clone());
                         }
                     }
-                    out
+                    (out, fields)
                 }
-                None => whole.clone(),
+                None => (whole.clone(), vec![Vec::new(); whole.len()]),
             };
-            accesses.push(Access { idx: i, holder, whole, proj, unsure });
+            accesses.push(Access { idx: i, holder, whole, proj, fields, unsure });
         }
         let mut point_checks: Vec<String> = Vec::new();
+        let site = (callee.line, callee.col);
+        let mut pcs: Vec<crate::tier::PointCheck> = Vec::new();
         // What the callee does, against the caller's live holders. An
         // argument that is a visible borrow is checked against them where
         // it is formed (`rule.control.flow-analysis`), which refutes every
@@ -6003,7 +6011,7 @@ impl<'a> Body<'a> {
             if matches!(&strip_parens_tc(&args[acc.idx]).kind, ExprKind::Borrow(..) | ExprKind::SliceOf(..)) {
                 continue;
             }
-            for k in &acc.proj {
+            for (k, kf) in acc.proj.iter().zip(acc.fields.iter()) {
                 for (h, facts) in self.flow.deriv.iter() {
                     let same_path = acc.holder.as_ref().map_or(false, |a| self.path_id(a) == self.path_id(h));
                     if Some(h) == acc.holder.as_ref() || same_path || through.contains(h) || accesses.iter().any(|x| x.holder.as_ref() == Some(h)) {
@@ -6024,10 +6032,17 @@ impl<'a> Body<'a> {
                             continue;
                         }
                         let sure = *v == Tri::T && !acc.unsure.iter().any(|(r, p)| *r == k.root && k.path.starts_with(p));
+                        let pc = || crate::tier::PointCheck { arg: acc.idx, fields: kf.clone(), mode: k.mode.clone(), other: crate::tier::PointOther::Holder(h.clone()), other_mode: hk.mode.clone(), callee: shown_callee(&key).to_string() };
                         match overlap3(&hk.path, &k.path) {
                             Ov::No => {}
-                            Ov::Maybe => point_checks.push(format!("P\t{}\t{}\t{}", self.current_line, shown_name(&k.root), h)),
-                            Ov::Yes if !sure => point_checks.push(format!("P\t{}\t{}\t{} (on some paths)", self.current_line, shown_name(&k.root), h)),
+                            Ov::Maybe => {
+                                point_checks.push(format!("P\t{}\t{}\t{}", self.current_line, shown_name(&k.root), h));
+                                pcs.push(pc());
+                            }
+                            Ov::Yes if !sure => {
+                                point_checks.push(format!("P\t{}\t{}\t{} (on some paths)", self.current_line, shown_name(&k.root), h));
+                                pcs.push(pc());
+                            }
                             Ov::Yes => {
                                 let msg = format!("`{}` {} `{}` through argument {} while {} still borrows `{}`; end that borrow first", shown_callee(&key), shown_access(&k.mode), shown_place(&k.root, &k.path), acc.idx + 1, holder_text(h), shown_place(&hk.root, &hk.path));
                                 return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
@@ -6052,20 +6067,33 @@ impl<'a> Body<'a> {
                         continue;
                     }
                 }
-                let pairs = a.proj.iter().flat_map(|x| b.whole.iter().map(move |y| (x, y))).chain(b.proj.iter().flat_map(|y| a.whole.iter().map(move |x| (y, x))));
-                for (x, y) in pairs {
+                // Each pair: what the callee does through one argument (`x`,
+                // with its summary fields), the other's whole referent (`y`).
+                let pairs = a.proj.iter().zip(a.fields.iter()).flat_map(|(x, f)| b.whole.iter().map(move |y| (x, f, y, a.idx, b.idx))).chain(b.proj.iter().zip(b.fields.iter()).flat_map(|(y, f)| a.whole.iter().map(move |x| (y, f, x, b.idx, a.idx))));
+                for (x, xf, y, xi, yi) in pairs {
                     if x.root != y.root || permitted(x.mode.clone(), y.mode.clone()) {
                         continue;
                     }
                     let is_unsure = |k: &DerivKey| a.unsure.iter().chain(b.unsure.iter()).any(|(r, p)| *r == k.root && k.path.starts_with(p));
+                    let pc = crate::tier::PointCheck { arg: xi, fields: xf.clone(), mode: x.mode.clone(), other: crate::tier::PointOther::Arg(yi), other_mode: y.mode.clone(), callee: shown_callee(&key).to_string() };
+                    // `[Swap-Places]`: the two places of a `swap`, of one
+                    // type, are one place (no conflict) or disjoint; the
+                    // values deciding which needs no check.
+                    let swap = key == "std::swap" || key == "std::swap_places";
                     match overlap3(&x.path, &y.path) {
                         Ov::No => {}
-                        Ov::Maybe => point_checks.push(format!("P\t{}\t{}\targuments {} and {}", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1)),
-                        Ov::Yes if is_unsure(x) || is_unsure(y) => point_checks.push(format!("P\t{}\t{}\targuments {} and {} (on some paths)", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1)),
+                        Ov::Maybe if swap => {}
+                        Ov::Yes if swap && (is_unsure(x) || is_unsure(y)) => {}
+                        Ov::Maybe => {
+                            point_checks.push(format!("P\t{}\t{}\targuments {} and {}", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1));
+                            pcs.push(pc);
+                        }
+                        Ov::Yes if is_unsure(x) || is_unsure(y) => {
+                            point_checks.push(format!("P\t{}\t{}\targuments {} and {} (on some paths)", self.current_line, shown_name(&x.root), a.idx + 1, b.idx + 1));
+                            pcs.push(pc);
+                        }
                         Ov::Yes => {
-                            // `x` is what the callee does through one argument,
-                            // `y` the other argument's whole referent.
-                            let (through, other) = if a.proj.iter().any(|k| std::ptr::eq(k, x)) { (a.idx, b.idx) } else { (b.idx, a.idx) };
+                            let (through, other) = (xi, yi);
                             let msg = if x.mode == Mode::Exclusive {
                                 format!("`{}` writes `{}` through argument {}, which argument {} also reaches", shown_callee(&key), shown_place(&x.root, &x.path), through + 1, other + 1)
                             } else {
@@ -6076,6 +6104,9 @@ impl<'a> Body<'a> {
                     }
                 }
             }
+        }
+        for pc in pcs {
+            crate::tier::record_point_check(self.items, site, pc);
         }
         if !point_checks.is_empty() {
             point_checks.sort();

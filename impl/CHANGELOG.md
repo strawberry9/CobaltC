@@ -289,6 +289,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0280 — Views and slices carry their tokens: frame-held reference data (deferred)
 - D-0281 — A cost model for references: which are free, which are checked, and what a check costs
 - D-0282 — Frame-held references: their conflicts are found before the run
+- D-0283 — A conflict at a call that only values decide is checked when the call is made
 
 ---
 
@@ -8160,3 +8161,17 @@ crossing to C by value.
 - 38 conformance cases are static now (3.273.0); four new cases keep the run-time forms with value-dependent
   overlap. The book's chapter 7 shows a call rejected for its callee's write, and a run-time conflict between
   two computed indexes.
+
+## CHG-0374: a conflict at a call that only values decide is checked when the call is made (2026-10-26)
+
+- D-0283 (D-0281 step 4c's open question; decided under the owner's delegation): a pair of places at a call
+  that meet only for some values, or through a fact that holds on some paths, is checked when the call is
+  made, from the callee's access summary, instead of at the callee's first conflicting access, so an
+  untracked tier-S body needs no state to find it. The static pass records each such point check
+  (`tier::PointCheck`: the call, the argument, the projection, the mode); `coby` makes them after binding
+  the parameters (`interp/point_checks.rs`), `cobc` emits `cb_point_check` before the call (`cbrt` checks
+  through the argument's path with the call's other argument paths counted as held). An empty range reaches
+  nothing; `swap`'s two places need no check.
+- Conformance 3.274.0: two cases fault at the call, two pass the shared reference in a struct (tier D) so
+  their faults stay inside the callee, four new rows. The book's chapter 7 and the guide's §08 and §14 say
+  where the check is made.

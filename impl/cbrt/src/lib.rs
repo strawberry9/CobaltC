@@ -1429,6 +1429,12 @@ fn has_range(p: &[Proj]) -> bool {
     p.iter().any(|x| matches!(x, Proj::Range(..)))
 }
 
+// A path holding an empty range (`s[k .. k]`) reaches nothing (D-0283's
+// point checks pass it by).
+fn empty_range(p: &[Proj]) -> bool {
+    p.iter().any(|x| matches!(x, Proj::Range(l, h) if l >= h))
+}
+
 // A path with each range that an index follows folded into that index,
 // made absolute (`[…, Range(l, h), Index(r)]` is `[…, Index(l + r)]`),
 // into a stack buffer: a path of a few steps (every path a
@@ -6500,6 +6506,34 @@ fn check_root_access(r: &Rt, of: u64, exclusive: bool, file: u32, line: u32) {
 }
 
 fn check_access(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, file: u32, line: u32) -> u64 {
+    check_access_with(r, tok, extra, exclusive, None, file, line).0
+}
+
+// D-0283: a call's point check (`cobc`'s `emit_point_checks`): an access
+// through argument path `tok` the callee's summary declares, checked at the
+// call, before the callee holds its arguments. The call's other argument
+// paths (`args`) are held by then, so they count even with no holder yet.
+#[no_mangle]
+pub unsafe extern "C" fn cb_point_check(args: *const u64, nargs: usize, tok: u64, p: *const CbProj, n: usize, exclusive: u32, msg: *const u8, msg_len: u64, file: u32, line: u32) {
+    if tok == 0 {
+        return;
+    }
+    let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
+    let held = if nargs == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs) };
+    let clash = {
+        let _e = enter_on(heap_of(tok));
+        let r = rt_ro();
+        check_access_with(r, tok, extra, exclusive != 0, Some(held), file, line).1
+    };
+    if clash {
+        cb_fault_msg(b"diag.aliasing-conflict\0".as_ptr() as *const c_char, msg, msg_len, file, line);
+    }
+}
+
+// With `point` (the call's argument paths), a clash is reported, not
+// faulted on.
+fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point: Option<&[u64]>, file: u32, line: u32) -> (u64, bool) {
+    let held = point.unwrap_or(&[]);
     let rec = match r.paths.get(&tok) {
         Some(p) if p.valid => p,
         _ => fault("diag.stale-binding", file, line),
@@ -6520,7 +6554,10 @@ fn check_access(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, file: u32, 
     let mut mine: Option<Norm> = None;
     for &t in toks {
         let p = &r.paths[&t];
-        if !p.valid || p.is_root || p.occ == 0 {
+        if !p.valid || p.is_root || (p.occ == 0 && !held.contains(&t)) {
+            continue;
+        }
+        if point.is_some() && (empty_range(&rec.proj) || empty_range(&p.proj)) {
             continue;
         }
         // `excluded`: the accessing path itself and its ancestors (a
@@ -6549,10 +6586,13 @@ fn check_access(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, file: u32, 
             continue;
         }
         if exclusive || p.exclusive {
+            if point.is_some() {
+                return (rec.of, true);
+            }
             fault("diag.aliasing-conflict", file, line);
         }
     }
-    rec.of
+    (rec.of, false)
 }
 
 // D-0205 / CHG-0237: whether a frozen parameter's body may run (`cobc`'s

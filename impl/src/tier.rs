@@ -66,6 +66,53 @@ impl Summaries {
     }
 }
 
+// D-0283: a point check at a call. The callee may access, through argument
+// `arg`, the projection `fields` of its referent with `mode`; whether that
+// meets `other` (another argument's referent, or what a live holder of the
+// caller borrows, with `other_mode`) depends on values (two indexes), so
+// the run compares the places when the call is made, and a call whose
+// places overlap faults there, before the callee runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PointOther {
+    Arg(usize),
+    Holder(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointCheck {
+    pub arg: usize,
+    pub fields: Proj,
+    pub mode: Mode,
+    pub other: PointOther,
+    pub other_mode: Mode,
+    // The callee as a message names it.
+    pub callee: String,
+}
+
+impl PointCheck {
+    // The fault's message.
+    pub fn message(&self) -> String {
+        let what = if self.mode == Mode::Exclusive { "write" } else { "read" };
+        format!("`{}` may {} through argument {}, and a live reference reaches the same place: the call is checked when it is made (D-0283)", self.callee, what, self.arg + 1)
+    }
+}
+
+pub fn record_point_check(items: &Items, site: (usize, usize), pc: PointCheck) {
+    let mut m = items.point_checks.lock().unwrap();
+    let v = m.entry(site).or_insert_with(|| Arc::new(Vec::new()));
+    if !v.contains(&pc) {
+        Arc::make_mut(v).push(pc);
+    }
+    items.any_point_checks.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn point_checks_at(items: &Items, site: (usize, usize)) -> Option<Arc<Vec<PointCheck>>> {
+    if !items.any_point_checks.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    items.point_checks.lock().unwrap().get(&site).cloned()
+}
+
 // The program's summaries, computed once per `Items` (its functions are
 // all loaded before the static pass runs).
 pub fn summaries(items: &Items) -> Arc<Summaries> {

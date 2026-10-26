@@ -118,6 +118,7 @@ impl Interp {
             if !local {
                 let name = segs.join("::");
                 if let Some(f) = self.items.fns.get(&name).cloned() {
+                    self.pc_site = Some((callee.line, callee.col));
                     return self.call_user_fn(&f, targs, args, subst);
                 }
                 if let Some(ext) = self.items.externs.get(&name).cloned() {
@@ -206,6 +207,7 @@ impl Interp {
         // D-0049's reborrow) is the call's, not a line of the callee's body
         // its lazy check may have left current (D-0219).
         let call_line = self.current_line;
+        let site = self.pc_site.take();
         let targs: Vec<Type> = targs.iter().map(|t| self.apply_subst(t, subst)).collect();
         let mut argvals = Vec::with_capacity(args.len());
         let mut inferred_skip: Vec<usize> = Vec::new();
@@ -282,6 +284,18 @@ impl Interp {
             // access in the callee).
             let r = self.weaken_arg(&argvals[i], Some(&pty)).and_then(|r| self.store_binding(&p.name, r, Some(pty.clone())));
             if let Err(e) = r {
+                return Err(match e {
+                    Flow::Fault(d) if !crate::diagnostics::has_location(&d) && user_line(call_line) => Flow::Fault(format!("{d}@{call_line}")),
+                    other => other,
+                });
+            }
+        }
+        // D-0283: the call's point checks, with its parameters bound and
+        // before the body runs (the fault is the call's).
+        if let Some(pcs) = site.and_then(|s| crate::tier::point_checks_at(&self.items, s)) {
+            if let Err(e) = self.run_point_checks(f, &pcs) {
+                // As a fault from the body: the callee's frame ends first.
+                self.pop_frame(None)?;
                 return Err(match e {
                     Flow::Fault(d) if !crate::diagnostics::has_location(&d) && user_line(call_line) => Flow::Fault(format!("{d}@{call_line}")),
                     other => other,

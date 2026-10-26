@@ -274,7 +274,7 @@ import std;
 
 fn set_and_read(ref<i32, exclusive> a, ref<i32, shared> b) : i32
 {
-    *a = 1;                           // ✗ at run time when i == j
+    *a = 1;
     *b
 }
 
@@ -285,7 +285,7 @@ fn main()
     while (i < 3)
     {
         usize j = 2 - i;
-        printf("%v\n", set_and_read(&mut v[i], &v[j]));    // decided by i and j
+        printf("%v\n", set_and_read(&mut v[i], &v[j]));    // ✗ at run time when i == j
         i = i + 1;
     }
 }
@@ -293,18 +293,20 @@ fn main()
 
 ```
 0
-fault[diag.aliasing-conflict]: this access conflicts with a live reference
- --> index_conflict.cb:5:5
-  |
-5 |     *a = 1;                           // ✗ at run time when i == j
-  |     ^
-  = repair: end the conflicting reference (let its holder go out of scope) before this access, or use `shared` on both sides
+fault[diag.aliasing-conflict]: `set_and_read` may write through argument 1, and a live reference reaches the same place: the call is checked when it is made (D-0283)
+  --> index_conflict.cb:16:9
+   |
+16 |         printf("%v\n", set_and_read(&mut v[i], &v[j]));    // ✗ at run time when i == j
+   |         ^^^^^^
+   = repair: end the conflicting reference (let its holder go out of scope) before this access, or use `shared` on both sides
 ```
 
 The first call passes elements 0 and 2, which are different. The second passes
-element 1 twice, and the write through `a` faults, because `b` reaches the same
-storage. The rule is the same one as before; only the moment it is applied
-differs.
+element 1 twice: `set_and_read` may write through `a`, and `b` reaches the same
+element, so the call faults before its body runs. The rule is the same one as
+before; only the moment it is applied differs. The check is made at the call,
+from what the function may do with its arguments, so it does not depend on
+which way the body would have gone on this run.
 
 This is the pattern for the whole language. Every rule is checked. Where the
 text of the program decides the question, it is decided before the run; where

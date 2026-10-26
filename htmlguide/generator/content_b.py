@@ -818,7 +818,8 @@ parameter: which fields it may read and which it may write. So a call that hands
 and `&x`, where the function writes through the first, is refuted at the call, and so is a call that
 writes what a live reference of the caller still borrows. The diagnostic names the function and what
 it does through which argument. Two references chosen by computed indexes into one array are told apart
-only by their values, so they are checked when used, and so are references kept inside data structures.
+only by their values, so the call checks them when it is made, from what the function may do with them,
+whichever way its body then goes; references kept inside data structures are checked when used.
 Three exceptions are stricter: definite assignment (§11), a use of a variable that may have been moved
 (§7), and reference escape (§10) reject on "unknown" rather than deferring.""")
 

@@ -104,6 +104,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             if f.name == "drop" && f.assoc_type.is_some() {
                 return internal("direct destructor call");
             }
+            self.pc_site = Some((callee.line, callee.col));
             return self.lower_user_call(&name, &f, targs, args, expected, line, None);
         }
         if self.g.items.externs.contains_key(&name) {

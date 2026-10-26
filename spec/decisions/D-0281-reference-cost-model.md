@@ -655,3 +655,37 @@ The form to build (`untracked` body), in order, each step measured on csvstat, e
 Soundness gate before any of it ships: run the generated corpora (77k model programs, the fuzz corpus) under
 coby with full tracking, and require that no fault occurs at an access D-0282 left unchecked in tier S, apart
 from the point checks it counted.
+
+## 21. Step 4c, first part (2026-10-26): point checks at the call (D-0283), and the pathless plan
+
+**D-0283, decided under the delegation.** A value-dependent overlap at a call (two computed indexes or ranges, or
+a fact `?`) is checked when the call is made, from the callee's summary: after binding, before the body, each
+summarized access through the argument is checked as if made at the call. Option A of the three (at the call;
+at the use through a checked twin; before the run). Exemptions found by testing against Update 137: an empty
+range reaches nothing, and `swap`'s two places are one or disjoint. Both tools record the checks in the shared
+pass (`tier::PointCheck`), `coby` checks after binding, `cobc` calls `cbrt`'s `cb_point_check` before the call.
+Measurement and verification: the D-0283 record.
+
+**Plan for the lowering: pathless first, objectless second.** The bookkeeping that step 1 measured is mostly
+paths, not objects: in csvstat `cb_stmt_pop` 36% (statement scopes exist to end temporaries' paths),
+`cb_elem_borrow_here` 28%, `cb_borrow_check` 7%, `cb_read` 5%, against `cb_new` 4% and `cb_frame_pop` 4%. So the
+first lowering keeps objects and frames (destruction stays exactly as it is) and drops paths:
+
+1. **Eligibility**, whole programs: no reachable function names a tier-D type, and no `spawn` lends a
+   reference. Decided in the static pass and reported (`cobc -v`).
+2. **Pathless build.** Every token is 0. `cbrt.h` under `CB_PATHLESS` makes the path entries (`cb_borrow*`,
+   `cb_elem_borrow*`, `cb_borrow_check`, `cb_borrow_unminted`, `cb_read`, `cb_write` without a resource target,
+   `cb_store_ref`, `cb_load_ref`, `cb_recv_ref`) constant expressions or no-ops, so the C compiler deletes the
+   calls and the arguments computed for them; the lowering is unchanged at its ~230 emission sites. Statement
+   scopes that then record nothing vanish in `resolve_scopes`.
+3. **Checks kept.** Bounds, overflow, stack, positions; the resource-overwrite test (it reads the target's
+   state, not a path: it must survive token 0); point checks at calls and element accesses as address compares
+   of the two places' byte ranges. The compare is exact when the two referent types are equal (a place cannot
+   hold another of its own type) or both own no heap storage; a point check of any other shape makes the
+   program ineligible (it stays tracked), until a deeper compare is written.
+4. **The soundness gate is a differential.** Each eligible program of the corpora (conformance, showcase,
+   examples, book, guide, stress, the model's generated programs) is built tracked and pathless and run; any
+   difference in outcome is a hole in D-0282/D-0283 (or in the eligibility rule) and blocks the step.
+5. **Measure** csvstat, extsort (wordpar lends to threads: tier D until scoped lending), instructions and time,
+   against the step-1 bound.
+6. **Then objectless** (the §20 plan's steps 2–3): compiler-placed drops, `cb_nt` unwinding on the main thread.

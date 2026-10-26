@@ -118,7 +118,8 @@ are the same programs. `cobc` stays in the tree as the Rust reference and the or
 toolchain leads: `cbc`, `cbparse` and `cobfmt-cb` accept the language of edition 2026.102501 and are ported
 forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port. Edition 2026.102503 (D-0282) makes the conflicts of frame-held references compile-time errors; until the port,
 `cbc` accepts those programs and finds the conflicts at run time, so the conformance rows D-0282 made static are
-`cobc`'s alone.
+`cobc`'s alone. D-0283 checks a conflict at a call that only values decide when the call is made; `cbc` still finds it at
+the callee's first conflicting access.
 
 ## `std`
 

@@ -338,6 +338,9 @@ pub struct Gen<'a> {
 
 struct Fx<'g, 'a> {
     g: &'g mut Gen<'a>,
+    // D-0283: the site (the callee's line and column) of the call
+    // `lower_call` is lowering, for its point checks; taken as it starts.
+    pc_site: Option<(usize, usize)>,
     // A `match`'s fused scrutinee, lowered as its place (`lower_match`).
     fused_scrut: Option<V>,
     // `*HashMap::entry(…) op= e` (`lower_block_body`'s compound pair):

@@ -161,6 +161,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             fused_scrut: None,
             map_acc: None,
             map_acc_used: false,
+            pc_site: None,
             compound_elem: false,
             datum_tok: None,
             datum_tok_out: None,
