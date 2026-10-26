@@ -104,6 +104,7 @@ pub fn new_items() -> interp::Items {
         tier_summaries: std::sync::OnceLock::new(),
         point_checks: std::sync::Mutex::new(HashMap::default()),
         any_point_checks: std::sync::atomic::AtomicBool::new(false),
+        tracking_needed: std::sync::Mutex::new(HashMap::default()),
     }
 }
 

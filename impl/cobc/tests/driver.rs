@@ -85,10 +85,17 @@ fn report_tracking_lists_tracked_lines_and_compiles_nothing() {
     fs::create_dir_all(&dir).unwrap();
     let src = "import std;\n\nfn main()\n{\n    Vec<i64> v = Vec::new();\n    Vec::push(&mut v, 1);\n    Vec::push(&mut v, 2);\n    i64 first = 7;\n    i64 t = 0;\n    foreach (i in 0..Vec::len(&v))\n    {\n        t += v[i];\n    }\n    Vec<i64> w = Vec::new();\n    Vec::push(&mut w, 3);\n    foreach (i in 0..Vec::len(&w))\n    {\n        t += w[i];\n    }\n    Vec<i64> keep = v;\n    printf(\"%v %v %v\\n\", t, first, Vec::len(&keep));\n}\n";
     fs::write(dir.join("prog.cb"), src).unwrap();
+    // Decided (D-0284): the program keeps no record, and the report says so.
     let out = Command::new(cobc_exe()).args(["--report-tracking", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let first = text.lines().nth(2).unwrap_or("");
+    assert!(text.starts_with("no run-time tracking: every conflict is decided"), "{}", text);
+    // With the record kept, the listing: what the record would cost.
+    let out = Command::new(cobc_exe()).args(["--report-tracking", "prog.cb"]).env("COBALTC_PATHLESS", "0").current_dir(&dir).output().expect("run cobc");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.starts_with("The program keeps a record of references: COBALTC_PATHLESS=0"), "{}", text);
+    let first = text.lines().nth(3).unwrap_or("");
     assert!(first.contains("prog.cb:12") && first.contains("loop") && first.contains("t += v[i];"), "{}", text);
     assert!(!text.contains("prog.cb:18 "), "the confined loop is listed:\n{}", text);
     assert!(!dir.join("prog").exists() && !dir.join("prog.c").exists(), "something was compiled");

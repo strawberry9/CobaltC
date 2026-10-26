@@ -97,6 +97,15 @@ impl PointCheck {
     }
 }
 
+// A checked body's name: the function's, with its type arguments.
+pub fn body_key(name: &str, targs: &[Type]) -> String {
+    if targs.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}<{}>", name, targs.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","))
+    }
+}
+
 pub fn record_point_check(items: &Items, site: (usize, usize), pc: PointCheck) {
     let mut m = items.point_checks.lock().unwrap();
     let v = m.entry(site).or_insert_with(|| Arc::new(Vec::new()));

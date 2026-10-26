@@ -41,7 +41,8 @@ if [ -z "$FAILED" ]; then
     run cobc_spec_rows cargo test --release -p cobc --test compiled_spec_rows
     run cobc_suite cargo test --release -p cobc --test compiled_suite
     run cobc_suite_allchecks env COBALTC_ALL_CHECKS=1 COBC_TEST_CCS=gcc cargo test --release -p cobc --test compiled_suite
-    run cobc_other cargo test --release -p cobc --no-fail-fast --test differential --test extern_code --test tracking --test runtime_bookkeeping --test output_order --test read_input --test driver
+    run cobc_other cargo test --release -p cobc --no-fail-fast --test differential --test extern_code --test tracking --test runtime_bookkeeping --test output_order --test read_input --test driver --test library --test returned_view_inlined
+    run cbrt_tests cargo test --release -p cbrt --no-fail-fast
     # The model sample (D-0219): every outcome the tools show is one the
     # model's rules allow.
     if [ -d "$R/impl/model/sample" ]; then

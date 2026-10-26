@@ -64,8 +64,10 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   pass through to the C compiler.
 - **Checks.** A compiled program makes the same run-time checks as the interpreter. The lowering leaves
   out the checks it can prove redundant (`spec/08` §4 `[Standing-Local]`, `spec/14` §6), and it keeps
-  every check whose hypotheses it cannot show. `--all-checks` keeps every check, for differential
-  testing. `--report-tracking` says which functions kept which tracking.
+  every check whose hypotheses it cannot show. A decided program (`spec/14` §6, D-0284: no conflict left
+  to the run) is built with no record of references at all; `-v` says "lowered pathless" or names the
+  first conflict that kept the record, and `COBALTC_PATHLESS=0` keeps it. `--all-checks` keeps every
+  check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.
 - **One C file.** A program's C, the `std` it reaches included, is one file, compiled every time (D-0277:
@@ -119,7 +121,8 @@ toolchain leads: `cbc`, `cbparse` and `cobfmt-cb` accept the language of edition
 forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port. Edition 2026.102503 (D-0282) makes the conflicts of frame-held references compile-time errors; until the port,
 `cbc` accepts those programs and finds the conflicts at run time, so the conformance rows D-0282 made static are
 `cobc`'s alone. D-0283 checks a conflict at a call that only values decide when the call is made; `cbc` still finds it at
-the callee's first conflicting access.
+the callee's first conflicting access. D-0284 builds decided programs with no record of references; `cbc`
+still keeps it.
 
 ## `std`
 

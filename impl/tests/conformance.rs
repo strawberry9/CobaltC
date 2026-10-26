@@ -2341,7 +2341,9 @@ fn conf_string_append_not_printable() {
 
 #[test]
 fn conf_string_append_self_conflict() {
-    expect_diag_dynamic_only("fn main() { String s = String::from_str(\"a\"); String::append(&mut s, &s); }", "diag.aliasing-conflict");
+    // D-0284: a borrow given to `append`'s type parameter is a reference
+    // argument, so the pair is refuted before the run.
+    expect_diag_static("fn main() { String s = String::from_str(\"a\"); String::append(&mut s, &s); }", "diag.aliasing-conflict");
 }
 
 #[test]

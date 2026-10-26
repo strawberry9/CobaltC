@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.31.0
+Version: 1.32.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -630,7 +630,7 @@ rule.resauth.destroy, rule.agg.index, rule.arith.checked,
 rule.arith.div, rule.arith.shift, rule.arith.neg, rule.arith.convert
 
 ### `rule.control.frame-references`
-**Status:** ACCEPTED (D-0282, D-0283)
+**Status:** ACCEPTED (D-0282, D-0283, D-0284)
 
 `rule.control.flow-analysis` refutes a conflict only when one function
 body shows it, and leaves to the run every conflict that passes through a
@@ -758,16 +758,45 @@ disjoint, and are not checked against each other (`[Swap-Places]`). A conflict
 the run finds otherwise (through a reference kept in data, tier D, or
 through a `fn` value) is found where its rule says, at the access.
 
-**Element accesses.** A read or borrow of a `Vec`'s element `v[k]` is
-an access to `v` at element `k`: refuted, `diag.aliasing-conflict`,
-when a live frame-held reference not used to reach it holds a fact `T`
-on `v` that certainly overlaps it in a mode not `permitted`.
+**Element accesses.** A read or borrow of a `Vec`'s element `v[k]`, and
+a write to it (`v[k] = e`, `v[k].f = e`), is an access to `v` at element
+`k`, exclusive for a write: refuted, `diag.aliasing-conflict`, when a
+live frame-held reference not used to reach it holds a fact `T` on `v`
+that certainly overlaps it in a mode not `permitted`; decided by the run
+at the access when they may overlap (D-0284). The hidden reference of
+`[Compound-Assign]` (`{ auto t = &mut p; *t = *t op e; }`, a target with
+a call) is live while `e` is evaluated; which element it holds is a value,
+so an access in `e` that meets its container is decided by the run.
 
 **Evaluation order.** In an assignment whose place is reached through a
 container's element (`v[0].x = e`, `*Vec::index_exclusive(&mut v, 0) =
 e`), the place is found before `e` is evaluated (D-0007). When `e`
-contains an exclusive borrow whose facts reach that container, the place
-may be moved before it is written: refuted, `diag.stale-binding`.
+contains, anywhere (a field of a literal, a branch, a block's statement),
+an exclusive borrow whose facts reach that container, the place may be
+moved before it is written: refuted, `diag.stale-binding`. Likewise the
+arguments of a call are evaluated left to right, and a reference argument
+is formed before the later ones (D-0007). When a later argument takes the
+root of an earlier reference argument's facts exclusively, assigns into
+it, or passes it by value, what the earlier one reaches may be moved
+before the call: decided by the run, `diag.stale-binding` at the use
+(D-0284). When a later argument assigns a frame-held reference that an
+earlier argument read, the earlier argument's copy keeps the old facts
+under no name: decided by the run.
+
+**Decided programs.** A program none of whose conflicts this rule or
+`rule.control.flow-analysis` leaves to the run is *decided*: every access
+it makes through a reference has been shown not to conflict, or is a
+check of a value (a bound, a resource's state) that needs no record of
+other references. No reference of a decided program can be found by the
+run in conflict, so an implementation may execute it keeping no record
+of references (paths), with the same outcome (D-0284). A program is not
+decided when one of its functions has a conflict left to the run (a may-
+overlap, a fact `?`, a binding of unknown origin, a point check at a call),
+when a type it uses keeps references in data (tier D, D-0281), when a
+closure of it borrows what it captures or captures a reference, when it
+forms a reference to a reclaimed object in its own code (`[Reclaim]`:
+the run checks it against the record of raw storage), or when it spawns
+a thread.
 
 **Moving out through a reference.** `*r`, for a reference binding `r`,
 used where its value is moved (a resource, an `Atomic`, a `Vec`, a
@@ -776,12 +805,13 @@ result) is refuted, `diag.move-while-aliased`, at the `*r`: `r` still
 refers to the place.
 
 **Depends on:** rule.control.flow-analysis, D-0011, D-0018, D-0049,
-D-0088, D-0111, D-0135, D-0281, D-0283
+D-0088, D-0111, D-0135, D-0281, D-0283, D-0284
 **Affects:** rule.alias.borrow, rule.fn.call,
 rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.32.0 — `CHG-0375` (D-0284): §6 `rule.control.frame-references`: element writes are element accesses; the hidden reference of `[Compound-Assign]` is live through its value; evaluation order covers the whole of an assigned value and a call's later arguments; decided programs, which may run with no record of references.
 - 1.31.0 — `CHG-0374` (D-0283): §6 `rule.control.frame-references`, point checks at the call: a value-dependent overlap at a call is checked when the call is made, from the callee's access summary, not at the callee's first conflicting access.
 - 1.30.0 — `CHG-0373` (D-0282): §6 `rule.control.frame-references`, the conflicts of frame-held references refuted before the run (inherited facts, liveness, access summaries, the call-site rule, element accesses, evaluation order, moving out through a reference, views of temporaries); `rule.control.flow-analysis`'s Scope names it.
 - 1.29.0 — `CHG-0365` (D-0275): `[Ref-Binding-Last-Use]`: a reference, slice or `StringView` to reference-free storage defers another binding's end only through a statement that may rebind it; the prose after the rule.

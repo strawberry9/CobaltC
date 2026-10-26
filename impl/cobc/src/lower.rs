@@ -292,6 +292,10 @@ pub struct Gen<'a> {
     // `extern fn` with a body (`program.rs`); the header's text for C
     // callers is in `Generated::header_text`.
     pub lib: bool,
+    // D-0281 step 4c: lower the program pathless when it is eligible
+    // (`pathless_blocker`): every reference carries token 0 and `cbrt.h`'s
+    // `CB_PATHLESS` block makes the path entries no-ops.
+    pub pathless: bool,
     // D-0192: closures whose reference parameters are all direct and never
     // handed on (`lower_closure_body`): their code keeps nothing of its
     // arguments, so a `fn` value holding one is pure (`cb_fn_mark_pure`).
@@ -685,6 +689,8 @@ pub struct Generated {
     pub tail: String,
     // D-0257: the C header of a library's entry points (`--lib`).
     pub header_text: String,
+    // D-0281 step 4c: lowered pathless, or why not (when it was asked).
+    pub pathless: Result<(), String>,
 }
 
 impl Generated {
@@ -789,6 +795,7 @@ impl Generated {
         let mut out = Vec::new();
         for p in 0..k {
             let mut t = String::new();
+            t.push_str(&self.prefix());
             t.push_str(HEADER);
             t.push_str("\n/* ---- types ---- */\n");
             t.push_str(&self.fwd);
@@ -824,8 +831,18 @@ impl Generated {
         out
     }
 
+    // What comes before `cbrt.h`: its `CB_PATHLESS` switch.
+    fn prefix(&self) -> String {
+        match &self.pathless {
+            Ok(()) => "#define CB_PATHLESS 1\n".to_string(),
+            Err(why) if !why.is_empty() => format!("/* cobc: kept paths: {} */\n", why.replace("*/", "* /")),
+            Err(_) => String::new(),
+        }
+    }
+
     fn combined_text(&self) -> String {
         let mut out = String::new();
+        out.push_str(&self.prefix());
         out.push_str(HEADER);
         out.push_str("\n/* ---- types ---- */\n");
         out.push_str(&self.fwd);

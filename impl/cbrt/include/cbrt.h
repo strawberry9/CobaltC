@@ -419,4 +419,43 @@ static inline uint8_t cb_bytes_eq(const void *a, uint64_t an, const void *b, uin
     return an == bn && (an == 0 || memcmp(a, b, an) == 0);
 }
 
+#ifdef CB_PATHLESS
+/* D-0281 step 4c: a whole tier-S program lowered with no paths (cobc defines
+   CB_PATHLESS when the program is eligible). Every reference carries token 0:
+   the path entries are constants or no-ops, so the C compiler deletes the calls
+   and what is computed only for them. Objects, frames, scopes and destruction
+   are unchanged, and so are bounds, overflow, positions and the value tests. A
+   reference in flight or an element's reference sent as data still takes its
+   place in the queue of what is in flight, as token 0. */
+static inline void cb_write_pathless(uint64_t base, const cb_proj *p, size_t n, uint32_t target_resource, uint32_t file, uint32_t line)
+{
+    /* A place reached through a reference holds its value: a resource
+       target that owns something now is overwritten live. */
+    if (base != 0)
+    {
+        cb_write(base, p, n, target_resource, file, line);
+    }
+    else if (target_resource)
+    {
+        cb_fault("diag.overwrite-of-live-resource", file, line);
+    }
+}
+#define cb_write cb_write_pathless
+#define cb_borrow(b, ...)                ((void)(b), (uint64_t)0)
+#define cb_borrow_range(b, ...)          ((void)(b), (uint64_t)0)
+#define cb_borrow_unstamped(b, ...)      ((void)(b), (uint64_t)0)
+#define cb_borrow_check(b, ...)          ((void)(b))
+#define cb_borrow_unminted(b, ...)       ((void)(b))
+#define cb_borrow_range_unminted(b, ...) ((void)(b))
+#define cb_read(b, ...)                  ((void)(b))
+#define cb_valid(t, ...)                 ((void)(t))
+#define cb_store_ref(s, t)               ((void)(s), (void)(t))
+#define cb_load_ref(s)                   ((void)(s), (uint64_t)0)
+#define cb_frame_hold(t)                 ((void)(t))
+#define cb_frame_unhold(t)               ((void)(t))
+#define cb_elem_borrow(a, t, m)          (cb_send_ref(0), (uint64_t)0)
+#define cb_elem_borrow_here(a, t, m)     ((void)(a), (uint64_t)0)
+#define cb_elem_borrow_datum(a, t, m)    (cb_send_tok_datum(0), (uint64_t)0)
+#endif
+
 #endif

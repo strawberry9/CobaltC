@@ -49,8 +49,16 @@ b += ul([
 b += p("""So the advice that matters most is not about saving checks: it is about writing code whose
 values the compiler can see through, so that tracking is left out. The sections below are in order
 of how much they saved in the measurements.""")
+b += p("""A program none of whose conflicts are left to the run, because the compiler refutes or proves every
+one of them before it runs, is <em>decided</em>, and `cobc` builds it with no tracking at all: no
+record of references, nothing retired at the end of a statement (D-0284). The outcome is the one
+the tracked build gives. A program stops being decided as soon as one function leaves a conflict to
+the run: a reference whose origin the compiler cannot follow, an overlap that depends on values, a
+type that keeps references in data, a closure that captures by reference, a `spawn`. `cobc -v`
+says which: "lowered pathless", or "kept paths" with the file and line of the first such conflict.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
-compiles nothing: it lists the lines whose generated C still calls the runtime's tracking, with the
+compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
+the run, then lists the lines whose generated C still calls the runtime's tracking, with the
 kinds of call on each, lines inside a loop first. A line inside a loop is the one to look at; a
 line that runs once (a binding, a move into a call) costs next to nothing. The sections below say
 how to rewrite what it finds.""")

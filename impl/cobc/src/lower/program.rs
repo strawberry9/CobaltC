@@ -63,6 +63,7 @@ impl<'a> Gen<'a> {
             writer_memo: std::cell::RefCell::new(HashMap::new()),
             fn_values: std::cell::RefCell::new(None),
             lib: false,
+            pathless: false,
             globals: HashSet::new(),
         }
     }
@@ -221,7 +222,9 @@ impl<'a> Gen<'a> {
             )
             .unwrap();
         }
+        let pathless = if self.pathless { self.pathless_blocker().map_or(Ok(()), Err) } else { Err("COBALTC_PATHLESS=0".to_string()) };
         Ok(Generated {
+            pathless,
             fwd: self.fwd,
             types: self.types,
             strings: self.strings,
@@ -232,6 +235,60 @@ impl<'a> Gen<'a> {
             tail: out,
             header_text,
         })
+    }
+
+    // D-0281 step 4c: why the program must keep its paths, if it must: it
+    // is a library (C callers keep what they like), it asks for every
+    // check, a function it lowers has a conflict the static pass left to
+    // the run (`Items::tracking_needed`), a type it uses keeps references
+    // in data (tier D), or it spawns a thread (references lent to a
+    // thread are tier D until scoped lending).
+    fn pathless_blocker(&self) -> Option<String> {
+        if self.lib {
+            return Some("a library (`--lib`)".to_string());
+        }
+        if self.all_checks {
+            return Some("every check was asked for".to_string());
+        }
+        let needed = self.items.tracking_needed.lock().unwrap();
+        let mut fns: Vec<String> = self.fn_names.keys().map(|(name, targs)| coby::tier::body_key(name, targs)).collect();
+        fns.sort();
+        for key in fns {
+            if let Some(why) = needed.get(&key) {
+                // "line N: …" in the combined text's line space, shown as
+                // the file and line it came from.
+                let why = match why.strip_prefix("line ").and_then(|r| r.split_once(": ")) {
+                    Some((n, rest)) => match n.parse().ok().and_then(|n| coby::locate(n, self.map)) {
+                        Some((f, l)) => format!("{}:{}: {}", f, l, rest),
+                        None => why.clone(),
+                    },
+                    None => why.clone(),
+                };
+                return Some(format!("`{}`, {}", key.strip_prefix("std::").unwrap_or(&key), why));
+            }
+        }
+        // A closure that borrows what it captures, or captures a reference,
+        // keeps references in its environment: a `fn` value kept in data
+        // may then be one.
+        let fn_refs = self.closures.values().any(|c| (!c.is_move && !c.fields.is_empty()) || c.fields.iter().any(|(_, t)| coby::typecheck::keeps_refs_in_data(self.items, t, true) || matches!(t, Type::Ref(..) | Type::Slice(..)) || matches!(t, Type::Named(n, _) if n == "std::StringView")));
+        // The static pass does not hold a closure's borrowed captures as
+        // borrows (its conflicts are the run's), so such a closure keeps the
+        // program's paths.
+        if fn_refs {
+            return Some("a closure borrows what it captures, or captures a reference".to_string());
+        }
+        let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data(self.items, t, fn_refs)).map(|t| t.to_string()).collect();
+        tys.sort();
+        if let Some(t) = tys.first() {
+            return Some(format!("the type `{}` keeps references in data (tier D)", t));
+        }
+        if self.units.iter().any(|u| u.text.contains("struct cb_env_")) || self.thunks_out.contains("struct cb_env_") {
+            return Some("it spawns a thread".to_string());
+        }
+        if self.units.iter().any(|u| u.text.contains("cb_point_check(")) {
+            return Some("a call is checked when it is made (D-0283)".to_string());
+        }
+        None
     }
 
     // External linkage only where it is needed. A function defined in a

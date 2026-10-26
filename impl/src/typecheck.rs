@@ -665,6 +665,10 @@ struct Body<'a> {
     // r1;`): a copy of a reference carries the same path, so the two never
     // conflict with each other.
     ref_copies: HashMap<String, String>,
+    // D-0281 step 4c: the hidden reference of `[Compound-Assign]` (`{ auto
+    // t = &mut p; *t = *t op e; }`) while `e` is checked: it is live
+    // through `e`, though its uses have the position of `p`.
+    compound_held: Vec<String>,
     // Locals initialized directly from a `move` closure literal that captured
     // a resource: resource-typed by derivation (`rule.type.is-resource`), so
     // passed or stored by value it is consumed (CHG-0302).
@@ -823,6 +827,7 @@ impl<'a> Ck<'a> {
                 closure_self_writes: HashSet::default(),
                 closure_copied: HashSet::default(),
                 ref_copies: HashMap::default(),
+                compound_held: Vec::new(),
                 closure_owning: HashSet::default(),
                 closure_arity: HashMap::default(),
                 move_captures: HashMap::default(),
@@ -862,12 +867,15 @@ impl<'a> Ck<'a> {
             for p in &f.params {
                 body.declare(&p.name, true);
             }
-            tier_report::begin(if targs.is_empty() { name.clone() } else { format!("{}<{}>", name, targs.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")) }, &f.body);
+            let key = crate::tier::body_key(&name, &targs);
+            tier_report::begin(key.clone(), &f.body);
             let checked = body.check_fn_body(&f.body, &ret);
             if let Err(d) = &checked {
                 tier_report::with(|r| r.error = Some(d.clone()));
             }
-            tier_report::end();
+            if let Some(why) = tier_report::end() {
+                self.items.tracking_needed.lock().unwrap().entry(key).or_insert(why);
+            }
             let bt = match checked {
                 Ok(bt) => bt,
                 Err(d) => {
@@ -1042,6 +1050,8 @@ mod tier_report {
         pub inherited: usize,
         pub tier_d: usize,
         pub point_checks: usize,
+        // D-0281 step 4c: the first conflict left to the run's tracking.
+        pub left: Option<String>,
         pub error: Option<String>,
         pub events: Vec<String>,
     }
@@ -1283,9 +1293,21 @@ mod tier_report {
         });
     }
 
-    pub fn end() {
-        let Some(path) = std::env::var_os("COBALTC_TIER_REPORT").filter(|v| !v.is_empty()) else { return };
-        let Some(r) = CUR.with(|c| c.borrow_mut().take()) else { return };
+    // A conflict this body leaves to the run's tracking, `why` (the first
+    // is kept).
+    pub fn left(why: String) {
+        with(|r| {
+            if r.left.is_none() {
+                r.left = Some(why);
+            }
+        });
+    }
+
+    // The body's end: the report written, and what it left to the run.
+    pub fn end() -> Option<String> {
+        let r = CUR.with(|c| c.borrow_mut().take())?;
+        let left = r.left.clone();
+        let Some(path) = std::env::var_os("COBALTC_TIER_REPORT").filter(|v| !v.is_empty()) else { return left };
         let mut out = format!("F\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", r.func, r.checks, r.undecided, r.unknown_origin, r.inherited, r.tier_d, r.point_checks);
         if let Some(e) = &r.error {
             out.push_str(&format!("E\t{}\n", e.replace('\n', " ")));
@@ -1297,6 +1319,7 @@ mod tier_report {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = f.write_all(out.as_bytes());
         }
+        left
     }
 }
 
@@ -1716,6 +1739,54 @@ fn holds_ref(items: &Items, ty: &Type) -> bool {
         }
         _ => false,
     }
+}
+
+// D-0281 step 4c: whether a value of type `ty` keeps a reference in data
+// -- a field, an element, a payload, a container's cells -- rather than
+// being one itself as a frame holds it (a reference, a slice, a view, an
+// `Option` or `Result` of one, a `fn` value): tier D, whose conflicts
+// only the run's tracking finds. A `fn` value in data counts when
+// `fn_refs`: some closure of the program keeps a reference in its
+// environment.
+pub fn keeps_refs_in_data(items: &Items, ty: &Type, fn_refs: bool) -> bool {
+    fn keeps(items: &Items, t: &Type, fn_refs: bool, seen: &mut HashSet<Type>) -> bool {
+        match t {
+            Type::Ref(..) | Type::Slice(..) | Type::Guard(..) | Type::Handle(..) => true,
+            Type::Closure(_) | Type::Fn(..) => fn_refs,
+            Type::Array(inner, _) | Type::Rawptr(inner) | Type::Mutex(inner) => keeps(items, inner, fn_refs, seen),
+            Type::Named(name, args) => {
+                if is_borrow_ty(t) {
+                    return true;
+                }
+                if !seen.insert(t.clone()) {
+                    return false;
+                }
+                if args.iter().any(|a| keeps(items, a, fn_refs, seen)) {
+                    return true;
+                }
+                if let Some(s) = items.structs.get(name) {
+                    let subst: HashMap<String, Type> = s.type_params.iter().cloned().zip(args.iter().cloned()).collect();
+                    s.fields.iter().any(|f| keeps(items, &apply_subst(&f.ty, &subst), fn_refs, seen))
+                } else if let Some(e) = items.enums.get(name) {
+                    let subst: HashMap<String, Type> = e.type_params.iter().cloned().zip(args.iter().cloned()).collect();
+                    e.variants.iter().any(|v| v.payload.as_ref().map_or(false, |p| keeps(items, &apply_subst(p, &subst), fn_refs, seen)))
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+    let frame_held = match ty {
+        Type::Ref(..) | Type::Slice(..) | Type::Closure(_) | Type::Fn(..) => true,
+        Type::Named(n, a) if n == "std::StringView" => a.is_empty(),
+        Type::Named(n, a) if n == "std::Option" || n == "std::Result" => a.first().map_or(false, |x| matches!(x, Type::Ref(..) | Type::Slice(..)) || matches!(x, Type::Named(m, _) if m == "std::StringView")) && a.iter().skip(1).all(|x| !keeps(items, x, fn_refs, &mut HashSet::default())),
+        _ => false,
+    };
+    if frame_held {
+        return false;
+    }
+    keeps(items, ty, fn_refs, &mut HashSet::default())
 }
 
 // D-0282: whether storage of type `ty` keeps references: in itself, or
@@ -2734,6 +2805,7 @@ impl<'a> Body<'a> {
                     r.point_checks += 1;
                     r.events.push(format!("P\t{}\t{}\taccess", line, x));
                 });
+                tier_report::left(format!("line {}: an access to `{}` that only values decide", line, shown_name(x)));
             }
             tier_report::with(|r| {
                 r.checks += 1;
@@ -2742,6 +2814,9 @@ impl<'a> Body<'a> {
                     r.events.push(format!("{}\t{}", undecided[0], line));
                 }
             });
+            if !undecided.is_empty() {
+                tier_report::left(format!("line {}: an access to `{}` that a reference may reach on some paths", line, shown_name(x)));
+            }
         }
         // The first holder by name, so the message is the same every run.
         if let Some((h, k)) = holders.into_iter().min_by(|a, b| a.0.cmp(b.0)) {
@@ -3575,6 +3650,7 @@ impl<'a> Body<'a> {
                     rep.tier_d += 1;
                     rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
                 });
+                tier_report::left(format!("line {}: `{}` keeps references in data (tier D)", line, r));
                 return Ok(());
             }
         }
@@ -3585,10 +3661,13 @@ impl<'a> Body<'a> {
         let inherited = e.map(|e| self.inherited_facts(e, 0).map(|v| v.into_iter().filter(|(k, _)| k.root != own).collect::<Vec<_>>()));
         match inherited {
             Some(None) => tier_report::with(|rep| rep.events.push(format!("S\t{}\t{}\t{}\t{}", line, r, ty, kind))),
-            Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<tier D>") => tier_report::with(|rep| {
-                rep.tier_d += 1;
-                rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
-            }),
+            Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<tier D>") => {
+                tier_report::with(|rep| {
+                    rep.tier_d += 1;
+                    rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
+                });
+                tier_report::left(format!("line {}: `{}` was read out of data that keeps references (tier D)", line, r));
+            }
             Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<temporary>") => {
                 if tier_report::live_after(r, self.current_line, self.current_col) {
                     let msg = format!("`{}` holds a view of a temporary that ends with this statement, and is used later (D-0135)", r);
@@ -3602,10 +3681,13 @@ impl<'a> Body<'a> {
                 });
                 self.set_deriv_tri(r, v);
             }
-            _ => tier_report::with(|rep| {
-                rep.unknown_origin += 1;
-                rep.events.push(format!("O\t{}\t{}\t{}\t{}", line, r, ty, kind));
-            }),
+            _ => {
+                tier_report::with(|rep| {
+                    rep.unknown_origin += 1;
+                    rep.events.push(format!("O\t{}\t{}\t{}\t{}", line, r, ty, kind));
+                });
+                tier_report::left(format!("line {}: what `{}` borrows is not known before the run", line, r));
+            }
         }
         Ok(())
     }
@@ -4628,7 +4710,25 @@ impl<'a> Body<'a> {
                 }
                 self.reinit_target = None;
                 let lt = lt?;
-                let rt = self.check_store_operand(rhs, lt.as_ref())?;
+                let held = match &strip_parens_tc(lhs).kind {
+                    ExprKind::Deref(t) => match &strip_parens_tc(t).kind {
+                        ExprKind::Path(segs, _) if segs.len() == 1 && segs[0].starts_with("__compound") => Some(segs[0].clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(t) = &held {
+                    self.compound_held.push(t.clone());
+                }
+                let rt = self.check_store_operand(rhs, lt.as_ref());
+                if held.is_some() {
+                    self.compound_held.pop();
+                }
+                let rt = rt?;
+                // D-0281 step 4c: a write to an element of a `Vec` is an
+                // exclusive access, against the live holders, as a borrow
+                // of it is (D-0282).
+                self.tier_elem_access(lhs, Mode::Exclusive)?;
                 if let (Some(l), Some(r)) = (&lt, &rt) {
                     if !has_unresolved_marker(l) && !has_unresolved_marker(r) && !ty_compat(l, r) {
                         // `a = b = 3`: C's chained assignment.
@@ -5685,7 +5785,7 @@ impl<'a> Body<'a> {
             if through.contains(h) || self.lookup_local(h).map_or(false, |t| self.tier_d_type(&t)) {
                 continue;
             }
-            if !tier_report::live_after(h, self.current_line, self.current_col) {
+            if !self.compound_held.contains(h) && !tier_report::live_after(h, self.current_line, self.current_col) {
                 continue;
             }
             for (k, v) in facts {
@@ -5695,7 +5795,9 @@ impl<'a> Body<'a> {
                 match overlap3(&k.path, path) {
                     Ov::No => {}
                     Ov::Maybe => point = true,
-                    Ov::Yes if *v != Tri::T => point = true,
+                    // The hidden reference's fact may be its whole
+                    // container (`&mut v[f(x)]`): which element is a value.
+                    Ov::Yes if *v != Tri::T || self.compound_held.contains(h) => point = true,
                     Ov::Yes => {
                         let msg = format!("{} still borrows `{}`, so it cannot be {} here", holder_text(h), shown_place(&k.root, &k.path), if mode == Mode::Exclusive { "written or borrowed `mut`" } else { "read" });
                         return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
@@ -5709,6 +5811,7 @@ impl<'a> Body<'a> {
                 r.point_checks += 1;
                 r.events.push(format!("P\t{}\t{}\telement", line, root));
             });
+            tier_report::left(format!("line {}: an element of `{}` that only values decide", line, shown_name(root)));
         }
         Ok(())
     }
@@ -5757,20 +5860,35 @@ impl<'a> Body<'a> {
             return Ok(());
         }
         let line = self.current_line;
+        // The container the place is found in: its root's keys, extended by
+        // the fields from the root to the root-most index (`p.cpu.r` of
+        // `p.cpu.r[0]`); only a value taking that or a place around it
+        // exclusively may move the element. Through a dereference, the
+        // whole referent.
         let through_elem = {
             let mut b: &Expr = lhs;
             let mut elem = false;
+            let mut fields: Vec<String> = Vec::new();
             loop {
                 match &strip_parens_tc(b).kind {
-                    ExprKind::Field(x, _) | ExprKind::Deref(x) => b = x,
+                    ExprKind::Field(x, f) => {
+                        fields.push(f.clone());
+                        b = x;
+                    }
+                    ExprKind::Deref(x) => {
+                        fields.clear();
+                        b = x;
+                    }
                     ExprKind::Index(x, _) => {
                         elem = true;
+                        fields.clear();
                         b = x;
                     }
                     ExprKind::Call(c, xs) => {
                         // `*Vec::index_exclusive(&mut v, i) = …`
                         if matches!(&c.kind, ExprKind::Path(segs, _) if segs.last().map_or(false, |l| l.starts_with("index"))) && !xs.is_empty() {
                             elem = true;
+                            fields.clear();
                             b = &xs[0];
                         } else {
                             break;
@@ -5781,42 +5899,20 @@ impl<'a> Body<'a> {
                 }
             }
             if elem {
-                self.inherited_facts(b, 0).unwrap_or_default()
+                let ext: Vec<PElem> = fields.iter().rev().map(|f| PElem::Field(f.clone())).collect();
+                let mut keys = self.inherited_facts(b, 0).unwrap_or_default();
+                for (k, _) in keys.iter_mut() {
+                    k.path.extend(ext.iter().cloned());
+                }
+                keys
             } else {
                 Vec::new()
             }
         };
         if !through_elem.is_empty() {
             let mut excl: Vec<DerivKey> = Vec::new();
-            fn borrows_in(e: &Expr, out: &mut Vec<Expr>) {
-                match &e.kind {
-                    ExprKind::Borrow(Mode::Exclusive, _) => out.push(e.clone()),
-                    ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Deref(x) | ExprKind::Field(x, _) => borrows_in(x, out),
-                    ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(a, b) => {
-                        borrows_in(a, out);
-                        borrows_in(b, out);
-                    }
-                    ExprKind::Call(c, xs) => {
-                        borrows_in(c, out);
-                        for x in xs {
-                            borrows_in(x, out);
-                        }
-                    }
-                    ExprKind::Block(b) => {
-                        for s in &b.stmts {
-                            if let Stmt::Expr(x) | Stmt::BlockLike(x) = s {
-                                borrows_in(x, out);
-                            }
-                        }
-                        if let Some(t) = &b.tail {
-                            borrows_in(t, out);
-                        }
-                    }
-                    _ => {}
-                }
-            }
             let mut bs = Vec::new();
-            borrows_in(rhs, &mut bs);
+            excl_borrows_in(rhs, &mut bs);
             for b in &bs {
                 if let Some(v) = self.inherited_facts(b, 0) {
                     excl.extend(v.into_iter().map(|(k, _)| k));
@@ -5850,6 +5946,68 @@ impl<'a> Body<'a> {
     fn tier_call_rule(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), String> {
         if !tier_report::on() || !self.report || self.flow.unreachable {
             return Ok(());
+        }
+        // An argument that reads a reference binding is a copy of it: a
+        // later argument that assigns the binding leaves that copy with no
+        // name, so what it reaches is the run's to check.
+        for i in 1..args.len() {
+            let mut assigned = Vec::new();
+            visit_exprs(&args[i], &mut |e| {
+                if let ExprKind::Assign(l, _) = &e.kind {
+                    if let ExprKind::Path(segs, _) = &strip_parens_tc(l).kind {
+                        if segs.len() == 1 {
+                            assigned.push(segs[0].clone());
+                        }
+                    }
+                }
+            });
+            let mut read = false;
+            for a in &args[..i] {
+                visit_exprs(a, &mut |e| {
+                    if let ExprKind::Path(segs, _) = &e.kind {
+                        read |= segs.len() == 1 && assigned.contains(&segs[0]);
+                    }
+                });
+            }
+            if let Some(x) = assigned.iter().find(|x| read && self.lookup_local(x).map_or(false, |t| holds_ref(self.items, &t))) {
+                tier_report::left(format!("line {}: an argument assigns `{}` after an earlier one read it", self.current_line, x));
+            }
+        }
+        // A reference argument is formed before the later arguments are
+        // computed (D-0007). One of them that takes its root exclusively,
+        // assigns into it or moves it may move what it reaches (`set(&mut
+        // v[0], grow(&mut v))`): the run's stale-binding check decides.
+        for i in 0..args.len().saturating_sub(1) {
+            let Some(facts) = self.inherited_facts(&args[i], 0) else { continue };
+            let roots: Vec<String> = facts.iter().map(|(k, _)| k.root.clone()).collect();
+            if roots.is_empty() {
+                continue;
+            }
+            let mut acts = false;
+            for a in &args[i + 1..] {
+                let mut bs = Vec::new();
+                excl_borrows_in(a, &mut bs);
+                for b in &bs {
+                    if let Some(v) = self.inherited_facts(b, 0) {
+                        acts |= v.iter().any(|(k, _)| roots.contains(&k.root));
+                    }
+                }
+                visit_exprs(a, &mut |e| match &e.kind {
+                    ExprKind::Assign(l, _) => acts |= root_local_name(l).map_or(false, |r| roots.contains(&r)),
+                    ExprKind::Call(_, xs) => {
+                        for x in xs {
+                            if let ExprKind::Path(segs, _) = &strip_parens_tc(x).kind {
+                                acts |= segs.len() == 1 && roots.contains(&segs[0]);
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            }
+            if acts {
+                tier_report::left(format!("line {}: a later argument acts on what an earlier reference argument reaches", self.current_line));
+                break;
+            }
         }
         // A call through a local `fn` value: whether it was emptied (moved
         // from) is a test of the value itself, a point check.
@@ -5907,7 +6065,7 @@ impl<'a> Body<'a> {
             // A type parameter's argument counts only when its value is
             // or holds a reference (`*r` given to `Vec::push` is a copy).
             let generic_ref = matches!(&p.ty, Type::Named(n, ta) if ta.is_empty() && f.type_params.iter().any(|tp| tp == n))
-                && self.value_shape(a).or_else(|| self.static_place_type(a)).map_or(false, |t| is_borrow_ty(&t) || holds_ref(self.items, &t));
+                && (matches!(&strip_parens_tc(a).kind, ExprKind::Borrow(..) | ExprKind::SliceOf(..)) || self.value_shape(a).or_else(|| self.static_place_type(a)).map_or(false, |t| is_borrow_ty(&t) || holds_ref(self.items, &t)));
             if is_borrow_ty(&p.ty) || holds_ref(self.items, &p.ty) || generic_ref {
                 roots_in(a, &mut through);
             }
@@ -5932,13 +6090,17 @@ impl<'a> Body<'a> {
                 t if holds_ref(self.items, t) => Mode::Shared,
                 // A type parameter: the argument's own value, when it is
                 // or holds a reference (a number is copied).
-                Type::Named(n, ta) if ta.is_empty() && f.type_params.iter().any(|tp| tp == n) => {
-                    let at = self.value_shape(a).or_else(|| self.static_place_type(a));
-                    match at {
-                        Some(t) if is_borrow_ty(&t) || holds_ref(self.items, &t) => Mode::Shared,
-                        _ => continue,
+                Type::Named(n, ta) if ta.is_empty() && f.type_params.iter().any(|tp| tp == n) => match &strip_parens_tc(a).kind {
+                    // `&x` given to `T b`: `T` is the borrow's type.
+                    ExprKind::Borrow(m, _) | ExprKind::SliceOf(m, _, _, _) => m.clone(),
+                    _ => {
+                        let at = self.value_shape(a).or_else(|| self.static_place_type(a));
+                        match at {
+                            Some(t) if is_borrow_ty(&t) || holds_ref(self.items, &t) => Mode::Shared,
+                            _ => continue,
+                        }
                     }
-                }
+                },
                 _ => continue,
             };
             let a = strip_parens_tc(a);
@@ -6111,10 +6273,12 @@ impl<'a> Body<'a> {
         if !point_checks.is_empty() {
             point_checks.sort();
             point_checks.dedup();
+            let line = self.current_line;
             tier_report::with(|r| {
                 r.point_checks += point_checks.len();
                 r.events.extend(point_checks);
             });
+            tier_report::left(format!("line {}: a call checked when it is made (D-0283)", line));
         }
         Ok(())
     }
@@ -6238,6 +6402,13 @@ impl<'a> Body<'a> {
             const TRUSTED_INTRINSICS: &[&str] = &["reclaim", "release", "copy_raw", "deallocate", "text_write", "parse_check", "parse_value", "read_volatile", "write_volatile", "rawptr_from_address", "rawptr_address"];
             if TRUSTED_INTRINSICS.contains(&name.as_str()) && self.unsafe_depth == 0 {
                 return Err("diag.trusted-outside-unsafe".to_string());
+            }
+            // A reclaimed object's references are checked by the run
+            // against the record of raw storage (`[Reclaim]`), which the
+            // static pass does not follow: the program is not decided
+            // (D-0284). `std`'s own uses are its containers' bookkeeping.
+            if name == "reclaim" && self.module != "std" && !self.module.starts_with("std::") {
+                tier_report::left(format!("line {}: a reference to a reclaimed object is checked by the run", self.current_line));
             }
             // WI-15: an intrinsic of a fixed shape called in another
             // (`sizeof()`, `widen<i64>()`): rejected here, before both
@@ -9189,4 +9360,144 @@ fn render_pattern(chain: &[String], payload: bool) -> String {
         s.push(')');
     }
     s
+}
+
+// Every expression in `e`, `e` first (the bodies of closures too).
+fn visit_exprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+    fn block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Expr(x) | Stmt::BlockLike(x) => visit_exprs(x, f),
+                Stmt::Let { init: Some(x), .. } | Stmt::Destructure { init: x, .. } => visit_exprs(x, f),
+                Stmt::Let { .. } => {}
+            }
+        }
+        if let Some(t) = &b.tail {
+            visit_exprs(t, f);
+        }
+    }
+    f(e);
+    match &e.kind {
+        ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Deref(x) | ExprKind::Field(x, _) | ExprKind::Borrow(_, x) | ExprKind::Propagate(x) | ExprKind::ArrayRepeat(x, _) | ExprKind::Return(Some(x)) => visit_exprs(x, f),
+        ExprKind::SliceOf(_, x, lo, hi) => {
+            visit_exprs(x, f);
+            visit_exprs(lo, f);
+            visit_exprs(hi, f);
+        }
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(a, b) => {
+            visit_exprs(a, f);
+            visit_exprs(b, f);
+        }
+        ExprKind::Call(c, xs) => {
+            visit_exprs(c, f);
+            for x in xs {
+                visit_exprs(x, f);
+            }
+        }
+        ExprKind::ArrayLit(xs) => {
+            for x in xs {
+                visit_exprs(x, f);
+            }
+        }
+        ExprKind::StructLit(_, _, fs) => {
+            for (_, x) in fs {
+                visit_exprs(x, f);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => block(b, f),
+        ExprKind::If(c, t, e) => {
+            visit_exprs(c, f);
+            block(t, f);
+            if let Some(e) = e {
+                visit_exprs(e, f);
+            }
+        }
+        ExprKind::While(c, b, step) => {
+            visit_exprs(c, f);
+            block(b, f);
+            if let Some(x) = step {
+                visit_exprs(x, f);
+            }
+        }
+        ExprKind::Match(x, arms) => {
+            visit_exprs(x, f);
+            for a in arms {
+                visit_exprs(&a.body, f);
+            }
+        }
+        ExprKind::Closure { body, .. } => block(body, f),
+        _ => {}
+    }
+}
+
+// The exclusive borrows written in `e` (`&mut x`, `&mut x[a..b]`), for the
+// D-0282 order rules.
+fn excl_borrows_in(e: &Expr, out: &mut Vec<Expr>) {
+    fn block_in(b: &Block, out: &mut Vec<Expr>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Expr(x) | Stmt::BlockLike(x) => excl_borrows_in(x, out),
+                Stmt::Let { init: Some(x), .. } | Stmt::Destructure { init: x, .. } => excl_borrows_in(x, out),
+                _ => {}
+            }
+        }
+        if let Some(t) = &b.tail {
+            excl_borrows_in(t, out);
+        }
+    }
+    match &e.kind {
+        ExprKind::Borrow(Mode::Exclusive, _) => out.push(e.clone()),
+        ExprKind::SliceOf(m, x, lo, hi) => {
+            if *m == Mode::Exclusive {
+                out.push(Expr { kind: ExprKind::Borrow(Mode::Exclusive, x.clone()), line: e.line, col: e.col });
+            }
+            excl_borrows_in(x, out);
+            excl_borrows_in(lo, out);
+            excl_borrows_in(hi, out);
+        }
+        ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Deref(x) | ExprKind::Field(x, _) | ExprKind::Borrow(_, x) | ExprKind::Propagate(x) | ExprKind::ArrayRepeat(x, _) => excl_borrows_in(x, out),
+        ExprKind::Return(Some(x)) => excl_borrows_in(x, out),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(a, b) => {
+            excl_borrows_in(a, out);
+            excl_borrows_in(b, out);
+        }
+        ExprKind::Call(c, xs) => {
+            excl_borrows_in(c, out);
+            for x in xs {
+                excl_borrows_in(x, out);
+            }
+        }
+        ExprKind::ArrayLit(xs) => {
+            for x in xs {
+                excl_borrows_in(x, out);
+            }
+        }
+        ExprKind::StructLit(_, _, fs) => {
+            for (_, x) in fs {
+                excl_borrows_in(x, out);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Unsafe(b) => block_in(b, out),
+        ExprKind::If(c, t, f) => {
+            excl_borrows_in(c, out);
+            block_in(t, out);
+            if let Some(f) = f {
+                excl_borrows_in(f, out);
+            }
+        }
+        ExprKind::While(c, b, step) => {
+            excl_borrows_in(c, out);
+            block_in(b, out);
+            if let Some(x) = step {
+                excl_borrows_in(x, out);
+            }
+        }
+        ExprKind::Match(x, arms) => {
+            excl_borrows_in(x, out);
+            for a in arms {
+                excl_borrows_in(&a.body, out);
+            }
+        }
+        _ => {}
+    }
 }

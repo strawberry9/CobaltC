@@ -457,10 +457,14 @@ impl<'g, 'a> Fx<'g, 'a> {
     // may overlap without a clash.
     pub(super) fn vouched_args(&self, f: &FnDecl, inst: &[Type], args: &[Expr]) -> bool {
         let sub = subst_of(&f.type_params, inst);
-        let refs: Vec<&Expr> = args.iter().zip(&f.params).filter(|(_, p)| matches!(apply(&p.ty, &sub), Type::Ref(..) | Type::Slice(..))).map(|(a, _)| a).collect();
+        let refs: Vec<usize> = args.iter().zip(&f.params).enumerate().filter(|(_, (_, p))| matches!(apply(&p.ty, &sub), Type::Ref(..) | Type::Slice(..))).map(|(i, _)| i).collect();
         match refs.as_slice() {
             [] => true,
-            [a] => self.fresh_ref_arg(a),
+            // A reference formed before a later argument is computed is
+            // fresh at the call only if that argument cannot act on what it
+            // reaches first (`set(&mut v[0], grow(&mut v))` moves the
+            // element): one with a call, a block or an assignment may.
+            [i] => self.fresh_ref_arg(&args[*i]) && !args[i + 1..].iter().any(coby::parser::has_call),
             _ => false,
         }
     }

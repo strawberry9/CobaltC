@@ -316,6 +316,12 @@ more and leave out checks it has proved unnecessary, which is what `cobc` does,
 but it may never accept a program the language rejects or run a check the
 language does not require.
 
+When nothing is left to the run, because every question of a program is
+decided by its text, the program is *decided*, and it keeps no record of its
+references while it runs: there is nothing such a record could find. `cobc`
+builds every decided program that way, and `cobc -v` says whether it did or
+names the first line that left a question to the run (D-0284).
+
 ## Returning a reference
 
 A function may return a reference when it has exactly one reference

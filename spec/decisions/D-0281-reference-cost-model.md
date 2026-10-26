@@ -689,3 +689,38 @@ first lowering keeps objects and frames (destruction stays exactly as it is) and
 5. **Measure** csvstat, extsort (wordpar lends to threads: tier D until scoped lending), instructions and time,
    against the step-1 bound.
 6. **Then objectless** (the §20 plan's steps 2–3): compiler-placed drops, `cb_nt` unwinding on the main thread.
+
+## 22. Step 4c, second part (2026-10-26): decided programs run pathless (D-0284)
+
+**D-0284, decided under the delegation**: option A, pathless by default. A program none of whose conflicts the
+static pass leaves to the run is *decided* (`spec/14` §6), and `cobc` builds it with no record of references;
+`--all-checks`, `--lib` and `COBALTC_PATHLESS=0` keep the record, and `-v`/`--report-tracking` name the first
+conflict that kept it. Per-function lowering (option C) waits for the §15 boundary design. `coby` keeps the
+record and is the gate's oracle.
+
+**The gate was the step's real work.** Seven forms were left to the run without being recorded, so a pathless
+build would have run them unchecked: an element write beside a held element; the hidden reference of a compound
+assignment whose target holds a call; evaluation order through literals, branches and blocks of the assigned
+value; later arguments that move or reassign what an earlier reference argument reaches (two forms); a borrow
+given to a type parameter (`String::append(&mut s, &s)`); references to reclaimed objects in the program's own
+`unsafe` code. Each is now refuted or keeps the record. One of them was a use-after-free in the *tracked* build:
+the dual-body dispatcher (D-0188) took a reference argument for a fresh borrow when a later argument had made it
+stale. The repair of the evaluation-order form first rejected `showcase/tier3/tinyos.cb` falsely (it compared the
+element's place by its root alone); a scan for new static rejections against Update 138 found it, and the rule
+now names the indexed container.
+
+**Results.** 19,835 hand-written programs: 9,692 decided under GCC, every difference timing, random input, or
+one of two programs that are not holes (a false fault of the tracked runtimes on zero-sized elements, recorded
+for repair; undefined behaviour in a program's own `unsafe` code). Clang the same. 410 of 1,109 conformance
+cases are decided; the compiled suite and the compiled rows pass under both compilers. csvstat 217 → 102 ms (942
+→ 405 M instructions), extsort 670 → 476 ms (2.80 → 2.05 G).
+
+**What keeps programs tracked** (the corpus's first reasons): tier-D types (247), reads out of tier-D data (21),
+closures capturing by reference (27), may-overlaps (5), and, after the soundness repairs, later arguments acting
+on what an earlier reference argument reaches. These set the order of what follows.
+
+**Next, in order:** objectless decided programs (compiler-placed drops, `cb_nt` unwinding on the main thread:
+statement scopes and frames are now the largest cost in csvstat and extsort); closures' borrowed captures held as
+borrows by the static pass; point checks as address compares (calls and elements) instead of keeping the record;
+`?` facts as local flags; `r = pass(r)` carrying facts; scoped lending for spawn + join (wordpar); then phase 1's
+leftovers (lazy `split`/`lines`, the `tracked` keyword, cost rows), per-function lowering, phase 3.

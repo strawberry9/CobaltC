@@ -561,6 +561,9 @@ fn real_main() -> ExitCode {
     let mut lowering = lower::Gen::new(&items, &analysis.map);
     lowering.line_directives = line_directives && !report_tracking;
     lowering.lib = lib;
+    // D-0284: a decided program is lowered with no record of references;
+    // `--all-checks` (the generator refuses it) and COBALTC_PATHLESS=0 keep it.
+    lowering.pathless = std::env::var("COBALTC_PATHLESS").map_or(true, |v| v != "0");
     let gen = match lowering.generate() {
         Ok(g) => g,
         Err(lower::Unsupported(what)) => {
@@ -568,8 +571,15 @@ fn real_main() -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    match &gen.pathless {
+        Ok(()) => note("lowered pathless (D-0284)"),
+        Err(why) => note(&format!("kept paths: {}", why)),
+    }
     if report_tracking {
-        print!("{}", report::report(&gen.combined("report.c"), &file));
+        match &gen.pathless {
+            Ok(()) => println!("no run-time tracking: every conflict is decided before the run, so the program keeps no record of references (D-0284)"),
+            Err(why) => print!("The program keeps a record of references: {}\n{}", why, report::report(&gen.combined("report.c"), &file)),
+        }
         return ExitCode::SUCCESS;
     }
     note(&format!("lowered to C in {} ms ({} units)", t_lower.elapsed().as_millis(), gen.units.len()));

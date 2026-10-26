@@ -150,6 +150,12 @@ pub struct Items {
     // programs with none the lookup.
     pub point_checks: Mutex<HashMap<(usize, usize), Arc<Vec<crate::tier::PointCheck>>>>,
     pub any_point_checks: std::sync::atomic::AtomicBool,
+    // D-0281 step 4c: the bodies (`tier::body_key`) in which the static
+    // pass left a conflict to the run's tracking (a point check, a fact it
+    // could not decide, a reference of unknown origin, a tier-D binding),
+    // each with the first reason; `cobc` lowers a program pathless only
+    // when none of its functions is here.
+    pub tracking_needed: Mutex<HashMap<String, String>>,
 }
 
 impl Items {

@@ -290,6 +290,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0281 — A cost model for references: which are free, which are checked, and what a check costs
 - D-0282 — Frame-held references: their conflicts are found before the run
 - D-0283 — A conflict at a call that only values decide is checked when the call is made
+- D-0284 — A program whose conflicts are all decided before the run keeps no record of references
 
 ---
 
@@ -8175,3 +8176,22 @@ crossing to C by value.
 - Conformance 3.274.0: two cases fault at the call, two pass the shared reference in a struct (tier D) so
   their faults stay inside the callee, four new rows. The book's chapter 7 and the guide's §08 and §14 say
   where the check is made.
+
+## CHG-0375: a program whose conflicts are all decided before the run keeps no record of references (2026-10-26)
+
+- D-0284 (D-0281 step 4c; decided under the owner's delegation): a program none of whose conflicts the static
+  pass leaves to the run is *decided* (`spec/14` §6), and `cobc` builds it with no record of references, by
+  default: every token is 0 and `cbrt.h` under `CB_PATHLESS` turns the path entries into constants or no-ops,
+  which the C compiler deletes. `--all-checks`, `--lib` and `COBALTC_PATHLESS=0` keep the record; `-v` and
+  `--report-tracking` say which and why (the file and line of the first conflict left to the run). The static
+  pass records what it leaves to the run per function (`Items.tracking_needed`).
+- The differential gate (`stress/d0281/pathless/gate/`, every decided program of 19,835 built pathless against
+  `coby`, under GCC and Clang) and the compiled conformance rows found seven forms the static pass left to the
+  run unrecorded; each is now refuted or keeps the record: an element write beside a held element, the hidden
+  reference of a compound assignment with a call in its target, evaluation order through literals, branches
+  and blocks of the assigned value, later arguments that move or reassign what an earlier reference argument
+  reaches, a borrow given to a type parameter (`String::append(&mut s, &s)` is refuted now), and references to
+  reclaimed objects in the program's own code.
+- `cobc`'s dual-body dispatcher (D-0188) no longer treats a reference argument as a fresh borrow when a later
+  argument contains a call, a block or an assignment: `set(&mut v[0], grow(&mut v))` wrote into freed storage.
+- csvstat 217 → 102 ms, extsort 670 → 476 ms. Conformance 3.275.0: six new rows, one now static.
