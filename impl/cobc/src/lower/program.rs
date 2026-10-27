@@ -293,14 +293,9 @@ impl<'a> Gen<'a> {
         }
         // A closure that borrows what it captures, or captures a reference,
         // keeps references in its environment: a `fn` value kept in data
-        // may then be one.
+        // may then be one. In a frame the static pass holds what such a
+        // closure reaches as a borrow (D-0288), so only data keeps paths.
         let fn_refs = self.closures.values().any(|c| (!c.is_move && !c.fields.is_empty()) || c.fields.iter().any(|(_, t)| coby::typecheck::keeps_refs_in_data(self.items, t, true) || matches!(t, Type::Ref(..) | Type::Slice(..)) || matches!(t, Type::Named(n, _) if n == "std::StringView")));
-        // The static pass does not hold a closure's borrowed captures as
-        // borrows (its conflicts are the run's), so such a closure keeps the
-        // program's paths.
-        if fn_refs {
-            return Some("a closure borrows what it captures, or captures a reference".to_string());
-        }
         let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data(self.items, t, fn_refs)).map(|t| t.to_string()).collect();
         tys.sort();
         if let Some(t) = tys.first() {

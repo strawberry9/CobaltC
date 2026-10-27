@@ -551,8 +551,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                         // kept as a callable box: a reference to it is then
                         // a reference to a `fn` value, as the callee reads
                         // it. Its value, copies and calls are the box's.
+                        // So is one the body assigns whole: the closure
+                        // assigned is of another type (`f = move [b]() …`
+                        // after `auto f = move [a]() …`), boxed as well.
                         let v = match (&declared, &v.ty) {
-                            (None, Type::Closure(id)) if self.pinned.contains(name) => {
+                            (None, Type::Closure(id)) if self.pinned.contains(name) || self.assigned.contains(name) => {
                                 let info = self.g.closures[id].clone();
                                 let dst = Type::Fn(info.params.clone(), Box::new(info.ret.clone()));
                                 self.box_closure(v, dst, e.line)?

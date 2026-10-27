@@ -755,7 +755,23 @@ impl<'g, 'a> Fx<'g, 'a> {
             };
             self.emit(&format!("if ({}) cb_fault(\"diag.overwrite-of-live-resource\", {});", target, loc));
         }
+        // D-0089: a plain value holding `fn` values that is overwritten
+        // ends, as a discarded one does: its closures end with it, and so
+        // do the references they hold (`f = move [b]() …` after
+        // `f = move [a]() …` lets `a` go). The slot owns its closures:
+        // a read copies them, or empties the slot (`cb_fn_read`).
+        let old_fns = if !self.is_res(&p.ty) && p.raw.is_none() && self.holds_fn(&p.ty) {
+            let c = self.g.ctype(&p.ty)?;
+            let t = self.g.fresh("old");
+            self.emit(&format!("{} {} = {};", c, t, p.c));
+            Some((t, self.tid(&p.ty)?))
+        } else {
+            None
+        };
         self.store(&p.c, &p.ty, &v)?;
+        if let Some((t, tid)) = old_fns {
+            self.emit(&format!("cb_drop_value(&{}, {}u);", t, tid));
+        }
         if self.is_res(&p.ty) && !self.inert_c.contains(&v.c) {
             let o = v.obj.as_ref().expect("resource value has object");
             match &p.raw {

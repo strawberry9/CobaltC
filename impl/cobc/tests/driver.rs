@@ -486,3 +486,37 @@ fn contained_fault_frees_objectless_locals() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&want.stdout), "the output differs from coby's");
     let _ = fs::remove_dir_all(&dir);
 }
+
+// `--emit-c -o OUT` writes to OUT the C that standard output gets, its
+// `#line` directives naming OUT unless `--c-name` names another; `-o -` is
+// standard output; the options come in either order; a program the static
+// pass rejects gets its diagnostic and status 1, and OUT is not written.
+#[test]
+fn emit_c_writes_to_the_file_o_names() {
+    let dir = std::env::temp_dir().join(format!("cobc-emit-c-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("prog.cb"), "import std;\n\nfn main()\n{\n    printf(\"hi\\n\");\n}\n").unwrap();
+    let emit = |args: &[&str]| Command::new(cobc_exe()).arg("--emit-c").args(args).current_dir(&dir).output().expect("run cobc");
+    let named = emit(&["--c-name", "out.c", "prog.cb"]);
+    assert!(named.status.success(), "{}", String::from_utf8_lossy(&named.stderr));
+    assert!(String::from_utf8_lossy(&named.stdout).contains(" \"out.c\"\n"), "no #line naming out.c");
+    let o = emit(&["-o", "out.c", "prog.cb"]);
+    assert!(o.status.success() && o.stdout.is_empty(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read(dir.join("out.c")).unwrap(), named.stdout);
+    let both = emit(&["-o", "other.c", "--c-name", "out.c", "prog.cb"]);
+    assert!(both.status.success());
+    assert_eq!(fs::read(dir.join("other.c")).unwrap(), named.stdout);
+    let plain = emit(&["prog.cb"]);
+    let dash = emit(&["-o", "-", "prog.cb"]);
+    assert!(dash.status.success() && !dash.stdout.is_empty());
+    assert_eq!(dash.stdout, plain.stdout);
+    fs::write(dir.join("bad.cb"), "fn main()\n{\n    u8 x = true;\n}\n").unwrap();
+    let bad = emit(&["-o", "bad.c", "bad.cb"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("diag.type-mismatch"), "{}", String::from_utf8_lossy(&bad.stderr));
+    assert!(!dir.join("bad.c").exists());
+    let usage = emit(&["-o", "x.c"]);
+    assert_eq!(usage.status.code(), Some(2));
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -3,7 +3,7 @@
 //   cobc [--run] [--keep-c] [-v] [-s] [-O LEVEL] [-march=CPU] [--cc COMPILER] [-o OUT] FILE.cb
 //   cobc --check PATH...
 //   cobc --check-syntax [--origin PATH] (FILE | -)
-//   cobc --emit-c [--c-name NAME] FILE
+//   cobc --emit-c [--c-name NAME] [-o OUT] FILE
 //   cobc --help
 //
 // Front end: `coby`'s (loader, parser, resolver, static pass) — a
@@ -107,7 +107,7 @@ const ABOUT: &str = concat!(
     "  coby --about          the interpreter\n",
 );
 
-const USAGE: &str = "usage: cobc [--explain] [--warn-shadow] [--unittest [--unittest-filter TEXT] [--unittest-std]] [--run] [--explore N] [--schedule-seed S] [--keep-c] [--no-line-directives] [-g] [--report-tracking] [--all-checks] [--bootstrap-form] [-v] [-s] [-O LEVEL] [-march=CPU] [--target TRIPLE] [--cc COMPILER] [-o OUT] FILE.cb [ARG...]\n       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n       cobc [--explain] [--warn-shadow] --check PATH...\n       cobc --check-syntax [--origin PATH] (FILE | -)\n       cobc --emit-c [--c-name NAME] FILE";
+const USAGE: &str = "usage: cobc [--explain] [--warn-shadow] [--unittest [--unittest-filter TEXT] [--unittest-std]] [--run] [--explore N] [--schedule-seed S] [--keep-c] [--no-line-directives] [-g] [--report-tracking] [--all-checks] [--bootstrap-form] [-v] [-s] [-O LEVEL] [-march=CPU] [--target TRIPLE] [--cc COMPILER] [-o OUT] FILE.cb [ARG...]\n       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n       cobc [--explain] [--warn-shadow] --check PATH...\n       cobc --check-syntax [--origin PATH] (FILE | -)\n       cobc --emit-c [--c-name NAME] [-o OUT] FILE";
 
 const HELP: &str = "\
 Compile a CobaltC program to a native executable.
@@ -235,11 +235,13 @@ Options:
                as part of that program, not on its own. Nothing is printed
                for an accepted program. `coby --check` does the same
                without the `extern` files.
-  --emit-c [--c-name NAME] FILE
-               The program's C on standard output, nothing compiled or
-               linked: the file `--keep-c` keeps, NAME the name its `#line`
-               directives give it (default a.c). A program the static pass
-               rejects gets its diagnostic and status 1.
+  --emit-c [--c-name NAME] [-o OUT] FILE
+               The program's C, nothing compiled or linked: the file
+               `--keep-c` keeps, written to OUT, or on standard output
+               without -o or with `-o -`. NAME is the name its `#line`
+               directives give it (default OUT, else a.c). A program the
+               static pass rejects gets its diagnostic and status 1, and
+               OUT is not written.
   --check-syntax [--origin PATH] (FILE | -)
                Whether one text parses, and nothing else: FILE, or standard
                input for `-`, its `module m \"./m.cb\";` files found
@@ -367,21 +369,42 @@ fn real_main() -> ExitCode {
         };
         return ExitCode::from(coby::check::run(&paths, "cobc", &externs));
     }
-    // `--emit-c [--c-name NAME] FILE`, as `cbc` has it: the C on standard
-    // output, nothing compiled; NAME is the name its `#line` directives
-    // give the C file (default `a.c`; with `-o OUT` the C is `OUT.c`).
-    let mut emit_c: Option<(String, PathBuf)> = None;
+    // `--emit-c [--c-name NAME] [-o OUT] FILE`: the C, nothing compiled;
+    // written to OUT, or on standard output (as `cbc` has it) without `-o`
+    // or with `-o -`. NAME is the name its `#line` directives give the C
+    // file (default OUT, else `a.c`).
+    let mut emit_c: Option<(String, Option<PathBuf>, PathBuf)> = None;
     if all.first().map_or(false, |a| a == "--emit-c") {
         let rest: Vec<String> = all[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        let (name, file) = match rest.as_slice() {
-            [n, c, f] if n == "--c-name" => (c.clone(), f.clone()),
-            [f] if !f.starts_with('-') => ("a.c".to_string(), f.clone()),
-            _ => {
-                eprintln!("usage: cobc --emit-c [--c-name NAME] FILE");
-                return ExitCode::from(2);
+        let (mut name, mut to, mut file) = (None, None, None);
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i].as_str() {
+                "--c-name" if name.is_none() && i + 1 < rest.len() => {
+                    name = Some(rest[i + 1].clone());
+                    i += 2;
+                }
+                "-o" if to.is_none() && i + 1 < rest.len() => {
+                    to = Some(rest[i + 1].clone());
+                    i += 2;
+                }
+                f if file.is_none() && !f.starts_with('-') => {
+                    file = Some(f.to_string());
+                    i += 1;
+                }
+                _ => {
+                    file = None;
+                    break;
+                }
             }
+        }
+        let Some(file) = file else {
+            eprintln!("usage: cobc --emit-c [--c-name NAME] [-o OUT] FILE");
+            return ExitCode::from(2);
         };
-        emit_c = Some((name, PathBuf::from(file)));
+        let to = to.filter(|o| o != "-");
+        let name = name.or_else(|| to.clone()).unwrap_or_else(|| "a.c".to_string());
+        emit_c = Some((name, to.map(PathBuf::from), PathBuf::from(file)));
     }
     let mut run = false;
     let mut explore: Option<u64> = None;
@@ -400,7 +423,7 @@ fn real_main() -> ExitCode {
     let mut out: Option<PathBuf> = None;
     let mut file: Option<PathBuf> = None;
     let mut prog_args: Vec<std::ffi::OsString> = Vec::new();
-    if let Some((_, f)) = &emit_c {
+    if let Some((_, _, f)) = &emit_c {
         file = Some(f.clone());
     }
     // Bytes, not text: a program's argument need not be UTF-8. (`--emit-c`'s
@@ -605,10 +628,18 @@ fn real_main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     note(&format!("lowered to C in {} ms ({} units)", t_lower.elapsed().as_millis(), gen.units.len()));
-    if let Some((name, _)) = &emit_c {
+    if let Some((name, to, _)) = &emit_c {
         use std::io::Write as _;
+        let c = gen.combined(name);
+        if let Some(to) = to {
+            if let Err(e) = std::fs::write(to, c.as_bytes()) {
+                eprintln!("cobc: cannot write {}: {}", to.display(), e);
+                return ExitCode::from(1);
+            }
+            return ExitCode::SUCCESS;
+        }
         let mut out = std::io::stdout().lock();
-        let ok = out.write_all(gen.combined(name).as_bytes()).and_then(|_| out.flush()).is_ok();
+        let ok = out.write_all(c.as_bytes()).and_then(|_| out.flush()).is_ok();
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
 

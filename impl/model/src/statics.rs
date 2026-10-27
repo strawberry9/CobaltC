@@ -195,6 +195,10 @@ impl Flow {
             }
         }
     }
+    // A holder's `deriv` facts, each with its value where not F (D-0288).
+    fn deriv_facts(&self, h: &str) -> Vec<(SPlace, Mode, Tri)> {
+        self.deriv.iter().filter(|(k, v)| k.0 == h && **v != Tri::F).map(|(k, v)| (k.1.clone(), k.2, *v)).collect()
+    }
     // A holder's facts for D-0282: its `deriv` facts and those it inherited,
     // each with its value where not F.
     fn holder_facts(&self, h: &str) -> Vec<(SPlace, Mode, Tri)> {
@@ -839,6 +843,10 @@ impl<'a> Cx<'a> {
             self.err(line, "diag.capture-list-mismatch", "the capture list is not the body's free variables".into());
         }
         let mut facts = Vec::new();
+        // D-0288: what the captures reach, for a closure with or without
+        // `move`: `*r` for a captured reference or slice, and the facts of
+        // another capture that may hold a reference.
+        let mut reach: Vec<(SPlace, Mode, Tri)> = Vec::new();
         for x in &c.caps {
             let Some(t) = self.ty_of(x) else {
                 self.err(line, "diag.unbound-name", format!("no binding `{}`", x));
@@ -846,6 +854,11 @@ impl<'a> Cx<'a> {
             };
             let m = if writes_root(&c.body, x) { Mode::Excl } else { Mode::Shared };
             let xe = Expr::Var(x.clone());
+            match &t {
+                Ty::Ref(_, rm) | Ty::Slice(rm) => reach.push((SPlace { root: Root::Deref(x.clone()), steps: vec![] }, *rm, Tri::T)),
+                _ if may_hold_ref(&t) => reach.extend(fl.deriv_facts(x)),
+                _ => {}
+            }
             if c.mv {
                 // `[Closure-Form-Move]`: the capture's value is stored (read).
                 self.rvalue(fl, &xe, line);
@@ -861,8 +874,9 @@ impl<'a> Cx<'a> {
                         facts.push((p, m));
                     } else if !PRE_D0243.load(std::sync::atomic::Ordering::Relaxed) {
                         // D-0243: the closure holds a borrow of the reference
-                        // binding itself, which no fact describes.
-                        fl.escaped.insert(p.root, Tri::T);
+                        // binding itself; since D-0288 a fact describes it.
+                        fl.escaped.insert(p.root.clone(), Tri::T);
+                        reach.push((p, m, Tri::T));
                     }
                 }
             }
@@ -873,6 +887,9 @@ impl<'a> Cx<'a> {
                 for (p, m) in facts {
                     fl.deriv.insert((h.to_string(), p, m), Tri::T);
                 }
+                for (p, m, v) in reach {
+                    fl.deriv.insert((h.to_string(), p, m), v);
+                }
             }
             // `&x…` in any other position.
             None => {
@@ -882,6 +899,36 @@ impl<'a> Cx<'a> {
             }
         }
         self.analyse_closure(c);
+    }
+
+    // D-0288's `fn` value row: a copy of a binding holds its facts; a call's
+    // result may hold what any argument that may hold a reference formed or
+    // held, which the run decides (`?`).
+    fn fn_value_facts(&self, fl: &Flow, e: &Expr) -> Vec<(SPlace, Mode, Tri)> {
+        match e {
+            Expr::Var(x) => fl.deriv_facts(x),
+            Expr::Call(_, args) => {
+                let mut out = Vec::new();
+                for a in args {
+                    match a {
+                        Expr::Borrow(m, p) => {
+                            if let Some(sp) = self.deriv_place(p) {
+                                out.push((sp, *m, Tri::Q));
+                            }
+                        }
+                        Expr::Var(y) if self.ty_of(y).map_or(false, |t| may_hold_ref(&t)) => {
+                            if let Some(Ty::Ref(_, rm) | Ty::Slice(rm)) = self.ty_of(y) {
+                                out.push((SPlace { root: Root::Deref(y.clone()), steps: vec![] }, rm, Tri::Q));
+                            }
+                            out.extend(fl.deriv_facts(y).into_iter().map(|(p, m, _)| (p, m, Tri::Q)));
+                        }
+                        _ => {}
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
     }
 
     // A closure's body, analysed as a body of its own: the captures bound
@@ -1020,6 +1067,11 @@ impl<'a> Cx<'a> {
                     let end = self.pos.stmt_end.get(&(s as *const Stmt)).copied().unwrap_or(0);
                     self.bind_frame_held(fl, name, &t, init, inh, id, end, line);
                 }
+                if let (Ty::Fn(_), false) = (&t, matches!(init, Expr::Closure(_))) {
+                    for (p, m, v) in self.fn_value_facts(fl, init) {
+                        fl.deriv.insert((name.clone(), p, m), v);
+                    }
+                }
                 self.binds.entry(name.clone()).or_default().push(Binding { ty: t, block, id });
                 if let Some(r) = self.regions.last_mut() {
                     r.insert(name.clone());
@@ -1070,6 +1122,11 @@ impl<'a> Cx<'a> {
                             self.clo_info.insert(n.clone(), (c.mv, c.mv && c.caps.iter().any(|x| writes_root(&c.body, x))));
                         } else {
                             self.clo_info.remove(&n);
+                            let facts = self.fn_value_facts(fl, value);
+                            fl.forget_holder(&n);
+                            for (p, m, v) in facts {
+                                fl.deriv.insert((n.clone(), p, m), v);
+                            }
                         }
                     }
                     if matches!(self.ty_of(&n), Some(Ty::Ref(..)) | Some(Ty::Slice(_))) {
@@ -1332,17 +1389,21 @@ impl<'a> Cx<'a> {
                 if self.end_blocked(b, &x, d, i, &mentions, &tail_names) {
                     still.push((x, d));
                 } else {
-                    free.push(x);
+                    free.push((x, d));
                 }
             }
             waiting = still;
             // One at a time, in order: a binding ended frees what was
             // rooted in it for the next.
-            for x in free {
+            // One whose facts still root another binding's reference waits
+            // for a later statement (D-0288).
+            for (x, d) in free {
                 let rooted = fl.deriv.iter().any(|(k, v)| *v != Tri::F && k.0 != x && (k.1.root == Root::Var(x.clone()) || k.1.root == Root::Deref(x.clone())));
                 if !rooted {
                     end_binding(fl, &x);
                     now.push(x);
+                } else {
+                    waiting.push((x, d));
                 }
             }
             if !now.is_empty() {
@@ -1386,7 +1447,20 @@ impl<'a> Cx<'a> {
     // binding that may hold a reference shares a statement with it since its
     // declaration and is mentioned after `i`.
     fn end_blocked(&self, b: &Block, x: &str, d: usize, i: usize, mentions: &[Vec<String>], tail: &[String]) -> bool {
-        let later = |m: &str| tail.iter().any(|t| t == m) || mentions[i + 1..].iter().any(|ms| ms.iter().any(|n| n == m));
+        // D-0288: `m` stops counting at a later statement that assigns it
+        // whole from a value that does not read it, with no `break` or
+        // `continue` on the way: what `m` got in statement `j` ends there.
+        let later = |m: &str, j: usize| {
+            for k in j + 1..b.stmts.len() {
+                if crate::ast::stmt_may_leave(&b.stmts[k - 1]) {
+                    break;
+                }
+                if crate::ast::stmt_overwrites(&b.stmts[k], m) {
+                    return mentions[i + 1..k.max(i + 1)].iter().any(|ms| ms.iter().any(|n| n == m));
+                }
+            }
+            tail.iter().any(|t| t == m) || mentions[i + 1..].iter().any(|ms| ms.iter().any(|n| n == m))
+        };
         (d..=i).filter(|&j| j == d || mentions[j].iter().any(|n| n == x)).any(|j| {
             let declared = match &b.stmts[j].kind {
                 StmtKind::Let { name, .. } => Some(name.clone()),
@@ -1397,7 +1471,7 @@ impl<'a> Cx<'a> {
                     && self.ty_of(&m).or_else(|| decl_ty_in(self, b, &m)).map_or(false, |t| {
                         may_hold_ref(&t) && (declared.as_deref() == Some(m.as_str()) || !inert_ref(&t) || crate::ast::stmt_rebinds(&b.stmts[j], &m))
                     })
-                    && later(&m)
+                    && later(&m, j)
             })
         })
     }
@@ -1449,7 +1523,10 @@ fn end_plan(cx: &Cx, b: &Block) -> (Vec<Vec<(String, usize)>>, Vec<Vec<String>>,
     // "no closure in the block captures x"
     let mut clos = Vec::new();
     block_closures(b, &mut clos);
-    let captured: BTreeSet<String> = clos.iter().flat_map(|c| c.caps.iter().cloned()).collect();
+    // D-0288: but a `move` closure bound whole (its binding holds the facts)
+    let mut whole = BTreeSet::new();
+    crate::ast::bound_whole_move(b, &mut whole);
+    let captured: BTreeSet<String> = clos.iter().filter(|c| !whole.contains(&c.id)).flat_map(|c| c.caps.iter().cloned()).collect();
     for (d, s) in b.stmts.iter().enumerate() {
         let StmtKind::Let { name: x, ty, init } = &s.kind else { continue };
         let Some(t) = ty.clone().or_else(|| guess_ty(cx, init)) else { continue };

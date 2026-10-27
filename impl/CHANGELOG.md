@@ -8255,3 +8255,58 @@ crossing to C by value.
   1,479 the same; 15 different, each one of Update 141's 17 (the times they print, random input, stack addresses);
   6 not decided (they reclaim raw storage, as before), where Update 141 had 12; no build failures. Release suites
   `stress/suites/runs/u142`: passed.
+
+## CHG-0380: an element of a `Vec` reached through a reference, and a `Vec` of a zero-sized type, in the static pass (2026-10-27)
+
+- `vec_element_root` (`typecheck.rs`) places `v[k]` where `v` is a reference to a `Vec` (auto-dereferenced), or
+  `(*r)[k]`, `r.f[k]`, at the referent `*r`; before, only a `Vec` binding of the frame was placed, and an access
+  through a reference was checked against nothing: two `&mut v[0]` through a parameter were decided, and the
+  decided build printed a view of a destroyed `String`.
+- `zero_sized` (struct fields, arrays; `None` for a type parameter): every element of a `Vec` of a zero-sized type
+  takes index 0 (D-0217: one place), an element type not known here an unknown index; the diagnostic adds "every
+  element of a `Vec` of a zero-sized type is one place". `stress/review2_oct11/z07.cb`, recorded as a false fault
+  of the tracked runtimes, was a miss of the static pass; both tools now reject it.
+- Gate `stress/d0281/objectless/dgate.sh` over the 1,500 programs of Update 141's sample: 1,477 the same; 17
+  different, the 3 not in Update 142's run only in the times they print; 6 not decided (they reclaim raw
+  storage); no build failures. Release suites `stress/suites/runs/u143c`: passed.
+
+## `cobc --emit-c -o OUT` (2026-10-27)
+
+- `cobc --emit-c [--c-name NAME] [-o OUT] FILE` writes the C to OUT (standard output without `-o` or with `-o -`);
+  the options come in any order, and `#line` directives name OUT unless `--c-name` names another. A program the
+  static pass rejects gets its diagnostic and status 1, and OUT is not written. Driver test
+  `emit_c_writes_to_the_file_o_names`. `cbc` keeps standard output until the port of D-0278.
+
+## CHG-0381: a closure holds what its captures reach, and a program with closures may be decided (D-0288, 2026-10-27)
+
+- `closure_facts_of` (`typecheck.rs`): any closure binding holds `deriv(c, *r, m)` for a captured reference and
+  the facts of a captured view, `Option` of a reference or `fn` value; one without `move` also borrows each
+  captured owner, as before. `fn_value_facts`: a `fn` binding copied from another holds its facts, one a call
+  returns holds its arguments' as `?`.
+- `early_end_plan` no longer keeps alive the captures of a `move` closure bound whole; `ref_end_blocked` lets a binding
+  stop counting once it is assigned whole (`stmt_overwrites`, `stmt_may_leave`); `end_ref_bindings` hands back
+  the bindings it could not end yet, which wait. `stress/d0281/captures/probes/p8.cb` was rejected for the first
+  string's write; it is now rejected only for the second, a real conflict, and the program without it runs.
+- `inherited_facts_in`: a variant built of a payload holds what the payload holds. `Some(String::as_view(&s))`
+  was static data, and both `cobc` builds read the view after the string was appended to.
+- `cobc`: `pathless_blocker` no longer blocks on closures; an assignment ends the old value when it holds `fn`
+  values (`cb_drop_value`), so an overwritten closure's captures are released; an `auto` closure binding the body
+  assigns whole is boxed, where it gave C that did not compile.
+- Found by the pathless gate once the blocker was gone: a closure without `move` now holds `deriv(c, r, m)` for a
+  captured reference binding `r` (`r = &mut y` while it lives is static, `conf.ref-captured-by-closure-then-reassigned`
+  and `conf.closure-ref-capture-blocks-deref` are static now); a shared borrow of a `fn` binding leaves the
+  function to the run (D-0218's `diag.borrow-exceeds-source`).
+- `inherited_facts_in`: `Option::unwrap`/`expect` and `Result::unwrap`/`expect` hold what their argument holds;
+  with the variant repair, `Ok(Option::unwrap(HashMap::get_mut(…)))` had become tier D, and is decided again.
+- `cobmodel` (`impl/model/src/statics.rs`, `ast.rs`) follows spec/14 1.35.0: the closure row's `deriv(c, *r, m)`
+  and copied facts, `deriv(c, r, m)` for a captured reference binding, the `fn` value row, and the three
+  `[Ref-Binding-Last-Use]` rules (`bound_whole_move`, `stmt_overwrites`, `stmt_may_leave`, a rooted binding
+  waiting). The model sample had found the tools outside the old model's set on three programs:
+  `three-p000238` (a binding rooted in another now waits and ends, where it lived to its block's end) and
+  `hand-k02`, `disagreed-r5c-p004329` (a closure's capture of a reference binding is a fact, so its
+  reassignment is static where it was decided by the run).
+- Pathless gate `stress/d0281/captures/gate1.sh` over the 2,608 closure programs: 711 the same, 1,882 not
+  decided, 15 different, of which 12 are `coby` timeouts on timing programs and 3 were the faults repaired
+  above (re-gated: not decided). Gate `stress/d0281/objectless/dgate.sh` over Update 141's sample: 1,474 the
+  same; 17 different, all timing; 9 not decided (2 newly, for D-0218's `&f`).
+- Release suites `stress/suites/runs/u143c`: passed, the model sample with no outcome outside the model's set.

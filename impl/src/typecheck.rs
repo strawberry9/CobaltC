@@ -3305,33 +3305,140 @@ impl<'a> Body<'a> {
     // spawn handle holds its arguments' borrows: a binding holding one
     // carries a `deriv` fact per captured local. A capture that is itself
     // a reference is left out (the closure borrows the reference, and
-    // what is reached through it is the reference's own fact).
-    fn closure_facts_of(&self, e: &Expr) -> Vec<DerivKey> {
-        let ExprKind::Closure { captures, body, .. } = &strip_parens_tc(e).kind else { return Vec::new() };
-        captures
-            .iter()
-            .filter(|c| self.flow.is_tracked(c) && !self.lookup_local(c).as_ref().map_or(true, is_borrow_ty))
-            .map(|c| DerivKey {
-                root: c.clone(),
-                path: Vec::new(),
-                mode: if crate::interp::closure_body_writes(body, c) { Mode::Exclusive } else { Mode::Shared },
-            })
-            .collect()
+    // what is reached through it is the reference's own fact). Any
+    // closure, `move` or not, holds what a captured reference, view or
+    // closure reaches: a reference its referent `*r`, as a copy of it
+    // does (D-0071), anything else the capture's own facts (D-0288).
+    fn closure_facts_of(&self, e: &Expr) -> Vec<(DerivKey, Tri)> {
+        let ExprKind::Closure { is_move, captures, body, .. } = &strip_parens_tc(e).kind else { return Vec::new() };
+        let mut facts = Vec::new();
+        for c in captures {
+            let t = self.lookup_local(c);
+            match &t {
+                Some(Type::Ref(_, m)) | Some(Type::Slice(_, m)) => facts.push((DerivKey { root: referent_root(c), path: Vec::new(), mode: m.clone() }, Tri::T)),
+                Some(t) if may_hold_ref(self.items, t, 0) && self.flow.deriv.contains_key(c) => {
+                    let held = self.flow.deriv.get(c).into_iter().flat_map(|f| f.iter()).filter(|(k, _)| k.root != "<tier D>" && k.root != "<temporary>");
+                    facts.extend(held.map(|(k, v)| (k.clone(), *v)));
+                }
+                _ => {}
+            }
+            // A captured reference is borrowed itself (spec/15 §6): the
+            // binding may not be assigned while the closure lives (D-0288).
+            if !*is_move && self.flow.is_tracked(c) && t.is_some() {
+                let mode = if crate::interp::closure_body_writes(body, c) { Mode::Exclusive } else { Mode::Shared };
+                facts.push((DerivKey { root: c.clone(), path: Vec::new(), mode }, Tri::T));
+            }
+        }
+        facts
+    }
+
+    // What a `fn` value that is no closure literal holds: a copy of one
+    // what it holds; a call's result, a closure that may have kept any
+    // argument that can hold a reference, what those reach, not known
+    // before the run (`Tri::U`: the run decides, D-0288).
+    fn fn_value_facts(&self, e: &Expr) -> Vec<(DerivKey, Tri)> {
+        let kept = |k: &DerivKey| k.root != "<tier D>" && k.root != "<temporary>";
+        // A value copied out of a binding (not a reference) holds what the
+        // binding held, and borrows nothing of the binding itself.
+        let held = |a: &Expr| match &strip_parens_tc(a).kind {
+            ExprKind::Path(segs, _) if segs.len() == 1 && !matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..)) | Some(Type::Slice(..))) => {
+                self.flow.deriv.get(&segs[0]).map(|f| f.iter().map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default()
+            }
+            _ => self.inherited_facts(a, 0).unwrap_or_default(),
+        };
+        let ExprKind::Call(callee, args) = &strip_parens_tc(e).kind else {
+            return held(e).into_iter().filter(|(k, _)| kept(k)).collect();
+        };
+        let params: Option<Vec<Type>> = self.resolve_fn_path(callee).map(|f| f.params.iter().map(|p| p.ty.clone()).collect());
+        let mut facts = Vec::new();
+        for (j, a) in args.iter().enumerate() {
+            if params.as_ref().map_or(false, |ps| ps.get(j).map_or(false, |t| !may_hold_ref(self.items, t, 0))) {
+                continue;
+            }
+            facts.extend(held(a).into_iter().filter(|(k, _)| kept(k)).map(|(k, _)| (k, Tri::U)));
+        }
+        facts
     }
 
     // `&v[i]` on a `Vec` is `Vec::index_shared(&v, i)` (`[Index-Vec]`), an
     // elided call on a borrow of `v`: derived from `v` as that call is.
     fn vec_element_root(&self, e: &Expr) -> Option<(String, Vec<PElem>)> {
         let ExprKind::Index(base, idx) = &strip_parens_tc(e).kind else { return None };
-        match self.static_place_type(base)? {
-            Type::Named(n, _) if n == "std::Vec" => self.place_of(base).map(|(r, mut p)| {
-                // D-0282: the element, so two of them are told apart.
+        // A `Vec` reached through a reference (`v[i]` with `v` one, auto-
+        // dereferenced, or `(*v)[i]`, `r.f[i]`): the element of its referent.
+        let (vt, root) = match self.static_place_type(base)? {
+            Type::Ref(t, _) | Type::Guard(t) => {
+                let r = match &strip_parens_tc(base).kind {
+                    ExprKind::Path(segs, _) if segs.len() == 1 && self.flow.is_tracked(&segs[0]) => Some((referent_root(&segs[0]), Vec::new())),
+                    _ => None,
+                };
+                (*t, r)
+            }
+            t => (t, self.place_of(base).or_else(|| self.deref_place_of(base))),
+        };
+        match vt {
+            Type::Named(n, args) if n == "std::Vec" => root.map(|(r, mut p)| {
+                // D-0282: the element, so two of them are told apart. D-0217: every
+                // element of a `Vec` of a zero-sized type is the one object anchored
+                // at its buffer, one place; an element type not known here may be one.
                 if tier_report::on() {
-                    p.push(PElem::Index(literal_value(idx).filter(|v| *v >= 0).map(|v| v as u128)));
+                    let lit = match args.first().map(|t| self.zero_sized(t, 0)) {
+                        Some(Some(false)) => literal_value(idx).filter(|v| *v >= 0).map(|v| v as u128),
+                        Some(Some(true)) => Some(0),
+                        _ => None,
+                    };
+                    p.push(PElem::Index(lit));
                 }
                 (r, p)
             }),
             _ => None,
+        }
+    }
+
+    // Whether `root.path` is an element of a `Vec` of a zero-sized type.
+    fn zero_sized_vec_element(&self, root: &str, path: &[PElem]) -> bool {
+        let Some((PElem::Index(_), pre)) = path.split_last() else { return false };
+        matches!(self.place_type(root, pre), Some(Type::Named(n, a)) if n == "std::Vec" && a.first().and_then(|t| self.zero_sized(t, 0)) == Some(true))
+    }
+
+    // Whether `t` is zero-sized (`spec/05`, D-0217): a struct whose fields
+    // all are, or an array of none or of a zero-sized element. `None` when
+    // it is not known here: a type parameter.
+    fn zero_sized(&self, t: &Type, depth: usize) -> Option<bool> {
+        if depth > 16 {
+            return None;
+        }
+        match t {
+            Type::Void => Some(true),
+            Type::Array(inner, n) => {
+                if *n == 0 {
+                    Some(true)
+                } else {
+                    self.zero_sized(inner, depth + 1)
+                }
+            }
+            Type::Named(n, args) => {
+                if let Some(sd) = self.items.structs.get(n) {
+                    if sd.bits.is_some() {
+                        return Some(false);
+                    }
+                    let subst: HashMap<String, Type> = sd.type_params.iter().cloned().zip(args.iter().cloned()).collect();
+                    let mut all = Some(true);
+                    for fd in &sd.fields {
+                        match self.zero_sized(&apply_subst(&fd.ty, &subst), depth + 1) {
+                            Some(true) => {}
+                            Some(false) => return Some(false),
+                            None => all = None,
+                        }
+                    }
+                    all
+                } else if self.items.enums.contains_key(n) || n.starts_with("std::") {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => Some(false),
         }
     }
 
@@ -3475,7 +3582,32 @@ impl<'a> Body<'a> {
                         return Some(out);
                     }
                 }
-                let f = self.resolve_fn_path(callee)?;
+                let Some(f) = self.resolve_fn_path(callee) else {
+                    // A variant made of its payload (`Some(v)`, `Ok(r)`) holds
+                    // what the payload holds; it was taken for static data,
+                    // and `Some(String::as_view(&s))` held nothing (D-0288).
+                    let ExprKind::Path(segs, _) = &callee.kind else { return None };
+                    let last = segs.last()?;
+                    let variant = self.items.enum_of_variant.contains_key(last)
+                        || (segs.len() > 1 && self.items.enums.get(&segs[..segs.len() - 1].join("::")).map_or(false, |en| en.variants.iter().any(|v| &v.name == last)));
+                    if !variant {
+                        return None;
+                    }
+                    let mut out: Option<Vec<(DerivKey, Tri)>> = None;
+                    for a in args {
+                        let plain = matches!(strip_parens_tc(a).kind, ExprKind::IntLit(..) | ExprKind::FloatLit(..) | ExprKind::BoolLit(_) | ExprKind::StrLit(_) | ExprKind::Unit)
+                            || self.value_shape(a).map_or(false, |t| !may_hold_ref(self.items, &t, 0));
+                        if plain {
+                            continue;
+                        }
+                        match self.inherited_facts_in(a, depth + 1, binder) {
+                            Some(v) if v.is_empty() => return Some(Vec::new()),
+                            Some(v) => out.get_or_insert_with(Vec::new).extend(v),
+                            None => {}
+                        }
+                    }
+                    return out;
+                };
                 // A sub-view (`String::view(&s, lo, hi)`, `StringView::sub`):
                 // the range of its source it covers.
                 if let ExprKind::Path(segs, _) = &callee.kind {
@@ -3487,6 +3619,12 @@ impl<'a> Body<'a> {
                             (k, t)
                         }).collect());
                     }
+                }
+                // `Option::unwrap(e)` and the like hold what `e` holds, as in
+                // `contained_ref_facts`.
+                let std_fn = |key: &str| self.items.fns.get(key).map_or(false, |g| std::sync::Arc::ptr_eq(g, &f));
+                if (std_fn("std::Option::unwrap") || std_fn("std::Option::expect") || std_fn("std::Result::unwrap") || std_fn("std::Result::expect")) && !args.is_empty() {
+                    return self.inherited_facts_in(&args[0], depth + 1, binder);
                 }
                 // A generic whose declared result holds a reference only
                 // through a type argument (`Vec::pop` of a `Vec<ref<T>>`)
@@ -3762,9 +3900,13 @@ impl<'a> Body<'a> {
             if !waiting.is_empty() {
                 let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut waiting).into_iter().partition(|(n, d)| !self.ref_end_blocked(b, n, *d, i, &mentions, &tail));
                 waiting = later;
-                let now: Vec<String> = now.into_iter().map(|(n, _)| n).collect();
-                if !now.is_empty() {
-                    self.end_ref_bindings(s, &now);
+                // One another binding's facts are still rooted in waits
+                // for those to end (`f = move [b]() …` drops what the old
+                // `f` copied out of `r`).
+                let names: Vec<String> = now.iter().map(|(n, _)| n.clone()).collect();
+                if !names.is_empty() {
+                    let rooted = self.end_ref_bindings(s, &names);
+                    waiting.extend(now.into_iter().filter(|(n, _)| rooted.contains(n)));
                 }
             }
         }
@@ -3775,9 +3917,25 @@ impl<'a> Body<'a> {
     // although no later statement mentions it: a binding that holds
     // references, shares a statement with `n` since `n`'s declaration (so
     // may hold a reference derived from it: `parts = split(v, …)`,
-    // `Vec::push(&mut rs, r)`), and is mentioned later.
+    // `Vec::push(&mut rs, r)`), and is mentioned later. Only while what
+    // it got there lasts: a later statement that assigns it whole from a
+    // value that does not read it ends that, when nothing leaves the
+    // block on the way (`f = move [vb]() …` after `f = move [va]() …`).
     fn ref_end_blocked(&self, b: &Block, n: &str, d: usize, i: usize, mentions: &[HashSet<String>], tail: &HashSet<String>) -> bool {
-        let later = |m: &str| tail.contains(m) || mentions[i + 1..].iter().any(|ms| ms.contains(m));
+        let later = |m: &str, j: usize| {
+            for k in j + 1..b.stmts.len() {
+                if stmt_may_leave(&b.stmts[k - 1]) {
+                    break;
+                }
+                if stmt_overwrites(&b.stmts[k], m) {
+                    if stmt_may_leave(&b.stmts[k]) {
+                        break;
+                    }
+                    return mentions[i + 1..k.max(i + 1)].iter().any(|ms| ms.contains(m));
+                }
+            }
+            tail.contains(m) || mentions[i + 1..].iter().any(|ms| ms.contains(m))
+        };
         (d..=i).filter(|&j| j == d || mentions[j].contains(n)).any(|j| {
             let declared = match &b.stmts[j] {
                 Stmt::Let { name, .. } => Some(name.as_str()),
@@ -3788,16 +3946,19 @@ impl<'a> Body<'a> {
                     && self.lookup_local(m).map_or(false, |t| {
                         may_hold_ref(self.items, &t, 0) && (declared == Some(m) || !inert_ref(self.items, &t) || stmt_rebinds(&b.stmts[j], m))
                     })
-                    && later(m)
+                    && later(m, j)
             })
         })
     }
 
-    fn end_ref_bindings(&mut self, s: &Stmt, names: &[String]) {
+    // The names another binding's facts are still rooted in, which do not
+    // end yet.
+    fn end_ref_bindings(&mut self, s: &Stmt, names: &[String]) -> Vec<String> {
         if self.flow.unreachable {
-            return;
+            return Vec::new();
         }
         let mut ended = Vec::new();
+        let mut rooted = Vec::new();
         for n in names {
             let is_ref = self.lookup_local(n).map_or(false, |t| ends_at_last_use(self.items, &t));
             if !is_ref {
@@ -3806,6 +3967,7 @@ impl<'a> Body<'a> {
             let rr = referent_root(n);
             let rooted_here = self.flow.deriv.iter().any(|(h, fs)| h != n && fs.keys().any(|k| k.root == *n || k.root == rr));
             if rooted_here {
+                rooted.push(n.clone());
                 continue;
             }
             self.flow.deriv.remove(n);
@@ -3821,6 +3983,7 @@ impl<'a> Body<'a> {
             }
             self.items.any_early_ends.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        rooted
     }
 
     // A nested block opens a scope: the bindings it declares end at its
@@ -4010,9 +4173,12 @@ impl<'a> Body<'a> {
                 } else if let Some(e) = init.as_ref().filter(|e| is_spawn_call(e)) {
                     let facts = self.spawn_facts_of(e);
                     self.set_deriv(name, facts);
-                } else if let Some(e) = init.as_ref().filter(|e| is_borrowing_closure(e)) {
+                } else if let Some(e) = init.as_ref().filter(|e| is_closure(e)) {
                     let facts = self.closure_facts_of(e);
-                    self.set_deriv(name, facts);
+                    self.set_deriv_tri(name, facts);
+                } else if let Some(e) = init.as_deref().filter(|_| matches!(final_ty, Some(Type::Fn(..)) | Some(Type::Closure(_)))) {
+                    let facts = self.fn_value_facts(e);
+                    self.set_deriv_tri(name, facts);
                 }
                 Ok(None)
             }
@@ -4285,6 +4451,16 @@ impl<'a> Body<'a> {
             ExprKind::Binary(op, a, b) => self.check_binary(*op, a, b, e, expected),
             ExprKind::Borrow(m, inner) => {
                 self.tier_elem_access(inner, m.clone())?;
+                // D-0218: a closure called through a shared reference may not
+                // write through what it captured; which closure a `fn` value
+                // is, the run knows (D-0288).
+                if *m == Mode::Shared && self.report && !self.flow.unreachable && tier_report::on() {
+                    if let ExprKind::Path(segs, _) = &strip_parens_tc(inner).kind {
+                        if segs.len() == 1 && matches!(self.lookup_local(&segs[0]), Some(Type::Fn(..)) | Some(Type::Closure(_))) {
+                            tier_report::left(format!("line {}: the `fn` value `{}` is reached through a shared reference, and only the run knows whether it writes what it captured (D-0218)", self.current_line, shown_name(&segs[0])));
+                        }
+                    }
+                }
                 // D-0258 `[Ref-Form-Static]`: `&NAME` of a static is a shared
                 // reference to one object with program extent; it never
                 // ends, so it is never tracked. `&mut NAME` is refused: the
@@ -4819,9 +4995,12 @@ impl<'a> Body<'a> {
                     } else if self.flow.is_tracked(&name) && is_spawn_call(rhs) && matches!(strip_parens_tc(lhs).kind, ExprKind::Path(..)) {
                         let facts = self.spawn_facts_of(rhs);
                         self.set_deriv(&name, facts);
-                    } else if self.flow.is_tracked(&name) && is_borrowing_closure(rhs) && matches!(strip_parens_tc(lhs).kind, ExprKind::Path(..)) {
+                    } else if self.flow.is_tracked(&name) && is_closure(rhs) && matches!(strip_parens_tc(lhs).kind, ExprKind::Path(..)) {
                         let facts = self.closure_facts_of(rhs);
-                        self.set_deriv(&name, facts);
+                        self.set_deriv_tri(&name, facts);
+                    } else if self.flow.is_tracked(&name) && matches!(lt, Some(Type::Fn(..)) | Some(Type::Closure(_))) && matches!(strip_parens_tc(lhs).kind, ExprKind::Path(..)) {
+                        let facts = self.fn_value_facts(rhs);
+                        self.set_deriv_tri(&name, facts);
                     }
                 }
                 Ok(Some(Type::Void))
@@ -5855,7 +6034,10 @@ impl<'a> Body<'a> {
                     // container (`&mut v[f(x)]`): which element is a value.
                     Ov::Yes if *v != Tri::T || self.compound_held.contains(h) => point = true,
                     Ov::Yes => {
-                        let msg = format!("{} still borrows `{}`, so it cannot be {} here", holder_text(h), shown_place(&k.root, &k.path), if mode == Mode::Exclusive { "written or borrowed `mut`" } else { "read" });
+                        let mut msg = format!("{} still borrows `{}`, so it cannot be {} here", holder_text(h), shown_place(&k.root, &k.path), if mode == Mode::Exclusive { "written or borrowed `mut`" } else { "read" });
+                        if self.zero_sized_vec_element(&k.root, &k.path) {
+                            msg.push_str(" (every element of a `Vec` of a zero-sized type is one place)");
+                        }
                         return self.refute(&crate::modres::named("diag.aliasing-conflict", msg));
                     }
                 }
@@ -9040,8 +9222,9 @@ fn int_lit_fits(t: IntTy, v: u128) -> bool {
 
 // D-0111: for each statement of `b`, the bindings declared by a `let` of
 // `b` (once only, and not a hidden `$` name) that no later statement nor
-// the tail mentions and that no closure in `b` captures: they may end
-// after that statement (`Body::end_ref_bindings` keeps those whose type
+// the tail mentions and that no closure in `b` captures, but a `move`
+// closure bound whole (`closure_captures_stmt`): they may end after that
+// statement (`Body::end_ref_bindings` keeps those whose type
 // is a reference, a slice or a `StringView`).
 fn early_end_plan(b: &Block) -> (Vec<Vec<(String, usize)>>, Vec<HashSet<String>>, HashSet<String>) {
     let n = b.stmts.len();
@@ -9127,6 +9310,28 @@ fn stmt_mentions(s: &Stmt) -> HashSet<String> {
 }
 
 fn closure_captures_stmt(s: &Stmt, out: &mut HashSet<String>) {
+    // A `move` closure bound whole (`auto f = move […]…`, `f = move […]…`)
+    // holds a copy of each capture, and its binding the facts the capture
+    // held (`closure_facts_of`): the capture may end before it. A closure
+    // anywhere else (an argument, `spawn`'s, a callee) carries no facts,
+    // so what it captures stays alive.
+    let bound = match s {
+        Stmt::Let { init: Some(e), .. } => Some(&**e),
+        Stmt::Expr(e) => match &strip_parens_tc(e).kind {
+            ExprKind::Assign(l, r) if matches!(&strip_parens_tc(l).kind, ExprKind::Path(segs, _) if segs.len() == 1) => Some(&**r),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(ExprKind::Closure { is_move: true, body, .. }) = bound.map(|e| &strip_parens_tc(e).kind) {
+        for st in &body.stmts {
+            closure_captures_stmt(st, out);
+        }
+        if let Some(t) = &body.tail {
+            closure_captures_expr(t, out);
+        }
+        return;
+    }
     match s {
         Stmt::Let { init: Some(e), .. } => closure_captures_expr(e, out),
         Stmt::Let { init: None, .. } => {}
@@ -9351,8 +9556,37 @@ fn const_expr(items: &Items, e: &Expr) -> bool {
     }
 }
 
-fn is_borrowing_closure(e: &Expr) -> bool {
-    matches!(&strip_parens_tc(e).kind, ExprKind::Closure { is_move: false, captures, .. } if !captures.is_empty())
+// Whether `s` is `m = e;` with `e` not reading `m`: it ends what `m` held.
+fn stmt_overwrites(s: &Stmt, m: &str) -> bool {
+    let Stmt::Expr(e) = s else { return false };
+    let ExprKind::Assign(lhs, rhs) = &strip_parens_tc(e).kind else { return false };
+    if !matches!(&strip_parens_tc(lhs).kind, ExprKind::Path(segs, _) if segs.len() == 1 && segs[0] == m) {
+        return false;
+    }
+    let mut free = HashSet::default();
+    collect_free_vars_expr(rhs, &mut HashSet::default(), &mut free);
+    !free.contains(m)
+}
+
+// Whether `s` may leave its block other than by running to its end: a
+// `break`, `continue`, `return` or `?` anywhere in it.
+fn stmt_may_leave(s: &Stmt) -> bool {
+    let mut found = false;
+    let mut look = |e: &Expr| {
+        if matches!(e.kind, ExprKind::Break | ExprKind::Continue | ExprKind::Return(_) | ExprKind::Propagate(_)) {
+            found = true;
+        }
+    };
+    match s {
+        Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) | Stmt::BlockLike(e) => crate::consts::visit(e, &mut look),
+        Stmt::Destructure { init, .. } => crate::consts::visit(init, &mut look),
+        Stmt::Let { init: None, .. } => {}
+    }
+    found
+}
+
+fn is_closure(e: &Expr) -> bool {
+    matches!(&strip_parens_tc(e).kind, ExprKind::Closure { .. })
 }
 
 fn is_spawn_call(e: &Expr) -> bool {

@@ -298,6 +298,56 @@ pub fn expr_closures<'a>(e: &'a Expr, out: &mut Vec<&'a Clo>) {
     }
 }
 
+// The `move` closures a block binds whole, nested blocks included:
+// `auto c = move […]…` and `c = move […]…` (D-0288).
+pub fn bound_whole_move(b: &Block, out: &mut std::collections::BTreeSet<usize>) {
+    for s in &b.stmts {
+        match &s.kind {
+            StmtKind::Let { init: Expr::Closure(c), .. } | StmtKind::Assign { place: Expr::Var(_), value: Expr::Closure(c) } if c.mv => {
+                out.insert(c.id);
+            }
+            StmtKind::Block(c) | StmtKind::While { body: c, .. } => bound_whole_move(c, out),
+            StmtKind::If { then, els, .. } => {
+                bound_whole_move(then, out);
+                if let Some(e) = els {
+                    bound_whole_move(e, out);
+                }
+            }
+            StmtKind::Match { some, none, .. } => {
+                bound_whole_move(some, out);
+                bound_whole_move(none, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+// Whether `s` assigns `x` whole from a value that does not read it (D-0288).
+pub fn stmt_overwrites(s: &Stmt, x: &str) -> bool {
+    match &s.kind {
+        StmtKind::Assign { place: Expr::Var(n), value } if n == x => {
+            let mut v = Vec::new();
+            expr_names(value, &mut v);
+            !v.iter().any(|m| m == x)
+        }
+        _ => false,
+    }
+}
+
+// Whether `s` holds a `break` or `continue` (D-0288), outside closures.
+pub fn stmt_may_leave(s: &Stmt) -> bool {
+    fn in_block(b: &Block) -> bool {
+        b.stmts.iter().any(stmt_may_leave)
+    }
+    match &s.kind {
+        StmtKind::Break | StmtKind::Continue => true,
+        StmtKind::Block(b) | StmtKind::While { body: b, .. } => in_block(b),
+        StmtKind::If { then, els, .. } => in_block(then) || els.as_ref().map_or(false, in_block),
+        StmtKind::Match { some, none, .. } => in_block(some) || in_block(none),
+        _ => false,
+    }
+}
+
 // Whether statement `s` may rebind `x` (D-0275): it assigns `x` whole,
 // borrows it whole exclusively, or a closure in it captures it.
 pub fn stmt_rebinds(s: &Stmt, x: &str) -> bool {

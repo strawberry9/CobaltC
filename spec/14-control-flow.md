@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.33.0
+Version: 1.35.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -53,13 +53,18 @@ provable" side-condition in this specification refers to.
         slice<τ, m>, StringView, or an aggregate, option or array holding one) and holds no
         resource and no fn value (D-0133);
         s_k (k ≥ d) the last of s_d … sn that mentions x, k < n or e present; e does not mention x;
-        no closure in the block captures x; x declared once in the block;
+        no closure in the block captures x, but a `move` closure bound whole, `auto c = move […]…`
+        or `c = move […]…` (it holds a copy of x, and c the facts x held: the closure row below,
+        D-0288); x declared once in the block;
         s_j (j ≥ k) the first statement after which no binding that may hold a reference, other
         than x, and mentioned in a statement with x since s_d (or declared by s_d), is mentioned
         again in s_{j+1} … sn or e;  j < n or e present;
         (D-0275: a binding y of type ref<τ, m>, slice<τ, m> or StringView, τ holding no reference
         and no fn value, counts through a statement s_i only if s_i declares y, assigns y whole,
         borrows y whole exclusively (&mut y), or has a closure that captures y)
+        (D-0288: y mentioned in s_i counts only until a later s_l assigns y whole, `y = e` with e
+        not mentioning y, none of s_i … s_l holding a `break`, `continue`, `return` or `?`: what
+        y got in s_i ends there, so y mentioned only after s_l does not count)
         after s_j, rule.control.flow-analysis's facts root no other binding's reference in x:
         deriv(y, x.π, m) = F and deriv(y, *x.π, m) = F for every y ≠ x, π, m
         (x passed whole to `spawn` is borrowed through: the lend is a borrow of *x the handle
@@ -69,7 +74,8 @@ provable" side-condition in this specification refers to.
         -- the path x held is held no more (`held-by`); nothing a resource owns ends earlier
         -- bindings ending after the same s_j end one at a time, in the order of their
         -- declarations, each judged after the ends before it; one whose facts still root
-        -- another binding's reference after s_j is not ended before its block's exit
+        -- another binding's reference after s_j waits, and ends after the first later
+        -- statement after which they no longer do (D-0288), or at its block's exit
 
 The end is deferred, never early: a binding `x` that shares a
 statement with another binding that may hold a reference — a struct
@@ -561,7 +567,9 @@ evaluation order within the statement):
 | `spawn(…, r …)` with `r` a tracked binding of reference type (D-0213) | the lend is a borrow of `*r` in the parameter's mode: `¬clash` against `deriv` facts, as `&_m *r` would be |
 | `join(h)` | `deriv(h, ·, ·) := F` (the thread has finished) |
 | `auto o = e;` / `o = e;` / a `match (e)` arm's binder `o`, where `e` is a call `f(a1, …, an)` (or `Option::unwrap`/`expect`, `Result::unwrap`/`expect` of one) whose result holds a reference without being one (`Option<ref<V, m>>`, D-0088) | `deriv(o, x.π, m) := T` for the first reference-typed parameter's argument, when it is a visible borrow or slice forming `deriv(·, x.π, m)`; other `deriv(o, ·, ·) := F` |
-| `auto c = [x1, …, xn](…) { … };` or `c = [x1, …](…) { … }` — a closure without `move` (CHG-0100) | `deriv(c, xi, m) := T` for each captured local `xi` not of reference type, `m` = `exclusive` when the body writes `xi` (spec/15 §6's capture mode) and `shared` otherwise; `escaped(r) := T` for each captured local `r` of reference type (D-0243: the closure holds a borrow of `r` itself, which no fact describes); other `deriv(c, ·, ·) := F` |
+| `auto c = [x1, …, xn](…) { … };` or `c = [x1, …](…) { … }` — a closure without `move` (CHG-0100) | `deriv(c, xi, m) := T` for each captured local `xi` not of reference type, `m` = `exclusive` when the body writes `xi` (spec/15 §6's capture mode) and `shared` otherwise; `deriv(c, r, m) := T` and `escaped(r) := T` for each captured local `r` of reference type (D-0243: the closure holds a borrow of `r` itself, `m` as for any capture; the fact since D-0288); and as for `move` below; other `deriv(c, ·, ·) := F` |
+| `auto c = move [x1, …, xn](…) { … };` or `c = move [x1, …](…) { … }`, and the closure without `move` above (D-0288) | `deriv(c, *r, m) := T` for each captured local `r` of type `ref<τ, m>` or `slice<τ, m>` (a copy of `r`, D-0071); `deriv(c, y.π, m) := deriv(x, y.π, m)` for each other captured local `x` that may hold a reference (a `StringView`, an `Option` of a reference, a `fn` value); other `deriv(c, ·, ·) := F` |
+| `auto c = e;` / `c = e;` for `c` of `fn` type, `e` no closure literal (D-0288) | `e` a binding `x`: `deriv(c, ·, ·) := deriv(x, ·, ·)` (a copy holds what `x` holds); `e` a call: `deriv(c, y.π, m) := ?` for every fact an argument that may hold a reference forms or holds (the closure returned may have kept it: the run decides); other `deriv(c, ·, ·) := F` |
 | a closure without `move` in any other position (an argument, a callee, `spawn`'s first argument) | `escaped(xi) := T` for each captured local `xi` (D-0243) |
 | the arm of `match (&_m e)` / `match (q)` (`q` a tracked reference binding, mode `m`) with binder `b` (D-0071) | in the arm: `deriv(b, e's place, m) := T` / `deriv(b, *q, m) := T` |
 | `q` assigned, moved, or ended at block exit (`q` of reference or guard type, D-0071) | every `deriv(·, *q.·, ·) := F`; a moved binding also `deriv(q, ·, ·) := F`, forgetting them (below) |
@@ -814,7 +822,13 @@ a write to it (`v[k] = e`, `v[k].f = e`), is an access to `v` at element
 `k`, exclusive for a write: refuted, `diag.aliasing-conflict`, when a
 live frame-held reference not used to reach it holds a fact `T` on `v`
 that certainly overlaps it in a mode not `permitted`; decided by the run
-at the access when they may overlap (D-0284). The hidden reference of
+at the access when they may overlap (D-0284). A `Vec` reached through a
+reference (`v[k]` with `v` one, `(*r)[k]`, `r.f[k]`) is its referent `*r`
+(and its fields), so the access is to `*r` at element `k` (CHG-0380).
+Every element of a `Vec` of a zero-sized type is one place, the object
+anchored at its buffer (`spec/04` `overlap`, D-0217): two of its elements
+certainly overlap, whatever `k`; where the element type is a type
+parameter, they may. The hidden reference of
 `[Compound-Assign]` (`{ auto t = &mut p; *t = *t op e; }`, a target with
 a call) is live while `e` is evaluated; which element it holds is a value,
 so an access in `e` that meets its container is decided by the run.
@@ -862,6 +876,8 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.35.0 — `CHG-0381` (D-0288): `[Ref-Binding-Last-Use]`: a `move` closure's capture ends at its last use; a binding assigned whole stops counting for what it got before; a binding whose facts still root another's waits for them to end. Two `deriv` rows: a `move` closure holds what its captures reach, as one without `move` also does; a `fn` value copied or returned holds what its source holds.
+- 1.34.0 — `CHG-0380`: §6 `rule.control.frame-references`, element accesses: a `Vec` reached through a reference is its referent; every element of a `Vec` of a zero-sized type is one place.
 - 1.33.0 — `CHG-0378` (D-0287): `rule.control.foreach-parts`, a consuming `foreach` over a text splitter's call walks the text and makes no `Vec`. `CHG-0379` (D-0287): §6 `rule.control.frame-references`: a block's end refutes a live outer reference to what the block declares; a call's result inherits static data from a static first reference argument; the hidden binding of `[Foreach-Parts]` inherits the text's facts.
 - 1.32.0 — `CHG-0375` (D-0284): §6 `rule.control.frame-references`: element writes are element accesses; the hidden reference of `[Compound-Assign]` is live through its value; evaluation order covers the whole of an assigned value and a call's later arguments; decided programs, which may run with no record of references.
 - 1.31.0 — `CHG-0374` (D-0283): §6 `rule.control.frame-references`, point checks at the call: a value-dependent overlap at a call is checked when the call is made, from the callee's access summary, not at the callee's first conflicting access.
