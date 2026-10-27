@@ -64,6 +64,7 @@ impl<'a> Gen<'a> {
             fn_values: std::cell::RefCell::new(None),
             lib: false,
             pathless: false,
+            decided: false,
             globals: HashSet::new(),
         }
     }
@@ -224,6 +225,7 @@ impl<'a> Gen<'a> {
         }
         let pathless = if self.pathless { self.pathless_blocker().map_or(Ok(()), Err) } else { Err("COBALTC_PATHLESS=0".to_string()) };
         Ok(Generated {
+            decided: self.decided && pathless.is_ok(),
             pathless,
             fwd: self.fwd,
             types: self.types,

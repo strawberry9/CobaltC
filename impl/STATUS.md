@@ -66,7 +66,10 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   out the checks it can prove redundant (`spec/08` §4 `[Standing-Local]`, `spec/14` §6), and it keeps
   every check whose hypotheses it cannot show. A decided program (`spec/14` §6, D-0284: no conflict left
   to the run) is built with no record of references at all; `-v` says "lowered pathless" or names the
-  first conflict that kept the record, and `COBALTC_PATHLESS=0` keeps it. `--all-checks` keeps every
+  first conflict that kept the record, and `COBALTC_PATHLESS=0` keeps it. Such a program is lowered a
+  second time knowing it is decided (D-0285): a value holding references is then plain data, with no
+  object, and statements that would record nothing open no scope; `-v` says "lowered pathless and
+  decided", and `COBALTC_DECIDED=0` keeps the first lowering. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

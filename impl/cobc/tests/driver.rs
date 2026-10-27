@@ -102,6 +102,39 @@ fn report_tracking_lists_tracked_lines_and_compiles_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// D-0285: a program the first lowering finds decided is lowered again
+// knowing it: the C says so (`CB_DECIDED`), a view copied and walked in a
+// function needs no object and its statements no scopes, and the program
+// ends as its first lowering does (COBALTC_DECIDED=0), under both C
+// compilers.
+#[test]
+fn decided_program_is_lowered_knowing_it() {
+    let dir = std::env::temp_dir().join(format!("cobc-decided-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src = "import std;\n\nfn count(StringView v) : u64\n{\n    u64 n = 0;\n    foreach (c in StringView::chars(v))\n    {\n        n += 1;\n    }\n    n\n}\n\nfn main()\n{\n    String s = String::from_str(\"h\u{e9}llo\");\n    StringView v = String::as_view(&s);\n    printf(\"%v %v\\n\", count(v), count(StringView::sub(v, 0, 1)));\n}\n";
+    fs::write(dir.join("prog.cb"), src).unwrap();
+    for cc in ["gcc", "clang"] {
+        let build = |decided: &str, out: &str| {
+            let o = Command::new(cobc_exe()).args(["-v", "--keep-c", "--cc", cc, "-o", out, "prog.cb"]).env("COBALTC_DECIDED", decided).current_dir(&dir).output().expect("run cobc");
+            assert!(o.status.success(), "{}: {}", cc, String::from_utf8_lossy(&o.stderr));
+            let run = Command::new(dir.join(out)).output().expect("run prog");
+            assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "5 1\n".to_string()), "{}", cc);
+            (String::from_utf8_lossy(&o.stderr).into_owned(), fs::read_to_string(dir.join(format!("{}.c", out))).unwrap())
+        };
+        let (note, c) = build("1", "d");
+        assert!(note.contains("lowered pathless and decided (D-0284, D-0285)"), "{}: {}", cc, note);
+        assert!(c.starts_with("#define CB_PATHLESS 1\n#define CB_DECIDED 1\n"), "{}: {}", cc, &c[..c.len().min(200)]);
+        let at = c.find("static uint64_t f_count(struct s_std__StringView p_v)\n{").expect("f_count");
+        let body = &c[at..at + c[at..].find("\n}\n").unwrap()];
+        assert!(!body.contains("cb_new(") && !body.contains("cb_stmt_push") && !body.contains("cb_copy_datum("), "{}: {}", cc, body);
+        let (note, c) = build("0", "p");
+        assert!(note.contains("lowered pathless (D-0284)"), "{}: {}", cc, note);
+        assert!(c.starts_with("#define CB_PATHLESS 1\n") && !c.contains("#define CB_DECIDED"), "{}", cc);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // Linkage: the program's own functions are `static` (the C compiler may
 // inline them), `main` is not, and a program whose loop calls pure-`std`
 // functions (`Vec::push`, `Vec::len`, the element accessor) builds and

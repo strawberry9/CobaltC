@@ -291,6 +291,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0282 — Frame-held references: their conflicts are found before the run
 - D-0283 — A conflict at a call that only values decide is checked when the call is made
 - D-0284 — A program whose conflicts are all decided before the run keeps no record of references
+- D-0285 — A decided program is lowered knowing it is decided
 
 ---
 
@@ -8195,3 +8196,16 @@ crossing to C by value.
 - `cobc`'s dual-body dispatcher (D-0188) no longer treats a reference argument as a fresh borrow when a later
   argument contains a call, a block or an assignment: `set(&mut v[0], grow(&mut v))` wrote into freed storage.
 - csvstat 217 → 102 ms, extsort 670 → 476 ms. Conformance 3.275.0: six new rows, one now static.
+
+## CHG-0376: a decided program is lowered knowing it is decided (2026-10-26)
+
+- D-0285 (D-0281 step 4d, first part; decided under the owner's delegation): `cobc` lowers a program its first
+  lowering finds decided a second time with `Gen::decided`, and uses that C (`#define CB_DECIDED 1` beside
+  `CB_PATHLESS`). There a value holding a reference inside it is plain data (`Gen::has_refs` answers no for it;
+  a reference or slice itself keeps its `cb_ref` form): no object, no copied holds (`cb_copy_datum`), no flight
+  of its own; `cbrt.h` makes the datum flights, `cb_frozen_ok` and `cb_call_done` constants, and
+  `resolve_scopes_in` leaves out the statement scopes that would hold nothing. A second lowering that fails or
+  finds the program not decided falls back to the first; `COBALTC_DECIDED=0` keeps the first; `-v` says
+  "lowered pathless and decided".
+- Gate `stress/d0281/objectless/dgate.sh` (decided against COBALTC_DECIDED=0, both `cobc`): over two random samples of the 8,854 programs the pathless gate built (Update 139), 1,800 programs: 1,776 the same; 6 no longer decided (they reclaim raw storage in their own code, D-0284 repair 7); 18 different, 16 only in the times they print, one printing the bytes of stack addresses and one a benchmark of random input. Driver test
+  `decided_program_is_lowered_knowing_it`. csvstat 95 → 73 ms, extsort 484 → 431 ms.

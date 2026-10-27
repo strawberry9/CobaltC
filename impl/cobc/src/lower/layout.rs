@@ -93,24 +93,40 @@ impl<'a> Gen<'a> {
         }
     }
 
+    // D-0285: in a decided program (`Gen::decided`) no reference is
+    // tracked, so a value that holds one inside it (a view, a struct with
+    // a reference field) holds none of these slots. A reference or a slice
+    // itself still answers yes: its C form (`cb_ref`, a token beside the
+    // address) is chosen by this answer.
     pub(super) fn has_refs(&self, t: &Type) -> bool {
         match t {
             Type::Ref(..) | Type::Slice(..) => true,
-            Type::Closure(id) => self.closures.get(id).map_or(false, |c| c.fields.iter().any(|(_, t)| self.has_refs(t))),
+            Type::Guard(..) => true,
+            _ if self.decided => false,
+            _ => self.holds_refs(t),
+        }
+    }
+
+    // Whether a value of `t` holds a reference somewhere (`has_refs`
+    // before D-0285).
+    fn holds_refs(&self, t: &Type) -> bool {
+        match t {
+            Type::Ref(..) | Type::Slice(..) => true,
+            Type::Closure(id) => self.closures.get(id).map_or(false, |c| c.fields.iter().any(|(_, t)| self.holds_refs(t))),
             Type::Named(n, args) => {
                 if let Some(sd) = self.struct_decl(n) {
                     let sub = subst_of(&sd.type_params, args);
-                    sd.fields.iter().any(|f| self.has_refs(&apply(&f.ty, &sub)))
+                    sd.fields.iter().any(|f| self.holds_refs(&apply(&f.ty, &sub)))
                 } else if let Some(ed) = self.enum_decl(n) {
                     let sub = subst_of(&ed.type_params, args);
-                    ed.variants.iter().any(|v| v.payload.as_ref().map_or(false, |p| self.has_refs(&apply(p, &sub))))
+                    ed.variants.iter().any(|v| v.payload.as_ref().map_or(false, |p| self.holds_refs(&apply(p, &sub))))
                 } else {
                     false
                 }
             }
-            Type::Array(inner, _) => self.has_refs(inner),
+            Type::Array(inner, _) => self.holds_refs(inner),
             Type::Guard(..) => true,
-            Type::Mutex(inner) => self.has_refs(inner),
+            Type::Mutex(inner) => self.holds_refs(inner),
             _ => false,
         }
     }

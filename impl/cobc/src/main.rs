@@ -558,20 +558,42 @@ fn real_main() -> ExitCode {
     };
 
     let t_lower = std::time::Instant::now();
-    let mut lowering = lower::Gen::new(&items, &analysis.map);
-    lowering.line_directives = line_directives && !report_tracking;
-    lowering.lib = lib;
-    // D-0284: a decided program is lowered with no record of references;
-    // `--all-checks` (the generator refuses it) and COBALTC_PATHLESS=0 keep it.
-    lowering.pathless = std::env::var("COBALTC_PATHLESS").map_or(true, |v| v != "0");
-    let gen = match lowering.generate() {
+    let lower_as = |decided: bool| {
+        let mut lowering = lower::Gen::new(&items, &analysis.map);
+        lowering.line_directives = line_directives && !report_tracking;
+        lowering.lib = lib;
+        // D-0284: a decided program is lowered with no record of references;
+        // `--all-checks` (the generator refuses it) and COBALTC_PATHLESS=0 keep it.
+        lowering.pathless = std::env::var("COBALTC_PATHLESS").map_or(true, |v| v != "0");
+        lowering.decided = decided;
+        lowering.generate()
+    };
+    let gen = match lower_as(false) {
         Ok(g) => g,
         Err(lower::Unsupported(what)) => {
             eprintln!("unsupported: {}", what);
             return ExitCode::from(3);
         }
     };
+    // D-0285: a program the first lowering found decided is lowered again
+    // knowing it (`Gen::decided`); COBALTC_DECIDED=0 keeps the first.
+    let gen = if gen.pathless.is_ok() && std::env::var("COBALTC_DECIDED").map_or(true, |v| v != "0") {
+        match lower_as(true) {
+            Ok(g) if g.pathless.is_ok() => g,
+            Ok(g) => {
+                note(&format!("decided lowering kept paths ({}); the first lowering is used", g.pathless.err().unwrap_or_default()));
+                gen
+            }
+            Err(lower::Unsupported(what)) => {
+                note(&format!("decided lowering: unsupported: {}; the first lowering is used", what));
+                gen
+            }
+        }
+    } else {
+        gen
+    };
     match &gen.pathless {
+        Ok(()) if gen.decided => note("lowered pathless and decided (D-0284, D-0285)"),
         Ok(()) => note("lowered pathless (D-0284)"),
         Err(why) => note(&format!("kept paths: {}", why)),
     }

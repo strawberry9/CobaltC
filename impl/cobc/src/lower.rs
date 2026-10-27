@@ -296,6 +296,11 @@ pub struct Gen<'a> {
     // (`pathless_blocker`): every reference carries token 0 and `cbrt.h`'s
     // `CB_PATHLESS` block makes the path entries no-ops.
     pub pathless: bool,
+    // D-0285: the program was found decided by a first lowering (D-0284),
+    // and this lowering knows it: a reference or a slice in a value is
+    // nothing the runtime tracks (`has_refs`), so such a value owns no
+    // object and its copies copy no holds.
+    pub decided: bool,
     // D-0192: closures whose reference parameters are all direct and never
     // handed on (`lower_closure_body`): their code keeps nothing of its
     // arguments, so a `fn` value holding one is pure (`cb_fn_mark_pure`).
@@ -691,6 +696,8 @@ pub struct Generated {
     pub header_text: String,
     // D-0281 step 4c: lowered pathless, or why not (when it was asked).
     pub pathless: Result<(), String>,
+    // D-0285: lowered knowing the program is decided (`Gen::decided`).
+    pub decided: bool,
 }
 
 impl Generated {
@@ -834,6 +841,7 @@ impl Generated {
     // What comes before `cbrt.h`: its `CB_PATHLESS` switch.
     fn prefix(&self) -> String {
         match &self.pathless {
+            Ok(()) if self.decided => "#define CB_PATHLESS 1\n#define CB_DECIDED 1\n".to_string(),
             Ok(()) => "#define CB_PATHLESS 1\n".to_string(),
             Err(why) if !why.is_empty() => format!("/* cobc: kept paths: {} */\n", why.replace("*/", "* /")),
             Err(_) => String::new(),

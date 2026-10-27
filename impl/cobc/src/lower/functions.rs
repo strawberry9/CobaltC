@@ -740,7 +740,7 @@ impl<'a> Gen<'a> {
             let roots_text: String = roots.iter().map(|r| format!("{}\n", r)).collect();
             let q = drop_quiet_checks(&fx.out, &fx.quiet_roots);
             dump_pass("drop_quiet_checks", &[("in", &fx.out), ("arg", &roots_text), ("out", &q)]);
-            dumped_text_passes(&q, self.line_directives)
+            dumped_text_passes(&q, self.line_directives, self.decided)
         };
         // D-0077: a call too deep for the stack faults here, at the call.
         // A body that calls nothing (`calls_nothing`) cannot go deeper:
@@ -849,11 +849,11 @@ pub(super) fn dump_pass(pass: &str, parts: &[(&str, &str)]) {
 
 // The text passes after `drop_quiet_checks`, each call dumped
 // (`dump_pass`).
-pub(super) fn dumped_text_passes(text: &str, marks: bool) -> String {
+pub(super) fn dumped_text_passes(text: &str, marks: bool, decided: bool) -> String {
     let z = fold_zero_tokens(text);
     dump_pass("fold_zero_tokens", &[("in", text), ("out", &z)]);
-    let s = resolve_scopes(&z);
-    dump_pass("resolve_scopes", &[("in", &z), ("out", &s)]);
+    let s = resolve_scopes_in(&z, decided);
+    dump_pass(if decided { "resolve_scopes_decided" } else { "resolve_scopes" }, &[("in", &z), ("out", &s)]);
     let d = drop_dead_locations(&s, marks);
     dump_pass("drop_dead_locations", &[("in", &s), ("arg", if marks { "true\n" } else { "false\n" }), ("out", &d)]);
     let e = elide_implied_checks(&d);

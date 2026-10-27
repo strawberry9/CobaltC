@@ -456,6 +456,28 @@ static inline void cb_write_pathless(uint64_t base, const cb_proj *p, size_t n, 
 #define cb_elem_borrow(a, t, m)          (cb_send_ref(0), (uint64_t)0)
 #define cb_elem_borrow_here(a, t, m)     ((void)(a), (uint64_t)0)
 #define cb_elem_borrow_datum(a, t, m)    (cb_send_tok_datum(0), (uint64_t)0)
+/* D-0285: no reference is ever stored with a path (`cb_store_ref` above), so
+   a copy of a value holding references has no hold to copy, and a call's
+   token, always 0, has nothing to end. */
+#define cb_copy_datum(d, s, t)           ((void)(d), (void)(s), (void)(t))
+#define cb_call_done(t)                  ((void)(t))
+/* A frozen parameter's token is 0: its body may run (`cb_frozen_ok`'s first
+   answer), so a dual body's checked twin is never chosen. */
+#define cb_frozen_ok(t, lo, n)           ((void)(t), (void)(lo), (void)(n), (uint8_t)1)
+#ifdef CB_DECIDED
+/* D-0285: lowered knowing the program is decided (cobc's second lowering):
+   a value holding references is plain data, sent and received as its bytes
+   alone, so every datum's flight is empty, on both sides. A reference
+   itself still takes its place in flight, as token 0. */
+#undef cb_elem_borrow_datum
+#define cb_elem_borrow_datum(a, t, m)    ((void)(a), (uint64_t)0)
+#define cb_send_datum(s, t)              ((void)(s), (void)(t))
+#define cb_send_tok_datum(t)             ((void)(t))
+#define cb_send_datum_none()             ((void)0)
+#define cb_recv_datum(d, t)              ((void)(d), (void)(t))
+#define cb_recv_datum_tok()              ((uint64_t)0)
+#define cb_peek_datum_tok(k, n)          ((void)(k), (void)(n), (uint64_t)0)
+#endif
 #endif
 
 #endif

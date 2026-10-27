@@ -570,6 +570,17 @@ pub(super) fn drop_dead_locations(out: &str, marks: bool) -> String {
 }
 
 pub(super) fn resolve_scopes(out: &str) -> String {
+    resolve_scopes_in(out, false)
+}
+
+// `resolve_scopes`, `decided` for a decided program's lowering (D-0285): the
+// entries `cbrt.h` makes constants there (`CB_PATHLESS`, `CB_DECIDED`) record
+// nothing in any scope, and an element's reference (`_pre`) has no path.
+pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
+    const DECIDED_FREE: &[&str] = &[
+        "cb_borrow", "cb_borrow_range", "cb_elem_borrow", "cb_elem_borrow_here", "cb_elem_borrow_datum", "cb_valid", "cb_frame_hold", "cb_frame_unhold",
+        "cb_send_tok_datum", "cb_send_datum_none", "cb_recv_datum", "cb_recv_datum_tok", "cb_peek_datum_tok", "cb_frozen_ok",
+    ];
     enum Eff {
         Scope,
         Frame,
@@ -610,7 +621,7 @@ pub(super) fn resolve_scopes(out: &str) -> String {
     // `cb_recv_datum` and `cb_recv_datum_tok` stamp what they receive into
     // the statement, as `cb_recv_ref` does.
     const SCOPE: &[&str] = &["cb_new", "cb_new_uninit", "cb_recv", "cb_recv_ref", "cb_recv_datum", "cb_recv_datum_tok", "cb_forget_obj", "cb_take", "cb_borrow", "cb_borrow_range", "cb_absorb", "cb_absorb_refs", "cb_elem_borrow", "cb_raw_move_in"];
-    fn effects(line: &str, out: &mut Vec<Eff>) {
+    let effects = |line: &str, out: &mut Vec<Eff>| {
         let b = line.as_bytes();
         let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
         let mut i = 0;
@@ -632,7 +643,7 @@ pub(super) fn resolve_scopes(out: &str) -> String {
             if id.starts_with("cb_") && !literal {
                 // A fn value's call thunk (`Gen::thunk`) records nothing in
                 // the caller's scopes (`cb_call_self`), as a direct call.
-                if id.starts_with("cb_call_") {
+                if id.starts_with("cb_call_") || (decided && DECIDED_FREE.contains(&id)) {
                 } else if SCOPE.contains(&id) {
                     out.push(Eff::Scope);
                 } else if id == "cb_bind" {
@@ -640,12 +651,12 @@ pub(super) fn resolve_scopes(out: &str) -> String {
                 } else if !FREE.contains(&id) {
                     out.push(Eff::All);
                 }
-            } else if id.ends_with("_pre") && b.get(e) == Some(&b'(') {
+            } else if !decided && id.ends_with("_pre") && b.get(e) == Some(&b'(') {
                 out.push(Eff::Scope);
             }
             i = e;
         }
-    }
+    };
     fn marker(line: &str) -> Option<(char, u32)> {
         let m = line.trim_start().strip_prefix('\u{1}')?;
         let k = m.chars().next()?;
