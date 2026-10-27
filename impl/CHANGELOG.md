@@ -293,6 +293,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0284 — A program whose conflicts are all decided before the run keeps no record of references
 - D-0285 — A decided program is lowered knowing it is decided
 - D-0286 — In a decided program, values pass between functions with no object
+- D-0287 — A `foreach` over a text splitter finds the parts as it takes them
 
 ---
 
@@ -8229,3 +8230,28 @@ crossing to C by value.
   "lowered pathless and decided".
 - Gate `stress/d0281/objectless/dgate.sh` (decided against COBALTC_DECIDED=0, both `cobc`): over two random samples of the 8,854 programs the pathless gate built (Update 139), 1,800 programs: 1,776 the same; 6 no longer decided (they reclaim raw storage in their own code, D-0284 repair 7); 18 different, 16 only in the times they print, one printing the bytes of stack addresses and one a benchmark of random input. Driver test
   `decided_program_is_lowered_knowing_it`. csvstat 95 → 73 ms, extsort 484 → 431 ms.
+
+## CHG-0378, CHG-0379: a `foreach` over a text splitter finds the parts as it goes; three static-pass repairs (2026-10-27)
+
+- D-0287 (D-0281 phase 1, the lazy splitters; decided under the owner's delegation): the parser wraps a consumed
+  `foreach`'s collection that is a call in `$each_lazy`; `modres` maps a resolved `StringView::{split, lines,
+  split_whitespace, chars}` or `String::…` call (no type arguments) to `std::Parts::{split, lines, words, chars,
+  string_*}` and unwraps every other. `std::Parts` (`std/text.cb`) is a view, a position, the last part's bounds,
+  a count and a `done` flag; `each.rs` walks it by value (`Parts::bound($d)`; each step `{ $d = Parts::next($d);
+  StringView::sub($d.v, $d.lo, $d.hi) }`), so it is never borrowed. The static pass holds `std::Parts` as it holds
+  a view (`tier_d_type`, `keeps_refs_in_data`). Word count over 13.7 MB: 9.80 s / 160 MB → 0.47 s / 42 MB; a first
+  version that borrowed the cursor at each step gave each loop an object and a token per part (0.56 s).
+- CHG-0379, the static pass (`typecheck.rs`): `check_block_exit`, at the end of a nested block and of a `match`
+  arm, refutes an outer binding with a fact `T` rooted at a dying binding and live after
+  (`diag.destroy-while-aliased`), and leaves a fact `?` to the run; `tier_inherit` makes facts on every pass over
+  a loop body (they were made on the reporting pass only, so never reached the loop head); `inherited_facts_in`
+  gives a call whose first reference argument is static data a static result. `keep = v;` out of a block was
+  decided and printed freed memory under `cobc` since D-0284.
+- `conf.http-error-closes-connection` failed the debug `cargo test` before and after this change: under an
+  unoptimised `coby` its client takes over 43 s to build the request (`Vec::push` 150,000 times) and the server's
+  30 s read timeout fires; the case now sets `timeout_ms` to ten minutes. `Vec::extend_from` is an element loop
+  under `coby` (about 50 µs an element in release), which makes the case take 14 s there.
+- Gate `stress/d0281/objectless/dgate.sh` on the final build, over the 1,500 programs of Update 141's sample:
+  1,479 the same; 15 different, each one of Update 141's 17 (the times they print, random input, stack addresses);
+  6 not decided (they reclaim raw storage, as before), where Update 141 had 12; no build failures. Release suites
+  `stress/suites/runs/u142`: passed.

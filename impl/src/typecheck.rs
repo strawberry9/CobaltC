@@ -1779,7 +1779,8 @@ pub fn keeps_refs_in_data(items: &Items, ty: &Type, fn_refs: bool) -> bool {
     }
     let frame_held = match ty {
         Type::Ref(..) | Type::Slice(..) | Type::Closure(_) | Type::Fn(..) => true,
-        Type::Named(n, a) if n == "std::StringView" => a.is_empty(),
+        // D-0287: `foreach`'s holder of a view's parts, as a view.
+        Type::Named(n, a) if n == "std::StringView" || n == "std::Parts" => a.is_empty(),
         Type::Named(n, a) if n == "std::Option" || n == "std::Result" => a.first().map_or(false, |x| matches!(x, Type::Ref(..) | Type::Slice(..)) || matches!(x, Type::Named(m, _) if m == "std::StringView")) && a.iter().skip(1).all(|x| !keeps(items, x, fn_refs, &mut HashSet::default())),
         _ => false,
     };
@@ -3524,7 +3525,9 @@ impl<'a> Body<'a> {
                     match self.inherited_facts_in(a, depth + 1, binder) {
                         Some(v) if v.is_empty() => return Some(Vec::new()),
                         Some(v) => out.extend(v),
-                        None => {}
+                        // Static data (a literal where a view is expected):
+                        // so is what the result borrows.
+                        None => return None,
                     }
                 }
                 Some(out)
@@ -3586,7 +3589,9 @@ impl<'a> Body<'a> {
     fn tier_d_type(&self, t: &Type) -> bool {
         let frame_ref = match t {
             Type::Ref(..) | Type::Slice(..) | Type::Closure(_) | Type::Fn(..) => true,
-            Type::Named(n, a) if n == "std::StringView" => a.is_empty(),
+            // D-0287: `foreach`'s holder of a view's parts is a view of
+            // the same text.
+            Type::Named(n, a) if n == "std::StringView" || n == "std::Parts" => a.is_empty(),
             Type::Named(n, a) if n == "std::Option" || n == "std::Result" => a.first().map_or(false, |x| matches!(x, Type::Ref(..) | Type::Slice(..)) || matches!(x, Type::Named(m, _) if m == "std::StringView")),
             _ => false,
         };
@@ -3628,9 +3633,13 @@ impl<'a> Body<'a> {
     // D-0282: at a binding `set_deriv` gave no fact: inherit,
     // or record the binding as of unknown (or static) origin.
     fn tier_inherit(&mut self, r: &str, e: Option<&Expr>) -> Result<(), String> {
-        if !tier_report::on() || !self.report || self.flow.unreachable || self.flow.deriv.contains_key(r) {
+        // The facts are made on every pass over a loop's body, the report
+        // only on the last: a fact made in the body reaches the loop's
+        // head and exit (`check_while`'s fixed point) only so.
+        if !tier_report::on() || self.flow.unreachable || self.flow.deriv.contains_key(r) {
             return Ok(());
         }
+        let report = self.report;
         if let Some(ExprKind::Path(segs, _)) = e.map(|e| &strip_parens_tc(e).kind) {
             let is_ref = |t: Option<Type>| matches!(t, Some(Type::Ref(..) | Type::Slice(..)));
             if segs.len() == 1 && segs[0] != r && is_ref(self.lookup_local(&segs[0])) && is_ref(self.lookup_local(r)) {
@@ -3646,11 +3655,13 @@ impl<'a> Body<'a> {
         // is tier D by its type (D-0281 §7), whatever it was made from.
         if let Some(t) = self.lookup_local(r) {
             if self.tier_d_type(&t) {
-                tier_report::with(|rep| {
-                    rep.tier_d += 1;
-                    rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
-                });
-                tier_report::left(format!("line {}: `{}` keeps references in data (tier D)", line, r));
+                if report {
+                    tier_report::with(|rep| {
+                        rep.tier_d += 1;
+                        rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
+                    });
+                    tier_report::left(format!("line {}: `{}` keeps references in data (tier D)", line, r));
+                }
                 return Ok(());
             }
         }
@@ -3660,8 +3671,12 @@ impl<'a> Body<'a> {
         let own = referent_root(r);
         let inherited = e.map(|e| self.inherited_facts(e, 0).map(|v| v.into_iter().filter(|(k, _)| k.root != own).collect::<Vec<_>>()));
         match inherited {
+            Some(None) if !report => {}
             Some(None) => tier_report::with(|rep| rep.events.push(format!("S\t{}\t{}\t{}\t{}", line, r, ty, kind))),
             Some(Some(v)) if v.iter().any(|(k, _)| k.root == "<tier D>") => {
+                if !report {
+                    return Ok(());
+                }
                 tier_report::with(|rep| {
                     rep.tier_d += 1;
                     rep.events.push(format!("D\t{}\t{}\t{}\t{}", line, r, ty, kind));
@@ -3676,11 +3691,14 @@ impl<'a> Body<'a> {
                 }
             }
             Some(Some(v)) if !v.is_empty() => {
-                tier_report::with(|rep| {
-                    rep.inherited += 1;
-                });
+                if report {
+                    tier_report::with(|rep| {
+                        rep.inherited += 1;
+                    });
+                }
                 self.set_deriv_tri(r, v);
             }
+            _ if !report => {}
             _ => {
                 tier_report::with(|rep| {
                     rep.unknown_origin += 1;
@@ -3811,9 +3829,47 @@ impl<'a> Body<'a> {
         let saved_gamma = self.gamma.clone();
         self.enter_scope();
         let r = self.check_block(b, expected);
+        let r = match r {
+            Ok(t) => self.check_block_exit().map(|_| t),
+            e => e,
+        };
         self.exit_scope();
         self.gamma = saved_gamma;
         r
+    }
+
+    // `[Block-Exit]` destroys what the block declared. A binding declared
+    // outside it that holds a reference to one of those (a `deriv` fact
+    // rooted there) conflicts with that destroy: when it surely does and
+    // is used later, an error (D-0282); when it may, the run decides.
+    fn check_block_exit(&mut self) -> Result<(), String> {
+        if !tier_report::on() || !self.report || self.flow.unreachable {
+            return Ok(());
+        }
+        let Some(sc) = self.scopes.last() else { return Ok(()) };
+        let dying: HashSet<&str> = sc.iter().map(|e| e.name.as_str()).collect();
+        let mut held: Vec<(String, String, Tri)> = Vec::new();
+        for (r, facts) in &self.flow.deriv {
+            if dying.contains(r.as_str()) {
+                continue;
+            }
+            for (k, t) in facts {
+                if dying.contains(k.root.as_str()) && *t != Tri::F {
+                    held.push((r.clone(), k.root.clone(), *t));
+                }
+            }
+        }
+        held.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let (line, col) = (self.current_line, self.current_col);
+        for (r, x, t) in held {
+            if t == Tri::T && tier_report::live_after(&r, line, col) {
+                let msg = format!("`{}` is destroyed at the end of its block while `{}` still refers to it, and `{}` is used later", shown_name(&x), shown_name(&r), shown_name(&r));
+                let diag = format!("{}{}", crate::modres::named("diag.destroy-while-aliased", msg), crate::diagnostics::at(line, col));
+                return self.refute(&diag);
+            }
+            tier_report::left(format!("line {}: `{}` may refer to `{}` when its block ends", line, shown_name(&r), shown_name(&x)));
+        }
+        Ok(())
     }
 
     // Returns the statement's own expression type for `Stmt::Expr`/
@@ -8156,6 +8212,10 @@ impl<'a> Body<'a> {
                 }
             }
             let at = self.check_store_operand(&arm.body, arm_expected.as_ref());
+            let at = match at {
+                Ok(t) => self.check_block_exit().map(|_| t),
+                e => e,
+            };
             self.exit_scope();
             self.gamma = saved;
             let at = at?;

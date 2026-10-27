@@ -1989,7 +1989,7 @@ impl Parser {
     //
     //   borrowed:  { auto $c = &c;  for (usize $i = 0; $i < $each_len($c); $i += 1)
     //                { auto k = $each_key($c, $i); auto x = $each_at($c, $i, n); body } }
-    //   consumed:  { auto $e = c;  auto $d = $each_drain($e, n);
+    //   consumed:  { auto $e = c;  auto $d = $each_drain($e, n);       ($each_lazy(c) for a call, D-0287)
     //                for (usize $i = 0; $i < $each_len($d); $i += 1)
     //                { auto k = $each_take_key($d, $i); auto x = $each_take($d, $i, n); body } }
     //
@@ -2039,6 +2039,10 @@ impl Parser {
                 (c.clone(), "$each_key", if m == Mode::Exclusive { "$each_at_mut" } else { "$each_at" })
             }
             None => {
+                // D-0287: a call is wrapped for `modres`, which makes one
+                // of the text splitters a loop that finds its parts as it
+                // takes them, and unwraps any other.
+                let coll = if matches!(coll.kind, ExprKind::Call(..)) { call("$each_lazy", vec![coll]) } else { coll };
                 stmts.push(Stmt::Let { ty: None, name: e.clone(), init: Some(Box::new(coll)), line, col });
                 let arity = mk(ExprKind::IntLit(names.len() as u128, None));
                 stmts.push(Stmt::Let { ty: None, name: d.clone(), init: Some(Box::new(call("$each_drain", vec![path(&e), arity]))), line, col });

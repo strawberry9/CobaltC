@@ -113,9 +113,9 @@ predecessor.
 | `std::sync` | `Channel::drop` | `sync.cb` 307 | `[Extern-Call]` | `[Extern-Call]` event_op(end) on the channel's own event ids: it touches no program storage. |
 | `std::sync` | `failure_text` | `sync.cb` 406 | `[Extern-Call]` | `[Extern-Call]` task_op writes [out.ptr, out.ptr + cap), out's reserved buffer. |
 | `std::text` | `String::from_c` | `text.cb` 175 | `[Rawptr-Read]` | `[Rawptr-Read]` through `Vec::from_c_bytes`, under the caller's assertion about `p`. |
-| `std::text` | `String::append_string` | `text.cb` 1346 | `[Rawptr-Read]` | `[Rawptr-Read]` of t's bytes below len, live for the call through the shared reference. |
-| `std::text` | `String::append_text` | `text.cb` 1363, 1370, 1377 | `[Extern-Call]`, `[Rawptr-Read]`, `[Deallocate]` | `[Extern-Call]` text_write writes at most 64 bytes at p, the allocation made just above; `[Rawptr-Read]` of the n it wrote; `[Deallocate]` of that allocation. |
-| `std::text` | `parse_bytes` | `text.cb` 1420, 1426 | `[Extern-Call]` | `[Extern-Call]` parse_check and parse_value read [p, p + n), bytes the caller keeps live. |
+| `std::text` | `String::append_string` | `text.cb` 1499 | `[Rawptr-Read]` | `[Rawptr-Read]` of t's bytes below len, live for the call through the shared reference. |
+| `std::text` | `String::append_text` | `text.cb` 1516, 1523, 1530 | `[Extern-Call]`, `[Rawptr-Read]`, `[Deallocate]` | `[Extern-Call]` text_write writes at most 64 bytes at p, the allocation made just above; `[Rawptr-Read]` of the n it wrote; `[Deallocate]` of that allocation. |
+| `std::text` | `parse_bytes` | `text.cb` 1573, 1579 | `[Extern-Call]` | `[Extern-Call]` parse_check and parse_value read [p, p + n), bytes the caller keeps live. |
 | `std::time` | `unix_ms` | `time.cb` 579 | `[Extern-Call]` | `[Extern-Call]` clock_read touches no program storage. |
 | `std::time` | `local_offset_seconds` | `time.cb` 598 | `[Extern-Call]` | `[Extern-Call]` tz_offset touches no program storage. |
 | `std::time` | `monotonic_ns` | `time.cb` 637 | `[Extern-Call]` | `[Extern-Call]` clock_read touches no program storage. |

@@ -1265,6 +1265,159 @@ export fn String::split_whitespace(ref<String, shared> s) : Vec<StringView>
     StringView::split_whitespace(&(*s)[0..$])
 }
 
+// D-0287: what `foreach (x in StringView::lines(v))` holds instead of the
+// `Vec` (and so for `split`, `split_whitespace`, `chars` and their `String`
+// forms; `rule.control.foreach-parts`, spec/14): the view, where the next
+// part starts, the part last found (`lo`, `hi`), how many parts it has
+// given and whether one is left. Each part is found when the loop takes
+// it, so the loop keeps no `Vec`, and each part is a view of `v`'s text as
+// the `Vec`'s would be. The loop passes it by value, a view and a few
+// numbers, so it is never borrowed; the static pass holds it as it holds a
+// view (one text, borrowed shared): the parts are tier S. `kind`: 0
+// `split` on `sep`, 1 `lines`, 2 `split_whitespace`, 3 `chars`. The parts
+// are the `Vec`'s, in its order.
+struct Parts
+{
+    StringView v;
+    str sep;
+    usize at;
+    usize lo;
+    usize hi;
+    usize taken;
+    u8 kind;
+    bool done;
+}
+
+fn Parts::split(StringView v, str sep) : Parts
+{
+    Parts { .v = v, .sep = sep, .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 0, .done = false }
+}
+
+fn Parts::lines(StringView v) : Parts
+{
+    Parts { .v = v, .sep = "", .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 1, .done = slice_len(v.bytes) == 0 }
+}
+
+fn Parts::words(StringView v) : Parts
+{
+    usize at = space_run_end(v.bytes, 0, true);
+    Parts { .v = v, .sep = "", .at = at, .lo = 0, .hi = 0, .taken = 0, .kind = 2, .done = at >= slice_len(v.bytes) }
+}
+
+fn Parts::chars(StringView v) : Parts
+{
+    Parts { .v = v, .sep = "", .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 3, .done = slice_len(v.bytes) == 0 }
+}
+
+fn Parts::string_split(ref<String, shared> s, str sep) : Parts
+{
+    Parts::split(&(*s)[0..$], sep)
+}
+
+fn Parts::string_lines(ref<String, shared> s) : Parts
+{
+    Parts::lines(&(*s)[0..$])
+}
+
+fn Parts::string_words(ref<String, shared> s) : Parts
+{
+    Parts::words(&(*s)[0..$])
+}
+
+fn Parts::string_chars(ref<String, shared> s) : Parts
+{
+    Parts::chars(&(*s)[0..$])
+}
+
+// The loop's bound: one past the parts given while one is left, so that
+// `$i < bound` holds exactly until the last part is taken.
+fn Parts::bound(Parts p) : usize
+{
+    if (p.done) { p.taken } else { p.taken + 1 }
+}
+
+// `p` with its next part found, the view `StringView::sub(p.v, p.lo,
+// p.hi)`, and where the one after it starts.
+fn Parts::next(Parts p) : Parts
+{
+    usize n = slice_len(p.v.bytes);
+    usize lo = p.at;
+    usize hi = n;
+    p.taken = p.taken + 1;
+    if (p.kind == 0)
+    {
+        usize m = str_len(p.sep);
+        match (if (m == 0) { None } else { StringView::find(StringView::sub(p.v, lo, n), StringView::of(p.sep)) })
+        {
+            Some(i) :
+            {
+                hi = lo + i;
+                p.at = hi + m;
+            },
+            None    : p.done = true,
+        }
+    }
+    else if (p.kind == 1)
+    {
+        usize i = byte_index_from(p.v.bytes, lo, b'\n');
+        if (i >= n)
+        {
+            p.done = true;
+        }
+        else
+        {
+            hi = if (i > lo && p.v.bytes[i - 1] == b'\r') { i - 1 } else { i };
+            p.at = i + 1;
+            p.done = p.at >= n;
+        }
+    }
+    else if (p.kind == 2)
+    {
+        hi = space_run_end(p.v.bytes, lo, false);
+        p.at = space_run_end(p.v.bytes, hi, true);
+        p.done = p.at >= n;
+    }
+    else
+    {
+        hi = lo + 1;
+        while (!StringView::boundary(p.v.bytes, hi))
+        {
+            hi += 1;
+        }
+        p.at = hi;
+        p.done = hi >= n;
+    }
+    p.lo = lo;
+    p.hi = hi;
+    p
+}
+
+/// A `foreach` over the parts finds each when it takes it; the parts are the `Vec`'s.
+unittest "StringView::lines: a foreach takes the parts as it goes"
+{
+    StringView text = "one\r\ntwo\n\nthree\n";
+    Vec<StringView> ls = StringView::lines(text);
+    usize n = 0;
+    foreach (i, l in StringView::lines(text))
+    {
+        assert(l == ls[i]);
+        n += 1;
+    }
+    assert(n == 4);
+    n = 0;
+    foreach (w in StringView::split_whitespace("  to  be\tor "))
+    {
+        n += StringView::len(w);
+    }
+    assert(n == 6);
+    n = 0;
+    foreach (f in StringView::split("a,,b", ","))
+    {
+        n += 1;
+    }
+    assert(n == 3);
+}
+
 /// The code point of the first character of `s`, or `None` when `s` is empty.
 export fn String::code_point(ref<String, shared> s) : Option<u32>
 {

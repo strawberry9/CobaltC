@@ -1,7 +1,7 @@
 # CobaltC Conformance Cases
 
 Status: normative artifact
-Version: 3.275.0
+Version: 3.276.0
 Conforms to: `spec/02-schema.md` (Kind: Conformance case, `conf.<name>`)
 Governed by: `CobaltC_Master_Instructions.md` §1, §19, §20
 
@@ -1222,6 +1222,9 @@ Rows added for case files that had none (CHG-0265):
 | `conf.foreach-range-float-rejected` | `foreach (v in 0.0..2.0) { }` | ✗ `diag.type-mismatch` (static) | `[Foreach-Range-Ill-Typed]`: the bounds are not integers |
 | `conf.foreach-range-three-names-rejected` | `foreach (i, j, v in 0..3) { }` | ✗ `diag.type-mismatch` (static) | `[Foreach-Range-Ill-Typed]`: a range takes one name or two |
 | `conf.foreach-range-dollar-rejected` | `impl/conformance/22-surface-syntax/foreach_range_dollar_rejected.cb` | ✗ `diag.syntax-error` (static) | `$` is written only inside `[…]`: a range has no length to name |
+| `conf.foreach-parts` | `impl/conformance/14-control-flow/foreach_parts_ok.cb` | ok | `[Foreach-Parts]` (D-0287): a consuming `foreach` over `split_whitespace`, `chars`, `split` (with positions, an empty separator), `lines` of an empty text and of a `String` with CRLF visits the `Vec`'s parts in its order without making it; a `return` from the loop; a part kept after its loop is a view of the text. Tier S: decided |
+| `conf.block-end-view-outlives-owner-rejected` | `impl/conformance/14-control-flow/block_end_view_outlives_owner_rejected.cb` | ✗ `diag.destroy-while-aliased` (static) | `rule.control.frame-references`, a block's end (D-0287): `keep = v`, `v` a view of the block's `text`, and `keep` is used after the block. Before D-0287 no check saw it, and a decided build read the destroyed text |
+| `conf.loop-kept-view-conflict-dynamic` | `impl/conformance/14-control-flow/loop_kept_view_conflict_dynamic.cb` | ✗ `diag.aliasing-conflict` (dynamic) | prints `0`, `3`, then faults at the second `append`: `keep`'s view of `text`, made at the end of one iteration, is live across the next's `append`; the fact is `?` there (static data on the first iteration), so the run decides (D-0287: a loop's body's facts reach its head) |
 | `conf.range-not-a-value` | `impl/conformance/22-surface-syntax/range_not_a_value_rejected.cb` | ✗ `diag.syntax-error` (static) | a range is written only in a `foreach` |
 | `conf.recursive-type-rejected` | `struct N { i32 v; Option<N> next; }` `N n = N { .v = 1, .next = None };` | ✗ `diag.recursive-type` (static) | `[Type-Recursive]`: `N` contains `Option<N>`, whose payload is `N`, by value |
 | `conf.recursive-type-array-rejected` | `struct A { array<A, 2> kids; }` `i32 x = 1;` | ✗ `diag.recursive-type` (static) | `[Type-Recursive]` through an array element |
@@ -2000,6 +2003,7 @@ Rows added for case files that had none (CHG-0265):
 
 ## Change Log
 
+- 3.276.0 — `CHG-0378` (D-0287): `conf.foreach-parts`. `CHG-0379` (D-0287): `conf.block-end-view-outlives-owner-rejected`, `conf.loop-kept-view-conflict-dynamic`; `conf.http-error-closes-connection`'s case gives its server a longer read timeout, which an unoptimised interpreter needs.
 - 3.275.0 — `CHG-0375` (D-0284): `conf.later-argument-moves-element-dynamic`, `conf.later-argument-replaces-vec-dynamic`, `conf.compound-call-target-reads-same-element-dynamic`, `conf.vec-element-write-beside-held-element-dynamic`, `conf.argument-reassigns-view-then-destroys-dynamic` and `conf.assign-value-grows-container-rejected` added: the conflicts the soundness gate of pathless lowering found unrecorded; `conf.string-append-self-conflict` is refuted before the run (a borrow given to a type parameter is a reference argument).
 - 3.274.0 — `CHG-0374` (D-0283): `conf.point-check-at-call-dynamic`, `conf.point-check-at-call-distinct`, `conf.point-check-swap-same-place` and `conf.point-check-empty-view` added; a value-dependent overlap at a call is decided when the call is made (`conf.state-and-own-field-input-dynamic`, `conf.overlapping-slice-arguments-dynamic`); `conf.vec-grow-fault-intact-dynamic` and `conf.fault-unwind-callee-tail-conflict-dynamic` pass the shared reference in a struct (tier D), so their faults stay in the callee.
 - 3.273.0 — `CHG-0373` (D-0282): 41 rows rejected statically (38 case files, `conf.move-through-param-rejected`, `conf.temp-borrow-escape-stale`, `conf.two-exclusive-arguments-fault-at-use`) that were dynamic (the call-site rule with access summaries, liveness by last use, evaluation order, moving out through a reference, a view of a temporary); `conf.vec-grow-fault-intact-dynamic`, `conf.fault-unwind-callee-tail-conflict-dynamic`, `conf.state-and-own-field-input-dynamic`, `conf.overlapping-slice-arguments-dynamic` keep the run-time forms; `conf.e2e-vec-realloc-stale-ref` and `conf.e2e-vec-pop-push-reuse-stale-ref` keep the reference in a struct.

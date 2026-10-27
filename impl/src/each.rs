@@ -13,6 +13,7 @@
 //   $each_key(c, i)         c : &C or &mut C        HashMap: key i; otherwise i
 //   $each_take(d, i, n)     d : holder              element i, moved out
 //   $each_take_key(d, i)    d : holder              HashMap: key i, moved out; otherwise i
+//   $each_lazy(c)           c : a call             gone after `modres` (D-0287): `std::Parts` for a splitter
 //   $each_range(b, e, n)    b : a range's bound     `e`, a literal expression, as b's integer type; () for none (D-0097)
 
 use crate::ast::*;
@@ -28,6 +29,7 @@ enum Coll {
     SetDrain,
     MapDrain,
     Slice(Mode),
+    Parts,
 }
 
 fn coll(t: &Type) -> Option<Coll> {
@@ -41,6 +43,7 @@ fn coll(t: &Type) -> Option<Coll> {
             "std::Drain" => Some(Coll::Drain),
             "std::SetDrain" => Some(Coll::SetDrain),
             "std::HashDrain" => Some(Coll::MapDrain),
+            "std::Parts" => Some(Coll::Parts),
             _ => None,
         },
         _ => None,
@@ -142,7 +145,7 @@ pub fn expand(name: &str, t0: &Type, args: &[Expr], line: usize, col: usize) -> 
         }
     }
     match (name, mode, c) {
-        ("$each_drain", None, Coll::Vec | Coll::Array(_) | Coll::Set | Coll::Slice(_)) if matches!(args.get(1).map(|e| &e.kind), Some(ExprKind::IntLit(3, _))) => bad(),
+        ("$each_drain", None, Coll::Vec | Coll::Array(_) | Coll::Set | Coll::Slice(_) | Coll::Parts) if matches!(args.get(1).map(|e| &e.kind), Some(ExprKind::IntLit(3, _))) => bad(),
         // A slice (D-0047) is a borrow already: looped over in its own mode.
         ("$each_drain", None, Coll::Slice(_)) => Ok(a0),
         ("$each_len", _, Coll::Slice(_)) => Ok(call("slice_len", vec![a0])),
@@ -152,6 +155,18 @@ pub fn expand(name: &str, t0: &Type, args: &[Expr], line: usize, col: usize) -> 
         ("$each_at", Some(Mode::Shared), Coll::Slice(_)) => Ok(shared(mk(ExprKind::Index(Box::new(deref(a0)), Box::new(a1()))))),
         ("$each_at_mut", Some(Mode::Exclusive), Coll::Slice(_)) => Ok(excl(mk(ExprKind::Index(Box::new(deref(a0)), Box::new(a1()))))),
         ("$each_key", Some(_), Coll::Slice(_)) => Ok(a1()),
+        // D-0287: a text splitter's parts, found as they are taken
+        // (`std::Parts`, which `modres` made the loop hold): the holder is
+        // the `Parts` itself, and the bound grows by one while a part is left.
+        ("$each_drain", None, Coll::Parts) => Ok(a0),
+        ("$each_len", None, Coll::Parts) => Ok(call("std::Parts::bound", vec![a0])),
+        // `{ $d = std::Parts::next($d); std::StringView::sub($d.v, $d.lo,
+        // $d.hi) }`: the holder goes by value, never borrowed.
+        ("$each_take", None, Coll::Parts) => {
+            let step = mk(ExprKind::Assign(Box::new(a0.clone()), Box::new(call("std::Parts::next", vec![a0.clone()]))));
+            Ok(mk(ExprKind::Block(Block { stmts: vec![Stmt::Expr(Box::new(step))], tail: Some(Box::new(call("std::StringView::sub", vec![field(a0.clone(), "v"), field(a0.clone(), "lo"), field(a0, "hi")]))) })))
+        }
+        ("$each_take_key", None, Coll::Parts) => Ok(a1()),
         ("$each_drain", None, Coll::Vec) => Ok(call("std::Vec::drain", vec![a0])),
         ("$each_drain", None, Coll::Array(_)) => Ok(a0),
         ("$each_drain", None, Coll::Set) => Ok(call("std::HashSet::drain", vec![a0])),

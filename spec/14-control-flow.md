@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.32.0
+Version: 1.33.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -383,6 +383,49 @@ reference).
 **Depends on:** rule.control.for, rule.stdlib.vec, rule.stdlib.hashmap,
 rule.type.expected, D-0042
 
+### `rule.control.foreach-parts`
+**Status:** ACCEPTED (D-0287)
+
+A consuming `foreach` whose collection is written as a call of a text
+splitter — `StringView::split`, `StringView::lines`,
+`StringView::split_whitespace`, `StringView::chars`, or the `String`
+function of the same name (`spec/21`, `rule.stdlib.stringview`,
+`rule.stdlib.string`) — visits the
+parts that call's `Vec<StringView>` would hold, in its order, each found
+when the loop reaches it. The `Vec` is not made:
+
+    [Foreach-Parts]   ⟨foreach (k, x in f(a1, …, an)) b, Σ⟩ ≡
+        ⟨{ auto $d = parts_f(a1, …, an); for (usize $i = 0; $i < bound($d); $i += 1)
+             { auto k = $i; auto x = { $d = next($d); part($d) }; b } }, Σ⟩
+
+(with one name, drop `auto k = …`). `parts_f` makes a `std`-private
+cursor, `Parts`, that holds a view of the text `a1` (of the `String`'s
+text, borrowed shared, for a `String` function), where the next part
+starts, the part last found and how many it has given; `bound($d)`
+is one more than the parts given while one is left, and the number
+given once none is; `next($d)` is the cursor with the next part found
+and moved past, and `part($d)` that part, a view of the text. The
+cursor goes by value: the loop never borrows it. The arguments are
+evaluated once, in order, before the first step.
+
+- **Nothing observable changes.** The parts, their number and their
+  order are the `Vec`'s, and each is a view of the same text, valid as
+  long as the text is, inside the loop or after it. The text is
+  borrowed for the whole loop, so changing it in `b` is the aliasing
+  conflict it would be under `[Foreach-Consumed]` with the `Vec` bound
+  first.
+- **A frame-held cursor.** `Parts` holds a view and is held by the loop
+  as a view is (`rule.control.frame-references`): each part inherits
+  the facts of the text, so a program looping over a splitter's parts
+  in this form is tier S (D-0281).
+- **Only this form.** A borrowed loop (`foreach (x in &f(…))`), a call
+  written through a `fn` value or with type arguments, and a `Vec`
+  bound first and looped over later keep `[Foreach-Consumed]` and the
+  `Vec`.
+
+**Depends on:** rule.control.foreach, rule.stdlib.stringview, rule.stdlib.string, D-0128,
+D-0181, D-0281, D-0287
+
 ### `rule.control.foreach-range`
 **Status:** ACCEPTED
 
@@ -664,14 +707,22 @@ inherits the facts of `e`:
 | `*b`, and `b.f` for a frame-held `b` | the facts of `b` |
 | `&_m p` or a slice of `p` | the fact §6 forms for it (`p`'s place, literal indices and ranges included) where it forms one; otherwise the facts of `p`'s root, extended by `p`'s fields up to its first index, in mode `m`; when `p`'s root is the result of a call that is not a reference, holds none and is not a constant: the temporary of that statement |
 | `String::view(s, lo, hi)`, `StringView::sub(s, lo, hi)` | the facts of `s`, each extended by the range `[lo, hi)` |
-| a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088); none when no parameter is; tier D when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them) |
-| a hidden `foreach` binding | the facts of the collection it walks; over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap |
+| a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088); none when no parameter is, and none (static data) when that argument is static data; tier D when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them) |
+| a hidden `foreach` binding | the facts of the collection it walks; over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap; under `[Foreach-Parts]`, the facts of the text |
 | `if`, a block, `match` | the facts of the results of the branches that complete (a `match` arm's binder stands for the scrutinee); facts from two or more branches are `?` |
 | an element of a container, or a reference read out of a field of an aggregate that holds references | tier D: no facts |
 | a name of no local, a literal | none: static data |
 
 A binding whose inherited facts name a temporary, and which is live
 after its statement, is refuted: `diag.destroy-while-aliased` (D-0135).
+
+**A block's end.** When a block ends, a frame-held reference declared
+outside it that holds a fact `T` rooted at a binding the block declares,
+and that is live after the block, is refuted:
+`diag.destroy-while-aliased` (D-0287), the owner being destroyed at the
+block's exit (`[Block-Exit]`) while the reference still refers to it.
+One that holds only a fact `?` rooted there is decided by the run, and
+the program is not decided.
 
 **Liveness.** A frame-held reference `h` is *live* at a point `P` when
 the binding of that name in scope at `P` is mentioned (read, borrowed,
@@ -811,6 +862,7 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.33.0 — `CHG-0378` (D-0287): `rule.control.foreach-parts`, a consuming `foreach` over a text splitter's call walks the text and makes no `Vec`. `CHG-0379` (D-0287): §6 `rule.control.frame-references`: a block's end refutes a live outer reference to what the block declares; a call's result inherits static data from a static first reference argument; the hidden binding of `[Foreach-Parts]` inherits the text's facts.
 - 1.32.0 — `CHG-0375` (D-0284): §6 `rule.control.frame-references`: element writes are element accesses; the hidden reference of `[Compound-Assign]` is live through its value; evaluation order covers the whole of an assigned value and a call's later arguments; decided programs, which may run with no record of references.
 - 1.31.0 — `CHG-0374` (D-0283): §6 `rule.control.frame-references`, point checks at the call: a value-dependent overlap at a call is checked when the call is made, from the callee's access summary, not at the callee's first conflicting access.
 - 1.30.0 — `CHG-0373` (D-0282): §6 `rule.control.frame-references`, the conflicts of frame-held references refuted before the run (inherited facts, liveness, access summaries, the call-site rule, element accesses, evaluation order, moving out through a reference, views of temporaries); `rule.control.flow-analysis`'s Scope names it.

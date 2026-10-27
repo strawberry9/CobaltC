@@ -932,7 +932,32 @@ impl<'a> RewriteCtx<'a> {
                     col,
                 };
                 let path = |p: &[&str]| Box::new(Expr { kind: ExprKind::Path(p.iter().map(|s| s.to_string()).collect(), Vec::new()), line, col });
-                if key == "checked_neg" && args.len() == 1 {
+                if key == "$each_lazy" && args.len() == 1 {
+                    // D-0287: a consuming `foreach` over a call (the parser's
+                    // wrapping). Over a text splitter, the loop holds a
+                    // `std::Parts` that finds each part as it is taken
+                    // (src/each.rs); over anything else, the call itself.
+                    let mut c = args.remove(0);
+                    if let ExprKind::Call(callee, _) = &mut c.kind {
+                        if let ExprKind::Path(segs, targs) = &mut callee.kind {
+                            let lazy = match segs.join("::").as_str() {
+                                "std::StringView::split" => Some("split"),
+                                "std::StringView::lines" => Some("lines"),
+                                "std::StringView::split_whitespace" => Some("words"),
+                                "std::StringView::chars" => Some("chars"),
+                                "std::String::split" => Some("string_split"),
+                                "std::String::lines" => Some("string_lines"),
+                                "std::String::split_whitespace" => Some("string_words"),
+                                "std::String::chars" => Some("string_chars"),
+                                _ => None,
+                            };
+                            if let (Some(f), true) = (lazy, targs.is_empty()) {
+                                *segs = vec!["std".to_string(), "Parts".to_string(), f.to_string()];
+                            }
+                        }
+                    }
+                    e.kind = c.kind;
+                } else if key == "checked_neg" && args.len() == 1 {
                     // D-0072: `checked_neg(a)` is `checked_sub(0, a)`; the
                     // `0` takes `a`'s type (`rule.arith.alt`).
                     let a = args.remove(0);

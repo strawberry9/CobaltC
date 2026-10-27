@@ -69,6 +69,41 @@ line that runs once (a binding, a move into a call) costs next to nothing. The s
 how to rewrite what it finds.""")
 b += p("""The other direction is `cobc --all-checks prog.cb`: it compiles the program with every proof about a function's reference parameters switched off, so every access through a parameter is checked where it is made. It is slower, and it exists for comparison: a program must behave the same both ways, and the project's test battery runs its whole file suite under it (D-0209).""")
 
+b += h3("Loop over a splitter's call", anchor="perf-parts")
+b += p("""A `Vec` of views keeps references in data, so a program that holds one is not decided. The
+commonest text loop, `foreach (l in StringView::lines(v))`, would hold one; written that way, with
+the splitter's call as the loop's collection, it holds none: the loop walks the text and finds each
+part as it reaches it, a view of the text like any other (D-0287). That covers `split`, `lines`,
+`split_whitespace` and `chars`, of a `StringView` or a `String`. The parts, their order and the
+program's outcome are the `Vec`'s; only the `Vec` is not made. Binding the result first
+(`Vec<StringView> words = StringView::split_whitespace(l);`), to take its length or index it, keeps
+the `Vec` and its cost. A word count over a 13.7 MB text (400,000 lines) took 9.8 s and 160 MB with
+the `Vec`s, and takes 0.47 s and 42 MB with the loops over the calls.""")
+b += code("""
+import std;
+
+fn main()
+{
+    String text = String::from_str("the quick fox\\njumps over\\n\\nthe dog\\n");
+    usize lines = 0;
+    usize words = 0;
+    usize longest = 0;
+    foreach (l in String::lines(&text))
+    {
+        lines += 1;
+        foreach (w in StringView::split_whitespace(l))
+        {
+            words += 1;
+            if (StringView::len(w) > longest)
+            {
+                longest = StringView::len(w);
+            }
+        }
+    }
+    printf("%v lines, %v words, longest %v\\n", lines, words, longest);
+}
+""", title="Counting words without a Vec", expect="ok", output="4 lines, 7 words, longest 5\n", section="perf", slug="perf-parts")
+
 b += h3("Keep hot vectors confined", anchor="perf-confined")
 b += p("""`cobc` proves a `Vec` <em>confined</em> when nothing but its own name can ever reach it.
 A confined `Vec`'s accesses compile to plain C with bounds and overflow checks and no tracking. A

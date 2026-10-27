@@ -71,7 +71,9 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   object, and statements that would record nothing open no scope; `-v` says "lowered pathless and
   decided", and `COBALTC_DECIDED=0` keeps the first lowering. There values pass between functions with no
   object (D-0286): an argument or a result is handed over as its value, and the receiver binds it objectless
-  where it can. `--all-checks` keeps every
+  where it can. A consuming `foreach` over a text splitter's call (`StringView::lines(v)`, `String::split(&s,
+  ",")`, …) walks the text, holding a view of it, and makes no `Vec` (D-0287, in both tools), so it leaves a
+  program decided. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

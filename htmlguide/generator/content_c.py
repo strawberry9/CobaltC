@@ -2820,7 +2820,10 @@ gives the words between runs of ASCII whitespace, none empty; `strip_prefix(v, t
 `None` otherwise, which is how `--name=value` is read. `code_point(v)` is the number of the first
 character (`None` for empty text), and `String::push_code_point(&mut s, cp)` appends one as UTF-8,
 turning a surrogate or a value above U+10FFFF into U+FFFD so the `String` stays valid. Each exists on
-a `String` too (`String::lines(&s)`, …). `String::parse<bool>` reads exactly `true` or `false`.""")
+a `String` too (`String::lines(&s)`, …). `String::parse<bool>` reads exactly `true` or `false`.
+A `foreach` over a call of `lines`, `split`, `split_whitespace` or `chars` finds each part as it
+reaches it and makes no `Vec` (D-0287, guide chapter P); bind the `Vec` first only to take its
+length or index it, as the example's `words` does.""")
 b += code("""
 import std;
 
