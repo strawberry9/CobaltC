@@ -265,7 +265,9 @@ impl<'g, 'a> Fx<'g, 'a> {
                     fused = Some((bm.clone(), base, p.projs.clone()));
                     // Lowered once: the place stands for the scrutinee below.
                     self.fused_scrut = Some(V { c: p.c, ty: p.ty, obj: None });
-                } else if p.raw.is_none() && self.direct_place(place) {
+                } else if p.raw.is_none() && (self.direct_place(place) || self.objectless_root(place)) {
+                    // D-0286: or an objectless local's (or a field of one):
+                    // nothing to check either.
                     // A field of a direct parameter (`box_rec_uses`): no
                     // check can fail (the parameter is the only way in), so
                     // none is made; the binder's base is "" (direct).
@@ -302,14 +304,21 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.map_get_acc = Some(cargs.as_ptr() as usize);
                 self.map_get_acc_out = None;
             }
+            // D-0286: a decided program's call result matched with no object.
+            self.arm_inert(scrut, false);
             let v = self.lower_expr(scrut, None);
+            self.inert_result = None;
             self.datum_tok = None;
             self.map_get_acc = None;
             datum_tok = self.datum_tok_out.take();
             acc_ptr = self.map_get_acc_out.take();
             v?
         } else {
-            self.lower_expr(scrut, None)?
+            // D-0286: a decided program's call result matched with no object.
+            self.arm_inert(scrut, false);
+            let v = self.lower_expr(scrut, None);
+            self.inert_result = None;
+            v?
         };
         if matches!(sv.ty, Type::Never) {
             return Ok(never());
@@ -446,11 +455,25 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.scopes.push(HashMap::new());
             let moved_out = self.bind_match_arm(arm, &inner_ty, &slot_path, &cross_slot, below, vis.len(), &crosses, &by_ref, &by_ref_prefix, &place_root, &acc_ptr, line)?;
             if scrut_res {
-                let o = s.obj.as_ref().expect("resource scrutinee has object");
-                // D-0049: consumed only by an arm that moved the payload
-                // out; otherwise the temporary ends with its statement.
-                if moved_out {
-                    self.emit(&format!("cb_end_moved_out({});", o));
+                match s.obj.as_ref() {
+                    // D-0049: consumed only by an arm that moved the payload
+                    // out; otherwise the temporary ends with its statement.
+                    Some(o) => {
+                        if moved_out {
+                            self.emit(&format!("cb_end_moved_out({});", o));
+                        }
+                    }
+                    // D-0286: an inert one (`arm_inert`), whose end frees
+                    // memory alone: an arm that moves nothing out drops it
+                    // where the arm ends.
+                    None if self.inert_c.contains(&s.c) => {
+                        if !moved_out {
+                            let tid = self.tid(&s.ty)?;
+                            let d = self.objectless_drop(&s.c, tid);
+                            self.push_drop(d);
+                        }
+                    }
+                    None => return internal("a resource scrutinee without an object"),
                 }
             }
             self.branch_scope = arm_scopes && sink.is_none();
@@ -524,9 +547,13 @@ impl<'g, 'a> Fx<'g, 'a> {
                 // (`cb_borrow_unminted`) and none minted; the call is
                 // made inline through the base (`unminted_binders`).
                 let box_use = !self.g.boot(7) && binder_used_once_first(&arm.body, binder) && binder_box_call(&arm.body, binder).map_or(false, |g| g == "std::Box::get" || (g == "std::Box::get_mut" && *mode == Mode::Exclusive));
-                if !box_use && tok.is_empty() {
+                if !box_use && tok.is_empty() && !self.g.decided {
                     return internal("a binder through a direct place used other than by `Box::get`");
                 }
+                // D-0286: in a decided program, through an objectless
+                // local: token 0 (every borrow is decided).
+                let tok = if tok.is_empty() && !box_use { "0".to_string() } else { tok.clone() };
+                let tok = &tok;
                 if box_use {
                     if !tok.is_empty() {
                         self.emit(&format!("cb_borrow_unminted({}, {}, {}, {}, {});", tok, projs, all.len(), m, loc));
@@ -578,7 +605,9 @@ impl<'g, 'a> Fx<'g, 'a> {
                     }
                     let tid = self.tid(&pty)?;
                     let arm_id = arm as *const Arm as usize;
-                    if self.objectless_names.contains(&arm_id) && self.g.objectless_type(&pty) && self.g.probing == 0 {
+                    // D-0286: in a decided program, by `objectless_binding`'s
+                    // whole test (its fields read by value are plain data).
+                    if self.objectless_names.contains(&arm_id) && self.g.objectless_type(&pty) && self.g.probing == 0 && (!self.g.decided || self.objectless_binding(arm_id, &pty)) {
                         // D-0200: an objectless binder (`objectless_strings`):
                         // the payload's bytes, no object.
                         let saved = self.cur_let.replace(arm_id);

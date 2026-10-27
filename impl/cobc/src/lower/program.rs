@@ -103,7 +103,29 @@ impl<'a> Gen<'a> {
             let start = self.fns.len();
             let pure = name.starts_with("std::") && targs.iter().all(std_only);
             self.lower_fn(&name, &targs, mask)?;
-            let text = self.fns[start..].to_string();
+            let mut text = self.fns[start..].to_string();
+            // D-0286: a decided program's natives and helpers, whose fixed
+            // text puts values in flight, made to hand them over instead
+            // (`ground_native`); text it does not know keeps the program
+            // on the first lowering.
+            if self.decided && (text.contains("cb_send(") || text.contains("cb_recv(")) {
+                let f = self.items.fns.get(&name).cloned().expect("a lowered function");
+                let subst = subst_of(&f.type_params, &targs);
+                let mut tids = Vec::new();
+                for p in &f.params {
+                    let pty = apply(&p.ty, &subst);
+                    if self.is_resource(&pty) {
+                        tids.push((format!("p_{}", san(&p.name)), self.type_id(&pty)?));
+                    }
+                }
+                text = match flights::ground_native(&text, &tids) {
+                    Ok(t) => t,
+                    Err(e) => return unsupported(&format!("a value in flight in `{}`: {}", name, e)),
+                };
+                if text.contains("cb_send(") || text.contains("cb_recv(") {
+                    return unsupported(&format!("a value in flight in `{}`", name));
+                }
+            }
             // A `spawn`'s block (`struct cb_env_N`) is defined with its
             // trampoline among the thunks, in the program's translation
             // unit: a function that spawns is compiled there too.

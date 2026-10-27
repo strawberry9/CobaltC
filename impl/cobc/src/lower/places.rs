@@ -394,7 +394,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                     }
                 }
             }
-            if self.raw_ret && std::mem::take(&mut self.raw_return_path) {
+            if (self.raw_ret || self.g.decided) && std::mem::take(&mut self.raw_return_path) {
                 // A `__raw` form returns it as it is (the caller binds it
                 // objectless too): no object at all. Only the result itself:
                 // a move anywhere else (a call's argument) takes an object.

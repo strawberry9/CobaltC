@@ -69,7 +69,9 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   first conflict that kept the record, and `COBALTC_PATHLESS=0` keeps it. Such a program is lowered a
   second time knowing it is decided (D-0285): a value holding references is then plain data, with no
   object, and statements that would record nothing open no scope; `-v` says "lowered pathless and
-  decided", and `COBALTC_DECIDED=0` keeps the first lowering. `--all-checks` keeps every
+  decided", and `COBALTC_DECIDED=0` keeps the first lowering. There values pass between functions with no
+  object (D-0286): an argument or a result is handed over as its value, and the receiver binds it objectless
+  where it can. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

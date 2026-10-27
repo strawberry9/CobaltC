@@ -135,6 +135,39 @@ fn decided_program_is_lowered_knowing_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// D-0286: in a decided program values pass between functions with no
+// object: past the runtime's header the C neither sends nor receives one,
+// a `String` taken by value is bound objectless and none is bound in the
+// function, and the program ends as its first lowering does
+// (COBALTC_DECIDED=0), under both C compilers.
+#[test]
+fn decided_program_passes_values_without_objects() {
+    let dir = std::env::temp_dir().join(format!("cobc-flights-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src = "import std;\n\nfn twice(String s) : String\n{\n    String r = String::clone(&s);\n    String::append(&mut r, String::as_view(&s));\n    r\n}\n\nfn first(Vec<String> v) : Option<String>\n{\n    if (Vec::len(&v) == 0)\n    {\n        return None;\n    }\n    Some(twice(String::clone(&v[0])))\n}\n\nfn main()\n{\n    Vec<String> v = Vec::new();\n    Vec::push(&mut v, String::from_str(\"ab\"));\n    match (first(v))\n    {\n        Some(x) : printf(\"%s %v\\n\", &x, String::len(&x)),\n        None : printf(\"none\\n\"),\n    }\n    match (first(Vec::new()))\n    {\n        Some(x) : printf(\"%s\\n\", &x),\n        None : printf(\"none\\n\"),\n    }\n}\n";
+    fs::write(dir.join("prog.cb"), src).unwrap();
+    for cc in ["gcc", "clang"] {
+        let build = |decided: &str, out: &str| {
+            let o = Command::new(cobc_exe()).args(["-v", "--keep-c", "--cc", cc, "-o", out, "prog.cb"]).env("COBALTC_DECIDED", decided).current_dir(&dir).output().expect("run cobc");
+            assert!(o.status.success(), "{}: {}", cc, String::from_utf8_lossy(&o.stderr));
+            let run = Command::new(dir.join(out)).output().expect("run prog");
+            assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "abab 4\nnone\n".to_string()), "{}", cc);
+            (String::from_utf8_lossy(&o.stderr).into_owned(), fs::read_to_string(dir.join(format!("{}.c", out))).unwrap())
+        };
+        let (note, c) = build("1", "d");
+        assert!(note.contains("lowered pathless and decided"), "{}: {}", cc, note);
+        let after = &c[c.find("/* ---- types ---- */").expect("types")..];
+        assert!(!after.contains("cb_send(") && !after.contains("cb_recv("), "{}: a value in flight", cc);
+        let at = c.find("static struct s_std__String f_twice(struct s_std__String p_s)\n{").expect("f_twice");
+        let body = &c[at..at + c[at..].find("\n}\n").unwrap()];
+        assert!(!body.contains("cb_bind(") && body.contains("cb_drop_plain_buf(&p_s,"), "{}: {}", cc, body);
+        let (_, c) = build("0", "p");
+        assert!(c.contains("cb_recv("), "{}", cc);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // Linkage: the program's own functions are `static` (the C compiler may
 // inline them), `main` is not, and a program whose loop calls pure-`std`
 // functions (`Vec::push`, `Vec::len`, the element accessor) builds and

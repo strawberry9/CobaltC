@@ -18,6 +18,18 @@ impl<'a> Gen<'a> {
     // a use resolves to the innermost binding of its name, so the same name
     // declared in two blocks (or shadowed) no longer disqualifies both.
     pub(super) fn objectless_strings(&self, body: &Block, params: &[String]) -> HashSet<usize> {
+        self.objectless_strings_with(body, params, &[], &mut HashMap::new())
+    }
+
+    // `objectless_strings`, the parameters `cands` (name, id) candidates as
+    // a `let` with an initializer is (D-0286: a decided program's by-value
+    // parameters, which arrive with no object).
+    // In a decided program (D-0286) a candidate may also be borrowed whole
+    // or by a field anywhere (the borrow is its address, token 0), and its
+    // fields read; `fields` gets, by candidate, the fields read by value,
+    // which `Fx::objectless_binding` allows only of plain data (no field
+    // is moved out of an objectless local).
+    pub(super) fn objectless_strings_with(&self, body: &Block, params: &[String], cands: &[(String, usize)], fields: &mut HashMap<usize, HashSet<String>>) -> HashSet<usize> {
         struct W<'s, 'a> {
             g: &'s Gen<'a>,
             bound: HashSet<String>,
@@ -31,6 +43,11 @@ impl<'a> Gen<'a> {
             indexed: HashSet<usize>,
             names: HashMap<usize, String>,
             depth: usize,
+            fields: HashMap<usize, HashSet<String>>,
+            // D-0286: the next block walked is the function's last
+            // expression (`unsafe { … x }` ending the body): its own last
+            // expression is the function's result too.
+            tail_next: bool,
         }
         // `std`'s `String` builders, which change the `String` they are lent
         // and keep no reference to it (each is native or a few `Vec` calls
@@ -41,6 +58,21 @@ impl<'a> Gen<'a> {
             // candidate (a parameter, a binder, a `let` with no initializer).
             fn id(&self, n: &str) -> Option<usize> {
                 self.scopes.iter().rev().find_map(|m| m.get(n).copied())
+            }
+            // D-0286: `x`, `x.f`, `x.f.g`…: the candidate at its root (not
+            // 0), and the first field named, if any.
+            fn field_root(&self, e: &Expr) -> Option<(usize, Option<String>)> {
+                let mut e = strip_parens(e);
+                let mut first = None;
+                while let ExprKind::Field(a, f) = &e.kind {
+                    first = Some(f.clone());
+                    e = strip_parens(a);
+                }
+                let ExprKind::Path(segs, t) = &e.kind else { return None };
+                if segs.len() != 1 || !t.is_empty() {
+                    return None;
+                }
+                self.id(&segs[0]).filter(|&id| id != 0).map(|id| (id, first))
             }
             fn mark_bad(&mut self, n: &str) {
                 if let Some(id) = self.id(n) {
@@ -150,6 +182,7 @@ impl<'a> Gen<'a> {
                 self.depth -= 1;
             }
             fn block(&mut self, b: &Block) {
+                let tail_here = std::mem::take(&mut self.tail_next);
                 self.depth += 1;
                 self.scopes.push(HashMap::new());
                 for st in &b.stmts {
@@ -180,7 +213,18 @@ impl<'a> Gen<'a> {
                     }
                 }
                 if let Some(t) = &b.tail {
-                    if !(self.depth == 1 && self.move_out(t)) {
+                    let at_tail = self.depth == 1 || (tail_here && self.g.decided);
+                    let inner = match &strip_parens(t).kind {
+                        ExprKind::Block(ib) | ExprKind::Unsafe(ib) if at_tail => {
+                            let scopes = &self.scopes;
+                            self.g.fusion_plan(ib, &|n| scopes.iter().any(|m| m.contains_key(n))).is_none().then_some(ib)
+                        }
+                        _ => None,
+                    };
+                    if let Some(ib) = inner.filter(|_| self.g.decided) {
+                        self.tail_next = true;
+                        self.nested(ib);
+                    } else if !(at_tail && self.move_out(t)) {
                         self.expr(t);
                     }
                 }
@@ -262,6 +306,26 @@ impl<'a> Gen<'a> {
                         let ExprKind::Index(a, i) = &strip_parens(x).kind else { unreachable!() };
                         self.mark_bad(path_name(a).unwrap());
                         self.expr(i);
+                    }
+                    // D-0286: in a decided program, a borrow of a candidate or
+                    // of a field of one (its address, token 0), and a field
+                    // read (recorded: only plain data may be read so).
+                    ExprKind::Borrow(_, x) if self.g.decided && self.field_root(x).is_some() => {
+                        let (id, _) = self.field_root(x).unwrap();
+                        self.seen.insert(id);
+                    }
+                    ExprKind::Field(..) if self.g.decided && self.field_root(e).is_some() => {
+                        let (id, f) = self.field_root(e).unwrap();
+                        self.seen.insert(id);
+                        if let Some(f) = f {
+                            self.fields.entry(id).or_default().insert(f);
+                        }
+                    }
+                    // A field written: not this.
+                    ExprKind::Assign(a, b) if self.g.decided && matches!(strip_parens(a).kind, ExprKind::Field(..)) && self.field_root(a).is_some() => {
+                        let (id, _) = self.field_root(a).unwrap();
+                        self.bad.insert(id);
+                        self.expr(b);
                     }
                     ExprKind::ArrayRepeat(a, _) | ExprKind::Unary(_, a) | ExprKind::Borrow(_, a) | ExprKind::Deref(a) | ExprKind::Field(a, _) | ExprKind::Propagate(a) | ExprKind::Paren(a) => self.expr(a),
                     // D-0200: a candidate compared (`==`, `<`, …): read where it
@@ -380,9 +444,10 @@ impl<'a> Gen<'a> {
             }
         }
         let bound: HashSet<String> = bound_names(body).into_iter().chain(params.iter().cloned()).collect();
-        let top: HashMap<String, usize> = params.iter().map(|p| (p.clone(), 0)).collect();
-        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), names: HashMap::new(), depth: 0 };
+        let top: HashMap<String, usize> = params.iter().map(|p| (p.clone(), cands.iter().find(|(n, _)| n == p).map_or(0, |c| c.1))).collect();
+        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), names: HashMap::new(), depth: 0, fields: HashMap::new(), tail_next: false };
         w.block(body);
+        *fields = std::mem::take(&mut w.fields);
         // A candidate moved away is recorded twice (`id` and `!id`): its
         // binding gets a moved flag (`Fx::objectless_bound`).
         w.seen
@@ -430,6 +495,19 @@ impl<'a> Gen<'a> {
                     let sub = subst_of(&sd.type_params, a);
                     seen.push(t.clone());
                     let ok = sd.fields.iter().all(|f| elem(&apply(&f.ty, &sub), seen));
+                    seen.pop();
+                    ok
+                }
+                _ => false,
+            },
+            // D-0286: in a decided program, an enum (`Option`, `Result`, the
+            // program's own) not declared `resource`, with no destructor of
+            // its own, whose payloads are such values or plain data.
+            Type::Named(n, a) if self.decided => match self.enum_decl(n) {
+                Some(ed) if !ed.resource && !self.items.fns.contains_key(&format!("{}::drop", n)) => {
+                    let sub = subst_of(&ed.type_params, a);
+                    seen.push(t.clone());
+                    let ok = ed.variants.iter().all(|v| v.payload.as_ref().map_or(true, |p| elem(&apply(p, &sub), seen)));
                     seen.pop();
                     ok
                 }

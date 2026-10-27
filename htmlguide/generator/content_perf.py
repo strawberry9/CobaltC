@@ -58,7 +58,9 @@ type that keeps references in data, a closure that captures by reference, a `spa
 says which: "lowered pathless", or "kept paths" with the file and line of the first such conflict.
 A decided program is also lowered a second time knowing it (D-0285): a view, or any value that only
 holds references, is then plain data with no runtime record at all, and `-v` says "lowered pathless
-and decided".""")
+and decided". There a value passed to a function or returned from one goes as its bytes, with no
+runtime record of its own (D-0286), and a parameter or result the function only reads, borrows or
+hands on is bound with none either.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
 the run, then lists the lines whose generated C still calls the runtime's tracking, with the

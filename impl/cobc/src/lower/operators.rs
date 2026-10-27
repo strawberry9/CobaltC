@@ -429,6 +429,19 @@ impl<'g, 'a> Fx<'g, 'a> {
                 };
                 let v = match raw {
                     Some(v) => v,
+                    // D-0286: in a decided program, the value of a raw sink
+                    // (the function's result) is made with no object: a
+                    // literal, a call's result, an objectless local moved.
+                    None if self.g.decided && ov.map_or(false, |o| self.raw_sinks.contains(o)) => {
+                        self.objectless = self.literal_expr(e);
+                        self.arm_inert(e, true);
+                        self.raw_return_path = matches!(strip_parens(e).kind, ExprKind::Path(..));
+                        let v = self.lower_expr(e, expected);
+                        self.objectless = false;
+                        self.inert_result = None;
+                        self.raw_return_path = false;
+                        v?
+                    }
                     None => self.lower_expr(e, expected)?,
                 };
                 if matches!(v.ty, Type::Never) {

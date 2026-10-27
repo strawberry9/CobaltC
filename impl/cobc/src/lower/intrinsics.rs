@@ -1352,15 +1352,21 @@ impl<'g, 'a> Fx<'g, 'a> {
                     let t = self.g.fresh("t");
                     let c = self.g.ctype(&e_ty)?;
                     self.emit(&format!("{} {} = {};", c, t, ev.c));
-                    let tid = self.tid(&e_ty)?;
-                    let oo = self.g.fresh("o");
-                    self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", oo, t, tid, loc));
-                    V { c: t, ty: e_ty.clone(), obj: Some(oo) }
+                    if self.g.decided {
+                        // D-0286: handed over as it is, with no object.
+                        self.inert_c.insert(t.clone());
+                        V { c: t, ty: e_ty.clone(), obj: None }
+                    } else {
+                        let tid = self.tid(&e_ty)?;
+                        let oo = self.g.fresh("o");
+                        self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", oo, t, tid, loc));
+                        V { c: t, ty: e_ty.clone(), obj: Some(oo) }
+                    }
                 } else {
                     self.into_temp(ev, line)?
                 };
                 if self.is_res(&e_ty) {
-                    self.emit(&format!("cb_send({});", ev.obj.as_ref().unwrap()));
+                    self.give_arg(&ev, "map_err's error")?;
                 } else if self.has_refs(&e_ty) && !matches!(e_ty, Type::Ref(..)) {
                     let tid = self.tid(&e_ty)?;
                     self.emit(&format!("cb_send_datum(&{}, {}u);", ev.c, tid));

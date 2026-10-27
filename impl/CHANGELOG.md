@@ -292,6 +292,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0283 — A conflict at a call that only values decide is checked when the call is made
 - D-0284 — A program whose conflicts are all decided before the run keeps no record of references
 - D-0285 — A decided program is lowered knowing it is decided
+- D-0286 — In a decided program, values pass between functions with no object
 
 ---
 
@@ -8196,6 +8197,25 @@ crossing to C by value.
 - `cobc`'s dual-body dispatcher (D-0188) no longer treats a reference argument as a fresh borrow when a later
   argument contains a call, a block or an assignment: `set(&mut v[0], grow(&mut v))` wrote into freed storage.
 - csvstat 217 → 102 ms, extsort 670 → 476 ms. Conformance 3.275.0: six new rows, one now static.
+
+## CHG-0377: in a decided program, values pass between functions with no object (2026-10-27)
+
+- D-0286 (D-0281 step 4d, second part; decided under the owner's delegation): in `cobc`'s decided lowering no
+  value is in flight. A by-value resource argument is handed over as its value (`Fx::give_arg`: the caller's
+  record ends, `cb_forget_obj`), every resource result leaves as a `__raw` form's does, and a call's result is
+  given an object only where it lands in a binding that needs one (`Fx::take_result`). A callee binds a by-value
+  resource parameter objectless where the analysis allows (`objectless_strings_with`: parameters are
+  candidates), else gives it an object. A call's result goes with no object (`arm_inert`) to an objectless
+  binding, an argument, a literal's part, a result or a `match`, whose arms that move nothing out drop it; an
+  inert literal argument, a literal payload or result, and an objectless local moved, go with none. In a decided
+  program the analysis also allows borrows of a candidate and its fields (token 0), reads of its plain fields,
+  enums over objectless payloads (`objectless_type`), and a result's last block; a `match (&x)` on an objectless
+  local borrows its binders with token 0. The natives' fixed texts are rewritten per function
+  (`flights::ground_native`); text it does not know keeps the program on the first lowering.
+- Gate `stress/d0281/objectless/dgate.sh` over the 1,500-program sample: 1,471 the same; 17 different (14 in
+  printed times, two of random input, one printing stack addresses); 12 not decided (6 reclaim raw storage
+  themselves; 6 fell back on `match (&x)`, fixed, the 7 such programs the same). Driver test
+  `decided_program_passes_values_without_objects`. extsort 431 → 288 ms, csvstat 73 → 72 ms.
 
 ## CHG-0376: a decided program is lowered knowing it is decided (2026-10-26)
 

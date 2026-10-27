@@ -18,7 +18,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         let mut names = Vec::new();
         for (pty, t) in &argv {
             if self.is_res(pty) {
-                self.emit(&format!("cb_send({});", t.obj.as_ref().expect("resource argument has object")));
+                self.give_arg(t, "a closure's or `fn` value's argument")?;
             } else if self.has_refs(pty) && !matches!(pty, Type::Ref(..)) {
                 let tid = self.tid(pty)?;
                 self.emit(&format!("cb_send_datum(&{}, {}u);", t.c, tid));
@@ -164,9 +164,16 @@ impl<'g, 'a> Fx<'g, 'a> {
                 // The payload is the last thing evaluated before the
                 // variant is: an inert literal, or a `Box` of one, needs no
                 // object of its own (`objectless`).
-                self.objectless = self.inert_expr(pe)? || self.inert_box_new(pe)?;
+                self.objectless = self.inert_expr(pe)? || self.inert_box_new(pe)? || (self.g.decided && self.literal_expr(pe));
+                // D-0286: a call's result, a literal, or an objectless local
+                // moved, goes in with no object (nothing is evaluated after
+                // it before the variant absorbs it).
+                self.arm_inert(pe, true);
+                self.raw_return_path = self.g.decided && matches!(strip_parens(pe).kind, ExprKind::Path(..));
                 let v = self.lower_expr(pe, exp.as_ref());
                 self.objectless = false;
+                self.inert_result = None;
+                self.raw_return_path = false;
                 let v = v?;
                 if matches!(v.ty, Type::Never) {
                     return Ok(never());
@@ -310,8 +317,14 @@ impl<'g, 'a> Fx<'g, 'a> {
             // An inert field owns nothing: a fault in a later field leaves
             // nothing of it to destroy (`inert_expr`).
             self.objectless = self.inert_expr(fe)?;
+            // D-0286: a call's result, or an objectless local moved, goes in
+            // with no object.
+            self.arm_inert(fe, false);
+            self.raw_return_path = self.g.decided && exp.as_ref().map_or(false, |t| self.g.objectless_type(t)) && matches!(strip_parens(fe).kind, ExprKind::Path(..));
             let v = self.lower_expr(fe, exp.as_ref());
             self.objectless = false;
+            self.inert_result = None;
+            self.raw_return_path = false;
             let v = v?;
             if matches!(v.ty, Type::Never) {
                 return Ok(never());

@@ -168,16 +168,27 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.stmt_match = matches!(t.kind, ExprKind::Match(..));
                 // D-0200: a `__raw` form's last `match` (`raw_tail`), or a
                 // local named alone (`raw_return_path`).
-                if sink.is_none() && self.raw_ret {
+                // D-0286: in a decided program, a raw sink's block (a `__raw`
+                // form's last block, `unsafe { … }` say) ends the same way.
+                let raw_sink = self.g.decided && sink.map_or(false, |(_, _, ov)| ov.map_or(false, |o| self.raw_sinks.contains(o)));
+                if (sink.is_none() && self.raw_ret) || raw_sink {
                     match &strip_parens(t).kind {
                         ExprKind::Match(_, arms) => self.raw_tail = Some(arms.as_ptr() as usize),
+                        ExprKind::Block(ib) | ExprKind::Unsafe(ib) if self.g.decided => self.raw_tail = Some(ib as *const Block as usize),
                         ExprKind::Path(..) => self.raw_return_path = true,
                         _ => {}
+                    }
+                    // D-0286: a call's result returned with no object.
+                    self.arm_inert(t, true);
+                    if raw_sink {
+                        self.objectless = self.literal_expr(t);
                     }
                 }
                 let v = self.lower_expr(t, expected);
                 self.stmt_match = false;
                 self.raw_return_path = false;
+                self.inert_result = None;
+                self.objectless = false;
                 let v = v?;
                 if matches!(v.ty, Type::Never) {
                     self.end_diverged();
@@ -419,7 +430,9 @@ impl<'g, 'a> Fx<'g, 'a> {
             let r = self.g.fresh("b");
             let c = self.g.reg_ctype(&value_ty)?;
             self.emit(&format!("{} {};", c, r));
-            let ov = self.sink_obj_var(&value_ty);
+            // D-0286: raw as a `match`'s is, when the block is a `__raw`
+            // form's last expression (`raw_tail`).
+            let ov = self.match_sink_obj_var(&value_ty, b as *const Block as usize);
             (Some(r), ov)
         };
         self.emit("{");
@@ -433,6 +446,12 @@ impl<'g, 'a> Fx<'g, 'a> {
         }
         self.ind -= 1;
         self.emit("}");
+        // A raw sink's value has no object (`inert_c`).
+        if let (Some(s), Some(o)) = (&sink, &ov) {
+            if self.raw_sinks.contains(o) {
+                self.inert_c.insert(s.clone());
+            }
+        }
         Ok(match sink {
             Some(s) => V { c: s, ty: value_ty, obj: v.obj },
             None => v,
@@ -516,12 +535,16 @@ impl<'g, 'a> Fx<'g, 'a> {
                                     let fits = ret.map_or(false, |t| self.objectless_binding(id, declared.as_ref().unwrap_or(&t)));
                                     if targs.is_empty() && self.lookup(&k).is_none() && self.g.raw_ret_ok(&k) && fits {
                                         self.raw_call = Some(self.g.request_fn(&k, Vec::new())?);
+                                    } else if fits {
+                                        // D-0286: any call's, in a decided program.
+                                        self.arm_inert(e, true);
                                     }
                                 }
                             }
                         }
                         let v = self.lower_expr(e, declared.as_ref());
                         self.raw_call = None;
+                        self.inert_result = None;
                         let v = v?;
                         // A closure-typed binding the body borrows (`&g`,
                         // passed where `ref<fn(…) : R, m>` is expected) is

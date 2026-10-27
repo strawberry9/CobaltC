@@ -299,6 +299,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                     self.emit(&format!("void *{} = (void *)&({});", ad, p.c));
                     return Ok(V { c: format!("((cb_ref){{ {}, 0 }})", ad), ty: Type::Ref(Box::new(p.ty), mode.clone()), obj: None });
                 }
+                // D-0286: a field of an objectless local (a decided program's,
+                // `Gen::objectless_strings_with`): its address, token 0.
+                if p.base.is_none() && p.raw.is_none() && !matches!(p.ty, Type::Never) && self.objectless_root(inner) {
+                    return Ok(V { c: format!("((cb_ref){{ (void *)&({}), 0 }})", p.c), ty: Type::Ref(Box::new(p.ty), mode.clone()), obj: None });
+                }
                 let Some(base) = &p.base else { return internal(&format!("borrow of a temporary (at {})", match coby::prelude::std_location(e.line) { Some((f, l)) => format!("std/{}:{}", f, l), None => format!("line {}", e.line.saturating_sub(prelude::line_count())) })) };
                 // `&v[i]` / `&mut v[i]` on a `Vec`: the index call, in the
                 // borrow's own mode (`vec_index_call` chose it from
@@ -371,9 +376,12 @@ impl<'g, 'a> Fx<'g, 'a> {
                 let ret = self.ret.clone();
                 let v = match opt {
                     Some(x) => {
-                        self.raw_return_path = self.raw_ret && matches!(strip_parens(x).kind, ExprKind::Path(..));
+                        self.raw_return_path = (self.raw_ret || self.g.decided) && matches!(strip_parens(x).kind, ExprKind::Path(..));
+                        // D-0286: a call's result returned with no object.
+                        self.arm_inert(x, true);
                         let v = self.lower_expr(x, Some(&ret));
                         self.raw_return_path = false;
+                        self.inert_result = None;
                         v?
                     }
                     None => unit(),

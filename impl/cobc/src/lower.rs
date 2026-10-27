@@ -43,6 +43,7 @@ mod equality;
 mod exprs;
 mod frames;
 mod header;
+mod flights;
 mod fresh;
 mod functions;
 mod intrinsics;
@@ -439,6 +440,9 @@ struct Fx<'g, 'a> {
     raw_return_path: bool,
     raw_call: Option<String>,
     objectless_c: HashSet<String>,
+    // D-0286: by candidate, the fields the body reads by value
+    // (`Gen::objectless_strings_with`).
+    objectless_fields: HashMap<usize, HashSet<String>>,
     // D-0200: an objectless local that may be moved away: the C flag set
     // when it is (`read_place`), tested at each later use (the staleness a
     // moved binding's object would have reported) and at its drop.
@@ -563,6 +567,12 @@ struct Fx<'g, 'a> {
     // than copying it into yet another temporary and moving the object
     // there too: only the value's last address matters to the runtime.
     obj_temps: HashSet<String>,
+    // D-0286: the call whose resource result the consumer being lowered
+    // takes with no object (`arm_inert`, by its arguments' address, and
+    // whether nothing is evaluated after it), and the same for the
+    // `finish_call` about to run.
+    inert_result: Option<(usize, bool)>,
+    inert_now: Option<bool>,
     // D-0269: the objectless locals bound in this body so far, each an
     // entry of the C table `cb_nt` (`objectless_bound`), and the id of
     // the body's root frame, whose exits pop the table (`notes_finish`).

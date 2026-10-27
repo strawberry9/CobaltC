@@ -254,7 +254,26 @@ impl<'g, 'a> Fx<'g, 'a> {
                     let len = format!("((({} *)({}).p))->len", vc, r0.c);
                     self.lower_index_arg(len, a)?
                 }
-                _ => self.lower_expr(a, exp.as_ref())?,
+                _ => {
+                    // D-0286: a by-value resource argument of a decided
+                    // program goes over with no object where it can: an
+                    // inert literal built with none, a call's result taken
+                    // with none (`arm_inert`), an objectless local moved
+                    // with none (`read_place`).
+                    let by_value = self.g.decided && !matches!(p.ty, Type::Ref(..) | Type::Slice(..) | Type::Fn(..)) && exp.as_ref().map_or(true, |t| self.is_res(t));
+                    if by_value {
+                        self.objectless = self.inert_expr(a)?;
+                        self.arm_inert(a, false);
+                        self.raw_return_path = matches!(strip_parens(a).kind, ExprKind::Path(..));
+                    }
+                    let v = self.lower_expr(a, exp.as_ref());
+                    if by_value {
+                        self.objectless = false;
+                        self.inert_result = None;
+                        self.raw_return_path = false;
+                    }
+                    v?
+                }
             };
             if matches!(v.ty, Type::Never) {
                 return Ok(never());
@@ -343,8 +362,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         for (j, (p, t)) in f.params.iter().zip(argv.iter()).enumerate() {
             let pty = apply(&p.ty, &fsub);
             if self.is_res(&pty) {
-                let Some(o) = t.obj.as_ref() else { return internal(&format!("a resource argument without an object: `{}` argument {} (`{}`) line {}", name, j, t.c, line)) };
-                self.emit(&format!("cb_send({});", o));
+                self.give_arg(t, &format!("`{}` argument {} line {}", name, j, line))?;
             } else if matches!(pty, Type::Slice(..)) && self.g.pure_direct(name, j) {
             } else if self.g.pure_view(name, j) {
                 // Not sent (`Gen::pure_view`): a temporary view ends after
@@ -426,7 +444,14 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.datum_tok_out = Some(tk);
             V { c: t, ty: ret, obj: None }
         } else {
-            self.finish_call(call, ret, line)?
+            // D-0286: the consumer took this call's result inert (`arm_inert`).
+            if let Some((_, last)) = self.inert_result.filter(|(a, _)| *a == args.as_ptr() as usize) {
+                self.inert_result = None;
+                self.inert_now = Some(last);
+            }
+            let v = self.finish_call(call, ret, line);
+            self.inert_now = None;
+            v?
         };
         // A slice reborrowed for a shared parameter (D-0049), or a
         // temporary view for a pure view parameter, served only the call:

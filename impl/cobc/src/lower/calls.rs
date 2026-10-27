@@ -551,7 +551,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                     ended.push(o.clone());
                 }
             } else if self.is_res(&p.ty) {
-                self.emit(&format!("cb_send({});", v.obj.as_ref().expect("resource argument has object")));
+                self.give_arg(v, &format!("`{}` argument {}", name, j))?;
             } else if self.has_refs(&p.ty) && !matches!(p.ty, Type::Ref(..)) {
                 let tid = self.tid(&p.ty)?;
                 self.emit(&format!("cb_send_datum(&{}, {}u);", v.c, tid));
@@ -675,8 +675,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             return Ok(Some(V { c: t, ty: st, obj: None }));
         }
         self.emit(&format!("{} {} = {}({}, {}, {});", sc, t, helper, s.c, lo.c, hi.c));
-        let o = self.g.fresh("o");
-        self.emit(&format!("uint64_t {} = cb_recv(&{});", o, t));
+        let o = self.take_result(&t, &st, line)?;
         Ok(Some(V { c: t, ty: st, obj: Some(o) }))
     }
 }

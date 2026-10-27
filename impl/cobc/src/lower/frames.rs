@@ -473,7 +473,19 @@ impl<'g, 'a> Fx<'g, 'a> {
         // Indexed (`id | 2`) only as a `Vec` of plain data, whose element
         // accesses are only bounds-checked.
         let plain_vec = matches!(ty, Type::Named(n, a) if n == "std::Vec" && a.len() == 1 && self.g.plain_data(&a[0]) && !self.has_refs(&a[0]) && !self.holds_fn(&a[0]));
+        // D-0286: a field read by value is plain data (no field is moved out).
+        let fields_plain = self.objectless_fields.get(&id).map_or(true, |fs| match ty {
+            Type::Named(n, a) => match self.g.struct_decl(n) {
+                Some(sd) => {
+                    let sub = subst_of(&sd.type_params, a);
+                    fs.iter().all(|f| sd.fields.iter().any(|fd| &fd.name == f && { let t = apply(&fd.ty, &sub); self.g.plain_data(&t) && !self.has_refs(&t) && !self.holds_fn(&t) }))
+                }
+                None => false,
+            },
+            _ => false,
+        });
         self.objectless_names.contains(&id)
+            && fields_plain
             && (!self.objectless_names.contains(&(id | 2)) || plain_vec)
             && (is_string || (self.g.objectless_type(ty) && !self.objectless_names.contains(&(id | 1))))
     }
@@ -896,6 +908,20 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", o, l, tid, NOLOC));
             self.emit(&format!("cb_store_ref(&{}, {}.tok);", l, pc));
             l
+        } else if self.is_res(&ty) && self.g.decided {
+            // D-0286: it arrives with no object. Objectless where the
+            // analysis allows (a candidate by its declaration's address);
+            // otherwise it takes one here.
+            let id = p as *const Param as usize;
+            if self.objectless_binding(id, &ty) {
+                let saved = self.cur_let.replace(id);
+                self.objectless_bound(&pc, tid);
+                self.cur_let = saved;
+                self.scopes.last_mut().unwrap().insert(p.name.clone(), Binding { c: pc, ty, root: String::new(), kind: BindKind::Local });
+                return Ok(());
+            }
+            self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", o, pc, tid, NOLOC));
+            pc
         } else if self.is_res(&ty) {
             self.emit(&format!("uint64_t {} = cb_recv(&{});", o, pc));
             pc
@@ -929,12 +955,14 @@ impl<'g, 'a> Fx<'g, 'a> {
         } else {
             let t = self.into_temp(v, 0)?;
             if self.is_res(&ret) {
+                // D-0286: so does every result in a decided program.
+                let raw = self.raw_ret || self.g.decided;
                 match t.obj.clone() {
                     // D-0200: a `__raw` form's result leaves with no object:
                     // the caller binds it objectless.
-                    Some(o) if self.raw_ret => self.emit(&format!("cb_forget_obj({});", o)),
+                    Some(o) if raw => self.emit(&format!("cb_forget_obj({});", o)),
                     Some(o) => self.emit(&format!("cb_send({});", o)),
-                    None if self.raw_ret => {}
+                    None if raw => {}
                     None => return internal("a resource result without an object"),
                 }
             } else if matches!(ret, Type::Ref(..)) {

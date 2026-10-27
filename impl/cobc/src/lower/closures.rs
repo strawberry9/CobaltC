@@ -141,6 +141,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 confined_fields: HashSet::new(),
                 read_confined: HashSet::new(),
                 objectless_names: HashSet::new(),
+                objectless_fields: HashMap::new(),
                 cur_let: None,
                 raw_ret: false, raw_tail: None, raw_sinks: HashSet::new(), raw_substring: None, raw_return_path: false,
                 raw_call: None,
@@ -188,7 +189,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                 branch_scope: false,
                 objectless: false,
                 inert_c: HashSet::new(),
-                obj_temps: HashSet::new(), notes: 0, root_frame: 0,
+                obj_temps: HashSet::new(), inert_result: None, inert_now: None, notes: 0, root_frame: 0,
             };
             fx.push_frame();
             fx.root_frame = fx.g.nscope;

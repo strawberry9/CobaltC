@@ -206,8 +206,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         self.at(line);
         self.emit(&format!("{} {} = {}_raw({}, {});", rc, t, cname, cv.c, vv.c));
         if self.is_res(&rt) {
-            let o = self.g.fresh("o");
-            self.emit(&format!("uint64_t {} = cb_recv(&{});", o, t));
+            let o = self.take_result(&t, &rt, line)?;
             return Ok(Some(V { c: t, ty: rt, obj: Some(o) }));
         }
         Ok(Some(V { c: t, ty: rt, obj: None }))
@@ -567,10 +566,13 @@ impl<'g, 'a> Fx<'g, 'a> {
             return Ok(V { c: t, ty: ret, obj: None });
         }
         self.emit(&format!("{} {} = {};", c, t, call));
+        // D-0286: asked for inert (`arm_inert`): no object.
+        if self.inert_now.take().map_or(false, |last| last || self.g.objectless_type(&ret)) && self.is_res(&ret) && !self.has_refs(&ret) {
+            self.inert_c.insert(t.clone());
+            return Ok(V { c: t, ty: ret, obj: None });
+        }
         let obj = if self.is_res(&ret) {
-            let o = self.g.fresh("o");
-            self.emit(&format!("uint64_t {} = cb_recv(&{});", o, t));
-            Some(o)
+            Some(self.take_result(&t, &ret, line)?)
         } else if self.has_refs(&ret) {
             let tid = self.tid(&ret)?;
             self.emit(&format!("cb_recv_datum(&{}, {}u);", t, tid));
