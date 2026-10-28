@@ -235,6 +235,9 @@ struct Cx<'a> {
     caps: BTreeSet<String>,
     // A binding holding a closure literal: (move, writes-self).
     clo_info: HashMap<String, (bool, bool)>,
+    // D-0289, CHG-0384: a spawn pushed onto a `Vec` of handles adds its
+    // facts to the `Vec`'s (`Vec::push(&mut hs, spawn(…))`).
+    accumulate: bool,
     // A binding holding a `move` closure literal that captured a resource:
     // resource-typed by derivation (`rule.type.is-resource`).
     clo_owns: BTreeSet<String>,
@@ -665,9 +668,32 @@ impl<'a> Cx<'a> {
                 let elided = holder.is_some()
                     && matches!(self.prog.func(f).map(|x| &x.ret), Some(Ty::Ref(..)))
                     && args.first().map_or(false, |a| matches!(a, Expr::Borrow(..)));
+                // D-0289, CHG-0384: `Vec::push(&mut hs, spawn(…))` into a `Vec`
+                // of handles of this frame binds the spawn: `hs` holds its
+                // facts besides what it held.
+                let pool = match (f.as_str(), args.first(), args.get(1)) {
+                    ("Vec::push", Some(Expr::Borrow(Mode::Excl, v)), Some(Expr::Spawn(..) | Expr::SpawnClo(_))) => match &**v {
+                        Expr::Var(hs) if matches!(self.ty_of(hs), Some(Ty::VecH)) => Some(hs.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // And a handle binding holding facts pushed there gives them
+                // to the `Vec` as it moves in.
+                let pushed: Option<(String, Vec<(SPlace, Mode, Tri)>)> = match (f.as_str(), args.first(), args.get(1)) {
+                    ("Vec::push", Some(Expr::Borrow(Mode::Excl, v)), Some(Expr::Var(t))) if matches!(self.ty_of(t), Some(Ty::Handle(_))) => match &**v {
+                        Expr::Var(hs) if matches!(self.ty_of(hs), Some(Ty::VecH)) => Some((hs.clone(), fl.holder_facts(t))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 for (i, a) in args.iter().enumerate() {
                     if i == 0 && elided {
                         self.rvalue_into(fl, a, line, holder);
+                    } else if let (1, Some(hs)) = (i, &pool) {
+                        let saved = std::mem::replace(&mut self.accumulate, true);
+                        self.rvalue_into(fl, a, line, Some(hs));
+                        self.accumulate = saved;
                     } else {
                         self.rvalue(fl, a, line);
                     }
@@ -680,6 +706,11 @@ impl<'a> Cx<'a> {
                     }
                 }
                 self.call_site(fl, e, f, args, line, holder);
+                if let Some((hs, facts)) = pushed {
+                    for (sp, m, v) in facts {
+                        fl.deriv.insert((hs.clone(), sp, m), v);
+                    }
+                }
             }
             Expr::Spawn(f, args) => {
                 let Some(func) = self.prog.func(f) else {
@@ -700,7 +731,11 @@ impl<'a> Cx<'a> {
                             self.check_borrow_mode(*m, p, line);
                             self.place(fl, p, Use::Borrow(*m), line);
                             if let Some(sp) = self.deriv_place(p) {
-                                fl.escaped.insert(sp.root.clone(), Tri::T);
+                                // D-0289: a handle bound whole holds the
+                                // lend; only an unbound one escapes it.
+                                if holder.is_none() {
+                                    fl.escaped.insert(sp.root.clone(), Tri::T);
+                                }
                                 facts.push((sp, *m));
                             }
                         }
@@ -733,7 +768,9 @@ impl<'a> Cx<'a> {
                     }
                 }
                 if let Some(h) = holder {
-                    fl.forget_holder(h);
+                    if !self.accumulate {
+                        fl.forget_holder(h);
+                    }
                     for (sp, m) in facts {
                         fl.deriv.insert((h.to_string(), sp, m), Tri::T);
                     }
@@ -822,14 +859,25 @@ impl<'a> Cx<'a> {
                     Expr::Var(n) if matches!(self.clo_info.get(n), Some((false, _))) => self.err(line, "diag.spawn-borrow-closure", "a closure passed to spawn must be a move closure".into()),
                     _ => {}
                 }
-                self.rvalue(fl, a, line);
+                // D-0289: the handle holds what the closure row gives the
+                // closure it runs: a literal's facts, a binding's copied.
+                let copied = match (&**a, holder) {
+                    (Expr::Var(n), Some(_)) => fl.deriv_facts(n),
+                    _ => Vec::new(),
+                };
+                match (&**a, holder) {
+                    (Expr::Closure(c), Some(h)) => self.closure_lit(fl, c, line, Some(h)),
+                    _ => self.rvalue(fl, a, line),
+                }
                 // A closure that owns a resource moves into the thread.
                 self.consume_resource(fl, &Ty::Unit, a, line);
-                // The spawn row forms deriv(h, ·, ·) from the arguments only;
-                // a closure's captures are lent, but the row does not name
-                // them.
-                if let Some(h) = holder {
-                    fl.forget_holder(h);
+                if let (Some(h), false) = (holder, matches!(&**a, Expr::Closure(_))) {
+                    if !self.accumulate {
+                        fl.forget_holder(h);
+                    }
+                    for (p, m, v) in copied {
+                        fl.deriv.insert((h.to_string(), p, m), v);
+                    }
                 }
             }
         }
@@ -883,7 +931,9 @@ impl<'a> Cx<'a> {
         }
         match holder {
             Some(h) => {
-                fl.forget_holder(h);
+                if !self.accumulate {
+                    fl.forget_holder(h);
+                }
                 for (p, m) in facts {
                     fl.deriv.insert((h.to_string(), p, m), Tri::T);
                 }
@@ -1206,6 +1256,15 @@ impl<'a> Cx<'a> {
                     if let Expr::Var(o) = scrut {
                         let root = self.copy_root(o);
                         self.copies.insert(binder.clone(), root);
+                    }
+                }
+                // D-0289, CHG-0384: a handle taken out of a `Vec` of them holds
+                // what the `Vec` holds.
+                if let (Ty::Handle(_), Expr::Call(f, args)) = (&bt, scrut) {
+                    if let (true, Some(Expr::Borrow(_, v))) = (f == "Vec::pop", args.first()) {
+                        if let Expr::Var(hs) = &**v {
+                            inh = fl.holder_facts(hs);
+                        }
                     }
                 }
                 let id = self.pos.decl.get(&(s as *const Stmt)).copied().unwrap_or(usize::MAX);
@@ -1622,6 +1681,7 @@ impl<'a> Cx<'a> {
             ret,
             caps: BTreeSet::new(),
             clo_info: HashMap::new(),
+            accumulate: false,
             clo_owns: BTreeSet::new(),
             sub_types: HashMap::new(),
             loops: Vec::new(),
@@ -1931,7 +1991,11 @@ impl<'a> Cx<'a> {
             .filter(|(n, b)| self.is_holder(fl, n, &b.ty) && !skip.contains(*n) && !self.caps.contains(*n))
             .map(|(n, b)| (n.clone(), b.id))
             .collect();
-        let mut live: BTreeSet<String> = held.iter().filter(|(_, id)| self.pos.live_after(*id, p)).map(|(n, _)| n.clone()).collect();
+        // A handle or a `Vec` of handles is not ended at its last mention:
+        // its end waits for its threads (CHG-0384), so it holds its facts to
+        // its scope's end.
+        let waits = |n: &str| matches!(self.ty_of(n), Some(Ty::Handle(_)) | Some(Ty::VecH));
+        let mut live: BTreeSet<String> = held.iter().filter(|(n, id)| self.pos.live_after(*id, p) || waits(n)).map(|(n, _)| n.clone()).collect();
         loop {
             let more: Vec<String> = held
                 .iter()

@@ -54,13 +54,22 @@ one of them before it runs, is <em>decided</em>, and `cobc` builds it with no tr
 record of references, nothing retired at the end of a statement (D-0284). The outcome is the one
 the tracked build gives. A program stops being decided as soon as one function leaves a conflict to
 the run: a reference whose origin the compiler cannot follow, an overlap that depends on values, a
-type that keeps references in data, a closure that captures by reference, a `spawn`. `cobc -v`
+type that keeps references in data (a `Vec` of views, a struct holding a reference), a thread
+whose handle leaves the frame that lent it something. `cobc -v`
 says which: "lowered pathless", or "kept paths" with the file and line of the first such conflict.
 A decided program is also lowered a second time knowing it (D-0285): a view, or any value that only
 holds references, is then plain data with no runtime record at all, and `-v` says "lowered pathless
 and decided". There a value passed to a function or returned from one goes as its bytes, with no
 runtime record of its own (D-0286), and a parameter or result the function only reads, borrows or
 hands on is bound with none either.""")
+b += p("""Threads are decided too when what they are lent is held by a handle a binding of the lending frame
+keeps until `join` (D-0289): no thread outlives the frame that holds its handle, so the compiler
+checks the lender's accesses against the lend as it would any borrow, and a lock takes no record
+either. A worker pool is decided too: a local `Vec` of handles holds what every thread pushed onto
+it was lent (`Vec::push(&mut hs, spawn(work, &shared))`), and a handle taken out of it by `foreach`
+or `Vec::pop` holds it as well, until it is joined (CHG-0384). A handle passed around while it lends,
+a `Vec` of handles given to another function, or a thread that runs a `fn` value, leaves the program
+to the run.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
 the run, then lists the lines whose generated C still calls the runtime's tracking, with the

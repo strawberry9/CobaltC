@@ -8403,6 +8403,21 @@ pub extern "C" fn cb_lock(tok: u64, m: *mut u8, file: u32, line: u32) -> u64 {
     mint_locked(r, of, gproj, true, false, anc, Some(proj))
 }
 
+// D-0289: `[Lock]` in a program lowered pathless (`CB_PATHLESS`): no
+// lock path, since no reference has one; the guard holds the mutex's
+// address, which is all its drop needs. The reentrancy fault and the
+// wait as `cb_lock`'s.
+#[no_mangle]
+pub extern "C" fn cb_lock_pathless(m: *mut u8, file: u32, line: u32) -> u64 {
+    let key = m as usize;
+    let me = me();
+    if book().locks.get(&key) == Some(&me) {
+        fault("diag.mutex-reentrant-lock", file, line);
+    }
+    claim_mutex(key, me, file, line);
+    0
+}
+
 // The mutex at `key` claimed by `me`, in the same hold of the book that
 // finds it free. D-0204: a poisoned mutex (`[Lock-Poisoned]`) is not
 // claimed; locking it faults.

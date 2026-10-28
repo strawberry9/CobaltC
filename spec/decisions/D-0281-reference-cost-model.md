@@ -291,9 +291,11 @@ oracle rather than a diagnostic.
 table kept for conflicts among tier-D holders only; then measure how much tier D real programs keep and decide the
 granularity question on that evidence.
 
-**Phase 4, decide O5 on evidence.** If after a few months of writing programs under phase 1 the `tracked`
-declarations in real code are rare and the lazy iterators cover the idioms, remove the door in an edition and
-delete the dynamic model from the compilers. If they are common, tier D has earned its place and stays priced.
+**Phase 4, decide O5 on evidence.** If the `tracked` declarations in real code are rare and the lazy iterators
+cover the idioms, remove the door in an edition and delete the dynamic model from the compilers. If they are
+common, tier D has earned its place and stays priced. (Amended 2026-10-28, by the owner: the evidence is the
+corpus, rewrite experiments and phase 3's measurements, gathered now, not months of use: nobody writes CobaltC
+yet. §23.)
 
 **Sequencing with D-0278.** Phases 1 to 3 change both compilers and the runtime. That is the strongest argument
 yet for deciding D-0278 (one toolchain) first: every phase is half the work with one compiler. The P4 plan's §5
@@ -724,3 +726,49 @@ statement scopes and frames are now the largest cost in csvstat and extsort); cl
 borrows by the static pass; point checks as address compares (calls and elements) instead of keeping the record;
 `?` facts as local flags; `r = pass(r)` carrying facts; scoped lending for spawn + join (wordpar); then phase 1's
 leftovers (lazy `split`/`lines`, the `tracked` keyword, cost rows), per-function lowering, phase 3.
+
+## 23. Phase 2 closed, and the plan to completion (2026-10-28)
+
+**What landed after §22.** D-0285 (Update 140, a decided program lowered knowing it is decided); D-0286 (Update
+141, values pass between functions with no object); D-0287 (Update 142, lazy text splitters); D-0288 (Update 143,
+closures hold what their captures reach); CHG-0382, D-0289 and CHG-0384 (Update 144: evaluation order counts only
+what can move; scoped lending, a program that spawns threads may be decided, worker pools whose handles a local
+`Vec` holds among them). Over the 11,022 programs of `stress/d0281/why/`, 9,810 are decided (Update 139: 7,931;
+Update 143: 9,067).
+
+**What still keeps programs tracked** (first reasons, of 517 kept):
+
+| reason | programs | where it goes |
+|---|---|---|
+| a type that keeps references in data, or a value read out of one (`Vec<StringView>`, `Option` of a view read out of a field, a struct with a reference field) | ≈ 205 | phase 1's `tracked` and frame-only aggregates (below) |
+| a thread lent references whose handle the frame does not hold | ≈ 160 | almost all model-enumerated programs that store a handle in a struct or pass it on; the run's by design |
+| a lent reference no fact describes, a thread running a `fn` value, a `fn` value reached through a shared reference | ≈ 50 | the run's by design (D-0289 rules 3, 5; D-0218) |
+| a reference to a reclaimed object | 25 | the run's by design: `reclaim` is a trust boundary (spec/20), and a program's own `unsafe` code is where a check pays |
+| a later argument acting on an earlier reference argument | 21 | all but none in generated fuzz programs |
+| a call checked when it is made (D-0283), a value-dependent overlap | ≤ 1 | point checks as address compares and `?` facts as local flags (§22 "next") are not worth their complexity on this evidence: no program in the corpus stays tracked for them first. Kept as possible later work, not part of D-0281's completion |
+
+**The order to completion**, in grouped Updates (each with one release-suite run):
+
+1. **Phase 1 closed, with per-function lowering.** The `tracked` keyword and the §15 boundary; frame-only
+   aggregates (an aggregate holding a reference that only a frame holds — a local `Vec<StringView>`, an
+   `Option<StringView>`, a parser holding a view — is a holder with facts, as a view binding is); the cost cases in
+   `spec/conformance.md`; the §14 contract table in `spec/14` §6, with the phase 3 study's corrections (below);
+   per-function lowering: a non-decided program's tier-S functions lowered pathless.
+2. **Phase 3 and phase 4.** The tier-D runtime of the study in `stress/d0281/phase3/DESIGN.md`: a reference the
+   static pass gives facts to is checked once, when formed, against its owner's holders, and recorded nowhere;
+   only holders (references without facts) keep a path record, and an owner's holder list is the §15 mark. The O5
+   decision, made on the corpus and on experiments, not on months of use (§6 as amended): the phase 4 study
+   (`stress/d0281/phase4/EVIDENCE.md`) found tier D in 3.6% of hand-written programs (38 of 1,069 accepted),
+   needing `tracked` on 0 of 96 showcase aggregates, 2 of 272 in `cbc` and 4 of 145 in `std`; every one of 14
+   tier-D programs it tried was rewritten without stored references, five of them markedly harder to read. Its
+   recommendation, O5 as *frame-only aggregates* rather than no references in aggregates, is item 1's design; the
+   decision on removing the rest of tier D follows phase 3's measurements.
+3. **The self-hosted compiler ported once**, after phase 3 (amending D-0278's porting at every phase boundary:
+   each intermediate port would be redone), with `cbc --emit-c -o`; then `cbc`'s cost measured.
+
+**Corrections the phase 3 study found in this record.** §12's claim that a `Vec`'s reallocation faults while an
+element reference is live is wrong: `impl/conformance/16-aggregates/vec_element_ref_held_in_struct_stale.cb` admits the push
+and faults at the later read. §13 row 2 is met by invalidation at release and a check at use, not by a count that
+forbids the push. Two lines of §14 cannot be met literally: a stored reference is 8 bytes (`[Repr-Ref]`), so moving
+a tracked aggregate cannot be free of metadata; and raw-pointer code with no base keeps a per-heap page lookup.
+Both are marked provisional when the table moves into `spec/14`.

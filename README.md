@@ -16,7 +16,7 @@ CobaltC is already well formed, but currently still in experimental stage.
 
 This project began on 19 September 2026, based on the instructions provided (to the AI) by the project owner (me), as set out in [CobaltC_Master_Instructions.md](CobaltC_Master_Instructions.md).
 
-Commit Update 143, 2026-10-27 22:21 UTC. Specification edition 2026.102703. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
+Commit Update 144, 2026-10-28 10:18 UTC. Specification edition 2026.102801. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
 The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 
@@ -71,12 +71,12 @@ This writes `coby`, `cobc`, `cobfmt`, and the runtime library `libcbrt.a` to `im
 | Command (in `impl/`) | `coby` | `cobc` | `cobfmt` | `libcbrt.a` |
 |---|---|---|---|---|
 | `cargo build --workspace` | built | built | built | built |
-| `cargo build` | built | — | — | — |
+| `cargo build` | built | built | built | built |
 | `cargo build -p cobc` | — | built | — | — |
 | `cargo build -p cobfmt` | — | — | built | — |
 | `cargo test --workspace` | built | built | built | **not written** |
 
-- `cargo build` with no flags builds only `coby`, because `impl/Cargo.toml` is the interpreter's own package as well as the workspace root.
+- `cargo build` with no flags builds the whole workspace, as `--workspace` does (`impl/Cargo.toml` lists every package in `default-members`). The same holds for `cargo test` with no flags, which runs every package's tests.
 - `cargo build -p cobc` builds a compiler that cannot link anything. It fails with `libcbrt.a not found in …`, or quietly uses an old `libcbrt.a` left by an earlier build. To build only the compiler, use `cargo build -p cbrt -p cobc`.
 - Old binaries left in `target/` are never flagged as out of date: an old `coby`, `cobc`, or `libcbrt.a` still runs. After pulling changes, rebuild with `--workspace` (in each profile you use) before running anything from `target/`.
 

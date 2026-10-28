@@ -1,6 +1,6 @@
 # Preface
 
-This book teaches CobaltC to someone who has not written it before. It
+This book teaches [CobaltC](https://github.com/strawberry9/CobaltC) to someone who has not written it before. It
 assumes you have programmed in some language, so that a loop, a function and a
 type are familiar ideas, and it assumes nothing else. If you know C, many
 things will look familiar and a few will surprise you; if you know Rust, the

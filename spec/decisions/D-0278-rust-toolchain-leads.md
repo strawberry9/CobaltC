@@ -106,6 +106,12 @@ seed and the place of `cbparse` are decided again after D-0281's phase 3, with a
 earlier recommendation (option 1 now) assumed the language was not entering a period of many front-end changes;
 the draft named that as what would change it, and D-0281 is that period.
 
+**Amendment (2026-10-28, under D-0281's delegation).** The CobaltC toolchain is ported forward once, after D-0281's
+phase 3, not at each phase boundary. Phases 1 to 3 are now grouped into three Updates whose changes overlap (the
+static pass's frame rules, the decided lowering, then a new tier-D runtime): a port at each boundary would port
+code the next phase rewrites. The single port includes `cbc --emit-c -o` (as `cobc` has it) and the closure and
+spawn rules; until then `cbc` keeps paths for every closure and spawn (D-0288, D-0289). D-0281 §23.
+
 ## Recommendation (as drafted, 2026-10-24, superseded by the decision)
 
 Option 1 now, and option 2 as a later decision once its preconditions hold: P4 has brought `cbc` within

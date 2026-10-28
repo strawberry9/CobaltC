@@ -8310,3 +8310,73 @@ crossing to C by value.
   above (re-gated: not decided). Gate `stress/d0281/objectless/dgate.sh` over Update 141's sample: 1,474 the
   same; 17 different, all timing; 9 not decided (2 newly, for D-0218's `&f`).
 - Release suites `stress/suites/runs/u143c`: passed, the model sample with no outcome outside the model's set.
+
+## A plain `cargo build` builds the whole toolchain (2026-10-27)
+
+- `impl/Cargo.toml` lists every package in `default-members`, so `cargo build` and `cargo test` with no flags
+  cover `coby`, `cobc`, `cbrt` (writing `libcbrt.a`), `cobfmt` and `cobmodel`, as `--workspace` does. Before,
+  they built only `coby`, the package the root manifest also is. The README's build table says so.
+
+## CHG-0382: evaluation order counts only what can move what an earlier argument reaches (2026-10-27)
+
+- `tier_call_rule` (`typecheck.rs`): a call was left to the run when a later argument shared a root with an
+  earlier argument's facts. Now only an argument that is or may hold a reference counts as formed early
+  (`arg_may_be_reference`); a later argument that is a borrow counts only for what its operand evaluates first;
+  and an exclusive borrow counts only where its path overlaps (`overlap3`). `std::Vec::swap`,
+  `std::Queue::pop_front` and the crypto helpers that pass one array twice no longer keep a program's record of
+  references.
+- Over 11,022 programs (`stress/d0281/why/`: the static comparison's corpus, `showcase/`, `cbc`, `cobfmt-cb`,
+  `cbparse`), 116 more are decided (9,067 → 9,179); 57 stop at a later reason; no rejection changes. The pathless
+  gate over the 116: 113 the same, 3 `coby` timeouts on timing programs (`stress/vec_g1/ops.cb` the same with a
+  longer limit).
+
+## CHG-0383: scoped lending, a program that spawns threads may be decided (D-0289, 2026-10-28)
+
+- Static pass (`typecheck.rs`): a `handle<T>` or `guard<T>` a frame holds is frame-held (`keeps_refs_in_data`,
+  `tier_d_type`); a handle in data keeps only what its result does. A bound spawn's handle holds its closure's
+  facts (`spawn_facts_tri_of`). Left to the run (`tier_spawn_rule`, `flow_consume`, `handle_lend_through`): a
+  lending spawn whose handle no binding holds, a handle or guard with facts moved anywhere but `join`, `try_join`
+  or `drop`, a thread running a `fn` value, a spawned closure capturing a guard, a lent argument no fact
+  describes, and a reference binding reassigned while a handle holds a lend through it.
+- `cobc`: no blocker for spawns; the trampoline marks a thread lent an exclusive reference (`cb_thread_lent`
+  under `CB_PATHLESS`); in a decided program a thread's resource argument and result pass as a call's do.
+- `cbrt`: `cb_lock_pathless`; under `CB_PATHLESS`, `cb_lock` takes no lock path and `cb_call_self` borrows nothing.
+  The latter was a defect since Update 143: a decided program calling a `fn` value in a loop grew its closure box's
+  paths without bound (`stress/perf_oct9/wordpar.cb` decided: 59 s; now 0.25 s, its tracked build 6.6 s).
+- `cobmodel`: the spawn row of spec/14 1.37.0 (a bound spawn escapes nothing; the handle holds the closure's facts).
+- Found on the way: the model sample's five threaded programs that the first cut lowered pathless with a conflict
+  unseen (a lend through a reassigned `r`, a slice binding lent whole); both are left to the run.
+- `stress/d0281/why/` over 11,022 programs: 9,769 decided (Update 143: 9,067); the one rejection that moves,
+  `stress/verify/vsweep/model_enum/p002049.cb`, is refuted at the conflicting spawn (line 17) instead of a later
+  read. Pathless gate over the 703 newly decided: the same but for `coby` timeouts on timing programs, three
+  `align` programs `coby` cannot run, and three whose outcome varies by schedule (their model headers allow
+  each). `cobmodel compare` over the 311 of them with model headers, eight schedules each: none outside.
+- `conf.spawned-closure-capture-blocks-owner-write` (static); `impl/cobc/tests/driver.rs`
+  `threads_lent_by_held_handles_leave_a_program_decided`.
+
+## CHG-0384: worker pools are decided; scoped lending repairs (D-0289, 2026-10-28)
+
+- Found by the first release suites of this Update (`stress/suites/runs/u144`, stopped): `conf.guard-moved-to-thread`
+  was decided and lowered pathless, so the thread's access through the guard it was given as an argument, which
+  faults (D-0240), went unchecked. `tier_spawn_rule` leaves to the run a thread given a guard as an argument, as one
+  whose closure captured one.
+- Worker pools: `Vec::push(&mut hs, spawn(…))` binds the spawn; `hs` holds every pushed spawn's facts, and a handle
+  taken out of it (a consuming `foreach`, a bound `Vec::pop`/`remove`/`swap_remove`, a pattern's binder) holds them
+  too. Moving `hs` or borrowing it exclusively for anything else is the run's.
+- A hole of CHG-0383 closed: an access that facts of value U may meet counted a holder only while it was mentioned
+  later; a handle, a guard or a `Vec` of handles holds its facts to its scope's end (`holder_live_after`). A handle
+  dropped on one branch only left a program decided whose thread could read what was then written.
+- `r = pass(r)`: a value made from `r` itself (`name = StringView::sub(name, 0, k)`) inherits what `r` held before
+  the assignment (`prev_facts`), not an unknown origin. `Option::unwrap_or` and `Result::unwrap_or` hold what
+  either argument holds; an `if` or `match` whose every branch is static data gives static data.
+- `coby`: a generic call given as a generic call's argument takes the type arguments the outer call's expected type
+  fixes (`Arc::new(Channel::new(4))` sized its slots for a default and faulted `diag.destroy-while-aliased` at the
+  `Arc`'s end). Found by the D-0281 phase 4 study.
+- `cobmodel`: `Vec::push` of a spawn onto a `Vec` of handles adds to its facts; a handle popped out of it holds
+  them; a handle or a `Vec` of handles is live to its scope's end. Four model-enumerated programs and `hand-e01.cb` of the
+  model sample, which the model and `coby` now both refute before the run (a write to what a handle in a `Vec` was
+  lent), have their headers updated. Static verdicts of model and `coby` over all 3,662 model-headed programs agree.
+- `conf.pool-vec-lend-blocks-owner-write` (static), `conf.generic-call-argument-takes-outer-expected-type`;
+  `impl/cobc/tests/driver.rs` `worker_pools_in_a_vec_leave_a_program_decided`. `conf.handle-moved-into-vec-then-referent-written`
+  is static: the handle moved into the `Vec` hands it its fact (release suites `u144b` ran it as dynamic and failed).
+- Release suites `stress/suites/runs/u144c`: passed.

@@ -64,8 +64,19 @@ impl<'g, 'a> Fx<'g, 'a> {
             }
             _ => return internal("spawn of a non-callable"),
         };
+        // D-0289: whether the thread is lent an exclusive reference, as
+        // `cb_thread_start` finds from the paths it holds; a pathless
+        // program has none, so the trampoline says so itself (spec/18
+        // `contained`). A thread that runs a `fn` value is never pathless
+        // (the static pass leaves it to the run).
+        let excl = |t: &Type| matches!(t, Type::Ref(_, Mode::Exclusive) | Type::Slice(_, Mode::Exclusive));
+        let mut lent_excl = match &fv.ty {
+            Type::Closure(id) => self.g.closures[id].fields.iter().any(|(_, t)| excl(t)),
+            _ => false,
+        };
         let fv = if matches!(fv.ty, Type::Closure(_)) { self.box_closure(fv, fty.clone(), line)? } else { fv };
         let Type::Fn(ps, ret) = fty.clone() else { unreachable!() };
+        lent_excl |= ps.iter().any(|p| excl(p));
         let ret = *ret;
         let h = self.g.fresh("h");
         self.emit(&format!("void *{} = {};", h, fv.c));
@@ -118,7 +129,10 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.emit(&format!("cb_move_to({}, &{}->a{});", o, e, i));
                 self.emit(&format!("cb_hold({});", o));
                 self.emit(&format!("{}->o{} = {};", e, i, o));
-                writeln!(body, "    cb_send(e->o{});", i).unwrap();
+                // D-0286: in a decided program the thread takes the value
+                // alone, as a callee does (`give_arg`).
+                let give = if self.g.decided { "cb_forget_obj" } else { "cb_send" };
+                writeln!(body, "    {}(e->o{});", give, i).unwrap();
             } else if self.has_refs(pty) {
                 let tid = self.tid(pty)?;
                 self.emit(&format!("cb_copy_datum(&{}->a{}, &({}), {}u);", e, i, t.c, tid));
@@ -156,7 +170,11 @@ impl<'g, 'a> Fx<'g, 'a> {
         } else {
             writeln!(body, "    e->res = {};", call).unwrap();
             writeln!(body, "    cb_env_forget(e, sizeof(*e));").unwrap();
-            if self.is_res(&ret) {
+            if self.is_res(&ret) && self.g.decided {
+                // D-0286: the result returns as its bytes (`take_result`).
+                writeln!(body, "    uint64_t o = cb_new(&e->res, {}u, {});", rtid, self.loc(line)).unwrap();
+                "o".to_string()
+            } else if self.is_res(&ret) {
                 writeln!(body, "    uint64_t o = cb_recv(&e->res);").unwrap();
                 "o".to_string()
             } else {
@@ -182,10 +200,11 @@ impl<'g, 'a> Fx<'g, 'a> {
             // the call was only 16-aligned (found on Windows, D-0255).
             writeln!(
                 self.g.thunks_out,
-                "static __attribute__((noinline)) void {t}_run(struct {e} *e)\n{{\n{b}}}\nvoid {t}(void *p)\n{{\n    struct {e} *e = p;\n    jmp_buf jb;\n    if (setjmp(jb) == 0)\n    {{\n    cb_thread_jmp((void *)jb);\n    cb_thread_start((void *)e, sizeof(*e), (void *)e->h);\n    {t}_run(e);\n    }}\n    else\n    {{\n    cb_env_forget(e, sizeof(*e));\n    cb_drop_fn(e->h);\n    cb_thread_failed();\n    }}\n}}",
+                "static __attribute__((noinline)) void {t}_run(struct {e} *e)\n{{\n{b}}}\nvoid {t}(void *p)\n{{\n    struct {e} *e = p;\n    jmp_buf jb;\n    if (setjmp(jb) == 0)\n    {{\n    cb_thread_jmp((void *)jb);\n    cb_thread_start((void *)e, sizeof(*e), (void *)e->h);\n{l}    {t}_run(e);\n    }}\n    else\n    {{\n    cb_env_forget(e, sizeof(*e));\n    cb_drop_fn(e->h);\n    cb_thread_failed();\n    }}\n}}",
                 t = tramp,
                 e = env,
-                b = body
+                b = body,
+                l = if lent_excl { "#ifdef CB_PATHLESS\n    cb_thread_lent();\n#endif\n" } else { "" }
             )
             .unwrap();
         }

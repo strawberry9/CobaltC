@@ -301,9 +301,6 @@ impl<'a> Gen<'a> {
         if let Some(t) = tys.first() {
             return Some(format!("the type `{}` keeps references in data (tier D)", t));
         }
-        if self.units.iter().any(|u| u.text.contains("struct cb_env_")) || self.thunks_out.contains("struct cb_env_") {
-            return Some("it spawns a thread".to_string());
-        }
         if self.units.iter().any(|u| u.text.contains("cb_point_check(")) {
             return Some("a call is checked when it is made (D-0283)".to_string());
         }

@@ -135,6 +135,93 @@ fn decided_program_is_lowered_knowing_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// CHG-0382: a call whose later argument is a borrow formed in place
+// (`std::Vec::swap`'s `swap_places(&mut (*v)[i], &mut (*v)[j])`), or
+// whose earlier argument is a value (`f(x, f(x, 1))`), leaves nothing to
+// the run: the program is decided, and ends as the interpreter has it.
+#[test]
+fn vec_swap_and_value_arguments_leave_a_program_decided() {
+    let dir = std::env::temp_dir().join(format!("cobc-evalorder-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src = "import std;\n\nfn f(i64 a, i64 b) : i64\n{\n    a + b\n}\n\nfn main()\n{\n    Vec<i32> v = Vec::new();\n    Vec::push(&mut v, 1);\n    Vec::push(&mut v, 2);\n    Vec::swap(&mut v, 0, 1);\n    i64 x = 2;\n    printf(\"%v %v %v\\n\", v[0], v[1], f(x, f(x, 1)));\n}\n";
+    fs::write(dir.join("prog.cb"), src).unwrap();
+    for cc in ["gcc", "clang"] {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", cc, "-o", "prog", "prog.cb"]).current_dir(&dir).output().expect("run cobc");
+        assert!(o.status.success(), "{}: {}", cc, String::from_utf8_lossy(&o.stderr));
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(note.contains("lowered pathless and decided (D-0284, D-0285)"), "{}: {}", cc, note);
+        let run = Command::new(dir.join("prog")).output().expect("run prog");
+        assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "2 1 5\n".to_string()), "{}", cc);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// D-0289: a program whose threads are lent what they reach by handles
+// its frames hold is decided: it locks a mutex with no lock path, a thread
+// lent an exclusive reference is not contained (its fault ends the
+// program, spec/18), a resource passes to and from a thread with no
+// object, and it ends as the interpreter has it, under both C compilers.
+#[test]
+fn threads_lent_by_held_handles_leave_a_program_decided() {
+    let dir = std::env::temp_dir().join(format!("cobc-scoped-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let ok = "import std;\n\nfn add(ref<mutex<u64>, shared> m, u64 n) : u64\n{\n    foreach (i in 0..n)\n    {\n        auto g = lock(m);\n        *g += 1;\n    }\n    n\n}\n\nfn bump(ref<i32, exclusive> p)\n{\n    *p = *p + 1;\n}\n\nfn total(Vec<u64> v) : Vec<u64>\n{\n    Vec<u64> r = Vec::new();\n    Vec::push(&mut r, widen<u64>(Vec::len(&v)));\n    r\n}\n\nfn main()\n{\n    auto m = Mutex::new(0: u64);\n    i32 x = 1;\n    {\n        auto a = spawn(add, &m, 30);\n        auto b = spawn(add, &m, 12);\n        auto c = spawn(bump, &mut x);\n        join(c);\n        printf(\"%v \", join(a) + join(b));\n    }\n    Vec<u64> v = Vec::new();\n    Vec::push(&mut v, 7);\n    auto t = spawn(total, v);\n    Vec<u64> r = join(t);\n    printf(\"%v %v %v\\n\", *lock(&m), x, r[0]);\n}\n";
+    let lent = "import std;\n\nfn boom(ref<i32, exclusive> p) : i32\n{\n    *p = 2;\n    1 / (*p - 2)\n}\n\nfn main()\n{\n    i32 x = 1;\n    auto h = spawn(boom, &mut x);\n    match (try_join(h))\n    {\n        Ok(v) : printf(\"ok %v\\n\", v),\n        Err(f) : printf(\"contained\\n\"),\n    }\n    printf(\"after\\n\");\n}\n";
+    fs::write(dir.join("ok.cb"), ok).unwrap();
+    fs::write(dir.join("lent.cb"), lent).unwrap();
+    // As `coby` ends them: the lent thread's fault is not contained, so
+    // the program ends with it and prints nothing.
+    let ok_want = (Some(0), "42 42 2 1\n".to_string());
+    let lent_want = (Some(1), String::new());
+    for cc in ["gcc", "clang"] {
+        for (f, want) in [("ok", &ok_want), ("lent", &lent_want)] {
+            let o = Command::new(cobc_exe()).args(["-v", "--cc", cc, "-o", f, &format!("{}.cb", f)]).current_dir(&dir).output().expect("run cobc");
+            assert!(o.status.success(), "{} {}: {}", cc, f, String::from_utf8_lossy(&o.stderr));
+            let note = String::from_utf8_lossy(&o.stderr).into_owned();
+            assert!(note.contains("lowered pathless and decided (D-0284, D-0285)"), "{} {}: {}", cc, f, note);
+            let run = Command::new(dir.join(f)).current_dir(&dir).output().expect("run prog");
+            assert_eq!(&(run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), want, "{} {}", cc, f);
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// D-0289, CHG-0384: a worker pool's handles kept in a local `Vec` hold
+// what their threads were lent, as a handle binding does: pushed by
+// `Vec::push(&mut hs, spawn(…))`, taken out by a consuming `foreach`, the
+// program is decided. A handle left lending on some paths when the lent
+// place is written (`popped`: one taken out, the rest still running;
+// `branch`: dropped on one branch only), or the `Vec` given away
+// (`given`), leave the function to the run.
+#[test]
+fn worker_pools_in_a_vec_leave_a_program_decided() {
+    let dir = std::env::temp_dir().join(format!("cobc-pools-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let pool = "import std;\n\nfn look(ref<i64, shared> x) : i64\n{\n    *x\n}\n\nfn main()\n{\n    i64 x = 3;\n    Vec<handle<i64>> hs = Vec::new();\n    for (i64 i = 0; i < 4; i += 1)\n    {\n        Vec::push(&mut hs, spawn(look, &x));\n    }\n    i64 t = 0;\n    foreach (h in hs)\n    {\n        t += join(h);\n    }\n    x = 10;\n    printf(\"%v %v\\n\", t, x);\n}\n";
+    let popped = "import std;\n\nfn look(ref<i64, shared> x) : i64\n{\n    *x\n}\n\nfn main()\n{\n    i64 x = 3;\n    Vec<handle<i64>> hs = Vec::new();\n    for (i64 i = 0; i < 4; i += 1)\n    {\n        Vec::push(&mut hs, spawn(look, &x));\n    }\n    i64 t = 0;\n    if (Some(w) = Vec::pop(&mut hs))\n    {\n        t += join(w);\n    }\n    x = 10;\n    printf(\"%v %v\\n\", t, x);\n}\n";
+    let branch = "import std;\n\nfn look(ref<i64, shared> x) : i64\n{\n    *x\n}\n\nfn main()\n{\n    i64 x = 3;\n    handle<i64> h = spawn(look, &x);\n    if (x == 3)\n    {\n        drop(h);\n    }\n    x = 10;\n    printf(\"%v\\n\", x);\n}\n";
+    let given = "import std;\n\nfn look(ref<i64, shared> x) : i64\n{\n    *x\n}\n\nfn give(ref<Vec<handle<i64>>, exclusive> hs, ref<Vec<handle<i64>>, exclusive> out)\n{\n    Vec::push(out, Option::unwrap(Vec::pop(hs)));\n}\n\nfn main()\n{\n    Vec<handle<i64>> keep = Vec::new();\n    {\n        i64 x = 3;\n        Vec<handle<i64>> hs = Vec::new();\n        Vec::push(&mut hs, spawn(look, &x));\n        give(&mut hs, &mut keep);\n    }\n    printf(\"%v\\n\", join(Option::unwrap(Vec::pop(&mut keep))));\n}\n";
+    for (f, src) in [("pool", pool), ("popped", popped), ("branch", branch), ("given", given)] {
+        fs::write(dir.join(format!("{}.cb", f)), src).unwrap();
+    }
+    for cc in ["gcc", "clang"] {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", cc, "-o", "pool", "pool.cb"]).current_dir(&dir).output().expect("run cobc");
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success() && note.contains("lowered pathless and decided (D-0284, D-0285)"), "{}: {}", cc, note);
+        let run = Command::new(dir.join("pool")).current_dir(&dir).output().expect("run prog");
+        assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "12 10\n".to_string()), "{}", cc);
+    }
+    for (f, why) in [("popped", "may reach on some paths"), ("branch", "may reach on some paths"), ("given", "is borrowed exclusively while it holds what its threads were lent")] {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", "gcc", "-o", f, &format!("{}.cb", f)]).current_dir(&dir).output().expect("run cobc");
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success() && note.contains("kept paths") && note.contains(why), "{}: {}", f, note);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // D-0286: in a decided program values pass between functions with no
 // object: past the runtime's header the C neither sends nor receives one,
 // a `String` taken by value is bound objectless and none is bound in the

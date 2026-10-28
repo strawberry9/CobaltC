@@ -28,3 +28,9 @@ but the consumption row did not apply it.
 
 `conf.handle-moved-into-vec-then-referent-written` (dynamic: the thread waits on a channel holding the lent
 path); the model now gives the dynamic outcomes both tools show.
+
+## Amendment (2026-10-28, CHG-0384)
+
+A handle moved into a `Vec` of handles that a binding of the frame holds is no longer a move out of sight: the facts
+follow it, and the `Vec` holds them to its end (D-0289, spec/14 §6 scoped lending). The case above is now refuted
+before the run. A handle moved anywhere else still forgets its facts as decided here.

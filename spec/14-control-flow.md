@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.35.0
+Version: 1.38.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -562,8 +562,8 @@ evaluation order within the statement):
 | `r = e` for reference-typed `r` from anything but a visible borrow | every `deriv(r, ·, ·) := F`, forgetting them (below); `escaped(x) := T` for the `x` the analysis cannot exclude |
 | block exit | for every `r` declared in the block: `deriv(r, ·, ·) := F`, forgetting them (below); for every `x` declared in it: `valid(x) := F` |
 | a binding `x` ended after `s_j` by `[Ref-Binding-Last-Use]` (D-0219, D-0221) | as block exit, for `x` alone: `deriv(x, ·, ·) := F`, forgetting them (below), `deriv(·, *x.·, ·) := F`, `valid(x) := F` |
-| `spawn(…, &_m x …)` | `escaped(x) := T` |
-| `auto h = spawn(f, a1, …, an);` or `h = spawn(…)` (D-0071) | `deriv(h, x.π, m) := T` for each `ai` that is a visible borrow, slice or elided call forming `deriv(·, x.π, m)` by the lines above; `deriv(h, *r, m) := T` for each `ai` that is a tracked binding `r` of reference type, `m` the mode `f`'s parameter takes (D-0213: the thread is lent `r`, `spec/19` `[Thread-Lend]`) — a `ref`, not a slice: a slice binding passed whole is lent as any value is, and forms no fact (D-0247); other `deriv(h, ·, ·) := F` |
+| `spawn(…, &_m x …)`, its handle not bound whole by a `let` or an assignment (D-0289) | `escaped(x) := T` |
+| `auto h = spawn(f, a1, …, an);` or `h = spawn(…)` (D-0071) | `deriv(h, x.π, m) := T` for each `ai` that is a visible borrow, slice or elided call forming `deriv(·, x.π, m)` by the lines above; `deriv(h, *r, m) := T` for each `ai` that is a tracked binding `r` of reference type, `m` the mode `f`'s parameter takes (D-0213: the thread is lent `r`, `spec/19` `[Thread-Lend]`) — a `ref`, not a slice: a slice binding passed whole is lent as any value is, and forms no fact (D-0247); when `f` is a closure literal or a closure binding, the facts the closure row gives it (D-0289); other `deriv(h, ·, ·) := F` |
 | `spawn(…, r …)` with `r` a tracked binding of reference type (D-0213) | the lend is a borrow of `*r` in the parameter's mode: `¬clash` against `deriv` facts, as `&_m *r` would be |
 | `join(h)` | `deriv(h, ·, ·) := F` (the thread has finished) |
 | `auto o = e;` / `o = e;` / a `match (e)` arm's binder `o`, where `e` is a call `f(a1, …, an)` (or `Option::unwrap`/`expect`, `Result::unwrap`/`expect` of one) whose result holds a reference without being one (`Option<ref<V, m>>`, D-0088) | `deriv(o, x.π, m) := T` for the first reference-typed parameter's argument, when it is a visible borrow or slice forming `deriv(·, x.π, m)`; other `deriv(o, ·, ·) := F` |
@@ -840,11 +840,17 @@ contains, anywhere (a field of a literal, a branch, a block's statement),
 an exclusive borrow whose facts reach that container, the place may be
 moved before it is written: refuted, `diag.stale-binding`. Likewise the
 arguments of a call are evaluated left to right, and a reference argument
-is formed before the later ones (D-0007). When a later argument takes the
-root of an earlier reference argument's facts exclusively, assigns into
-it, or passes it by value, what the earlier one reaches may be moved
-before the call: decided by the run, `diag.stale-binding` at the use
-(D-0284). When a later argument assigns a frame-held reference that an
+(one that is or may hold a reference; a value of a type that holds none
+reaches nothing) is formed before the later ones (D-0007). When a later
+argument, as it is evaluated, takes exclusively a place that overlaps
+what an earlier reference argument's facts reach, assigns into the root
+of those facts, or passes that root by value, what the earlier one
+reaches may be moved before the call: decided by the run,
+`diag.stale-binding` at the use (D-0284). A later argument that is itself
+a borrow (`&mut (*v)[j]`, `&mut q.b`) is formed in place and moves
+nothing: only what its operand evaluates first (an index, a call inside
+it) counts, and the borrow itself meets the earlier argument at the call,
+under the call-site rule above (CHG-0382). When a later argument assigns a frame-held reference that an
 earlier argument read, the earlier argument's copy keeps the old facts
 under no name: decided by the run.
 
@@ -857,11 +863,41 @@ run in conflict, so an implementation may execute it keeping no record
 of references (paths), with the same outcome (D-0284). A program is not
 decided when one of its functions has a conflict left to the run (a may-
 overlap, a fact `?`, a binding of unknown origin, a point check at a call),
-when a type it uses keeps references in data (tier D, D-0281), when a
-closure of it borrows what it captures or captures a reference, when it
-forms a reference to a reclaimed object in its own code (`[Reclaim]`:
-the run checks it against the record of raw storage), or when it spawns
-a thread.
+when a type it uses keeps references in data (tier D, D-0281; a `fn`
+value, a thread's handle and a lock's guard do so only in data: one a
+frame holds is its facts, D-0288, D-0289), or when it forms a reference
+to a reclaimed object in its own code (`[Reclaim]`: the run checks it
+against the record of raw storage).
+
+**Scoped lending.** What a spawn lends — its borrowed arguments, the
+references it passes, what its closure captured — is held as `deriv`
+facts by the handle a binding of the lending frame takes from it
+(`auto h = spawn(…)`, `h = spawn(…)`) until `join(h)`, `drop(h)` or the
+binding's end, and no thread outlives the frame that holds its handle
+(`spec/19` `[Handle-Destructor]`): the lender's accesses meet the lend
+before the run, as any other holder's (D-0289). The run checks it, and
+the program is not decided, when a spawn that lends has no such binding
+(its handle passed, stored or discarded), when a handle or a guard
+holding facts is moved anywhere but `join` or `drop` (returned, passed,
+captured), when a spawned thread runs a `fn` value (whose captures are
+not known before the run), and when a spawned closure captures a guard
+or a thread is given one as an argument (a lock's path stays its
+locking thread's, D-0240).
+
+A `Vec` of handles a binding of the lending frame holds is such a
+binding for every spawn pushed onto it (`Vec::push(&mut hs, spawn(…))`)
+and every handle holding facts pushed there: it holds the union of
+their facts until its end, since destroying it waits for every thread
+it still holds. A handle taken out of it by a consuming `foreach`, by
+`Vec::pop`, `Vec::remove` or `Vec::swap_remove` whose result is bound
+(through `Option::unwrap` or a pattern) holds what the `Vec` holds; the
+run checks, and the program is not decided, when the `Vec` is moved
+anywhere but such a binding or reached by an exclusive reference other
+than those operations' and `push`'s, `len`'s, `is_empty`'s, `clear`'s,
+`truncate`'s and `reserve`'s (CHG-0384). A holder whose end waits or
+releases — a handle, a guard, a `Vec` of handles — holds its facts to
+the end of its scope, not to its last use: an access that may meet
+them on some paths is the run's.
 
 **Moving out through a reference.** `*r`, for a reference binding `r`,
 used where its value is moved (a resource, an `Atomic`, a `Vec`, a
@@ -876,6 +912,9 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.38.0 — `CHG-0384` (D-0289): §6 scoped lending: a guard given to a thread as an argument is the run's; a `Vec` of handles the frame holds holds what its threads were lent, and a handle taken out of it holds that too; a holder whose end waits or releases holds its facts to its scope's end.
+- 1.37.0 — `CHG-0383` (D-0289): §6 decided programs: scoped lending, a thread's handle and a lock's guard held by a frame are its facts; the spawn rows (a bound spawn's handle holds its closure's facts and escapes nothing); the paragraph no longer lists closures (D-0288) or spawns.
+- 1.36.0 — `CHG-0382`: §6 `rule.control.frame-references`, evaluation order: only an argument that is or may hold a reference is formed early; a later argument acts on it only through an exclusive borrow of an overlapping place evaluated before the call, an assignment or a move of its root, and a later argument that is itself a borrow is not one.
 - 1.35.0 — `CHG-0381` (D-0288): `[Ref-Binding-Last-Use]`: a `move` closure's capture ends at its last use; a binding assigned whole stops counting for what it got before; a binding whose facts still root another's waits for them to end. Two `deriv` rows: a `move` closure holds what its captures reach, as one without `move` also does; a `fn` value copied or returned holds what its source holds.
 - 1.34.0 — `CHG-0380`: §6 `rule.control.frame-references`, element accesses: a `Vec` reached through a reference is its referent; every element of a `Vec` of a zero-sized type is one place.
 - 1.33.0 — `CHG-0378` (D-0287): `rule.control.foreach-parts`, a consuming `foreach` over a text splitter's call walks the text and makes no `Vec`. `CHG-0379` (D-0287): §6 `rule.control.frame-references`: a block's end refutes a live outer reference to what the block declares; a call's result inherits static data from a static first reference argument; the hidden binding of `[Foreach-Parts]` inherits the text's facts.

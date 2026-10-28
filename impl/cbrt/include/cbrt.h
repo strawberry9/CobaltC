@@ -372,6 +372,7 @@ void     cb_cancel(uint64_t tid);   /* [Cancel] (D-0204) */
 int64_t  cb_task_op(uint64_t op, uint64_t id, void *out, uint64_t cap);   /* [Failure-Text] and the supervision operations' queries */
 uint64_t cb_join(uint64_t tid, void *dst);                         /* [Join]: the result's object, or 0 */
 uint64_t cb_lock(uint64_t tok, void *m, uint32_t file, uint32_t line);   /* [Lock]: the lock path's token */
+uint64_t cb_lock_pathless(void *m, uint32_t file, uint32_t line);   /* D-0289: [Lock] with no lock path (CB_PATHLESS) */
 void     cb_lock_bare(void *m, uint32_t file, uint32_t line);   /* D-0200: lock without a guard — [Lock] without a guard object (D-0200, std's own bodies): sync(o) := locked-by; unlocked by cb_unlock_bare */
 void     cb_unlock_bare(void *m);   /* [Guard-Drop] without a guard object */
 void     cb_unlock_signal(void *m, uint64_t id);   /* D-0200: event_op(3, id) then cb_unlock_bare(m) — [Atomic-Notify]-like event signal (event_op(3, id)) then [Guard-Drop] without a guard, as one step */
@@ -464,6 +465,11 @@ static inline void cb_write_pathless(uint64_t base, const cb_proj *p, size_t n, 
 /* A frozen parameter's token is 0: its body may run (`cb_frozen_ok`'s first
    answer), so a dual body's checked twin is never chosen. */
 #define cb_frozen_ok(t, lo, n)           ((void)(t), (void)(lo), (void)(n), (uint8_t)1)
+/* A closure call borrows no path of its box: `cb_call_done` above ends
+   nothing, so one made here would never be retired (CHG-0383). */
+#define cb_call_self(r)                  ((void)(r), (uint64_t)0)
+/* D-0289: a lock makes no path; the guard holds the mutex's address. */
+#define cb_lock(t, m, f, l)              ((void)(t), cb_lock_pathless((m), (f), (l)))
 #ifdef CB_DECIDED
 /* D-0285: lowered knowing the program is decided (cobc's second lowering):
    a value holding references is plain data, sent and received as its bytes

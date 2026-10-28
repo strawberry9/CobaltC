@@ -239,11 +239,19 @@ impl Interp {
             let mut fixed: Vec<usize> = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 let known = self.infer_skipping(f, &targs, &argvals, &deferred, None);
-                let hint = f
+                let mut hint = f
                     .params
                     .get(i)
                     .map(|p| self.apply_subst(&p.ty, &known))
                     .filter(|t| !mentions_type_param(t, &f.type_params));
+                // A generic call as the argument (`Arc::new(Channel::new(4))`
+                // for an `Arc<Channel<u32>>`): what the call's expected type
+                // fixes is the argument's, or the inner call's own `T` is
+                // left to a default and its storage sized for that.
+                if hint.is_none() && expected.is_some() && matches!(a.kind, ExprKind::Call(..)) {
+                    let known = self.infer_skipping(f, &targs, &argvals, &deferred, expected.as_ref());
+                    hint = f.params.get(i).map(|p| self.apply_subst(&p.ty, &known)).filter(|t| !mentions_type_param(t, &f.type_params));
+                }
                 argvals.push(match hint {
                     Some(t) => { let r0 = self.eval_expected(a, subst, &t)?; self.arg_now(r0)? },
                     // A payload-less variant of a generic enum (`None`)
