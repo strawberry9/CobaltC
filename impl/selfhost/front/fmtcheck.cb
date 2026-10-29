@@ -1,0 +1,224 @@
+// `printf` and `String::appendf`'s format strings (`spec/21` §2f
+// `rule.stdlib.format`, D-0038), as impl/src/fmt.rs parses them for the
+// static check: each specifier's kind, in order, a `*` width or precision
+// taking a `usize` before its value (D-0100); or why the text is no format.
+
+import std;
+
+export enum FmtKind
+{
+    FInt,
+    FFloat,
+    FText,
+    // `%v`: any value, as it is.
+    FValue,
+    // D-0100: the `usize` a `*` width or precision takes.
+    FWidth,
+}
+
+const usize LIMIT = 4096;
+
+fn conv_kind(u8 c) : FmtKind
+{
+    if (c == b'd' || c == b'i' || c == b'u' || c == b'x' || c == b'X' || c == b'o' || c == b'b')
+    {
+        return FmtKind::FInt;
+    }
+    if (c == b'f' || c == b'F' || c == b'e' || c == b'E' || c == b'g' || c == b'G')
+    {
+        return FmtKind::FFloat;
+    }
+    if (c == b'v')
+    {
+        return FmtKind::FValue;
+    }
+    FmtKind::FText
+}
+
+fn byte_in(u8 c, str set) : bool
+{
+    slice<u8, shared> b = StringView::as_bytes(StringView::of(set));
+    for (usize i = 0; i < StringView::len(StringView::of(set)); i += 1)
+    {
+        if (b[i] == c)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn char_text(u8 c) : String
+{
+    String s = String::new();
+    String::push_ascii(&mut s, c);
+    s
+}
+
+// The digits at `*i`, as a width or precision (0 when there are none).
+fn digits(slice<u8, shared> f, usize n, ref<usize, exclusive> i) : Result<usize, String>
+{
+    usize start = *i;
+    usize v = 0;
+    bool big = false;
+    while (*i < n && f[*i] >= b'0' && f[*i] <= b'9')
+    {
+        if (!big)
+        {
+            match (checked_add(Option::unwrap_or(checked_mul(v, 10), max_value<usize>()), widen<usize>(f[*i] - b'0')))
+            {
+                Some(x) : v = x,
+                None    : big = true,
+            }
+        }
+        *i += 1;
+    }
+    if (start == *i)
+    {
+        return Ok(0);
+    }
+    if (big || v > LIMIT)
+    {
+        return Err(sprintf("a width or precision above %v", LIMIT));
+    }
+    Ok(v)
+}
+
+// The argument kinds a format takes, in order; an `Err` says why it is not
+// a format.
+export fn fmt_arg_kinds(slice<u8, shared> f) : Result<Vec<FmtKind>, String>
+{
+    usize n = slice_len(f);
+    Vec<FmtKind> out = Vec::new();
+    usize i = 0;
+    while (i < n)
+    {
+        if (f[i] != b'%')
+        {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i < n && f[i] == b'%')
+        {
+            i += 1;
+            continue;
+        }
+        bool left = false;
+        bool zero = false;
+        bool plus = false;
+        bool space = false;
+        bool alt = false;
+        while (i < n)
+        {
+            u8 c = f[i];
+            if (c == b'-')
+            {
+                left = true;
+            }
+            else if (c == b'0')
+            {
+                zero = true;
+            }
+            else if (c == b'+')
+            {
+                plus = true;
+            }
+            else if (c == b' ')
+            {
+                space = true;
+            }
+            else if (c == b'#')
+            {
+                alt = true;
+            }
+            else
+            {
+                break;
+            }
+            i += 1;
+        }
+        bool width_star = false;
+        bool prec_star = false;
+        bool has_prec = false;
+        if (i < n && f[i] == b'*')
+        {
+            width_star = true;
+            i += 1;
+        }
+        else
+        {
+            digits(f, n, &mut i)?;
+        }
+        if (i < n && f[i] == b'.')
+        {
+            i += 1;
+            has_prec = true;
+            if (i < n && f[i] == b'*')
+            {
+                prec_star = true;
+                i += 1;
+            }
+            else
+            {
+                digits(f, n, &mut i)?;
+            }
+        }
+        if (i >= n)
+        {
+            return Err(String::from_str("a `%` with no conversion at the end"));
+        }
+        u8 conv = f[i];
+        i += 1;
+        if (conv == b'*')
+        {
+            return Err(String::from_str("a `*` width or precision comes before the conversion, as in `%*d` or `%.*s`"));
+        }
+        if (!byte_in(conv, "diuxXobfFeEgGsv"))
+        {
+            if (conv == b'c')
+            {
+                return Err(String::from_str("`%c` is not a conversion (a byte above 127 would not be text); print a one-character `str` or `String` with `%s`"));
+            }
+            if (byte_in(conv, "lhzjtLq"))
+            {
+                return Err(sprintf(
+                    "`%%%s` is a C length modifier, which CobaltC does not take: `%%d` prints every integer type",
+                    &char_text(conv),
+                ));
+            }
+            if (conv >= 33 && conv <= 126)
+            {
+                return Err(sprintf(
+                    "`%%%s` is not a conversion; the conversions are d i u x X o b f F e E g G s v",
+                    &char_text(conv),
+                ));
+            }
+            return Err(String::from_str("a `%` not followed by a conversion; write `%%` for a `%`"));
+        }
+        FmtKind k = conv_kind(conv);
+        bool ok = match (k)
+        {
+            FmtKind::FInt   : if (byte_in(conv, "diu")) { !alt } else { !plus && !space },
+            FmtKind::FFloat : true,
+            FmtKind::FText  : !zero && !plus && !space && !alt,
+            FmtKind::FValue : !zero && !plus && !space && !alt && !has_prec,
+            FmtKind::FWidth : true,
+        };
+        if (!ok)
+        {
+            str what = if (alt) { "the `#` flag" } else if (zero) { "the `0` flag" } else if (plus) { "the `+` flag" } else if (space) { "the ` ` flag" } else { "a precision" };
+            return Err(sprintf("`%%%s` does not take %s", &char_text(conv), what));
+        }
+        if (width_star)
+        {
+            Vec::push(&mut out, FmtKind::FWidth);
+        }
+        if (prec_star)
+        {
+            Vec::push(&mut out, FmtKind::FWidth);
+        }
+        Vec::push(&mut out, k);
+    }
+    Ok(out)
+}

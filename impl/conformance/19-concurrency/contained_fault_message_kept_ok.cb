@@ -1,0 +1,49 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: spec/18 [Fault-Contain] (D-0204) with the assertion's message (D-0065); conf.contained-fault-message-kept
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 646961672e6173736572742d6661696c65640a6661756c745b646961672e6173736572742d6661696c65645d3a206e20697320372c206e6f74206e656761746976650a63616e63656c6c65643a2066616c73650a646961672e6d757465782d706f69736f6e65640a
+//
+// A thread fails an assertion with a formatted message, holding a lock;
+// the failure is taken by `try_join`, its diagnostic's name and its
+// report's first line (the message included) read back, and the mutex is
+// found poisoned by a second thread. The runtime keeps the failure's text
+// as the one it built at the fault (CHG-0338: the name and message were
+// copied at the entry point and lost at the contained fault's jump).
+
+import std;
+
+fn worker(ref<mutex<i64>, shared> m, i64 n) : i64
+{
+    guard<i64> g = lock(m);
+    *g += n;
+    assert(n < 0, "n is %v, not negative", n);
+    n
+}
+
+fn probe(ref<mutex<i64>, shared> m) : i64
+{
+    *lock(m)
+}
+
+fn main()
+{
+    mutex<i64> m = Mutex::new(0: i64);
+    match (try_join(spawn(worker, &m, 7)))
+    {
+        Ok(v)  : printf("finished %v\n", v),
+        Err(f) :
+        {
+            printf("%v\n", &ThreadFailure::diagnostic(&f));
+            String report = ThreadFailure::text(&f);
+            printf("%v\n", StringView::lines(String::as_view(&report))[0]);
+            printf("cancelled: %v\n", ThreadFailure::is_cancelled(&f));
+        },
+    }
+    match (try_join(spawn(probe, &m)))
+    {
+        Ok(v)  : printf("read %v\n", v),
+        Err(f) : printf("%v\n", &ThreadFailure::diagnostic(&f)),
+    }
+}

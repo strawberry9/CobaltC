@@ -1,0 +1,383 @@
+// JSON Web Tokens
+//
+// Shows: four ways to sign the same kind of token, all from `std`:
+// HMAC-SHA-256 under a shared secret (HS256), Ed25519 (EdDSA), ECDSA on
+// P-256 (ES256) and RSA PKCS #1 v1.5 (RS256, the key read from the PEM
+// `openssl genpkey` wrote), each checked against the RFCs' own examples
+// where they have one. A token is three base64url parts, header.claims.
+// signature; the verifier knows which kind of key it holds and refuses a
+// token whose header names any other algorithm, so a token cannot talk
+// its way past the check ("alg": "none", or HS256 keyed with a public
+// key, are the classic attacks). ECDSA signatures are DER in `std` and
+// raw r ‖ s in JWS, so the program converts both ways with `der_read`.
+// ES256 signing is deterministic (RFC 6979), and so is RS256: the same key
+// and claims give the same token every run.
+
+import std;
+
+// A 1024-bit RSA key (short, so the interpreter signs in seconds; use
+// 2048 bits or more for real), as `openssl genpkey` wrote it.
+const str RSA_KEY =
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAMJa7a/fwjWxCYMe\n"
+    "Z1oU/7Faf/U5pU7fCnMSLPUu0fb/Kek4LYvb2JI8ue+VdX29DjA9M/grIqobOgbU\n"
+    "WkP/GEogbrpSvUFSktCvBqTJiFT6bTDeI3ieT7hV9uKHi8UL5NMLwc2A7EtDf+w2\n"
+    "fcf7EoBI771i3mBCFD0n9gKvHQLjAgMBAAECgYA+Ztd96of+mTMGqFJit+9I0FfZ\n"
+    "MoMDCdXfEGzi4/+CIHcibGkjSJkGivzgEcrBblwJ3Py8p4zftRIycyfwQQ1Y4ETk\n"
+    "+MTGZYxutbtmIcbg7xPDB9kHdBbknOqbnORn5F+dWmIB+/yGO35iU36or+niwz4f\n"
+    "fiSKLTP52W0at/bz0QJBAOIZ6MW6sBYopePGY90/bEhkqKRGXCC3JCbIiPsY6Azd\n"
+    "X2CqDN7a1uRc5vdifhESOC/xEPCVfF1S6wF1rQFj0w0CQQDcDlZP13wpCT+e0aQD\n"
+    "m2949zTLnQdO0zxGKQO8F1DO9Fq0FES7rxOT23xawqsXGy9WhTjjn8bkgo4cx/eY\n"
+    "03GvAkBdeGKPY4cqEfHKgRiFvZNxNhO1ndS2PZ/3XI2saHZ94wJr/sDFXGjcDT/6\n"
+    "Y0BEpGiQATOEkffQyNeYSeKUoYT9AkB6DOWoYO73X67Oqp3adlKMeCfrKswL1zMe\n"
+    "As+UeiYSswq/yGIa6s7j+h9tw3zbUvOdfESCU3Mf+J1Tr0FPnS73AkEAm8ju/kTJ\n"
+    "heYC2PkZ7XSN902WyvDG7uqWNDL6O0D5TYgxaHSGCwtHIMQDZ7LVomt2fBcElmD0\n"
+    "lbBjPbxbgq2xcw==\n"
+    "-----END PRIVATE KEY-----\n";
+
+// base64url (RFC 4648 §5) without padding, as JWS writes it.
+fn b64url(slice<u8, shared> bytes) : String
+{
+    String plain = base64_encode(bytes);
+    String out = String::new();
+    foreach (c in String::as_bytes(&plain))
+    {
+        if (*c == b'+')
+        {
+            String::push_ascii(&mut out, b'-');
+        }
+        else if (*c == b'/')
+        {
+            String::push_ascii(&mut out, b'_');
+        }
+        else if (*c != b'=')
+        {
+            String::push_ascii(&mut out, *c);
+        }
+    }
+    out
+}
+
+fn b64url_decode(StringView text) : Option<Vec<u8>>
+{
+    String plain = String::new();
+    foreach (c in StringView::as_bytes(text))
+    {
+        u8 b = *c;
+        if (b == b'+' || b == b'/' || b == b'=')
+        {
+            return None;
+        }
+        String::push_ascii(&mut plain, if (b == b'-') { b'+' } else if (b == b'_') { b'/' } else { b });
+    }
+    while (String::len(&plain) % 4 != 0)
+    {
+        String::push_ascii(&mut plain, b'=');
+    }
+    match (base64_decode(String::as_view(&plain)))
+    {
+        Ok(v)  : Some(v),
+        Err(_) : None,
+    }
+}
+
+// A key that signs, and the key that checks it.
+enum Signer
+{
+    HmacSecret(Vec<u8>),
+    EdPrivate(Vec<u8>),
+    EcPrivate(Vec<u8>),
+    RsaSigner(RsaPrivateKey),
+}
+
+enum Checker
+{
+    HmacCheck(Vec<u8>),
+    EdPublic(Vec<u8>),
+    EcPublic(Vec<u8>),
+    RsaCheck(RsaPublicKey),
+}
+
+fn alg_of(ref<Checker, shared> c) : str
+{
+    match (c)
+    {
+        HmacCheck(_) : "HS256",
+        EdPublic(_)  : "EdDSA",
+        EcPublic(_)  : "ES256",
+        RsaCheck(_)  : "RS256",
+    }
+}
+
+// An ECDSA signature: std's DER SEQUENCE { r, s } to JWS's 64 raw bytes.
+fn der_to_raw(slice<u8, shared> der) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Der seq = Option::unwrap(der_read(der, 0));
+    usize at = seq.start;
+    for (usize i = 0; i < 2; i += 1)
+    {
+        Der n = Option::unwrap(der_read(der, at));
+        usize len = n.end - n.start;
+        usize skip = if (len > 32) { len - 32 } else { 0 };
+        for (usize k = len - skip; k < 32; k += 1)
+        {
+            Vec::push(&mut out, 0);
+        }
+        Vec::extend_from(&mut out, &der[n.start + skip..n.end]);
+        at = n.next;
+    }
+    out
+}
+
+// And back: each half as a minimal DER INTEGER.
+fn raw_to_der(slice<u8, shared> raw) : Vec<u8>
+{
+    Vec<u8> body = Vec::new();
+    for (usize half = 0; half < 2; half += 1)
+    {
+        usize from = 32 * half;
+        while (from < 32 * half + 31 && raw[from] == 0)
+        {
+            from += 1;
+        }
+        bool pad = raw[from] >= 0x80;
+        Vec::push(&mut body, 0x02);
+        Vec::push(&mut body, narrow<u8>(32 * half + 32 - from + (if (pad) { 1 } else { 0 })));
+        if (pad)
+        {
+            Vec::push(&mut body, 0);
+        }
+        Vec::extend_from(&mut body, &raw[from..32 * half + 32]);
+    }
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, 0x30);
+    Vec::push(&mut out, narrow<u8>(Vec::len(&body)));
+    Vec::extend_from(&mut out, &body[0..$]);
+    out
+}
+
+// The signature over "header.claims", both already base64url.
+fn signature(ref<Signer, shared> key, StringView input) : Vec<u8>
+{
+    slice<u8, shared> data = StringView::as_bytes(input);
+    match (key)
+    {
+        HmacSecret(k) : Vec::from_slice(&hmac_sha256(&k[0..$], data)[0..$]),
+        EdPrivate(k)  : Vec::from_slice(&ed25519_sign(&k[0..$], data)[0..$]),
+        EcPrivate(k)  :
+        {
+            array<u8, 32> digest = sha256(data);
+            der_to_raw(&Option::unwrap(ecdsa_sign(P256, &k[0..$], &digest[0..$]))[0..$])
+        },
+        RsaSigner(k)  : rsa_sign_pkcs1v15(k, Sha2_256, &sha256(data)[0..$]),
+    }
+}
+
+fn token(ref<Signer, shared> key, StringView header, StringView claims) : String
+{
+    String out = b64url(StringView::as_bytes(header));
+    String::append(&mut out, ".");
+    String::append(&mut out, String::as_view(&b64url(StringView::as_bytes(claims))));
+    Vec<u8> sig = signature(key, String::as_view(&out));
+    String::append(&mut out, ".");
+    String::append(&mut out, String::as_view(&b64url(&sig[0..$])));
+    out
+}
+
+enum Refusal
+{
+    Malformed,
+    WrongAlgorithm(String),
+    BadSignature,
+    Expired(i64),
+}
+
+// The value of a top-level `"name":` in a small JSON object: a string's
+// contents or a number's digits. Enough for headers and claims we wrote.
+fn json_field(StringView json, str name) : Option<StringView>
+{
+    String key = String::from_str("\"");
+    String::append(&mut key, name);
+    String::append(&mut key, "\":");
+    usize at = StringView::find(json, String::as_view(&key))? + String::len(&key);
+    StringView rest = StringView::trim_start(StringView::sub(json, at, StringView::len(json)));
+    if (StringView::starts_with(rest, "\""))
+    {
+        StringView inner = StringView::sub(rest, 1, StringView::len(rest));
+        usize end = StringView::find(inner, "\"")?;
+        return Some(StringView::sub(inner, 0, end));
+    }
+    slice<u8, shared> b = StringView::as_bytes(rest);
+    usize end = 0;
+    while (end < slice_len(b) && (ascii_is_digit(b[end]) || b[end] == b'-'))
+    {
+        end += 1;
+    }
+    Some(StringView::sub(rest, 0, end))
+}
+
+// A base64url part that decodes to UTF-8 text.
+fn text_part(StringView part) : Result<String, Refusal>
+{
+    Vec<u8> bytes = Option::ok_or(b64url_decode(part), Malformed)?;
+    match (String::from_utf8(bytes))
+    {
+        Ok(t)  : Ok(t),
+        Err(_) : Err(Malformed),
+    }
+}
+
+// The claims of a token this checker accepts at time `now`.
+fn verify(ref<Checker, shared> key, StringView tok, i64 now) : Result<String, Refusal>
+{
+    Vec<StringView> parts = StringView::split(tok, ".");
+    if (Vec::len(&parts) != 3)
+    {
+        return Err(Malformed);
+    }
+    String header = text_part(parts[0])?;
+    StringView alg = Option::ok_or(json_field(String::as_view(&header), "alg"), Malformed)?;
+    if (!StringView::eq(alg, StringView::of(alg_of(key))))
+    {
+        return Err(WrongAlgorithm(String::from_view(alg)));
+    }
+    Vec<u8> sig = Option::ok_or(b64url_decode(parts[2]), Malformed)?;
+    StringView input = StringView::sub(tok, 0, StringView::len(parts[0]) + 1 + StringView::len(parts[1]));
+    slice<u8, shared> data = StringView::as_bytes(input);
+    bool good = match (key)
+    {
+        HmacCheck(k) : digest_eq(&hmac_sha256(&k[0..$], data)[0..$], &sig[0..$]),
+        EdPublic(k)  : ed25519_verify(&k[0..$], data, &sig[0..$]),
+        EcPublic(k) : Vec::len(&sig) == 64 && ecdsa_verify(
+            P256,
+            &k[0..$],
+            &sha256(data)[0..$],
+            &raw_to_der(&sig[0..$])[0..$],
+        ),
+        RsaCheck(k)  : rsa_verify_pkcs1v15(k, Sha2_256, &sha256(data)[0..$], &sig[0..$]),
+    };
+    if (!good)
+    {
+        return Err(BadSignature);
+    }
+    String claims = text_part(parts[1])?;
+    if (Some(exp) = json_field(String::as_view(&claims), "exp"))
+    {
+        i64 when = Result::unwrap_or(StringView::parse<i64>(exp), 0);
+        if (when <= now)
+        {
+            return Err(Expired(when));
+        }
+    }
+    Ok(claims)
+}
+
+fn report(str label, Result<String, Refusal> r)
+{
+    match (r)
+    {
+        Ok(claims)             : printf("%-24s accepted: %s\n", label, &claims),
+        Err(Malformed)         : printf("%-24s refused: malformed\n", label),
+        Err(WrongAlgorithm(a)) : printf("%-24s refused: header says %s\n", label, &a),
+        Err(BadSignature)      : printf("%-24s refused: bad signature\n", label),
+        Err(Expired(when))     : printf("%-24s refused: expired at %v\n", label, when),
+    }
+}
+
+fn bytes64(str text) : Vec<u8>
+{
+    Option::unwrap(b64url_decode(StringView::of(text)))
+}
+
+// The same token with one character of its claims changed.
+fn tampered(ref<String, shared> tok) : String
+{
+    Vec<u8> b = Vec::clone(String::as_bytes(tok));
+    usize dot = Option::unwrap(String::find(tok, "."));
+    b[dot + 3] = if (b[dot + 3] == b'A') { b'B' } else { b'A' };
+    Result::unwrap(String::from_utf8(b))
+}
+
+fn main() : u8
+{
+    // RFC 7515 Appendix A.1: HS256, the header and claims exactly as the
+    // RFC encodes them (with their CR LF), and its signature.
+    Vec<u8> secret = bytes64("AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow");
+    Signer hs = HmacSecret(Vec::clone(&secret));
+    String hs_token = token(
+        &hs,
+        "{\"typ\":\"JWT\",\r\n \"alg\":\"HS256\"}",
+        "{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}",
+    );
+    printf("HS256 token:\n  %s\n", &hs_token);
+    printf(
+        "  matches RFC 7515 A.1: %v\n",
+        String::ends_with(&hs_token, ".dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+    );
+    Checker hs_check = HmacCheck(Vec::clone(&secret));
+    report("  before exp", verify(&hs_check, String::as_view(&hs_token), 1300819370));
+    report("  after exp", verify(&hs_check, String::as_view(&hs_token), 1300819390));
+    report("  claims changed", verify(&hs_check, String::as_view(&tampered(&hs_token)), 1300819370));
+
+    // RFC 8037 Appendix A.4: Ed25519, the RFC's key and its signature.
+    Vec<u8> ed_private = bytes64("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A");
+    array<u8, 32> ed_public = ed25519_public_key(&ed_private[0..$]);
+    printf("\nEdDSA public key (RFC 8037 A.2: 11qYAYKx...): %s\n", &b64url(&ed_public[0..$]));
+    Signer ed = EdPrivate(Vec::clone(&ed_private));
+    String ed_token = token(&ed, "{\"alg\":\"EdDSA\"}", "Example of Ed25519 signing");
+    printf("EdDSA token:\n  %s\n", &ed_token);
+    printf(
+        "  matches RFC 8037 A.4: %v\n",
+        String::ends_with(
+            &ed_token,
+            ".hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg",
+        ),
+    );
+    Checker ed_check = EdPublic(Vec::from_slice(&ed_public[0..$]));
+    report("  as signed", verify(&ed_check, String::as_view(&ed_token), 0));
+    report("  claims changed", verify(&ed_check, String::as_view(&tampered(&ed_token)), 0));
+
+    // ES256 with RFC 7515 A.3's P-256 key, signed deterministically.
+    Vec<u8> ec_private = bytes64("jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI");
+    Vec<u8> ec_public = Option::unwrap(ec_public_key(P256, &ec_private[0..$]));
+    printf("\nES256 public key x (RFC 7515 A.3: f83OJ3D2...): %s\n", &b64url(&ec_public[1..33]));
+    Signer es = EcPrivate(Vec::clone(&ec_private));
+    String es_token = token(
+        &es,
+        "{\"alg\":\"ES256\",\"typ\":\"JWT\"}",
+        "{\"sub\":\"alice\",\"role\":\"admin\",\"exp\":2000000000}",
+    );
+    printf("ES256 token:\n  %s\n", &es_token);
+    Checker es_check = EcPublic(Vec::clone(&ec_public));
+    report("  as signed", verify(&es_check, String::as_view(&es_token), 1800000000));
+    report("  claims changed", verify(&es_check, String::as_view(&tampered(&es_token)), 1800000000));
+
+    // RS256 with an RSA key read from PEM.
+    RsaPrivateKey rsa = match (Result::unwrap(PrivateKey::from_pem(RSA_KEY)))
+    {
+        RsaPrivate(k) : k,
+        _             : return 1,
+    };
+    Checker rs_check = RsaCheck(RsaPrivateKey::public_key(&rsa));
+    Signer rs = RsaSigner(rsa);
+    String rs_token = token(&rs, "{\"alg\":\"RS256\"}", "{\"sub\":\"build-bot\",\"exp\":2000000000}");
+    printf("\nRS256 token:\n  %s\n", &rs_token);
+    report("  as signed", verify(&rs_check, String::as_view(&rs_token), 1800000000));
+    report("  claims changed", verify(&rs_check, String::as_view(&tampered(&rs_token)), 1800000000));
+
+    // The attacks: an unsigned token, and an HS256 token whose "secret"
+    // is the server's public key, which anyone has.
+    String none = b64url(&b"{\"alg\":\"none\"}"[0..$]);
+    String::append(&mut none, ".");
+    String::append(&mut none, String::as_view(&b64url(&b"{\"sub\":\"mallory\",\"role\":\"admin\"}"[0..$])));
+    String::append(&mut none, ".");
+    printf("\nforged tokens:\n");
+    report("  alg none", verify(&es_check, String::as_view(&none), 1800000000));
+    Signer confused = HmacSecret(Vec::clone(&ec_public));
+    String forged = token(&confused, "{\"alg\":\"HS256\"}", "{\"sub\":\"mallory\",\"role\":\"admin\"}");
+    report("  HS256 with public key", verify(&es_check, String::as_view(&forged), 1800000000));
+    report("  EdDSA to ES256 check", verify(&es_check, String::as_view(&ed_token), 1800000000));
+    report("  not three parts", verify(&es_check, "abc.def", 1800000000));
+    0
+}

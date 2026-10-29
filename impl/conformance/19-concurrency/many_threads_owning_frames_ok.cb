@@ -1,0 +1,64 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.spawn [Spawn] [Join]; D-0202, D-0204; conf.many-threads-owning-frames
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 746f74616c2032373132350a
+//
+// Three hundred threads alive at once -- more than `cbrt` has heaps for, so
+// heaps are shared -- each owning a vector moved to it and working on it
+// through references in calls, while all the others do the same. (An id from
+// a heap past the 127th once read as a frame's held path when its frame
+// ended, and a sound program faulted with `diag.aliasing-conflict`.)
+
+import std;
+
+// Appends to a vector the thread owns, through an exclusive reference.
+fn grow(ref<Vec<String>, exclusive> mine, u64 k)
+{
+    Vec::push(mine, sprintf("%v", k * 2));
+}
+
+fn lengths(ref<Vec<String>, shared> mine) : usize
+{
+    usize n = 0;
+    foreach (p in mine)
+    {
+        n += String::len(p);
+    }
+    n
+}
+
+fn worker(Vec<String> mine, u64 k, ref<Channel<u8>, shared> start) : usize
+{
+    _ = Channel::recv(start);
+    usize total = 0;
+    foreach (round in 0..5)
+    {
+        grow(&mut mine, k);
+        total += lengths(&mine);
+    }
+    total
+}
+
+fn main()
+{
+    Channel<u8> start = Channel::new(300);
+    Vec<handle<usize>> hs = Vec::new();
+    foreach (k in 0..300: u64)
+    {
+        Vec<String> mine = Vec::new();
+        Vec::push(&mut mine, sprintf("thread %v", k));
+        Vec::push(&mut hs, spawn(worker, mine, k, &start));
+    }
+    foreach (k in 0..300)
+    {
+        _ = Channel::send(&start, 1);
+    }
+    usize total = 0;
+    foreach (h in hs)
+    {
+        total += join(h);
+    }
+    printf("total %v\n", total);
+}

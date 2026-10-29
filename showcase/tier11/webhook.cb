@@ -1,0 +1,90 @@
+// Webhook signatures
+//
+// Shows: how a service proves a message came from a partner that shares
+// a secret. The sender sends the body with `sha256=` and the hex of
+// HMAC-SHA-256(secret, body), as GitHub and Stripe do. The receiver
+// recomputes it and compares with `digest_eq`, which looks at every byte
+// whatever the first difference, so the time a check takes tells an
+// attacker nothing. A changed body, a signature made with another secret,
+// a malformed header and a missing prefix are each refused with the
+// reason. The secret is fixed here so the output is; a real one comes
+// from `os_random_bytes`.
+
+import std;
+
+enum Verdict
+{
+    Accepted,
+    NoPrefix,
+    NotHex,
+    WrongLength,
+    BadSignature,
+}
+
+fn sign(slice<u8, shared> secret, StringView body) : String
+{
+    array<u8, 32> mac = hmac_sha256(secret, StringView::as_bytes(body));
+    String header = "sha256=";
+    String::append(&mut header, &to_hex(&mac[0..$]));
+    header
+}
+
+fn verify(slice<u8, shared> secret, StringView body, StringView header) : Verdict
+{
+    if (!StringView::starts_with(header, "sha256="))
+    {
+        return NoPrefix;
+    }
+    Vec<u8> given = match (from_hex(StringView::sub(header, 7, StringView::len(header))))
+    {
+        Ok(v)  : v,
+        Err(_) : return NotHex,
+    };
+    if (Vec::len(&given) != 32)
+    {
+        return WrongLength;
+    }
+    array<u8, 32> want = hmac_sha256(secret, StringView::as_bytes(body));
+    if (digest_eq(&given[0..$], &want[0..$])) { Accepted } else { BadSignature }
+}
+
+fn verdict_text(Verdict v) : str
+{
+    match (v)
+    {
+        Accepted     : "accepted",
+        NoPrefix     : "refused: no sha256= prefix",
+        NotHex       : "refused: signature is not hex",
+        WrongLength  : "refused: signature is not 32 bytes",
+        BadSignature : "refused: signature does not match",
+    }
+}
+
+fn main()
+{
+    slice<u8, shared> secret = StringView::as_bytes("whsec_example_shared_secret");
+    slice<u8, shared> other = StringView::as_bytes("someone_else's_secret");
+    StringView body = "{\"event\":\"payment.succeeded\",\"amount\":4200}";
+    String header = sign(secret, body);
+    printf("body:      %s\nsignature: %s\n\n", body, &header);
+    printf("as sent:             %s\n", verdict_text(verify(secret, body, String::as_view(&header))));
+    printf(
+        "amount changed:      %s\n",
+        verdict_text(verify(secret, "{\"event\":\"payment.succeeded\",\"amount\":9900}", String::as_view(&header))),
+    );
+    String forged = sign(other, body);
+    printf("other secret:        %s\n", verdict_text(verify(secret, body, String::as_view(&forged))));
+    printf(
+        "no prefix:           %s\n",
+        verdict_text(verify(secret, body, StringView::sub(String::as_view(&header), 7, String::len(&header)))),
+    );
+    printf("not hex:             %s\n", verdict_text(verify(secret, body, "sha256=zz")));
+    printf(
+        "cut short:           %s\n",
+        verdict_text(verify(secret, body, StringView::sub(String::as_view(&header), 0, 39))),
+    );
+    printf(
+        "as base64, for a header that wants it: %s\n",
+        &base64_encode(&hmac_sha256(secret, StringView::as_bytes(body))[0..$]),
+    );
+}

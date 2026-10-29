@@ -1,0 +1,62 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.net [Udp] [Resolve] (D-0144); conf.net-udp, conf.net-resolve-localhost
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 73656e743a2031300a7265636569766564205b70696e672c20706f6e675d2066726f6d207468652073656e646572277320706f72743a20747275650a6e6f7468696e67206d6f72653a2074696d6564206f75740a6c6f63616c686f73743a20736f6d652061646472657373657320747275652c2065616368207769746820706f727420383020747275650a
+//
+// A datagram sent between two loopback sockets arrives whole, and
+// `recv_from` names the sender's port. `resolve("localhost", 80)` needs
+// only the system's hosts file, no network: the one case that asks the
+// resolver. (A name that does not resolve is tested outside the suite:
+// offline, the resolver may take long to say so.)
+
+import std;
+
+fn main() : u8
+{
+    UdpSocket a = match (UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(u)  : u,
+        Err(_) : return 1,
+    };
+    UdpSocket b = match (UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(u)  : u,
+        Err(_) : return 2,
+    };
+    UdpSocket::set_read_timeout_ms(&mut b, 5000);
+    printf(
+        "sent: %u\n",
+        Result::unwrap_or(UdpSocket::send_to(&mut a, &b"ping, pong"[0..$], UdpSocket::local_addr(&b)), 0),
+    );
+    match (UdpSocket::recv_from(&mut b, 100))
+    {
+        Ok(d)  :
+        {
+            String text = Result::unwrap_or(String::from_utf8(Vec::clone(&d.data)), String::new());
+            printf("received [%s] from the sender's port: %v\n", &text, d.from.port == UdpSocket::local_addr(&a).port);
+        },
+        Err(e) : printf("recv_from: %s\n", NetError::text(&e)),
+    }
+    UdpSocket::set_read_timeout_ms(&mut b, 50);
+    match (UdpSocket::recv_from(&mut b, 100))
+    {
+        Err(e) : printf("nothing more: %s\n", NetError::text(&e)),
+        Ok(_)  : printf("a second datagram?\n"),
+    }
+    match (resolve("localhost", 80))
+    {
+        Ok(addrs) :
+        {
+            bool all = true;
+            foreach (x in &addrs)
+            {
+                all = all && x.port == 80;
+            }
+            printf("localhost: some addresses %v, each with port 80 %v\n", Vec::len(&addrs) > 0, all);
+        },
+        Err(e)    : printf("resolve: %s\n", NetError::text(&e)),
+    }
+    0
+}
