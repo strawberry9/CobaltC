@@ -1,0 +1,81 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Request] [Http-Response] (D-0173, D-0174); conf.http-head-too-large (D-0211, CHG-0249)
+// kind: positive
+// expect: ok
+// slow: a 70,000-byte head line built byte by byte, both ways (about 45 s interpreted; the limit it crosses is 64 KiB)
+// expect-stdout-hex: 7365727665723a207468652048545450206d657373616765206973206c6172676572207468616e20746865206c696d69740a636c69656e743a207468652048545450206d657373616765206973206c6172676572207468616e20746865206c696d69740a616e73776572656420776974682037303033382062797465730a
+//
+// The head limit, both ways: a message's request or status line and
+// headers may take at most 64 KiB. A raw client sends the server a request
+// whose one header is 70,000 bytes long: `HttpConnection::request` is
+// `TooLarge` and the connection closes. A raw server answers the client
+// with a status line of 70,000 bytes: `http_get` is `TooLarge`. Neither
+// side reads the rest.
+
+import std;
+
+fn big_line(usize n) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut v, 97);
+    }
+    v
+}
+
+fn serve(HttpServer s) : String
+{
+    HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+    String seen = match (HttpConnection::request(&mut c))
+    {
+        Ok(Some(_)) : String::from_str("a request"),
+        Ok(None)    : String::from_str("closed"),
+        Err(e)      : String::from_str(HttpError::text(&e)),
+    };
+    HttpConnection::close(&mut c);
+    seen
+}
+
+fn answer(TcpListener l) : usize
+{
+    TcpStream c = Result::unwrap(TcpListener::accept(&mut l));
+    Vec<u8> head = Vec::new();
+    _ = TcpStream::read(&mut c, &mut head, 4096);
+    Vec<u8> reply = Vec::new();
+    Vec::extend_from(&mut reply, StringView::as_bytes("HTTP/1.1 200 "));
+    Vec::append(&mut reply, big_line(70000));
+    Vec::extend_from(&mut reply, StringView::as_bytes("\r\nContent-Length: 2\r\n\r\nok"));
+    _ = TcpStream::write(&mut c, &reply[0..$]);
+    Vec::len(&reply)
+}
+
+fn main() : u8
+{
+    // the server's side
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr addr = HttpServer::local_addr(&s);
+    auto h = spawn(serve, s);
+    TcpStream c = Result::unwrap(TcpStream::connect(addr));
+    Vec<u8> req = Vec::new();
+    Vec::extend_from(&mut req, StringView::as_bytes("GET / HTTP/1.1\r\nHost: localhost\r\nX-Long: "));
+    Vec::append(&mut req, big_line(70000));
+    Vec::extend_from(&mut req, StringView::as_bytes("\r\n\r\n"));
+    _ = TcpStream::write(&mut c, &req[0..$]);
+    _ = TcpStream::shutdown_write(&mut c);
+    printf("server: %v\n", &join(h));
+    // the client's side
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String url = String::from_str("http://");
+    String::append(&mut url, &SocketAddr::text(&TcpListener::local_addr(&l)));
+    String::append(&mut url, "/");
+    auto a = spawn(answer, l);
+    match (http_get(String::as_view(&url)))
+    {
+        Ok(_)  : printf("client: a response\n"),
+        Err(e) : printf("client: %s\n", HttpError::text(&e)),
+    }
+    printf("answered with %v bytes\n", join(a));
+    0
+}

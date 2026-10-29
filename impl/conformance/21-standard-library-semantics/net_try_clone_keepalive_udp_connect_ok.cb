@@ -1,0 +1,59 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.net [Try-Clone] [Keepalive] [Udp-Connect] (D-0181, D-0185); conf.tcp-try-clone, conf.tcp-keepalive, conf.udp-connect
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 747275650a7265616465723a20746f2074686520636c6f6e650a7365727665723a2066726f6d20746865206f726967696e616c0a7365727665723a207374696c6c206f70656e0a342070696e6720706f6e20747275650a
+//
+// A second handle on a connection reads in one thread while the first
+// writes in another, and the connection stays open until both are gone;
+// keepalive is accepted; a connected UDP socket sends with `send`,
+// receives with `recv`, and drops a datagram from anyone else.
+
+import std;
+
+fn reader(TcpStream s) : u8
+{
+    String line = Option::unwrap_or(Result::unwrap(TcpStream::read_line(&mut s)), String::from_str("-"));
+    printf("reader: %v\n", &line);
+    0
+}
+
+fn main()
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    TcpStream client = Result::unwrap(TcpStream::connect(TcpListener::local_addr(&l)));
+    TcpStream server = Result::unwrap(TcpListener::accept(&mut l));
+    TcpStream::set_keepalive(&mut client, true);
+    TcpStream::set_keepalive(&mut client, false);
+    TcpStream second = Result::unwrap(TcpStream::try_clone(&client));
+    printf("%v\n", TcpStream::peer_addr(&second).port == TcpStream::peer_addr(&client).port);
+    auto h = spawn(reader, second);
+    _ = TcpStream::write_text(&mut server, "to the clone\n");
+    _ = join(h);
+    _ = TcpStream::write_text(&mut client, "from the original\n");
+    printf("server: %v\n", &Option::unwrap_or(Result::unwrap(TcpStream::read_line(&mut server)), String::new()));
+    {
+        TcpStream third = Result::unwrap(TcpStream::try_clone(&client));
+        drop(third);
+    }
+    _ = TcpStream::write_text(&mut client, "still open\n");
+    printf("server: %v\n", &Option::unwrap_or(Result::unwrap(TcpStream::read_line(&mut server)), String::new()));
+    UdpSocket a = Result::unwrap(UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    UdpSocket b = Result::unwrap(UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    UdpSocket stranger = Result::unwrap(UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    _ = UdpSocket::connect(&mut a, UdpSocket::local_addr(&b));
+    _ = UdpSocket::connect(&mut b, UdpSocket::local_addr(&a));
+    _ = UdpSocket::send_to(&mut stranger, &b"intruder"[0..$], UdpSocket::local_addr(&b));
+    printf("%v ", Result::unwrap(UdpSocket::send(&mut a, &b"ping"[0..$])));
+    UdpSocket::set_read_timeout_ms(&mut b, 2000);
+    Vec<u8> got = Result::unwrap(UdpSocket::recv(&mut b, 100));
+    printf("%v ", &Result::unwrap(String::from_utf8(got)));
+    _ = UdpSocket::send(&mut b, &b"pong!"[0..$]);
+    Vec<u8> back = Result::unwrap(UdpSocket::recv(&mut a, 3));
+    printf(
+        "%v %v\n",
+        &Result::unwrap(String::from_utf8(back)),
+        Result::is_err(&UdpSocket::send(&mut stranger, &b"x"[0..$])),
+    );
+}

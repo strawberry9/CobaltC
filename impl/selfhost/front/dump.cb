@@ -1,0 +1,652 @@
+// The canonical text of a parsed program's own part, as
+// impl/src/astdump.rs writes it (`coby --dump-ast`), byte for byte: one
+// S-expression per node, every expression with its `@line:col`, strings
+// as their bytes in hex, floats as their bits. The two parsers are
+// compared through it (impl/selfhost/compare_parser.sh).
+
+import std;
+import ast;
+
+export fn dump_program(ref<Program, shared> p, usize skip_items, usize skip_tests) : String
+{
+    String o = String::new();
+    for (usize i = skip_items; i < Vec::len(&p.items); i += 1)
+    {
+        item(&mut o, &p.items[i], 0);
+    }
+    for (usize i = skip_tests; i < Vec::len(&p.tests); i += 1)
+    {
+        ref<UnitTest, shared> t = &p.tests[i];
+        String::appendf(&mut o, "(test %s %s %s %v)\n", &path_text(&t.module_), &t.fn_name, &opt_hex(&t.name), t.line);
+    }
+    o
+}
+
+fn path_text(ref<Vec<String>, shared> segs) : String
+{
+    if (Vec::len(segs) == 0)
+    {
+        return String::from_str("-");
+    }
+    joined(segs, "::")
+}
+
+fn joined(ref<Vec<String>, shared> v, str sep) : String
+{
+    String::join(&v[0..$], StringView::of(sep))
+}
+
+fn hex(StringView s) : String
+{
+    String o = String::from_str("x");
+    foreach (b in StringView::as_bytes(s))
+    {
+        String::appendf(&mut o, "%02x", *b);
+    }
+    o
+}
+
+fn opt_hex(ref<Option<String>, shared> s) : String
+{
+    match (s)
+    {
+        Some(x) : hex(String::as_view(x)),
+        None    : String::from_str("-"),
+    }
+}
+
+fn opt_str(ref<Option<String>, shared> s) : String
+{
+    match (s)
+    {
+        Some(x) : String::clone(x),
+        None    : String::from_str("-"),
+    }
+}
+
+fn ind(ref<String, exclusive> o, usize d)
+{
+    for (usize i = 0; i < d; i += 1)
+    {
+        String::append(o, "  ");
+    }
+}
+
+fn mode(Mode m) : str
+{
+    if (m == Mode::Shared) { "shared" } else { "exclusive" }
+}
+
+fn types(ref<Vec<Type>, shared> ts, str sep) : String
+{
+    String o = String::new();
+    for (usize i = 0; i < Vec::len(ts); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut o, sep);
+        }
+        String::append(&mut o, &ty(&ts[i]));
+    }
+    o
+}
+
+export fn ty(ref<Type, shared> t) : String
+{
+    match (t)
+    {
+        Type::TInt(i)     : String::from_str(int_ty_name(*i)),
+        Type::TF32        : String::from_str("f32"),
+        Type::TF64        : String::from_str("f64"),
+        Type::TBool       : String::from_str("bool"),
+        Type::TStr        : String::from_str("str"),
+        Type::TVoid       : String::from_str("void"),
+        Type::TNever      : String::from_str("never"),
+        Type::TRef(m)     : sprintf("(ref %s %s)", &ty(&Box::get(m).inner), mode(Box::get(m).mode)),
+        Type::TSlice(m)   : sprintf("(slice %s %s)", &ty(&Box::get(m).inner), mode(Box::get(m).mode)),
+        Type::TRawptr(x)  : sprintf("(rawptr %s)", &ty(Box::get(x))),
+        Type::TArray(s)   : sprintf("(array %s %v)", &ty(&Box::get(s).inner), Box::get(s).n),
+        Type::TSimd(s)    : sprintf("(simd %s %v)", &ty(&Box::get(s).inner), Box::get(s).n),
+        Type::TFn(f)      : sprintf("(fn (%s) %s)", &types(&Box::get(f).params, " "), &ty(&Box::get(f).ret)),
+        Type::THandle(x)  : sprintf("(handle %s)", &ty(Box::get(x))),
+        Type::TMutex(x)   : sprintf("(mutex %s)", &ty(Box::get(x))),
+        Type::TGuard(x)   : sprintf("(guard %s)", &ty(Box::get(x))),
+        Type::TNamed(n)   : sprintf("(named %s (%s))", &Box::get(n).name, &types(&Box::get(n).args, " ")),
+        Type::TClosure(i) : sprintf("(closure %v)", *i),
+    }
+}
+
+fn params(ref<Vec<ParamDecl>, shared> ps) : String
+{
+    String o = String::from_str("(");
+    for (usize i = 0; i < Vec::len(ps); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut o, " ");
+        }
+        String::appendf(&mut o, "(%s %s)", &ty(&ps[i].ty), &ps[i].name);
+    }
+    String::append(&mut o, ")");
+    o
+}
+
+fn bounds(ref<Vec<Option<Bound>>, shared> bs) : String
+{
+    String o = String::new();
+    for (usize i = 0; i < Vec::len(bs); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut o, " ");
+        }
+        match (bs[i])
+        {
+            Some(b) : String::append(&mut o, bound_name(b)),
+            None    : String::append(&mut o, "-"),
+        }
+    }
+    o
+}
+
+fn item(ref<String, exclusive> o, ref<Item, shared> it, usize d)
+{
+    ind(o, d);
+    match (it)
+    {
+        Item::IFn(fb)         :
+        {
+            ref<FnDecl, shared> f = Box::get(fb);
+            String::appendf(
+                o,
+                "(fn %v %s %s (%s) (%s) %s %s line %v const %v auto %v derived %v c %v\n",
+                f.export_,
+                &opt_str(&f.assoc_type),
+                &f.name,
+                &joined(&f.type_params, " "),
+                &bounds(&f.type_bounds),
+                &params(&f.params),
+                &ty(&f.ret),
+                f.line,
+                f.is_const,
+                f.auto_type,
+                f.derived,
+                f.c_entry,
+            );
+            block(o, &f.body, d + 1);
+            ind(o, d);
+            String::append(o, ")\n");
+        },
+        Item::IExtern(eb)     :
+        {
+            ref<ExternDecl, shared> e = Box::get(eb);
+            String::appendf(
+                o,
+                "(extern %v %s %s %s line %v)\n",
+                e.export_,
+                &e.name,
+                &params(&e.params),
+                &ty(&e.ret),
+                e.line,
+            );
+        },
+        Item::IStatic(sb)     :
+        {
+            ref<StaticDecl, shared> s = Box::get(sb);
+            String::appendf(o, "(static %v %s %s line %v\n", s.export_, &s.name, &ty(&s.ty), s.line);
+            expr(o, &s.init, d + 1);
+            ind(o, d);
+            String::append(o, ")\n");
+        },
+        Item::IStruct(sb)     :
+        {
+            ref<StructDecl, shared> s = Box::get(sb);
+            String bits = match (s.bits)
+            {
+                Some(b) : String::from_str(int_ty_name(b)),
+                None    : String::from_str("-"),
+            };
+            String al = match (s.align)
+            {
+                Some(a) : sprintf("%v", a),
+                None    : String::from_str("-"),
+            };
+            String::appendf(
+                o,
+                "(struct %v %v %s (%s) line %v bits %s align %s\n",
+                s.export_,
+                s.resource_,
+                &s.name,
+                &joined(&s.type_params, " "),
+                s.line,
+                &bits,
+                &al,
+            );
+            foreach (f in &s.fields)
+            {
+                ind(o, d + 1);
+                String w = match (f.width)
+                {
+                    Some(x) : sprintf("%v", x),
+                    None    : String::from_str("-"),
+                };
+                String::appendf(o, "(field %v %s %s %s)\n", f.export_, &ty(&f.ty), &f.name, &w);
+            }
+            ind(o, d);
+            String::append(o, ")\n");
+        },
+        Item::IEnum(eb)       :
+        {
+            ref<EnumDecl, shared> e = Box::get(eb);
+            String::appendf(
+                o,
+                "(enum %v %v %s (%s) line %v\n",
+                e.export_,
+                e.resource_,
+                &e.name,
+                &joined(&e.type_params, " "),
+                e.line,
+            );
+            foreach (v in &e.variants)
+            {
+                ind(o, d + 1);
+                String p = match (&v.payload)
+                {
+                    Some(t) : ty(t),
+                    None    : String::from_str("-"),
+                };
+                String::appendf(o, "(variant %s %s)\n", &v.name, &p);
+            }
+            ind(o, d);
+            String::append(o, ")\n");
+        },
+        Item::IModule(mb)     :
+        {
+            ref<ModuleItem, shared> m = Box::get(mb);
+            String::appendf(o, "(module %v %s line %v\n", m.export_, &m.name, m.line);
+            foreach (x in &m.items)
+            {
+                item(o, x, d + 1);
+            }
+            ind(o, d);
+            String::append(o, ")\n");
+        },
+        Item::IImport(ib)     :
+        {
+            ref<ImportItem, shared> m = Box::get(ib);
+            String::appendf(o, "(import %v %s line %v)\n", m.export_, &m.path, m.line);
+        },
+        Item::IExternCode(cb) :
+        {
+            ref<ExternCodeItem, shared> c = Box::get(cb);
+            String::appendf(o, "(extern-code %s line %v)\n", &hex(String::as_view(&c.code)), c.line);
+        },
+    }
+}
+
+fn block(ref<String, exclusive> o, ref<Block, shared> b, usize d)
+{
+    ind(o, d);
+    String::append(o, "(block\n");
+    foreach (s in &b.stmts)
+    {
+        stmt(o, s, d + 1);
+    }
+    match (&b.tail)
+    {
+        Some(t) :
+        {
+            ind(o, d + 1);
+            String::append(o, "(tail\n");
+            expr(o, Box::get(t), d + 2);
+            ind(o, d + 1);
+            String::append(o, ")\n");
+        },
+        None    : {},
+    }
+    ind(o, d);
+    String::append(o, ")\n");
+}
+
+fn close(ref<String, exclusive> o, usize d)
+{
+    ind(o, d);
+    String::append(o, ")\n");
+}
+
+fn stmt(ref<String, exclusive> o, ref<Stmt, shared> s, usize d)
+{
+    ind(o, d);
+    match (s)
+    {
+        Stmt::SLet(lb)         :
+        {
+            ref<LetStmt, shared> l = Box::get(lb);
+            String t = match (&l.ty)
+            {
+                Some(x) : ty(x),
+                None    : String::from_str("auto"),
+            };
+            String::appendf(o, "(let %s %s @%v:%v\n", &t, &l.name, l.line, l.col);
+            match (&l.init)
+            {
+                Some(e) : expr(o, e, d + 1),
+                None    : {},
+            }
+            close(o, d);
+        },
+        Stmt::SDestructure(db) :
+        {
+            ref<DestructureStmt, shared> x = Box::get(db);
+            String::appendf(
+                o,
+                "(destructure %s (%s) (%s) %v\n",
+                &x.struct_name,
+                &joined(&x.fields, " "),
+                &joined(&x.names, " "),
+                x.rest,
+            );
+            expr(o, &x.init, d + 1);
+            close(o, d);
+        },
+        Stmt::SExpr(e)         :
+        {
+            String::append(o, "(expr\n");
+            expr(o, Box::get(e), d + 1);
+            close(o, d);
+        },
+        Stmt::SBlockLike(e)    :
+        {
+            String::append(o, "(blocklike\n");
+            expr(o, Box::get(e), d + 1);
+            close(o, d);
+        },
+    }
+}
+
+fn binop(BinOp op) : str
+{
+    match (op)
+    {
+        BinOp::Add    : "+",
+        BinOp::Sub    : "-",
+        BinOp::Mul    : "*",
+        BinOp::Div    : "/",
+        BinOp::Rem    : "%",
+        BinOp::Shl    : "<<",
+        BinOp::Shr    : ">>",
+        BinOp::BitAnd : "&",
+        BinOp::BitOr  : "|",
+        BinOp::BitXor : "^",
+        BinOp::Eq     : "==",
+        BinOp::Ne     : "!=",
+        BinOp::Lt     : "<",
+        BinOp::Le     : "<=",
+        BinOp::Gt     : ">",
+        BinOp::Ge     : ">=",
+        BinOp::And    : "&&",
+        BinOp::Or     : "||",
+    }
+}
+
+fn unop(UnOp op) : str
+{
+    match (op)
+    {
+        UnOp::Neg    : "neg",
+        UnOp::Not    : "not",
+        UnOp::BitNot : "bitnot",
+    }
+}
+
+fn targs(ref<Vec<Type>, shared> ts) : String
+{
+    sprintf("<%s>", &types(ts, " "))
+}
+
+// The bits of a float, 16 hex digits.
+fn float_bits(f64 v) : String
+{
+    sprintf("%016x", reinterpret<u64>(v))
+}
+
+fn expr(ref<String, exclusive> o, ref<Expr, shared> e, usize d)
+{
+    ind(o, d);
+    String at = sprintf("@%v:%v", e.line, e.col);
+    match (&e.kind)
+    {
+        ExprKind::EInt(b)         :
+        {
+            ref<IntLit, shared> x = Box::get(b);
+            String::appendf(o, "(int %s %v %s)\n", &at, x.v, &opt_str(&x.sfx));
+        },
+        ExprKind::EFloat(b)       :
+        {
+            ref<FloatLit, shared> x = Box::get(b);
+            String::appendf(o, "(float %s %s %s)\n", &at, &float_bits(x.v), &opt_str(&x.sfx));
+        },
+        ExprKind::EStr(s)         : String::appendf(o, "(str %s %s)\n", &at, &hex(String::as_view(s))),
+        ExprKind::EBool(v)        : String::appendf(o, "(bool %s %v)\n", &at, *v),
+        ExprKind::EUnit           : String::appendf(o, "(unit %s)\n", &at),
+        ExprKind::EDollar         : String::appendf(o, "(dollar %s)\n", &at),
+        ExprKind::EBreak          : String::appendf(o, "(break %s)\n", &at),
+        ExprKind::EContinue       : String::appendf(o, "(continue %s)\n", &at),
+        ExprKind::EPath(b)        :
+        {
+            ref<PathExpr, shared> x = Box::get(b);
+            String::appendf(o, "(path %s %s %s)\n", &at, &joined(&x.segs, "::"), &targs(&x.targs));
+        },
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, shared> x = Box::get(b);
+            String::appendf(o, "(structlit %s %s %s\n", &at, &joined(&x.segs, "::"), &targs(&x.targs));
+            foreach (f in &x.fields)
+            {
+                ind(o, d + 1);
+                String::appendf(o, "(set %s\n", &f.name);
+                expr(o, &f.value, d + 2);
+                close(o, d + 1);
+            }
+            close(o, d);
+        },
+        ExprKind::EArrayLit(xs)   :
+        {
+            String::appendf(o, "(arraylit %s\n", &at);
+            foreach (x in xs)
+            {
+                expr(o, x, d + 1);
+            }
+            close(o, d);
+        },
+        ExprKind::EArrayRepeat(b) :
+        {
+            ref<RepeatExpr, shared> x = Box::get(b);
+            String::appendf(o, "(arrayrepeat %s %v\n", &at, x.n);
+            expr(o, &x.value, d + 1);
+            close(o, d);
+        },
+        ExprKind::EUnary(b)       :
+        {
+            ref<UnaryExpr, shared> x = Box::get(b);
+            String::appendf(o, "(unary %s %s\n", &at, unop(x.op));
+            expr(o, &x.e, d + 1);
+            close(o, d);
+        },
+        ExprKind::EBinary(b)      :
+        {
+            ref<BinaryExpr, shared> x = Box::get(b);
+            String::appendf(o, "(binary %s %s\n", &at, binop(x.op));
+            expr(o, &x.a, d + 1);
+            expr(o, &x.b, d + 1);
+            close(o, d);
+        },
+        ExprKind::EBorrow(b)      :
+        {
+            ref<BorrowExpr, shared> x = Box::get(b);
+            String::appendf(o, "(borrow %s %s\n", &at, mode(x.mode));
+            expr(o, &x.e, d + 1);
+            close(o, d);
+        },
+        ExprKind::ESliceOf(b)     :
+        {
+            ref<SliceExpr, shared> x = Box::get(b);
+            String::appendf(o, "(sliceof %s %s\n", &at, mode(x.mode));
+            expr(o, &x.base, d + 1);
+            expr(o, &x.lo, d + 1);
+            expr(o, &x.hi, d + 1);
+            close(o, d);
+        },
+        ExprKind::EDeref(x)       :
+        {
+            String::appendf(o, "(deref %s\n", &at);
+            expr(o, Box::get(x), d + 1);
+            close(o, d);
+        },
+        ExprKind::EField(b)       :
+        {
+            ref<FieldExpr, shared> x = Box::get(b);
+            String::appendf(o, "(field %s %s\n", &at, &x.name);
+            expr(o, &x.e, d + 1);
+            close(o, d);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            ref<PairExpr, shared> x = Box::get(b);
+            String::appendf(o, "(index %s\n", &at);
+            expr(o, &x.a, d + 1);
+            expr(o, &x.b, d + 1);
+            close(o, d);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, shared> x = Box::get(b);
+            String::appendf(o, "(call %s\n", &at);
+            expr(o, &x.callee, d + 1);
+            foreach (a in &x.args)
+            {
+                expr(o, a, d + 1);
+            }
+            close(o, d);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            ref<PairExpr, shared> x = Box::get(b);
+            String::appendf(o, "(assign %s\n", &at);
+            expr(o, &x.a, d + 1);
+            expr(o, &x.b, d + 1);
+            close(o, d);
+        },
+        ExprKind::EPropagate(x)   :
+        {
+            String::appendf(o, "(propagate %s\n", &at);
+            expr(o, Box::get(x), d + 1);
+            close(o, d);
+        },
+        ExprKind::EParen(x)       :
+        {
+            String::appendf(o, "(paren %s\n", &at);
+            expr(o, Box::get(x), d + 1);
+            close(o, d);
+        },
+        ExprKind::EBlock(b)       :
+        {
+            String::appendf(o, "(blockexpr %s\n", &at);
+            block(o, b, d + 1);
+            close(o, d);
+        },
+        ExprKind::EUnsafe(b)      :
+        {
+            String::appendf(o, "(unsafe %s\n", &at);
+            block(o, b, d + 1);
+            close(o, d);
+        },
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, shared> x = Box::get(b);
+            String::appendf(o, "(if %s\n", &at);
+            expr(o, &x.cond, d + 1);
+            block(o, &x.then_, d + 1);
+            match (&x.else_)
+            {
+                Some(y) : expr(o, y, d + 1),
+                None    : {},
+            }
+            close(o, d);
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, shared> x = Box::get(b);
+            String::appendf(o, "(while %s\n", &at);
+            expr(o, &x.cond, d + 1);
+            block(o, &x.body, d + 1);
+            match (&x.step)
+            {
+                Some(y) : expr(o, y, d + 1),
+                None    : {},
+            }
+            close(o, d);
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, shared> x = Box::get(b);
+            String::appendf(o, "(match %s\n", &at);
+            expr(o, &x.scrut, d + 1);
+            foreach (a in &x.arms)
+            {
+                ind(o, d + 1);
+                String::appendf(
+                    o,
+                    "(arm %s (%s) %s\n",
+                    &opt_str(&a.variant),
+                    &joined(&a.nested, " "),
+                    &opt_str(&a.binder),
+                );
+                match (&a.lit)
+                {
+                    Some(l) :
+                    {
+                        ind(o, d + 2);
+                        String::append(o, "(lit\n");
+                        expr(o, Box::get(l), d + 3);
+                        close(o, d + 2);
+                    },
+                    None    : {},
+                }
+                expr(o, Box::get(&a.body), d + 2);
+                close(o, d + 1);
+            }
+            close(o, d);
+        },
+        ExprKind::EReturn(x)      :
+        {
+            String::appendf(o, "(return %s\n", &at);
+            match (x)
+            {
+                Some(y) : expr(o, Box::get(y), d + 1),
+                None    : {},
+            }
+            close(o, d);
+        },
+        ExprKind::EClosure(b)     :
+        {
+            ref<ClosureExpr, shared> x = Box::get(b);
+            String r = match (&x.ret)
+            {
+                Some(t) : ty(t),
+                None    : String::from_str("-"),
+            };
+            String::appendf(
+                o,
+                "(closure %s %v (%s) %s %s\n",
+                &at,
+                x.is_move,
+                &joined(&x.captures, " "),
+                &params(&x.params),
+                &r,
+            );
+            block(o, &x.body, d + 1);
+            close(o, d);
+        },
+    }
+}

@@ -1,0 +1,1510 @@
+// The layout: tokens and comments in, the house style out
+// (`private/cobfmt-proposal.md` §3), as impl/cobfmt/src/format.rs gives
+// it. Line structure is the author's: a line break is never added or
+// removed, except that a block's `{` and an `else` go on lines of their
+// own (Allman, §3.1), and blank lines are normalised (§3.4). Within a
+// line, the spacing between two tokens is fixed by a rule where the
+// tokens alone decide it, and kept as written (collapsed to none or one
+// space) where they do not.
+
+import std;
+import lexer;
+
+// No index: an `Option<usize>` kept in a `Vec<usize>`.
+export const usize NO = ~0;
+
+// One element of a line: a token or a comment, by its index in the
+// token or the trivia list.
+const u8 E_TOK = 0;
+const u8 E_LINE = 1;
+const u8 E_BLOCK = 2;
+
+struct Elem
+{
+    u8 kind;
+    usize idx;
+}
+
+struct Line
+{
+    Vec<Elem> elems;
+    usize blank;                      // blank lines in the source before this line
+}
+
+// The source (without a byte-order mark), its tokens and trivia.
+struct Src
+{
+    String text;
+    Vec<Token> toks;
+    Vec<Trivia> trivia;
+}
+
+struct Braces
+{
+    Vec<usize> close_of;
+    Vec<usize> open_of;
+}
+
+// A line rendered: its code, and its trailing line comment with the
+// source column it began at.
+struct Rendered
+{
+    String code;
+    bool tr;
+    String tr_text;
+    usize tr_col;
+}
+
+// ---- small helpers ----
+
+fn tk(ref<Src, shared> s, usize i) : Tok
+{
+    if (i == NO || i >= Vec::len(&s.toks))
+    {
+        return Tok::Eof;
+    }
+    s.toks[i].tok
+}
+
+fn view(ref<Src, shared> s) : StringView
+{
+    String::as_view(&s.text)
+}
+
+// Whether the token at `i` is the name `in` (not a keyword token).
+fn is_in(ref<Src, shared> s, usize i) : bool
+{
+    i != NO && is_name(view(s), s.toks[i], "in")
+}
+
+fn is_opener(Tok t) : bool
+{
+    t == Tok::LBrace || t == Tok::LParen || t == Tok::LBracket
+}
+
+fn is_closer(Tok t) : bool
+{
+    t == Tok::RBrace || t == Tok::RParen || t == Tok::RBracket
+}
+
+fn elems_sub(ref<Vec<Elem>, shared> v, usize lo, usize hi) : Vec<Elem>
+{
+    Vec::from_slice(&v[lo..hi])
+}
+
+fn has_tok(ref<Vec<Elem>, shared> v, usize lo, usize hi) : bool
+{
+    for (usize k = lo; k < hi; k += 1)
+    {
+        if (v[k].kind == E_TOK)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_line(ref<Vec<Line>, exclusive> out, Vec<Elem> elems, usize blank)
+{
+    Vec::push(out, Line { .elems = elems, .blank = blank });
+}
+
+fn line_clone(ref<Line, shared> l) : Line
+{
+    Line { .elems = Vec::clone(&l.elems), .blank = l.blank }
+}
+
+// The comment's text: a line comment without a trailing `\r`, a block
+// comment with `\r\n` as `\n`.
+fn comment_text(ref<Src, shared> s, usize ti) : String
+{
+    Trivia t = s.trivia[ti];
+    usize hi = t.pos + t.len;
+    if (t.kind == TRIVIA_LINE)
+    {
+        while (hi > t.pos && String::as_bytes(&s.text)[hi - 1] == b'\r')
+        {
+            hi -= 1;
+        }
+        return String::from_view(String::view(&s.text, t.pos, hi));
+    }
+    StringView::replace(String::view(&s.text, t.pos, hi), "\r\n", "\n")
+}
+
+fn elem_pos(ref<Src, shared> s, Elem e) : usize
+{
+    if (e.kind == E_TOK)
+    {
+        return s.toks[e.idx].pos;
+    }
+    s.trivia[e.idx].pos
+}
+
+// The first and last token of a line; `NO` when it has none.
+fn first_code(ref<Line, shared> l) : usize
+{
+    foreach (e in &l.elems)
+    {
+        if (e.kind == E_TOK)
+        {
+            return e.idx;
+        }
+    }
+    NO
+}
+
+fn last_code(ref<Line, shared> l) : usize
+{
+    usize k = Vec::len(&l.elems);
+    while (k > 0)
+    {
+        k -= 1;
+        if (l.elems[k].kind == E_TOK)
+        {
+            return l.elems[k].idx;
+        }
+    }
+    NO
+}
+
+// Characters, not bytes: the bytes that do not continue a UTF-8 sequence.
+export fn char_count(StringView v) : usize
+{
+    usize n = 0;
+    foreach (b in StringView::as_bytes(v))
+    {
+        if ((*b & 0xC0) != 0x80)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn spaces(ref<String, exclusive> out, usize n)
+{
+    for (usize i = 0; i < n; i += 1)
+    {
+        String::push_ascii(out, b' ');
+    }
+}
+
+// The columns, in characters, before `pos` on its source line; a tab is four.
+fn indent_of_source(ref<Src, shared> s, usize pos) : usize
+{
+    ref<Vec<u8>, shared> b = String::as_bytes(&s.text);
+    usize start = pos;
+    while (start > 0 && b[start - 1] != b'\n')
+    {
+        start -= 1;
+    }
+    usize n = 0;
+    for (usize i = start; i < pos; i += 1)
+    {
+        u8 c = b[i];
+        if (c == b'\t')
+        {
+            n += 4;
+        }
+        else if ((c & 0xC0) != 0x80)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// Whether the text ends in white space as Rust's `char::is_whitespace`
+// has it, and how many bytes that last character takes.
+fn trailing_space_len(StringView v) : usize
+{
+    slice<u8, shared> b = StringView::as_bytes(v);
+    usize n = StringView::len(v);
+    if (n == 0)
+    {
+        return 0;
+    }
+    u8 c = b[n - 1];
+    if (c == b' ' || c == b'\t' || c == b'\n' || c == 0x0B || c == 0x0C || c == b'\r')
+    {
+        return 1;
+    }
+    if (c < 0x80)
+    {
+        return 0;
+    }
+    usize k = n - 1;
+    while (k > 0 && (b[k] & 0xC0) == 0x80)
+    {
+        k -= 1;
+    }
+    u32 cp = match (StringView::code_point(StringView::sub(v, k, n)))
+    {
+        Some(cp) : cp,
+        None     : return 0,
+    };
+    bool ws = cp == 0x85 || cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029
+        || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+    if (ws)
+    {
+        return n - k;
+    }
+    0
+}
+
+export fn trim_end(StringView v) : StringView
+{
+    StringView r = v;
+    while (true)
+    {
+        usize k = trailing_space_len(r);
+        if (k == 0)
+        {
+            return r;
+        }
+        r = StringView::sub(r, 0, StringView::len(r) - k);
+    }
+    r
+}
+
+// ---- lines ----
+
+// The source split into logical lines of tokens and comments.
+fn split_lines(ref<Src, shared> s) : Vec<Line>
+{
+    Vec<Line> lines = Vec::new();
+    Vec<Elem> cur = Vec::new();
+    usize cur_blank = 0;
+    usize newlines_run = 0;
+    bool first = true;
+    for (usize i = 0; i < Vec::len(&s.toks); i += 1)
+    {
+        Token t = s.toks[i];
+        for (usize r = t.tr_lo; r < t.tr_hi; r += 1)
+        {
+            u8 kind = s.trivia[r].kind;
+            if (kind == TRIVIA_NEWLINE)
+            {
+                if (Vec::len(&cur) > 0)
+                {
+                    push_line(&mut lines, replace(&mut cur, Vec::new()), cur_blank);
+                    cur_blank = 0;
+                    newlines_run = 1;
+                }
+                else
+                {
+                    newlines_run += 1;
+                }
+            }
+            else
+            {
+                if (Vec::len(&cur) == 0)
+                {
+                    cur_blank = if (first || newlines_run == 0) { 0 } else { newlines_run - 1 };
+                    first = false;
+                }
+                Vec::push(&mut cur, Elem { .kind = if (kind == TRIVIA_LINE) { E_LINE } else { E_BLOCK }, .idx = r });
+                newlines_run = 0;
+            }
+        }
+        if (t.tok == Tok::Eof)
+        {
+            break;
+        }
+        if (Vec::len(&cur) == 0)
+        {
+            cur_blank = if (first || newlines_run == 0) { 0 } else { newlines_run - 1 };
+            first = false;
+        }
+        Vec::push(&mut cur, Elem { .kind = E_TOK, .idx = i });
+        newlines_run = 0;
+    }
+    if (Vec::len(&cur) > 0)
+    {
+        push_line(&mut lines, cur, cur_blank);
+    }
+    lines
+}
+
+// The index of each bracket's partner, over token indices.
+fn match_braces(ref<Src, shared> s) : Braces
+{
+    usize n = Vec::len(&s.toks);
+    Braces b = Braces { .close_of = Vec::filled(n, NO), .open_of = Vec::filled(n, NO) };
+    Vec<usize> stack = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Tok t = s.toks[i].tok;
+        if (is_opener(t))
+        {
+            Vec::push(&mut stack, i);
+        }
+        else if (is_closer(t))
+        {
+            match (Vec::pop(&mut stack))
+            {
+                Some(o) :
+                {
+                    b.close_of[o] = i;
+                    b.open_of[i] = o;
+                },
+                None    : {},
+            }
+        }
+    }
+    b
+}
+
+// The line each token is on.
+fn token_lines(ref<Vec<Line>, shared> lines, usize n) : Vec<usize>
+{
+    Vec<usize> at = Vec::filled(n, NO);
+    for (usize li = 0; li < Vec::len(lines); li += 1)
+    {
+        foreach (e in &lines[li].elems)
+        {
+            if (e.kind == E_TOK)
+            {
+                at[e.idx] = li;
+            }
+        }
+    }
+    at
+}
+
+// ---- Allman (§3.1) ----
+
+// Whether the `{` at `ti` opens a function declaration's body: walking
+// back at bracket depth 0 reaches `fn` followed by the function's name
+// (`fn f(`, `fn T::f(`), not a `fn(…)` type or a closure's `= [](…)`; or
+// a test's body (`unittest { … }`, `unittest "name" { … }`, D-0230).
+fn is_fn_body(ref<Src, shared> s, usize ti, ref<Vec<usize>, shared> open_of) : bool
+{
+    if (ti >= 1 && tk(s, ti - 1) == Tok::Unittest)
+    {
+        return true;
+    }
+    if (ti >= 2 && tk(s, ti - 1) == Tok::Str && tk(s, ti - 2) == Tok::Unittest)
+    {
+        return true;
+    }
+    usize k = ti;
+    while (k > 0)
+    {
+        k -= 1;
+        Tok t = s.toks[k].tok;
+        if (is_closer(t))
+        {
+            if (open_of[k] != NO && t != Tok::RBrace)
+            {
+                k = open_of[k];
+            }
+            else
+            {
+                return false;
+            }
+        }
+        else if (t == Tok::Fn)
+        {
+            Tok n = tk(s, k + 1);
+            return n == Tok::Ident || n == Tok::TypeName;
+        }
+        else if (t == Tok::Semi || t == Tok::LBrace || t == Tok::Eq || t == Tok::LParen || t == Tok::LBracket || t == Tok::Comma)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+// Whether the `{` at `ti` opens a block or a declaration body that the
+// Allman rule moves: not a struct literal's (its fields begin `.x =`),
+// and not a block used as a value right after an operator, `=`, `,` or
+// `(` (`x = {`, `f(a, {`), which keep the author's layout.
+fn is_block_brace(ref<Src, shared> s, usize ti) : bool
+{
+    if (tk(s, ti + 1) == Tok::Dot)
+    {
+        return false;
+    }
+    if (ti == 0)
+    {
+        return true;
+    }
+    Tok p = s.toks[ti - 1].tok;
+    bool value_block = p == Tok::Eq || p == Tok::Comma || p == Tok::LParen || p == Tok::LBracket || p == Tok::OrOr
+        || p == Tok::AndAnd || p == Tok::Plus || p == Tok::Minus || p == Tok::Star || p == Tok::Slash
+        || p == Tok::Percent || p == Tok::EqEq || p == Tok::NotEq || p == Tok::Lt || p == Tok::Le || p == Tok::Ge
+        || p == Tok::Return || p == Tok::Colon || (p >= Tok::PlusEq && p <= Tok::ShrEq);
+    !value_block
+}
+
+// Allman for one line's braces: a `{` whose block (or function body) is
+// on later lines goes on a line of its own. True when the line was split
+// (its parts pushed to `out`).
+fn allman_braces(
+    ref<Src, shared> s,
+    ref<Line, shared> l,
+    ref<Braces, shared> b,
+    ref<Vec<usize>, shared> at,
+    ref<Vec<Line>, exclusive> out,
+) : bool
+{
+    usize n = Vec::len(&l.elems);
+    for (usize k = 0; k < n; k += 1)
+    {
+        Elem e = l.elems[k];
+        if (e.kind != E_TOK || s.toks[e.idx].tok != Tok::LBrace)
+        {
+            continue;
+        }
+        usize ti = e.idx;
+        bool fn_body = is_fn_body(s, ti, &b.open_of);
+        usize c = b.close_of[ti];
+        if (c == NO)
+        {
+            continue;
+        }
+        // Any other block: only when its body continues on later lines
+        // (a one-line block stays, decision 4).
+        if (!fn_body && (at[c] == at[ti] || !is_block_brace(s, ti)))
+        {
+            continue;
+        }
+        usize ck = NO;
+        for (usize j = 0; j < n; j += 1)
+        {
+            if (l.elems[j].kind == E_TOK && l.elems[j].idx == c)
+            {
+                ck = j;
+                break;
+            }
+        }
+        if (ck == NO)
+        {
+            // The body ends on a later line: code after the `{` on this
+            // one moves to a line of its own, and the `{` to one before it.
+            if (!has_tok(&l.elems, k + 1, n))
+            {
+                continue;
+            }
+            Vec<Elem> head = elems_sub(&l.elems, 0, k);
+            if (has_tok(&head, 0, k))
+            {
+                push_line(out, head, l.blank);
+                push_line(out, elems_sub(&l.elems, k, k + 1), 0);
+            }
+            else
+            {
+                push_line(out, elems_sub(&l.elems, k, k + 1), l.blank);
+            }
+            push_line(out, elems_sub(&l.elems, k + 1, n), 0);
+            return true;
+        }
+        Vec<Elem> head = elems_sub(&l.elems, 0, k);
+        if (!has_tok(&head, 0, k))
+        {
+            return false;
+        }
+        // A comment on the line stays with the declaration.
+        for (usize j = k + 1; j < n; j += 1)
+        {
+            if (l.elems[j].kind == E_LINE)
+            {
+                Vec::push(&mut head, l.elems[j]);
+            }
+        }
+        push_line(out, head, l.blank);
+        push_line(out, elems_sub(&l.elems, k, k + 1), 0);
+        Vec<Elem> body = Vec::new();
+        for (usize j = k + 1; j < ck; j += 1)
+        {
+            if (l.elems[j].kind != E_LINE)
+            {
+                Vec::push(&mut body, l.elems[j]);
+            }
+        }
+        if (Vec::len(&body) > 0)
+        {
+            push_line(out, body, 0);
+        }
+        // `}`, with a `;` or `,` that closes it; anything else after it
+        // starts a line of its own.
+        Vec<Elem> rest = Vec::new();
+        for (usize j = ck + 1; j < n; j += 1)
+        {
+            if (l.elems[j].kind != E_LINE)
+            {
+                Vec::push(&mut rest, l.elems[j]);
+            }
+        }
+        usize n_close = 0;
+        while (n_close < Vec::len(&rest) && rest[n_close].kind == E_TOK
+            && (s.toks[rest[n_close].idx].tok == Tok::Semi || s.toks[rest[n_close].idx].tok == Tok::Comma))
+        {
+            n_close += 1;
+        }
+        Vec<Elem> close = elems_sub(&l.elems, ck, ck + 1);
+        Vec::extend_from(&mut close, &rest[0..n_close]);
+        push_line(out, close, 0);
+        if (n_close < Vec::len(&rest))
+        {
+            push_line(out, elems_sub(&rest, n_close, Vec::len(&rest)), 0);
+        }
+        return true;
+    }
+    false
+}
+
+// The rest of Allman for one line: one statement per line, a block's `}`
+// on a line of its own, a `{` that ends a line onto its own, and `else`
+// after a `}` onto its own. True when the line was split.
+fn allman_rest(
+    ref<Src, shared> s,
+    ref<Line, shared> l,
+    ref<Braces, shared> b,
+    ref<Vec<usize>, shared> encl,
+    ref<Vec<usize>, shared> at,
+    ref<Vec<Line>, exclusive> out,
+) : bool
+{
+    usize n = Vec::len(&l.elems);
+    Vec<usize> code = Vec::new();
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (l.elems[k].kind == E_TOK)
+        {
+            Vec::push(&mut code, k);
+        }
+    }
+    usize nc = Vec::len(&code);
+    if (nc < 2)
+    {
+        return false;
+    }
+    // One statement per line: after a `;` that ends a statement of a block
+    // opened on an earlier line (or of the file), the rest moves to a line
+    // of its own. A `;` inside brackets (a `for` header) or inside a
+    // one-line block or declaration stays.
+    for (usize c = 0; c + 1 < nc; c += 1)
+    {
+        usize k = code[c];
+        usize ti = l.elems[k].idx;
+        if (s.toks[ti].tok != Tok::Semi)
+        {
+            continue;
+        }
+        usize o = encl[ti];
+        bool in_block = o == NO || (s.toks[o].tok == Tok::LBrace && at[o] != at[ti]);
+        usize nx = l.elems[code[c + 1]].idx;
+        if (!in_block || s.toks[nx].tok == Tok::RBrace)
+        {
+            continue;
+        }
+        push_line(out, elems_sub(&l.elems, 0, k + 1), l.blank);
+        push_line(out, elems_sub(&l.elems, k + 1, n), 0);
+        return true;
+    }
+    // A block's `}` after code on its line, the block opened on an earlier
+    // line, goes on a line of its own (with a `,` or `;` that follows it).
+    for (usize c = 1; c < nc; c += 1)
+    {
+        usize k = code[c];
+        usize ti = l.elems[k].idx;
+        if (s.toks[ti].tok != Tok::RBrace)
+        {
+            continue;
+        }
+        usize o = b.open_of[ti];
+        if (o == NO || at[o] == at[ti] || !is_block_brace(s, o))
+        {
+            continue;
+        }
+        push_line(out, elems_sub(&l.elems, 0, k), l.blank);
+        push_line(out, elems_sub(&l.elems, k, n), 0);
+        return true;
+    }
+    // A `{` ending the line, its block closing on a later one: split
+    // before it; a trailing comment stays with the code line.
+    usize last_k = code[nc - 1];
+    usize lt = l.elems[last_k].idx;
+    if (s.toks[lt].tok == Tok::LBrace && is_block_brace(s, lt))
+    {
+        usize c = b.close_of[lt];
+        if (c != NO && at[c] != at[lt])
+        {
+            Vec<Elem> head = elems_sub(&l.elems, 0, last_k);
+            Vec::extend_from(&mut head, &l.elems[last_k + 1..n]);
+            push_line(out, head, l.blank);
+            push_line(out, elems_sub(&l.elems, last_k, last_k + 1), 0);
+            return true;
+        }
+    }
+    // `} else`, the block opened on an earlier line: `else` on its own.
+    usize first_k = code[0];
+    usize t0 = l.elems[first_k].idx;
+    usize t1 = l.elems[code[1]].idx;
+    if (s.toks[t0].tok == Tok::RBrace && s.toks[t1].tok == Tok::Else)
+    {
+        usize o = b.open_of[t0];
+        if (o != NO && at[o] != at[t0])
+        {
+            push_line(out, elems_sub(&l.elems, 0, first_k + 1), l.blank);
+            push_line(out, elems_sub(&l.elems, first_k + 1, n), 0);
+            return true;
+        }
+    }
+    false
+}
+
+// The innermost bracket each token lies inside: its opening token.
+fn enclosing(ref<Src, shared> s) : Vec<usize>
+{
+    usize n = Vec::len(&s.toks);
+    Vec<usize> encl = Vec::filled(n, NO);
+    Vec<usize> stack = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Tok t = s.toks[i].tok;
+        if (is_closer(t))
+        {
+            Vec::pop(&mut stack);
+        }
+        usize top = Vec::len(&stack);
+        encl[i] = if (top > 0) { stack[top - 1] } else { NO };
+        if (is_opener(t))
+        {
+            Vec::push(&mut stack, i);
+        }
+    }
+    encl
+}
+
+// Allman, repeated to a fixed point.
+fn allman(ref<Src, shared> s, Vec<Line> start) : Vec<Line>
+{
+    Braces b = match_braces(s);
+    Vec<usize> encl = enclosing(s);
+    Vec<Line> lines = start;
+    while (true)
+    {
+        Vec<usize> at = token_lines(&lines, Vec::len(&s.toks));
+        Vec<Line> out = Vec::new();
+        bool changed = false;
+        foreach (l in &lines)
+        {
+            if (allman_braces(s, l, &b, &at, &mut out) || allman_rest(s, l, &b, &encl, &at, &mut out))
+            {
+                changed = true;
+            }
+            else
+            {
+                Vec::push(&mut out, line_clone(l));
+            }
+        }
+        lines = out;
+        if (!changed)
+        {
+            return lines;
+        }
+    }
+    lines
+}
+
+// ---- spacing ----
+
+fn is_word(Tok t) : bool
+{
+    t <= Tok::Void
+}
+
+// Keywords followed by `(` with one space: `if (c)`.
+fn is_paren_keyword(Tok t) : bool
+{
+    t == Tok::If || t == Tok::While || t == Tok::For || t == Tok::Foreach || t == Tok::Match || t == Tok::Return
+}
+
+fn is_binary_only(Tok t) : bool
+{
+    t == Tok::EqEq || t == Tok::NotEq || t == Tok::Le || t == Tok::Ge || t == Tok::AndAnd || t == Tok::OrOr
+        || t == Tok::Pipe || t == Tok::Caret || t == Tok::Shl || t == Tok::Slash || t == Tok::Percent || t == Tok::Eq
+        || (t >= Tok::PlusEq && t <= Tok::ShrEq) || t == Tok::Plus
+}
+
+// Whether a token can end an operand: after one, `-`/`*`/`&` are binary.
+// `}`: a block used as a value (`unsafe { … } - 1.0`).
+fn ends_operand(Tok t) : bool
+{
+    t <= Tok::False || t == Tok::Ident || t == Tok::RParen || t == Tok::RBracket || t == Tok::RBrace || t == Tok::Dollar
+        || t == Tok::Question
+}
+
+// A literal or a closing bracket: a ` : ` after one is a return type or
+// a match arm's.
+fn colon_spaced_after(Tok t) : bool
+{
+    t <= Tok::False || t == Tok::RParen || t == Tok::RBracket
+}
+
+fn after_cmp(Tok t) : bool
+{
+    t <= Tok::False || t == Tok::Minus || t == Tok::Not
+}
+
+// The spacing between two adjacent tokens on one line, `pi` then `ni`
+// (`ppi` before them, `nni` after, or `NO`): the number of spaces fixed
+// by a rule, or -1 to keep the source's (none, or one space).
+fn spacing(ref<Src, shared> s, usize pi, usize ni, usize ppi, usize nni) : i32
+{
+    Tok prev = tk(s, pi);
+    Tok next = tk(s, ni);
+    Tok pp = tk(s, ppi);
+    // Never a space before these.
+    if (next == Tok::Comma || next == Tok::Semi || next == Tok::Question || next == Tok::RParen || next == Tok::RBracket
+        || next == Tok::ColonColon)
+    {
+        return 0;
+    }
+    if (prev == Tok::LParen || prev == Tok::LBracket || prev == Tok::ColonColon)
+    {
+        return 0;
+    }
+    if (prev == Tok::Comma || prev == Tok::Semi)
+    {
+        return 1;
+    }
+    // Braces on one line: `{ x }`, `{}`, and a space before `{`.
+    if (prev == Tok::LBrace)
+    {
+        return if (next == Tok::RBrace) { 0 } else { 1 };
+    }
+    if (next == Tok::RBrace || next == Tok::LBrace)
+    {
+        return 1;
+    }
+    if (prev == Tok::RBrace)
+    {
+        return -1;
+    }
+    // ` : ` after `)` and after a literal: a return type or a match arm.
+    // A bound (`<T: clone>`) follows a name and is left as written.
+    if (next == Tok::Colon && colon_spaced_after(prev))
+    {
+        return 1;
+    }
+    if (prev == Tok::Colon && colon_spaced_after(pp))
+    {
+        return 1;
+    }
+    // `.` field access and `.x =` in a struct literal: attached to what follows.
+    if (prev == Tok::Dot)
+    {
+        return 0;
+    }
+    if (next == Tok::Dot)
+    {
+        return if (ends_operand(prev) || prev == Tok::Gt) { 0 } else { -1 };
+    }
+    // `if (`: one space; a call or an index: none.
+    if (next == Tok::LParen)
+    {
+        if (is_paren_keyword(prev))
+        {
+            return 1;
+        }
+        if (prev == Tok::Ident || prev == Tok::TypeName || prev == Tok::RParen || prev == Tok::RBracket || prev == Tok::Fn)
+        {
+            return 0;
+        }
+        return -1;
+    }
+    if (next == Tok::LBracket)
+    {
+        if (is_in(s, pi))
+        {
+            return 1;
+        }
+        if (prev == Tok::Ident || prev == Tok::RParen || prev == Tok::RBracket)
+        {
+            return 0;
+        }
+        return -1;
+    }
+    // Unary operators: no space after.
+    if (prev == Tok::Not || prev == Tok::Tilde)
+    {
+        return 0;
+    }
+    if (prev == Tok::Minus || prev == Tok::Star || prev == Tok::Amp)
+    {
+        // `foreach (x in &v)`: `in` is not a keyword token.
+        bool unary = ppi == NO || is_in(s, ppi) || !ends_operand(pp);
+        return if (unary) { 0 } else { 1 };
+    }
+    if (next == Tok::Minus || next == Tok::Star || next == Tok::Amp)
+    {
+        if (is_in(s, pi))
+        {
+            return 1;
+        }
+        return if (ends_operand(prev)) { 1 } else { -1 };
+    }
+    // `&mut x`
+    if (prev == Tok::Mut)
+    {
+        return 1;
+    }
+    // `<` and `>`: comparisons when a literal (or a unary `-`/`!`) is
+    // beside them, which a type's angle brackets never have.
+    if ((prev == Tok::Lt || prev == Tok::Gt) && after_cmp(next))
+    {
+        return 1;
+    }
+    if ((next == Tok::Lt || next == Tok::Gt) && nni != NO && after_cmp(tk(s, nni)))
+    {
+        return 1;
+    }
+    // Binary operators that are never anything else.
+    if (is_binary_only(prev) || is_binary_only(next))
+    {
+        return 1;
+    }
+    // Two words: one space.
+    if (is_word(prev) && is_word(next))
+    {
+        return 1;
+    }
+    -1
+}
+
+// ---- rendering ----
+
+// The text of a line's elements `elems[lo..hi]` (no indentation), and its
+// trailing line comment with the source column where it begins.
+fn render(ref<Src, shared> s, ref<Vec<Elem>, shared> elems, usize lo, usize hi) : Rendered
+{
+    Rendered r = Rendered { .code = String::new(), .tr = false, .tr_text = String::new(), .tr_col = 0 };
+    ref<Vec<u8>, shared> bytes = String::as_bytes(&s.text);
+    usize prev = NO;
+    for (usize k = lo; k < hi; k += 1)
+    {
+        Elem e = elems[k];
+        if (e.kind == E_TOK)
+        {
+            Token t = s.toks[e.idx];
+            if (prev != NO)
+            {
+                usize pi = elems[prev].idx;
+                usize ppi = NO;
+                usize j = prev;
+                while (j > lo)
+                {
+                    j -= 1;
+                    if (elems[j].kind == E_TOK)
+                    {
+                        ppi = elems[j].idx;
+                        break;
+                    }
+                }
+                usize nni = NO;
+                for (usize m = k + 1; m < hi; m += 1)
+                {
+                    if (elems[m].kind == E_TOK)
+                    {
+                        nni = elems[m].idx;
+                        break;
+                    }
+                }
+                i32 n = spacing(s, pi, e.idx, ppi, nni);
+                if (n < 0)
+                {
+                    // As written: was there a space?
+                    n = 0;
+                    for (usize g = s.toks[pi].pos + s.toks[pi].len; g < t.pos; g += 1)
+                    {
+                        if (bytes[g] == b' ' || bytes[g] == b'\t')
+                        {
+                            n = 1;
+                        }
+                    }
+                }
+                if (n > 0)
+                {
+                    String::push_ascii(&mut r.code, b' ');
+                }
+            }
+            else if (k > lo)
+            {
+                // After a leading block comment on the same line.
+                String::push_ascii(&mut r.code, b' ');
+            }
+            String::append(&mut r.code, text(view(s), t));
+            prev = k;
+        }
+        else
+        {
+            String c = comment_text(s, e.idx);
+            if (prev != NO && k == hi - 1 && e.kind == E_LINE)
+            {
+                // A trailing line comment: its source column, for alignment.
+                r.tr = true;
+                r.tr_col = indent_of_source(s, s.trivia[e.idx].pos);
+                r.tr_text = c;
+            }
+            else
+            {
+                if (String::len(&r.code) > 0)
+                {
+                    String::push_ascii(&mut r.code, b' ');
+                }
+                String::append(&mut r.code, &c);
+            }
+        }
+    }
+    r
+}
+
+// What the layout passes keep per line.
+struct Layout
+{
+    Vec<usize> arm_ctx;               // the `match` (or bitstruct) body the line sits directly in
+    Vec<bool> bit_body;               // per token: a `{` opening a bitstruct's body
+}
+
+// A line's arm colon: its first `:` outside brackets, when the line is a
+// one-line arm (it ends with `,`, or is the last before the `}`) or an
+// arm whose value begins on the next line; for a bitstruct's field, a
+// `name : 4;`. `NO` otherwise.
+fn arm_colon(ref<Src, shared> s, ref<Vec<Line>, shared> lines, ref<Layout, shared> lay, usize li) : usize
+{
+    usize ctx = lay.arm_ctx[li];
+    if (ctx == NO)
+    {
+        return NO;
+    }
+    ref<Line, shared> l = &lines[li];
+    i32 depth = 0;
+    usize colon = NO;
+    usize n = Vec::len(&l.elems);
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (l.elems[k].kind != E_TOK)
+        {
+            continue;
+        }
+        Tok t = s.toks[l.elems[k].idx].tok;
+        if (is_opener(t))
+        {
+            depth += 1;
+        }
+        else if (is_closer(t))
+        {
+            depth -= 1;
+        }
+        else if (t == Tok::Colon && depth == 0 && colon == NO)
+        {
+            colon = k;
+        }
+    }
+    if (colon == NO || colon == 0 || depth != 0)
+    {
+        return NO;
+    }
+    bool rest_has_code = has_tok(&l.elems, colon + 1, n);
+    Tok last = tk(s, last_code(l));
+    if (lay.bit_body[ctx])
+    {
+        return if (rest_has_code && last == Tok::Semi) { colon } else { NO };
+    }
+    bool ends = last == Tok::Comma || (li + 1 < Vec::len(lines) && tk(s, first_code(&lines[li + 1])) == Tok::RBrace);
+    if (!rest_has_code || ends)
+    {
+        return colon;
+    }
+    NO
+}
+
+// Whether the line begins with a `}` closing a block opened on an earlier line.
+fn lead_closes_block(
+    ref<Src, shared> s,
+    ref<Line, shared> l,
+    ref<Vec<usize>, shared> open_of,
+    ref<Vec<usize>, shared> at,
+    usize li,
+) : bool
+{
+    if (Vec::len(&l.elems) == 0 || l.elems[0].kind != E_TOK)
+    {
+        return false;
+    }
+    usize i = l.elems[0].idx;
+    s.toks[i].tok == Tok::RBrace && open_of[i] != NO && at[open_of[i]] != li
+}
+
+// The indentation of a line inside brackets or a statement continued: as
+// written, relative to the line `h` it continues.
+fn relative(
+    ref<Vec<usize>, shared> new_indent,
+    ref<Vec<usize>, shared> orig_indent,
+    usize h,
+    usize li,
+    usize extra,
+) : usize
+{
+    usize base_new = new_indent[h];
+    usize base_orig = orig_indent[h];
+    if (orig_indent[li] > base_orig || (extra == 0 && orig_indent[li] == base_orig))
+    {
+        return base_new + (orig_indent[li] - base_orig);
+    }
+    base_new + extra
+}
+
+struct Frame
+{
+    usize open_line;
+    bool brace;
+    usize inner;                      // the indentation of statements inside a brace frame
+    usize match_body;                 // a `match`'s or bitstruct's body: its `{` token, or `NO`
+}
+
+// The formatted text of `src_in`, or a lexical error as `LINE:COL: MESSAGE`.
+export fn format_source(StringView src_in) : Result<String, String>
+{
+    bool bom = StringView::starts_with(src_in, "\u{feff}");
+    StringView body = if (bom) { StringView::sub(src_in, 3, StringView::len(src_in)) } else { src_in };
+    bool crlf = match (StringView::find(body, "\n"))
+    {
+        Some(i) : i > 0 && StringView::as_bytes(body)[i - 1] == b'\r',
+        None    : false,
+    };
+    String text_in = String::from_view(body);
+    Lexed lx = match (lex(&text_in))
+    {
+        Ok(lx) : lx,
+        Err(e) : return Err(sprintf("%v:%v: %s", e.line, e.col, &e.msg)),
+    };
+    Src s = Src {
+        .text = text_in,
+        .toks = replace(&mut lx.toks, Vec::new()),
+        .trivia = replace(&mut lx.trivia, Vec::new()),
+    };
+    Vec<Line> lines = allman(&s, split_lines(&s));
+    Braces b = match_braces(&s);
+    usize nt = Vec::len(&s.toks);
+    usize nl = Vec::len(&lines);
+    Vec<usize> at = token_lines(&lines, nt);
+
+    // Indentation (§3.1): a stack of open brackets that span lines.
+    Layout lay = Layout { .arm_ctx = Vec::filled(nl, NO), .bit_body = Vec::filled(nt, false) };
+    Vec<Frame> stack = Vec::new();
+    Vec<usize> new_indent = Vec::filled(nl, 0);
+    Vec<usize> orig_indent = Vec::filled(nl, 0);
+    for (usize li = 0; li < nl; li += 1)
+    {
+        orig_indent[li] = indent_of_source(&s, elem_pos(&s, lines[li].elems[0]));
+    }
+    // Per brace frame: the line where the current statement began.
+    Vec<usize> head_line = Vec::new();
+    Vec::push(&mut head_line, NO);
+    bool stmt_ended = true;           // the previous code line ended a statement
+    bool prev_one_line_block = false; // ... with a `}` closing a `{` on the same line
+    // Per line: the line where its segment began (itself, or, for a line
+    // inside brackets opened earlier, the line that opened the outermost).
+    Vec<usize> seg_start = Vec::new();
+    for (usize li = 0; li < nl; li += 1)
+    {
+        Vec::push(&mut seg_start, li);
+    }
+    usize last_code_line = NO;
+    // The previous code line, when it began with a `}` closing a block
+    // opened on an earlier line.
+    usize prev_close_line = NO;
+    for (usize li = 0; li < nl; li += 1)
+    {
+        ref<Line, shared> l = &lines[li];
+        // Leading closers close their frames first.
+        usize lead_close = 0;
+        foreach (e in &l.elems)
+        {
+            if (e.kind != E_TOK)
+            {
+                continue;
+            }
+            if (is_closer(s.toks[e.idx].tok) && b.open_of[e.idx] != NO && at[b.open_of[e.idx]] != li)
+            {
+                lead_close += 1;
+                continue;
+            }
+            break;
+        }
+        Tok first_tok = tk(&s, first_code(l));
+        bool is_comment_only = first_tok == Tok::Eof;
+        usize ind = 0;
+        if (lead_close > 0)
+        {
+            // `}`/`)`/`]` at the start of a line: at the indentation of the
+            // line that opened it.
+            usize open_line = li;
+            for (usize c = 0; c < lead_close; c += 1)
+            {
+                match (Vec::pop(&mut stack))
+                {
+                    Some(f) :
+                    {
+                        open_line = f.open_line;
+                        if (f.brace)
+                        {
+                            Vec::pop(&mut head_line);
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            ind = new_indent[open_line];
+        }
+        else
+        {
+            usize depth = Vec::len(&stack);
+            bool in_paren = depth > 0 && !stack[depth - 1].brace;
+            usize frame_inner = 0;
+            usize j = depth;
+            while (j > 0)
+            {
+                j -= 1;
+                if (stack[j].brace)
+                {
+                    frame_inner = stack[j].inner;
+                    break;
+                }
+            }
+            usize hl = Vec::len(&head_line);
+            usize h = if (hl > 0 && head_line[hl - 1] != NO) { head_line[hl - 1] } else { li };
+            if (first_tok == Tok::LBrace)
+            {
+                // `{` on its own line: at the indentation of the line that
+                // began the code just above it; a bare block statement
+                // where a statement goes.
+                ind = if (stmt_ended || last_code_line == NO) { frame_inner } else { new_indent[seg_start[last_code_line]] };
+            }
+            else if (first_tok == Tok::Else && prev_close_line != NO)
+            {
+                // `else` after a `}` on a line of its own: with that `}`.
+                ind = new_indent[prev_close_line];
+            }
+            else if (in_paren)
+            {
+                // Inside a bracket opened on an earlier line: as written,
+                // relative to the line that opened it.
+                ind = relative(&new_indent, &orig_indent, stack[depth - 1].open_line, li, 4);
+            }
+            else if (first_tok == Tok::Else && prev_one_line_block)
+            {
+                // `else` after a one-line block: a continuation, as written.
+                ind = relative(&new_indent, &orig_indent, h, li, 0);
+            }
+            else if (stmt_ended || is_comment_only)
+            {
+                ind = frame_inner;
+            }
+            else
+            {
+                // A statement continued without a bracket: as written,
+                // relative to its first line.
+                ind = relative(&new_indent, &orig_indent, h, li, 0);
+            }
+        }
+        new_indent[li] = ind;
+        if (is_comment_only)
+        {
+            continue;
+        }
+        usize depth = Vec::len(&stack);
+        if (lead_close == 0 && depth > 0)
+        {
+            lay.arm_ctx[li] = stack[depth - 1].match_body;
+        }
+        // Brackets (not braces) open since the innermost brace frame.
+        usize j = depth;
+        while (j > 0 && !stack[j - 1].brace)
+        {
+            j -= 1;
+        }
+        if (j < depth)
+        {
+            seg_start[li] = seg_start[stack[j].open_line];
+        }
+        bool continues_else = first_tok == Tok::Else && (prev_one_line_block || prev_close_line != NO);
+        if (stmt_ended && lead_close == 0 && first_tok != Tok::LBrace && !continues_else)
+        {
+            usize hl = Vec::len(&head_line);
+            if (hl > 0)
+            {
+                head_line[hl - 1] = li;
+            }
+        }
+        // Open brackets that this line leaves open.
+        bool in_lead = true;
+        foreach (e in &l.elems)
+        {
+            if (e.kind != E_TOK)
+            {
+                continue;
+            }
+            usize i = e.idx;
+            Tok t = s.toks[i].tok;
+            if (!is_closer(t))
+            {
+                in_lead = false;
+            }
+            if (is_opener(t))
+            {
+                usize c = b.close_of[i];
+                if (c != NO && at[c] != li)
+                {
+                    // A struct literal's braces hold fields laid out as
+                    // the author chose, like a bracket's contents.
+                    bool literal = tk(&s, i + 1) == Tok::Dot;
+                    bool brace = t == Tok::LBrace && !literal;
+                    // `match (…) {`: the token before `{` is `)`, whose `(` follows `match`.
+                    bool is_match = false;
+                    if (brace && i > 0 && s.toks[i - 1].tok == Tok::RParen)
+                    {
+                        usize o = b.open_of[i - 1];
+                        is_match = o != NO && o > 0 && s.toks[o - 1].tok == Tok::Match;
+                    }
+                    // `bitstruct Name : u32 {`: its fields' `:` align as arms do.
+                    bool is_bits = brace && i >= 4 && s.toks[i - 4].tok == Tok::Bitstruct;
+                    if (is_bits)
+                    {
+                        lay.bit_body[i] = true;
+                    }
+                    Vec::push(
+                        &mut stack,
+                        Frame { .open_line = li, .brace = brace, .inner = ind + 4, .match_body = if (is_match || is_bits) { i } else { NO } },
+                    );
+                    if (brace)
+                    {
+                        Vec::push(&mut head_line, NO);
+                    }
+                }
+            }
+            else if (is_closer(t))
+            {
+                // Closed here, opened on an earlier line, not at the line's
+                // start (those were handled above).
+                usize o = b.open_of[i];
+                if (o != NO && at[o] != li && !in_lead)
+                {
+                    match (Vec::pop(&mut stack))
+                    {
+                        Some(f) :
+                        {
+                            if (f.brace)
+                            {
+                                Vec::pop(&mut head_line);
+                            }
+                        },
+                        None    : {},
+                    }
+                }
+            }
+        }
+        last_code_line = li;
+        prev_close_line = if (lead_close > 0 && first_tok == Tok::RBrace) { li } else { NO };
+        // Did this line end a statement?
+        usize lc = last_code(l);
+        Tok last = tk(&s, lc);
+        stmt_ended = last == Tok::Semi || last == Tok::LBrace || last == Tok::Comma || last == Tok::RBrace;
+        prev_one_line_block = last == Tok::RBrace && b.open_of[lc] != NO && at[b.open_of[lc]] == li;
+        // A line inside a still-open bracket never ends the statement.
+        usize d = Vec::len(&stack);
+        if (d > 0 && !stack[d - 1].brace)
+        {
+            stmt_ended = false;
+        }
+    }
+
+    // Match arms (the owner's rule): in a run of consecutive one-line arms
+    // of one `match`, the ` : ` of each stands in one column, one space
+    // after the longest pattern.
+    Vec<usize> colons = Vec::new();
+    for (usize li = 0; li < nl; li += 1)
+    {
+        Vec::push(&mut colons, arm_colon(&s, &lines, &lay, li));
+    }
+    Vec<usize> arm_col = Vec::filled(nl, NO);  // the width the pattern is padded to
+    for (usize li = 0; li < nl; li += 1)
+    {
+        if (colons[li] == NO || arm_col[li] != NO)
+        {
+            continue;
+        }
+        usize ctx = lay.arm_ctx[li];
+        Vec<usize> members = Vec::new();
+        for (usize j = li; j < nl; j += 1)
+        {
+            if (lay.arm_ctx[j] == ctx && colons[j] != NO)
+            {
+                Vec::push(&mut members, j);
+            }
+        }
+        if (Vec::len(&members) < 2)
+        {
+            continue;
+        }
+        usize w = 0;
+        foreach (j in &members)
+        {
+            Rendered p = render(&s, &lines[*j].elems, 0, colons[*j]);
+            usize pw = char_count(String::as_view(&p.code));
+            if (pw > w)
+            {
+                w = pw;
+            }
+        }
+        foreach (j in &members)
+        {
+            arm_col[*j] = w;
+        }
+    }
+
+    // Render, then align trailing comments (§3.5).
+    Vec<Rendered> texts = Vec::new();
+    for (usize li = 0; li < nl; li += 1)
+    {
+        ref<Line, shared> l = &lines[li];
+        usize n = Vec::len(&l.elems);
+        Rendered r = if (arm_col[li] != NO && colons[li] != NO)
+        {
+            usize k = colons[li];
+            Rendered p = render(&s, &l.elems, 0, k);
+            Rendered rest = render(&s, &l.elems, k + 1, n);
+            // A comment alone after the colon is the line's trailing comment.
+            if (n == k + 2 && l.elems[k + 1].kind == E_LINE)
+            {
+                rest.code = String::new();
+                rest.tr = true;
+                rest.tr_text = comment_text(&s, l.elems[k + 1].idx);
+                rest.tr_col = indent_of_source(&s, s.trivia[l.elems[k + 1].idx].pos);
+            }
+            String code = replace(&mut p.code, String::new());
+            usize pw = char_count(String::as_view(&code));
+            if (arm_col[li] > pw)
+            {
+                spaces(&mut code, arm_col[li] - pw);
+            }
+            if (String::len(&rest.code) == 0)
+            {
+                String::append(&mut code, " :");
+            }
+            else
+            {
+                String::append(&mut code, " : ");
+                String::append(&mut code, &rest.code);
+            }
+            rest.code = code;
+            rest
+        }
+        else
+        {
+            render(&s, &l.elems, 0, n)
+        };
+        // A line comment alone on its line at the column of the trailing
+        // comment just above continues that comment: it stays in the column.
+        if (li > 0 && first_code(l) == NO && n == 1 && l.elems[0].kind == E_LINE && texts[li - 1].tr)
+        {
+            usize col = texts[li - 1].tr_col;
+            if (indent_of_source(&s, s.trivia[l.elems[0].idx].pos) == col)
+            {
+                String c = comment_text(&s, l.elems[0].idx);
+                Vec::push(&mut texts, Rendered { .code = String::new(), .tr = true, .tr_text = c, .tr_col = col });
+                continue;
+            }
+        }
+        String line = String::new();
+        spaces(&mut line, new_indent[li]);
+        String::append(&mut line, &r.code);
+        r.code = line;
+        Vec::push(&mut texts, r);
+    }
+    Vec<String> out_lines = Vec::new();
+    usize k = 0;
+    while (k < nl)
+    {
+        if (!texts[k].tr)
+        {
+            Vec::push(&mut out_lines, String::clone(&texts[k].code));
+            k += 1;
+            continue;
+        }
+        // A group: consecutive lines with trailing comments at the same source column.
+        usize col = texts[k].tr_col;
+        usize e = k;
+        usize widest = 0;
+        while (e < nl && texts[e].tr && texts[e].tr_col == col)
+        {
+            usize w = char_count(String::as_view(&texts[e].code));
+            if (w > widest)
+            {
+                widest = w;
+            }
+            e += 1;
+        }
+        usize use_col = if (widest < col) { col } else if (e - k == 1) { widest + 1 } else { (widest + 1 + 3) / 4 * 4 };
+        for (usize j = k; j < e; j += 1)
+        {
+            String line = String::clone(&texts[j].code);
+            usize w = char_count(String::as_view(&line));
+            spaces(&mut line, if (use_col > w) { use_col - w } else { 1 });
+            String::append(&mut line, &texts[j].tr_text);
+            Vec::push(&mut out_lines, line);
+        }
+        k = e;
+    }
+    // Blank lines (§3.4).
+    String text = String::new();
+    for (usize li = 0; li < nl; li += 1)
+    {
+        ref<Line, shared> l = &lines[li];
+        usize blanks = if (l.blank > 0 && li > 0) { 1 } else { 0 };
+        if (li > 0 && tk(&s, last_code(&lines[li - 1])) == Tok::LBrace && Vec::len(&lines[li - 1].elems) == 1)
+        {
+            blanks = 0;
+        }
+        // None right before a closing `}` line.
+        if (tk(&s, first_code(l)) == Tok::RBrace && !has_comment(l) && lead_closes_block(&s, l, &b.open_of, &at, li))
+        {
+            blanks = 0;
+        }
+        if (blanks > 0)
+        {
+            String::push_ascii(&mut text, b'\n');
+        }
+        String::append(&mut text, trim_end(String::as_view(&out_lines[li])));
+        String::push_ascii(&mut text, b'\n');
+    }
+    if (crlf)
+    {
+        text = String::replace(&text, "\n", "\r\n");
+    }
+    if (bom)
+    {
+        String with = String::from_str("\u{feff}");
+        String::append(&mut with, &text);
+        text = with;
+    }
+    Ok(text)
+}
+
+fn has_comment(ref<Line, shared> l) : bool
+{
+    foreach (e in &l.elems)
+    {
+        if (e.kind != E_TOK)
+        {
+            return true;
+        }
+    }
+    false
+}

@@ -1,0 +1,1840 @@
+// `std::encoding::toml` (spec/21 §2r′, D-0268): TOML 1.0 (toml.io) read
+// into a value tree and written back. A `Toml` is one of the seven kinds;
+// a table keeps its members in order, so a document reads back in the
+// order it was written. Integers are `i64`, exact; floats `f64`; a
+// date-time is a `TomlDateTime`, one of the four forms the format has.
+// The reader takes the whole language: tables, arrays of tables, inline
+// tables, dotted keys, the four string forms, integers in four bases with
+// underscores, floats with `inf` and `nan`, and the date-time forms, and
+// refuses what the format refuses (a key defined twice, a table defined
+// twice, a value added to a closed table). The writer gives one canonical
+// text: a table's plain members first, then its sub-tables under headers,
+// arrays of tables under `[[…]]`; comments are not kept. Written in CobaltC
+// over `std::text`.
+
+// A TOML value. The variant names carry `Toml` so that none clashes with
+// another `std` enum's (`JsonString`, `PgValue::Text`).
+/// A TOML value: a string, an integer, a float, a boolean, a date-time, an array or a table.
+///
+/// - `TomlString(s)`: a string, its escapes decoded.
+/// - `TomlInteger(i)`: an integer, exact in `i64`.
+/// - `TomlFloat(x)`: a float, `inf` and `nan` included.
+/// - `TomlBool(b)`: `true` or `false`.
+/// - `TomlDateTime(d)`: one of the four date-time forms (see `TomlDateTime`).
+/// - `TomlArray(items)`: the elements, in order; elements may be of different kinds.
+/// - `TomlTable(members)`: the members in the order read or added; a key occurs once.
+///
+/// The variant names carry `Toml` so that none clashes with another `std` enum's. Dropping a `Toml` frees the
+/// whole tree.
+export enum Toml
+{
+    TomlString(String),
+    TomlInteger(i64),
+    TomlFloat(f64),
+    TomlBool(bool),
+    TomlDateTime(TomlDateTime),
+    TomlArray(Vec<Toml>),
+    TomlTable(Vec<TomlMember>),
+}
+
+// One member of a table: its key and value.
+/// One member of a TOML table: its key and its value.
+///
+/// - `key`: the member's name, one key part (a dotted key `a.b` is a member `a` holding a table with a member `b`).
+/// - `value`: its value.
+export struct TomlMember
+{
+    export String key;
+    export Toml value;
+}
+
+/// Which of the four date-time forms a `TomlDateTime` is.
+///
+/// - `TomlOffsetDateTime`: a date, a time and an offset from UTC: `1979-05-27T07:32:00Z`, `…-08:00`.
+/// - `TomlLocalDateTime`: a date and a time with no offset: `1979-05-27T07:32:00`.
+/// - `TomlLocalDate`: a date alone: `1979-05-27`.
+/// - `TomlLocalTime`: a time alone: `07:32:00`.
+export enum TomlDateKind
+{
+    TomlOffsetDateTime,
+    TomlLocalDateTime,
+    TomlLocalDate,
+    TomlLocalTime,
+}
+
+/// A TOML date-time: the fields of RFC 3339's form, and `kind`, which of the four forms it is.
+///
+/// - `kind`: the form; the fields a form does not have are 0.
+/// - `year`, `month`, `day`: the date (`month` 1 to 12, `day` 1 to the month's length).
+/// - `hour`, `minute`, `second`: the time (`second` up to 60 for a leap second).
+/// - `nanoseconds`: the fraction of the second, 0 to 999 999 999; digits beyond nine are dropped when read.
+/// - `offset_minutes`: the offset from UTC in minutes, `-1439` to `1439`; 0 for every other form.
+///
+/// A plain struct, assigned by copying. `TomlDateTime::text` writes it as the format does.
+export struct TomlDateTime
+{
+    export TomlDateKind kind;
+    export i64 year;
+    export u8 month;
+    export u8 day;
+    export u8 hour;
+    export u8 minute;
+    export u8 second;
+    export u32 nanoseconds;
+    export i32 offset_minutes;
+}
+
+// ---- the document while it is read ----
+
+// How deep arrays and inline tables may nest.
+const usize TOML_MAX_DEPTH = 512;
+
+// What a table is, which decides what may be added to it later: the
+// `Toml` tree does not keep this, so the document is built as `TNode`s
+// and converted at the end.
+const u8 K_VALUE = 0;              // a value: a string, number, date-time, array or inline table; closed
+const u8 K_HEADER = 1;             // a table defined by a `[header]`; defined once
+const u8 K_IMPLICIT = 2;           // made on the way to a `[deeper.header]`; a `[header]` may still define it
+const u8 K_DOTTED = 3;             // made by a dotted key; no header may define it, a deeper header may go below it
+const u8 K_ARRAY = 4;              // an array of tables, `[[header]]`; its members are the elements, each `K_HEADER`
+
+struct TNode
+{
+    String key;
+    u8 kind;
+    Toml leaf;
+    Vec<TNode> members;
+}
+
+fn tnode_new(String key, u8 kind, Toml leaf) : TNode
+{
+    TNode { .key = key, .kind = kind, .leaf = leaf, .members = Vec::new() }
+}
+
+fn tnode_find(ref<Vec<TNode>, shared> members, StringView key) : Option<usize>
+{
+    for (usize i = 0; i < Vec::len(members); i += 1)
+    {
+        if (members[i].key == key)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// `[a.b.c]` (`is_array` false) or `[[a.b.c]]` (`is_array` true) applied at `n`
+// for `path[i..]`: true when the format allows it.
+fn tnode_define(ref<TNode, exclusive> n, ref<Vec<String>, shared> path, usize i, bool is_array) : bool
+{
+    StringView part = String::as_view(&path[i]);
+    bool last = i + 1 == Vec::len(path);
+    usize k = match (tnode_find(&n.members, part))
+    {
+        Some(k) : k,
+        None    :
+        {
+            if (last && is_array)
+            {
+                TNode arr = tnode_new(String::from_view(part), K_ARRAY, TomlBool(false));
+                Vec::push(&mut arr.members, tnode_new(String::new(), K_HEADER, TomlBool(false)));
+                Vec::push(&mut n.members, arr);
+                return true;
+            }
+            Vec::push(
+                &mut n.members,
+                tnode_new(String::from_view(part), if (last) { K_HEADER } else { K_IMPLICIT }, TomlBool(false)),
+            );
+            if (last)
+            {
+                return true;
+            }
+            Vec::len(&n.members) - 1
+        },
+    };
+    u8 kind = n.members[k].kind;
+    if (kind == K_VALUE)
+    {
+        return false;
+    }
+    if (last)
+    {
+        if (is_array)
+        {
+            if (kind != K_ARRAY)
+            {
+                return false;
+            }
+            Vec::push(&mut n.members[k].members, tnode_new(String::new(), K_HEADER, TomlBool(false)));
+            return true;
+        }
+        if (kind != K_IMPLICIT)
+        {
+            return false;
+        }
+        n.members[k].kind = K_HEADER;
+        return true;
+    }
+    if (kind == K_ARRAY)
+    {
+        usize e = Vec::len(&n.members[k].members) - 1;
+        return tnode_define(&mut n.members[k].members[e], path, i + 1, is_array);
+    }
+    tnode_define(&mut n.members[k], path, i + 1, is_array)
+}
+
+// `keys[ki..] = v` inside the table `ctx[ci..]` below `n`: true when the
+// format allows it. Each key part before the last makes a table or goes
+// into one made by a dotted key.
+fn tnode_insert(
+    ref<TNode, exclusive> n,
+    ref<Vec<String>, shared> ctx,
+    usize ci,
+    ref<Vec<String>, shared> keys,
+    usize ki,
+    Toml v,
+) : bool
+{
+    if (ci < Vec::len(ctx))
+    {
+        // Down the current table's path, made by its header.
+        usize k = match (tnode_find(&n.members, String::as_view(&ctx[ci])))
+        {
+            Some(k) : k,
+            None    : return false,
+        };
+        if (n.members[k].kind == K_ARRAY)
+        {
+            usize e = Vec::len(&n.members[k].members) - 1;
+            return tnode_insert(&mut n.members[k].members[e], ctx, ci + 1, keys, ki, v);
+        }
+        return tnode_insert(&mut n.members[k], ctx, ci + 1, keys, ki, v);
+    }
+    StringView part = String::as_view(&keys[ki]);
+    bool last = ki + 1 == Vec::len(keys);
+    match (tnode_find(&n.members, part))
+    {
+        Some(k) :
+        {
+            if (last)
+            {
+                return false;
+            }
+            u8 kind = n.members[k].kind;
+            if (kind != K_DOTTED && kind != K_IMPLICIT)
+            {
+                return false;
+            }
+            n.members[k].kind = K_DOTTED;
+            tnode_insert(&mut n.members[k], ctx, ci, keys, ki + 1, v)
+        },
+        None    :
+        {
+            if (last)
+            {
+                Vec::push(&mut n.members, tnode_new(String::from_view(part), K_VALUE, v));
+                return true;
+            }
+            Vec::push(&mut n.members, tnode_new(String::from_view(part), K_DOTTED, TomlBool(false)));
+            usize k = Vec::len(&n.members) - 1;
+            tnode_insert(&mut n.members[k], ctx, ci, keys, ki + 1, v)
+        },
+    }
+}
+
+// The finished tree: a `K_VALUE` its value, an array of tables an array
+// of them, any other kind a table of its members.
+fn tnode_to_toml(TNode n) : Toml
+{
+    TNode { key, kind, leaf, members } = n;
+    drop(key);
+    if (kind == K_VALUE)
+    {
+        drop(members);
+        return leaf;
+    }
+    drop(leaf);
+    if (kind == K_ARRAY)
+    {
+        Vec<Toml> items = Vec::new();
+        while (Some(m) = Vec::pop(&mut members))
+        {
+            Vec::push(&mut items, tnode_to_toml(m));
+        }
+        Vec::reverse(&mut items);
+        return TomlArray(items);
+    }
+    Vec<TomlMember> out = Vec::new();
+    while (Some(m) = Vec::pop(&mut members))
+    {
+        String key = clone(&m.key);
+        Vec::push(&mut out, TomlMember { .key = key, .value = tnode_to_toml(m) });
+    }
+    Vec::reverse(&mut out);
+    TomlTable(out)
+}
+
+// ---- reading ----
+
+struct TomlReader
+{
+    StringView text;
+    usize at;
+}
+
+// The byte at the position, or 0 at the end (0 is invalid in TOML
+// wherever it occurs, so the two need no telling apart).
+fn TomlReader::peek(ref<TomlReader, shared> r) : u8
+{
+    if (r.at < StringView::len(r.text))
+    {
+        return r.text.bytes[r.at];
+    }
+    0
+}
+
+fn TomlReader::peek_at(ref<TomlReader, shared> r, usize ahead) : u8
+{
+    if (r.at + ahead < StringView::len(r.text))
+    {
+        return r.text.bytes[r.at + ahead];
+    }
+    0
+}
+
+fn TomlReader::at_end(ref<TomlReader, shared> r) : bool
+{
+    r.at >= StringView::len(r.text)
+}
+
+// Spaces and tabs.
+fn TomlReader::skip_ws(ref<TomlReader, exclusive> r)
+{
+    while (true)
+    {
+        u8 c = TomlReader::peek(r);
+        if (c != b' ' && c != b'\t')
+        {
+            return;
+        }
+        r.at += 1;
+    }
+}
+
+// A newline, LF or CRLF, consumed: true; a bare CR is not a newline.
+fn TomlReader::newline(ref<TomlReader, exclusive> r) : bool
+{
+    u8 c = TomlReader::peek(r);
+    if (c == b'\n')
+    {
+        r.at += 1;
+        return true;
+    }
+    if (c == b'\r' && TomlReader::peek_at(r, 1) == b'\n')
+    {
+        r.at += 2;
+        return true;
+    }
+    false
+}
+
+// A comment, `#` to the end of the line, consumed; a control character
+// other than tab in it is `Invalid` there.
+fn TomlReader::comment(ref<TomlReader, exclusive> r) : Result<void, ParseError>
+{
+    r.at += 1;
+    while (!TomlReader::at_end(r))
+    {
+        u8 c = TomlReader::peek(r);
+        if (c == b'\n' || (c == b'\r' && TomlReader::peek_at(r, 1) == b'\n'))
+        {
+            return Ok(());
+        }
+        if ((c < 0x20 && c != b'\t') || c == 0x7F)
+        {
+            return Err(Invalid(r.at));
+        }
+        r.at += 1;
+    }
+    Ok(())
+}
+
+// The rest of a line after a header or a key/value pair: whitespace, a
+// comment, then a newline or the end.
+fn TomlReader::line_end(ref<TomlReader, exclusive> r) : Result<void, ParseError>
+{
+    TomlReader::skip_ws(r);
+    if (TomlReader::peek(r) == b'#')
+    {
+        TomlReader::comment(r)?;
+    }
+    if (TomlReader::at_end(r) || TomlReader::newline(r))
+    {
+        return Ok(());
+    }
+    Err(Invalid(r.at))
+}
+
+// Whitespace, newlines and comments, as between an array's elements.
+fn TomlReader::skip_space_lines(ref<TomlReader, exclusive> r) : Result<void, ParseError>
+{
+    while (true)
+    {
+        TomlReader::skip_ws(r);
+        u8 c = TomlReader::peek(r);
+        if (c == b'#')
+        {
+            TomlReader::comment(r)?;
+            continue;
+        }
+        if (!TomlReader::newline(r))
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn toml_is_bare(u8 c) : bool
+{
+    ascii_is_alnum(c) || c == b'_' || c == b'-'
+}
+
+fn toml_hex_digit(u8 c) : i64
+{
+    if (c >= b'0' && c <= b'9') { widen<i64>(c - b'0') }
+    else if (c >= b'a' && c <= b'f') { widen<i64>(c - b'a') + 10 }
+    else if (c >= b'A' && c <= b'F') { widen<i64>(c - b'A') + 10 }
+    else { -1 }
+}
+
+// `\uXXXX` or `\UXXXXXXXX` (`n` digits), the `\u` consumed: the code
+// point pushed as UTF-8; a surrogate or a value above U+10FFFF is Invalid.
+fn TomlReader::unicode_escape(
+    ref<TomlReader, exclusive> r,
+    usize n,
+    ref<String, exclusive> out,
+) : Result<void, ParseError>
+{
+    i64 v = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        i64 d = toml_hex_digit(TomlReader::peek(r));
+        if (d < 0)
+        {
+            return Err(Invalid(r.at));
+        }
+        v = v * 16 + d;
+        r.at += 1;
+    }
+    if ((v >= 0xD800 && v <= 0xDFFF) || v > 0x10FFFF)
+    {
+        return Err(Invalid(r.at - n));
+    }
+    String::push_code_point(out, narrow<u32>(v));
+    Ok(())
+}
+
+// A basic string, the opening `"` consumed, or a multi-line one, its
+// `"""` consumed: the text with its escapes decoded.
+fn TomlReader::basic(ref<TomlReader, exclusive> r, bool multi) : Result<String, ParseError>
+{
+    String out = String::new();
+    if (multi)
+    {
+        // A newline right after the opening delimiter is not part of the text.
+        TomlReader::newline(r);
+    }
+    while (true)
+    {
+        if (TomlReader::at_end(r))
+        {
+            return Err(Invalid(r.at));
+        }
+        u8 c = TomlReader::peek(r);
+        if (c == b'"')
+        {
+            if (!multi)
+            {
+                r.at += 1;
+                return Ok(out);
+            }
+            // The closing `"""`, with up to two more quotes before it as text.
+            usize run = 0;
+            while (TomlReader::peek_at(r, run) == b'"')
+            {
+                run += 1;
+            }
+            if (run < 3)
+            {
+                for (usize i = 0; i < run; i += 1)
+                {
+                    String::push_ascii(&mut out, b'"');
+                }
+                r.at += run;
+                continue;
+            }
+            if (run > 5)
+            {
+                return Err(Invalid(r.at + 5));
+            }
+            for (usize i = 3; i < run; i += 1)
+            {
+                String::push_ascii(&mut out, b'"');
+            }
+            r.at += run;
+            return Ok(out);
+        }
+        if (c == b'\\')
+        {
+            r.at += 1;
+            u8 e = TomlReader::peek(r);
+            if (e == b'"') { String::push_ascii(&mut out, b'"'); }
+            else if (e == b'\\') { String::push_ascii(&mut out, b'\\'); }
+            else if (e == b'b') { String::push_ascii(&mut out, 8); }
+            else if (e == b't') { String::push_ascii(&mut out, 9); }
+            else if (e == b'n') { String::push_ascii(&mut out, 10); }
+            else if (e == b'f') { String::push_ascii(&mut out, 12); }
+            else if (e == b'r') { String::push_ascii(&mut out, 13); }
+            else if (e == b'u' || e == b'U')
+            {
+                r.at += 1;
+                TomlReader::unicode_escape(r, if (e == b'u') { 4 } else { 8 }, &mut out)?;
+                continue;
+            }
+            else if (multi && (e == b' ' || e == b'\t' || e == b'\n' || e == b'\r'))
+            {
+                // A line-ending backslash: the whitespace and newlines up to
+                // the next text are dropped; a newline must be among them.
+                usize save = r.at;
+                TomlReader::skip_ws(r);
+                if (!TomlReader::newline(r))
+                {
+                    return Err(Invalid(save));
+                }
+                while (true)
+                {
+                    TomlReader::skip_ws(r);
+                    if (!TomlReader::newline(r))
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+            else
+            {
+                return Err(Invalid(r.at));
+            }
+            r.at += 1;
+            continue;
+        }
+        if (c == b'\n' || c == b'\r')
+        {
+            if (!multi)
+            {
+                return Err(Invalid(r.at));
+            }
+            if (c == b'\r')
+            {
+                if (TomlReader::peek_at(r, 1) != b'\n')
+                {
+                    return Err(Invalid(r.at));
+                }
+                String::push_ascii(&mut out, b'\r');
+                r.at += 1;
+            }
+            String::push_ascii(&mut out, b'\n');
+            r.at += 1;
+            continue;
+        }
+        if ((c < 0x20 && c != b'\t') || c == 0x7F)
+        {
+            return Err(Invalid(r.at));
+        }
+        // Any other byte, of a multi-byte character too: the text is UTF-8
+        // and every byte the format treats apart is ASCII, so a character's
+        // bytes are copied whole.
+        Vec::push(&mut out.bytes, c);
+        r.at += 1;
+    }
+}
+
+// A literal string, the opening `'` consumed, or a multi-line one, its
+// `'''` consumed: the text as it is.
+fn TomlReader::literal(ref<TomlReader, exclusive> r, bool multi) : Result<String, ParseError>
+{
+    String out = String::new();
+    if (multi)
+    {
+        TomlReader::newline(r);
+    }
+    while (true)
+    {
+        if (TomlReader::at_end(r))
+        {
+            return Err(Invalid(r.at));
+        }
+        u8 c = TomlReader::peek(r);
+        if (c == b'\'')
+        {
+            if (!multi)
+            {
+                r.at += 1;
+                return Ok(out);
+            }
+            usize run = 0;
+            while (TomlReader::peek_at(r, run) == b'\'')
+            {
+                run += 1;
+            }
+            if (run < 3)
+            {
+                for (usize i = 0; i < run; i += 1)
+                {
+                    String::push_ascii(&mut out, b'\'');
+                }
+                r.at += run;
+                continue;
+            }
+            if (run > 5)
+            {
+                return Err(Invalid(r.at + 5));
+            }
+            for (usize i = 3; i < run; i += 1)
+            {
+                String::push_ascii(&mut out, b'\'');
+            }
+            r.at += run;
+            return Ok(out);
+        }
+        if (c == b'\n' || c == b'\r')
+        {
+            if (!multi)
+            {
+                return Err(Invalid(r.at));
+            }
+            if (c == b'\r')
+            {
+                if (TomlReader::peek_at(r, 1) != b'\n')
+                {
+                    return Err(Invalid(r.at));
+                }
+                String::push_ascii(&mut out, b'\r');
+                r.at += 1;
+            }
+            String::push_ascii(&mut out, b'\n');
+            r.at += 1;
+            continue;
+        }
+        if ((c < 0x20 && c != b'\t') || c == 0x7F)
+        {
+            return Err(Invalid(r.at));
+        }
+        // Any other byte, of a multi-byte character too: the text is UTF-8
+        // and every byte the format treats apart is ASCII, so a character's
+        // bytes are copied whole.
+        Vec::push(&mut out.bytes, c);
+        r.at += 1;
+    }
+}
+
+// One part of a key: bare, or a single-line basic or literal string.
+fn TomlReader::key_part(ref<TomlReader, exclusive> r) : Result<String, ParseError>
+{
+    u8 c = TomlReader::peek(r);
+    if (c == b'"')
+    {
+        r.at += 1;
+        if (TomlReader::peek(r) == b'"' && TomlReader::peek_at(r, 1) == b'"')
+        {
+            return Err(Invalid(r.at));
+        }
+        return TomlReader::basic(r, false);
+    }
+    if (c == b'\'')
+    {
+        r.at += 1;
+        if (TomlReader::peek(r) == b'\'' && TomlReader::peek_at(r, 1) == b'\'')
+        {
+            return Err(Invalid(r.at));
+        }
+        return TomlReader::literal(r, false);
+    }
+    usize start = r.at;
+    while (toml_is_bare(TomlReader::peek(r)))
+    {
+        r.at += 1;
+    }
+    if (r.at == start)
+    {
+        return Err(Invalid(r.at));
+    }
+    Ok(String::from_view(StringView::sub(r.text, start, r.at)))
+}
+
+// A key, possibly dotted, with whitespace around its dots: its parts.
+fn TomlReader::key(ref<TomlReader, exclusive> r) : Result<Vec<String>, ParseError>
+{
+    Vec<String> parts = Vec::new();
+    while (true)
+    {
+        Vec::push(&mut parts, TomlReader::key_part(r)?);
+        TomlReader::skip_ws(r);
+        if (TomlReader::peek(r) != b'.')
+        {
+            return Ok(parts);
+        }
+        r.at += 1;
+        TomlReader::skip_ws(r);
+    }
+}
+
+// Decimal digits with single underscores between them, from `r.at`,
+// pushed onto `out` without the underscores: how many digits there were.
+fn TomlReader::digits(ref<TomlReader, exclusive> r, ref<String, exclusive> out) : Result<usize, ParseError>
+{
+    usize count = 0;
+    while (true)
+    {
+        u8 c = TomlReader::peek(r);
+        if (ascii_is_digit(c))
+        {
+            String::push_ascii(out, c);
+            count += 1;
+            r.at += 1;
+            continue;
+        }
+        if (c == b'_' && count > 0 && ascii_is_digit(TomlReader::peek_at(r, 1)))
+        {
+            r.at += 1;
+            continue;
+        }
+        if (c == b'_')
+        {
+            return Err(Invalid(r.at));
+        }
+        return Ok(count);
+    }
+}
+
+// An integer in base 16, 8 or 2, its `0x`/`0o`/`0b` consumed.
+fn TomlReader::prefixed(ref<TomlReader, exclusive> r, i64 base) : Result<Toml, ParseError>
+{
+    i64 v = 0;
+    usize count = 0;
+    while (true)
+    {
+        u8 c = TomlReader::peek(r);
+        i64 d = toml_hex_digit(c);
+        if (d >= 0 && d < base)
+        {
+            match (checked_mul(v, base))
+            {
+                Some(m) : match (checked_add(m, d))
+                {
+                    Some(s) : v = s,
+                    None    : return Err(OutOfRange),
+                },
+                None : return Err(OutOfRange),
+            }
+            count += 1;
+            r.at += 1;
+            continue;
+        }
+        if (c == b'_' && count > 0)
+        {
+            i64 next = toml_hex_digit(TomlReader::peek_at(r, 1));
+            if (next >= 0 && next < base)
+            {
+                r.at += 1;
+                continue;
+            }
+        }
+        if (count == 0 || c == b'_')
+        {
+            return Err(Invalid(r.at));
+        }
+        return Ok(TomlInteger(v));
+    }
+}
+
+// A number: an integer in any base, or a float with a fraction, an
+// exponent, or `inf`/`nan`, with an optional sign.
+fn TomlReader::number(ref<TomlReader, exclusive> r) : Result<Toml, ParseError>
+{
+    String text = String::new();
+    u8 c = TomlReader::peek(r);
+    bool negative = false;
+    bool signed = false;
+    if (c == b'+' || c == b'-')
+    {
+        negative = c == b'-';
+        signed = true;
+        if (negative)
+        {
+            String::push_ascii(&mut text, b'-');
+        }
+        r.at += 1;
+        c = TomlReader::peek(r);
+    }
+    if (c == b'i' || c == b'n')
+    {
+        bool inf = TomlReader::word(r, "inf");
+        if (!inf && !TomlReader::word(r, "nan"))
+        {
+            return Err(Invalid(r.at));
+        }
+        f64 x = if (inf) { 1.0 / 0.0 } else { 0.0 / 0.0 };
+        return Ok(TomlFloat(if (negative) { 0.0 - x } else { x }));
+    }
+    if (c == b'0' && !signed)
+    {
+        u8 p = TomlReader::peek_at(r, 1);
+        if (p == b'x' || p == b'o' || p == b'b')
+        {
+            r.at += 2;
+            return TomlReader::prefixed(r, if (p == b'x') { 16 } else if (p == b'o') { 8 } else { 2 });
+        }
+    }
+    usize start = r.at;
+    usize n = TomlReader::digits(r, &mut text)?;
+    if (n == 0)
+    {
+        return Err(Invalid(r.at));
+    }
+    if (n > 1 && r.text.bytes[start] == b'0')
+    {
+        return Err(Invalid(start + 1));
+    }
+    bool float = false;
+    if (TomlReader::peek(r) == b'.')
+    {
+        float = true;
+        String::push_ascii(&mut text, b'.');
+        r.at += 1;
+        if (!ascii_is_digit(TomlReader::peek(r)))
+        {
+            return Err(Invalid(r.at));
+        }
+        TomlReader::digits(r, &mut text)?;
+    }
+    c = TomlReader::peek(r);
+    if (c == b'e' || c == b'E')
+    {
+        float = true;
+        String::push_ascii(&mut text, b'e');
+        r.at += 1;
+        c = TomlReader::peek(r);
+        if (c == b'+' || c == b'-')
+        {
+            String::push_ascii(&mut text, c);
+            r.at += 1;
+        }
+        if (!ascii_is_digit(TomlReader::peek(r)))
+        {
+            return Err(Invalid(r.at));
+        }
+        TomlReader::digits(r, &mut text)?;
+    }
+    if (float)
+    {
+        return match (StringView::parse<f64>(String::as_view(&text)))
+        {
+            Ok(x)  : Ok(TomlFloat(x)),
+            Err(_) : Err(OutOfRange),
+        };
+    }
+    match (StringView::parse<i64>(String::as_view(&text)))
+    {
+        Ok(i)  : Ok(TomlInteger(i)),
+        Err(_) : Err(OutOfRange),
+    }
+}
+
+// Exactly `n` decimal digits at the position, as a number; -1 otherwise.
+fn TomlReader::fixed(ref<TomlReader, exclusive> r, usize n) : i64
+{
+    i64 v = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        u8 c = TomlReader::peek_at(r, i);
+        if (!ascii_is_digit(c))
+        {
+            return -1;
+        }
+        v = v * 10 + widen<i64>(c - b'0');
+    }
+    r.at += n;
+    v
+}
+
+fn toml_days_in_month(i64 year, i64 month) : i64
+{
+    if (month == 2)
+    {
+        bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        return if (leap) { 29 } else { 28 };
+    }
+    if (month == 4 || month == 6 || month == 9 || month == 11) { 30 } else { 31 }
+}
+
+// `HH:MM:SS` with an optional fraction into `d`; the position of the
+// time's start is `at` for the error.
+fn TomlReader::time_part(ref<TomlReader, exclusive> r, ref<TomlDateTime, exclusive> d) : Result<void, ParseError>
+{
+    usize at = r.at;
+    i64 hour = TomlReader::fixed(r, 2);
+    if (hour < 0 || TomlReader::peek(r) != b':')
+    {
+        return Err(Invalid(r.at));
+    }
+    r.at += 1;
+    i64 minute = TomlReader::fixed(r, 2);
+    if (minute < 0 || TomlReader::peek(r) != b':')
+    {
+        return Err(Invalid(r.at));
+    }
+    r.at += 1;
+    i64 second = TomlReader::fixed(r, 2);
+    if (second < 0)
+    {
+        return Err(Invalid(r.at));
+    }
+    if (hour > 23 || minute > 59 || second > 60)
+    {
+        return Err(Invalid(at));
+    }
+    d.hour = narrow<u8>(hour);
+    d.minute = narrow<u8>(minute);
+    d.second = narrow<u8>(second);
+    if (TomlReader::peek(r) == b'.')
+    {
+        r.at += 1;
+        if (!ascii_is_digit(TomlReader::peek(r)))
+        {
+            return Err(Invalid(r.at));
+        }
+        u32 nanos = 0;
+        usize digits = 0;
+        while (ascii_is_digit(TomlReader::peek(r)))
+        {
+            if (digits < 9)
+            {
+                nanos = nanos * 10 + widen<u32>(TomlReader::peek(r) - b'0');
+            }
+            digits += 1;
+            r.at += 1;
+        }
+        while (digits < 9)
+        {
+            nanos = nanos * 10;
+            digits += 1;
+        }
+        d.nanoseconds = nanos;
+    }
+    Ok(())
+}
+
+// A date-time in any of the four forms, beginning at the position.
+fn TomlReader::datetime(ref<TomlReader, exclusive> r, bool has_date) : Result<Toml, ParseError>
+{
+    TomlDateTime d = TomlDateTime {
+        .kind = TomlLocalTime,
+        .year = 0,
+        .month = 0,
+        .day = 0,
+        .hour = 0,
+        .minute = 0,
+        .second = 0,
+        .nanoseconds = 0,
+        .offset_minutes = 0,
+    };
+    if (!has_date)
+    {
+        TomlReader::time_part(r, &mut d)?;
+        return Ok(TomlDateTime(d));
+    }
+    usize start = r.at;
+    i64 year = TomlReader::fixed(r, 4);
+    if (year < 0 || TomlReader::peek(r) != b'-')
+    {
+        return Err(Invalid(r.at));
+    }
+    r.at += 1;
+    i64 month = TomlReader::fixed(r, 2);
+    if (month < 0 || TomlReader::peek(r) != b'-')
+    {
+        return Err(Invalid(r.at));
+    }
+    r.at += 1;
+    i64 day = TomlReader::fixed(r, 2);
+    if (day < 0)
+    {
+        return Err(Invalid(r.at));
+    }
+    if (month < 1 || month > 12 || day < 1 || day > toml_days_in_month(year, month))
+    {
+        return Err(Invalid(start));
+    }
+    d.year = year;
+    d.month = narrow<u8>(month);
+    d.day = narrow<u8>(day);
+    d.kind = TomlLocalDate;
+    u8 c = TomlReader::peek(r);
+    if (c == b'T' || c == b't' || (c == b' ' && ascii_is_digit(TomlReader::peek_at(r, 1))))
+    {
+        r.at += 1;
+        TomlReader::time_part(r, &mut d)?;
+        d.kind = TomlLocalDateTime;
+        c = TomlReader::peek(r);
+        if (c == b'Z' || c == b'z')
+        {
+            r.at += 1;
+            d.kind = TomlOffsetDateTime;
+        }
+        else if (c == b'+' || c == b'-')
+        {
+            usize at = r.at;
+            r.at += 1;
+            i64 oh = TomlReader::fixed(r, 2);
+            if (oh < 0 || TomlReader::peek(r) != b':')
+            {
+                return Err(Invalid(r.at));
+            }
+            r.at += 1;
+            i64 om = TomlReader::fixed(r, 2);
+            if (om < 0)
+            {
+                return Err(Invalid(r.at));
+            }
+            if (oh > 23 || om > 59)
+            {
+                return Err(Invalid(at));
+            }
+            i64 minutes = oh * 60 + om;
+            d.offset_minutes = narrow<i32>(if (c == b'-') { 0 - minutes } else { minutes });
+            d.kind = TomlOffsetDateTime;
+        }
+    }
+    Ok(TomlDateTime(d))
+}
+
+// Whether a date (`DDDD-`) or a time (`DD:`) begins at the position.
+fn TomlReader::date_ahead(ref<TomlReader, shared> r) : bool
+{
+    for (usize i = 0; i < 4; i += 1)
+    {
+        if (!ascii_is_digit(TomlReader::peek_at(r, i)))
+        {
+            return false;
+        }
+    }
+    TomlReader::peek_at(r, 4) == b'-'
+}
+
+fn TomlReader::time_ahead(ref<TomlReader, shared> r) : bool
+{
+    ascii_is_digit(TomlReader::peek(r)) && ascii_is_digit(TomlReader::peek_at(
+        r,
+        1,
+    )) && TomlReader::peek_at(r, 2) == b':'
+}
+
+// Whether the literal `word` is at the reader's position; then it is
+// consumed.
+fn TomlReader::word(ref<TomlReader, exclusive> r, str word) : bool
+{
+    usize n = str_len(word);
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (TomlReader::peek_at(r, i) != str_byte(word, i))
+        {
+            return false;
+        }
+    }
+    r.at += n;
+    true
+}
+
+// An inline table, its `{` consumed: closed once read.
+fn TomlReader::inline_table(ref<TomlReader, exclusive> r, usize depth) : Result<Toml, ParseError>
+{
+    TNode table = tnode_new(String::new(), K_HEADER, TomlBool(false));
+    Vec<String> ctx = Vec::new();
+    TomlReader::skip_ws(r);
+    if (TomlReader::peek(r) == b'}')
+    {
+        r.at += 1;
+        return Ok(tnode_to_toml(table));
+    }
+    while (true)
+    {
+        TomlReader::skip_ws(r);
+        usize key_at = r.at;
+        Vec<String> keys = TomlReader::key(r)?;
+        if (TomlReader::peek(r) != b'=')
+        {
+            return Err(Invalid(r.at));
+        }
+        r.at += 1;
+        TomlReader::skip_ws(r);
+        Toml v = TomlReader::value(r, depth + 1)?;
+        if (!tnode_insert(&mut table, &ctx, 0, &keys, 0, v))
+        {
+            return Err(Invalid(key_at));
+        }
+        TomlReader::skip_ws(r);
+        u8 c = TomlReader::peek(r);
+        r.at += 1;
+        if (c == b'}')
+        {
+            return Ok(tnode_to_toml(table));
+        }
+        if (c != b',')
+        {
+            return Err(Invalid(r.at - 1));
+        }
+    }
+}
+
+// An array, its `[` consumed: elements of any kinds, newlines and
+// comments between them, a trailing comma allowed.
+fn TomlReader::array_value(ref<TomlReader, exclusive> r, usize depth) : Result<Toml, ParseError>
+{
+    Vec<Toml> items = Vec::new();
+    while (true)
+    {
+        TomlReader::skip_space_lines(r)?;
+        if (TomlReader::peek(r) == b']')
+        {
+            r.at += 1;
+            return Ok(TomlArray(items));
+        }
+        Toml v = TomlReader::value(r, depth + 1)?;
+        Vec::push(&mut items, v);
+        TomlReader::skip_space_lines(r)?;
+        u8 c = TomlReader::peek(r);
+        if (c == b']')
+        {
+            r.at += 1;
+            return Ok(TomlArray(items));
+        }
+        if (c != b',')
+        {
+            return Err(Invalid(r.at));
+        }
+        r.at += 1;
+    }
+}
+
+fn TomlReader::value(ref<TomlReader, exclusive> r, usize depth) : Result<Toml, ParseError>
+{
+    u8 c = TomlReader::peek(r);
+    if (c == b'"')
+    {
+        r.at += 1;
+        if (TomlReader::peek(r) == b'"' && TomlReader::peek_at(r, 1) == b'"')
+        {
+            r.at += 2;
+            return Ok(TomlString(TomlReader::basic(r, true)?));
+        }
+        return Ok(TomlString(TomlReader::basic(r, false)?));
+    }
+    if (c == b'\'')
+    {
+        r.at += 1;
+        if (TomlReader::peek(r) == b'\'' && TomlReader::peek_at(r, 1) == b'\'')
+        {
+            r.at += 2;
+            return Ok(TomlString(TomlReader::literal(r, true)?));
+        }
+        return Ok(TomlString(TomlReader::literal(r, false)?));
+    }
+    if (c == b'[' || c == b'{')
+    {
+        if (depth >= TOML_MAX_DEPTH)
+        {
+            return Err(OutOfRange);
+        }
+        r.at += 1;
+        return if (c == b'[') { TomlReader::array_value(r, depth) } else { TomlReader::inline_table(r, depth) };
+    }
+    if (TomlReader::word(r, "true"))
+    {
+        return Ok(TomlBool(true));
+    }
+    if (TomlReader::word(r, "false"))
+    {
+        return Ok(TomlBool(false));
+    }
+    if (TomlReader::date_ahead(r))
+    {
+        return TomlReader::datetime(r, true);
+    }
+    if (TomlReader::time_ahead(r))
+    {
+        return TomlReader::datetime(r, false);
+    }
+    if (c == b'+' || c == b'-' || c == b'i' || c == b'n' || ascii_is_digit(c))
+    {
+        return TomlReader::number(r);
+    }
+    Err(Invalid(r.at))
+}
+
+// The document `text` holds: a table of its key/value pairs, tables and
+// arrays of tables. An empty document is an empty table. `Invalid(i)`
+// names the first byte that does not fit, or the key that is defined
+// twice or added to a closed table; `OutOfRange` an integer beyond
+// `i64`, a float beyond `f64`, or nesting deeper than 512.
+/// The TOML document `text` holds, as a table.
+///
+/// The whole of TOML 1.0: tables and arrays of tables under headers, dotted keys, inline tables, the four
+/// string forms with every escape, integers in decimal, hexadecimal, octal and binary with underscores,
+/// floats with `inf` and `nan`, and the four date-time forms. An empty document is an empty table.
+///
+/// - `Err(Invalid(i))` at the first byte that does not fit, or at a key that is defined twice or would
+///   add to a table the format has closed (one defined by an earlier header, or an inline table).
+/// - `Err(OutOfRange)` for an integer beyond `i64`, a float beyond `f64`, or arrays and inline tables
+///   nested deeper than 512.
+///
+/// `Err(Empty)` never occurs: a document with no key is an empty table.
+export fn Toml::parse(StringView text) : Result<Toml, ParseError>
+{
+    TomlReader r = TomlReader { .text = text, .at = 0 };
+    TNode root = tnode_new(String::new(), K_HEADER, TomlBool(false));
+    Vec<String> ctx = Vec::new();
+    while (true)
+    {
+        TomlReader::skip_ws(&mut r);
+        if (TomlReader::at_end(&r))
+        {
+            break;
+        }
+        u8 c = TomlReader::peek(&r);
+        if (c == b'#')
+        {
+            TomlReader::comment(&mut r)?;
+            continue;
+        }
+        if (TomlReader::newline(&mut r))
+        {
+            continue;
+        }
+        if (c == b'[')
+        {
+            r.at += 1;
+            bool is_array = TomlReader::peek(&r) == b'[';
+            if (is_array)
+            {
+                r.at += 1;
+            }
+            TomlReader::skip_ws(&mut r);
+            usize key_at = r.at;
+            Vec<String> parts = TomlReader::key(&mut r)?;
+            if (TomlReader::peek(&r) != b']' || (is_array && TomlReader::peek_at(&r, 1) != b']'))
+            {
+                return Err(Invalid(r.at));
+            }
+            r.at += if (is_array) { 2 } else { 1 };
+            if (!tnode_define(&mut root, &parts, 0, is_array))
+            {
+                return Err(Invalid(key_at));
+            }
+            overwrite(&mut ctx, parts);
+            TomlReader::line_end(&mut r)?;
+            continue;
+        }
+        usize key_at = r.at;
+        Vec<String> keys = TomlReader::key(&mut r)?;
+        if (TomlReader::peek(&r) != b'=')
+        {
+            return Err(Invalid(r.at));
+        }
+        r.at += 1;
+        TomlReader::skip_ws(&mut r);
+        Toml v = TomlReader::value(&mut r, 0)?;
+        if (!tnode_insert(&mut root, &ctx, 0, &keys, 0, v))
+        {
+            return Err(Invalid(key_at));
+        }
+        TomlReader::line_end(&mut r)?;
+    }
+    Ok(tnode_to_toml(root))
+}
+
+/// A document with tables, an array of tables, dotted and quoted keys, and every kind of value.
+unittest "Toml::parse: a configuration file"
+{
+    Toml doc = Result::unwrap(Toml::parse("title = \"Example\"\n[owner]\nname = \"Tom\"\ndob = 1979-05-27T07:32:00-08:00\n[database]\nports = [ 8001, 8001, 8002 ]\nenabled = true\ntemp_targets = { cpu = 79.5, case = 72.0 }\n[[servers]]\nip = \"10.0.0.1\"\n[[servers]]\nip = \"10.0.0.2\"\n"));
+    assert(Option::unwrap(Toml::as_text(Option::unwrap(Toml::lookup(&doc, "owner.name")))) == "Tom");
+    assert(Toml::as_i64(Option::unwrap(Toml::lookup(&doc, "database.ports.2"))) == Some(8002: i64));
+    assert(Toml::as_f64(Option::unwrap(Toml::lookup(&doc, "database.temp_targets.cpu"))) == Some(79.5));
+    assert(Option::unwrap(Toml::as_text(Option::unwrap(Toml::lookup(&doc, "servers.1.ip")))) == "10.0.0.2");
+    TomlDateTime dob = Option::unwrap(Toml::as_datetime(Option::unwrap(Toml::lookup(&doc, "owner.dob"))));
+    assert(dob.year == 1979 && dob.hour == 7 && dob.offset_minutes == -480);
+}
+
+/// The error names the byte where the text stops fitting, or the key that is defined twice.
+unittest "Toml::parse: where the error is"
+{
+    match (Toml::parse("a = 1\nb = \n"))
+    {
+        Err(Invalid(i)) : assert(i == 10),
+        _               : assert(false),
+    }
+    match (Toml::parse("a = 1\na = 2\n"))
+    {
+        Err(Invalid(i)) : assert(i == 6),
+        _               : assert(false),
+    }
+    match (Toml::parse("n = 9223372036854775808"))
+    {
+        Err(OutOfRange) : {},
+        _               : assert(false),
+    }
+}
+
+// ---- writing ----
+
+// `s` as a basic string: quoted, with `"`, `\` and the control characters
+// escaped (`\n`, `\t`, `\r`, `\b`, `\f`, else `\u00XX`); everything else,
+// non-ASCII included, as it is.
+fn toml_quote(ref<String, exclusive> out, StringView s)
+{
+    str digits = "0123456789ABCDEF";
+    String::push_ascii(out, b'"');
+    for (usize i = 0; i < StringView::len(s); i += 1)
+    {
+        u8 b = s.bytes[i];
+        if (b >= 0x20 && b != b'"' && b != b'\\' && b != 0x7F)
+        {
+            Vec::push(&mut out.bytes, b);          // a multi-byte character's bytes, whole
+            continue;
+        }
+        String::push_ascii(out, b'\\');
+        if (b == b'"') { String::push_ascii(out, b'"'); }
+        else if (b == b'\\') { String::push_ascii(out, b'\\'); }
+        else if (b == 10) { String::push_ascii(out, b'n'); }
+        else if (b == 13) { String::push_ascii(out, b'r'); }
+        else if (b == 9) { String::push_ascii(out, b't'); }
+        else if (b == 8) { String::push_ascii(out, b'b'); }
+        else if (b == 12) { String::push_ascii(out, b'f'); }
+        else
+        {
+            String::append(out, "u00");
+            String::push_ascii(out, str_byte(digits, widen<usize>(b >> 4)));
+            String::push_ascii(out, str_byte(digits, widen<usize>(b & 15)));
+        }
+    }
+    String::push_ascii(out, b'"');
+}
+
+// A key part: bare when it can be, else quoted.
+fn toml_key(ref<String, exclusive> out, StringView key)
+{
+    bool bare = StringView::len(key) > 0;
+    for (usize i = 0; i < StringView::len(key); i += 1)
+    {
+        if (!toml_is_bare(key.bytes[i]))
+        {
+            bare = false;
+        }
+    }
+    if (bare)
+    {
+        String::append(out, key);
+    }
+    else
+    {
+        toml_quote(out, key);
+    }
+}
+
+fn toml_float(ref<String, exclusive> out, f64 x)
+{
+    if (x != x)
+    {
+        String::append(out, "nan");
+    }
+    else if (!is_finite(x))
+    {
+        String::append(out, if (x > 0.0) { "inf" } else { "-inf" });
+    }
+    else
+    {
+        String::append(out, x);
+    }
+}
+
+fn toml_two_digits(ref<String, exclusive> out, u8 v)
+{
+    String::push_ascii(out, b'0' + v / 10);
+    String::push_ascii(out, b'0' + v % 10);
+}
+
+// `d` as the format writes it: `YYYY-MM-DD`, `T`, `HH:MM:SS`, the
+// fraction without trailing zeros when there is one, `Z` or `±HH:MM`.
+/// The date-time as TOML (and RFC 3339) writes it: the date, `T`, the time, its fraction when there is one,
+/// and the offset as `Z` or `±HH:MM`; a local form leaves out what it does not have.
+export fn TomlDateTime::text(ref<TomlDateTime, shared> d) : String
+{
+    String out = String::new();
+    bool date = match (d.kind)
+    {
+        TomlLocalTime : false,
+        _             : true,
+    };
+    bool time = match (d.kind)
+    {
+        TomlLocalDate : false,
+        _             : true,
+    };
+    if (date)
+    {
+        i64 y = d.year;
+        if (y < 0)
+        {
+            String::push_ascii(&mut out, b'-');
+            y = 0 - y;
+        }
+        if (y < 1000) { String::push_ascii(&mut out, b'0'); }
+        if (y < 100) { String::push_ascii(&mut out, b'0'); }
+        if (y < 10) { String::push_ascii(&mut out, b'0'); }
+        String::append(&mut out, y);
+        String::push_ascii(&mut out, b'-');
+        toml_two_digits(&mut out, d.month);
+        String::push_ascii(&mut out, b'-');
+        toml_two_digits(&mut out, d.day);
+    }
+    if (date && time)
+    {
+        String::push_ascii(&mut out, b'T');
+    }
+    if (time)
+    {
+        toml_two_digits(&mut out, d.hour);
+        String::push_ascii(&mut out, b':');
+        toml_two_digits(&mut out, d.minute);
+        String::push_ascii(&mut out, b':');
+        toml_two_digits(&mut out, d.second);
+        if (d.nanoseconds > 0)
+        {
+            String::push_ascii(&mut out, b'.');
+            u32 n = d.nanoseconds;
+            u32 scale = 100000000;
+            while (n > 0)
+            {
+                String::push_ascii(&mut out, b'0' + narrow<u8>(n / scale));
+                n = n % scale;
+                scale = scale / 10;
+            }
+        }
+    }
+    match (d.kind)
+    {
+        TomlOffsetDateTime :
+        {
+            if (d.offset_minutes == 0)
+            {
+                String::push_ascii(&mut out, b'Z');
+            }
+            else
+            {
+                i32 m = d.offset_minutes;
+                String::push_ascii(&mut out, if (m < 0) { b'-' } else { b'+' });
+                if (m < 0)
+                {
+                    m = 0 - m;
+                }
+                toml_two_digits(&mut out, narrow<u8>(m / 60));
+                String::push_ascii(&mut out, b':');
+                toml_two_digits(&mut out, narrow<u8>(m % 60));
+            }
+        },
+        _                  : {},
+    }
+    out
+}
+
+/// Each form written back as it was read.
+unittest "TomlDateTime::text: the four forms"
+{
+    String text = "a = 1979-05-27T07:32:00.999999Z\nb = 1979-05-27T00:32:00.5-07:00\nc = 1979-05-27T07:32:00\nd = 1979-05-27\ne = 07:32:00\n";
+    Toml doc = Result::unwrap(Toml::parse(String::as_view(&text)));
+    assert(Toml::text(&doc) == text);
+    TomlDateTime b = Option::unwrap(Toml::as_datetime(Option::unwrap(Toml::get(&doc, "b"))));
+    assert(b.nanoseconds == 500000000 && b.offset_minutes == -420 && TomlDateTime::text(&b) == "1979-05-27T00:32:00.5-07:00");
+}
+
+// Whether `v` is a table, and whether it is a non-empty array of tables
+// (written as `[[…]]` sections rather than inline).
+fn toml_is_table(ref<Toml, shared> v) : bool
+{
+    match (v)
+    {
+        TomlTable(_) : true,
+        _            : false,
+    }
+}
+
+fn toml_is_table_array(ref<Toml, shared> v) : bool
+{
+    match (v)
+    {
+        TomlArray(items) :
+        {
+            if (Vec::len(items) == 0)
+            {
+                return false;
+            }
+            for (usize i = 0; i < Vec::len(items); i += 1)
+            {
+                if (!toml_is_table(&items[i]))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        _                : false,
+    }
+}
+
+// `v` in the form a value takes after `=`: an array `[a, b]`, a table
+// inline `{k = v, …}`.
+fn toml_inline(ref<String, exclusive> out, ref<Toml, shared> v)
+{
+    match (v)
+    {
+        TomlString(s)      : toml_quote(out, String::as_view(s)),
+        TomlInteger(i)     : String::append(out, *i),
+        TomlFloat(x)       : toml_float(out, *x),
+        TomlBool(b)        : String::append(out, if (*b) { "true" } else { "false" }),
+        TomlDateTime(d)    : String::append(out, &TomlDateTime::text(d)),
+        TomlArray(items)   :
+        {
+            String::push_ascii(out, b'[');
+            for (usize i = 0; i < Vec::len(items); i += 1)
+            {
+                if (i > 0)
+                {
+                    String::append(out, ", ");
+                }
+                toml_inline(out, &items[i]);
+            }
+            String::push_ascii(out, b']');
+        },
+        TomlTable(members) :
+        {
+            String::push_ascii(out, b'{');
+            for (usize i = 0; i < Vec::len(members); i += 1)
+            {
+                String::append(out, if (i > 0) { ", " } else { " " });
+                toml_key(out, String::as_view(&members[i].key));
+                String::append(out, " = ");
+                toml_inline(out, &members[i].value);
+            }
+            String::append(out, if (Vec::len(members) > 0) { " }" } else { "}" });
+        },
+    }
+}
+
+// A table's members under the header `path`: the plain members as
+// `key = value` lines, then each sub-table under its own header and each
+// array of tables under `[[…]]` headers, in order.
+fn toml_write_table(ref<String, exclusive> out, ref<Vec<TomlMember>, shared> members, ref<String, shared> path)
+{
+    for (usize i = 0; i < Vec::len(members); i += 1)
+    {
+        ref<Toml, shared> v = &members[i].value;
+        if (toml_is_table(v) || toml_is_table_array(v))
+        {
+            continue;
+        }
+        toml_key(out, String::as_view(&members[i].key));
+        String::append(out, " = ");
+        toml_inline(out, v);
+        String::push_ascii(out, b'\n');
+    }
+    for (usize i = 0; i < Vec::len(members); i += 1)
+    {
+        ref<Toml, shared> v = &members[i].value;
+        bool table = toml_is_table(v);
+        if (!table && !toml_is_table_array(v))
+        {
+            continue;
+        }
+        String sub = clone(path);
+        if (String::len(&sub) > 0)
+        {
+            String::push_ascii(&mut sub, b'.');
+        }
+        toml_key(&mut sub, String::as_view(&members[i].key));
+        match (v)
+        {
+            TomlTable(inner) :
+            {
+                if (String::len(out) > 0)
+                {
+                    String::push_ascii(out, b'\n');
+                }
+                String::push_ascii(out, b'[');
+                String::append(out, &sub);
+                String::append(out, "]\n");
+                toml_write_table(out, inner, &sub);
+            },
+            TomlArray(items) :
+            {
+                for (usize k = 0; k < Vec::len(items); k += 1)
+                {
+                    if (String::len(out) > 0)
+                    {
+                        String::push_ascii(out, b'\n');
+                    }
+                    String::append(out, "[[");
+                    String::append(out, &sub);
+                    String::append(out, "]]\n");
+                    match (&items[k])
+                    {
+                        TomlTable(inner) : toml_write_table(out, inner, &sub),
+                        _                : {},
+                    }
+                }
+            },
+            _                : {},
+        }
+    }
+}
+
+// `t` as a TOML document: a table's plain members first, one per line,
+// then its sub-tables under `[headers]` and arrays of tables under
+// `[[headers]]`, each in the order the members have; a value that is not
+// a table in the form it takes after `=`.
+/// The value `t` as TOML text.
+///
+/// A table is written as a document: its plain members as `key = value` lines, then each member that is a
+/// table under a `[header]`, and each non-empty array of tables under `[[headers]]`, in order, recursively; a
+/// key is bare when it can be and quoted otherwise. Strings are basic strings with `"`, `\` and the control
+/// characters escaped; a float is written in the shortest digits that read back as it, with `inf` and `nan`;
+/// a date-time as `TomlDateTime::text` writes it. A value that is not a table is written in the form it takes
+/// after `=`: arrays as `[a, b]`, inline tables as `{ k = v }`. Comments are not kept. `Toml::parse` of the text
+/// gives `t` back, the plain members of each table before its sub-tables.
+export fn Toml::text(ref<Toml, shared> t) : String
+{
+    String out = String::new();
+    match (t)
+    {
+        TomlTable(members) :
+        {
+            String path = String::new();
+            toml_write_table(&mut out, members, &path);
+        },
+        _                  : toml_inline(&mut out, t),
+    }
+    out
+}
+
+/// Headers for the tables, lines for the values, and a round trip.
+unittest "Toml::text: the layout"
+{
+    Toml doc = Result::unwrap(Toml::parse("[server]\nhost = \"example.org\"\nports = [80, 443]\n[server.tls]\ncert = 'a b'\n[[users]]\nname = \"ann\"\n[[users]]\nname = \"bob\"\n"));
+    String t = Toml::text(&doc);
+    assert(t == "[server]\nhost = \"example.org\"\nports = [80, 443]\n\n[server.tls]\ncert = \"a b\"\n\n[[users]]\nname = \"ann\"\n\n[[users]]\nname = \"bob\"\n");
+    assert(Toml::text(&Result::unwrap(Toml::parse(String::as_view(&t)))) == t);
+}
+
+// ---- reading a tree ----
+
+// The value of the member named `key` of a table; `None` for another
+// kind of value or no such member.
+/// The value of the member named `key` when `t` is a table, else `None`.
+///
+/// `None` also when there is no such member.
+export fn Toml::get(ref<Toml, shared> t, StringView key) : Option<ref<Toml, shared>>
+{
+    match (t)
+    {
+        TomlTable(members) :
+        {
+            for (usize i = 0; i < Vec::len(members); i += 1)
+            {
+                if (members[i].key == key)
+                {
+                    return Some(&members[i].value);
+                }
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+// Element `i` of an array; `None` for another kind of value or past the
+// end.
+/// Element `i` of `t` when `t` is an array, else `None`.
+///
+/// `None` also when `i` is past the end.
+export fn Toml::at(ref<Toml, shared> t, usize i) : Option<ref<Toml, shared>>
+{
+    match (t)
+    {
+        TomlArray(items) : if (i < Vec::len(items)) { Some(&items[i]) } else { None },
+        _                : None,
+    }
+}
+
+// The value at a dotted path: each part a member's key, or an element's
+// index where the value is an array.
+/// The value at the dotted `path` below `t`: `Toml::lookup(&doc, "database.ports.0")`.
+///
+/// Each part of the path names a member of a table, or, where the value reached is an array, an element by
+/// its index written in decimal. `None` when any part is not there. A key that itself contains a dot is
+/// reached with `Toml::get`.
+export fn Toml::lookup(ref<Toml, shared> t, StringView path) : Option<ref<Toml, shared>>
+{
+    Vec<StringView> parts = StringView::split(path, ".");
+    ref<Toml, shared> cur = t;
+    for (usize i = 0; i < Vec::len(&parts); i += 1)
+    {
+        cur = match (cur)
+        {
+            TomlArray(_) : match (StringView::parse<usize>(parts[i]))
+            {
+                Ok(k)  : Toml::at(cur, k)?,
+                Err(_) : return None,
+            },
+            _ : Toml::get(cur, parts[i])?,
+        };
+    }
+    Some(cur)
+}
+
+/// The string `t` holds as a view, or `None` when `t` is not `TomlString`.
+export fn Toml::as_text(ref<Toml, shared> t) : Option<StringView>
+{
+    match (t)
+    {
+        TomlString(s) : Some(String::as_view(s)),
+        _             : None,
+    }
+}
+
+/// The integer `t` holds, or `None` when `t` is not `TomlInteger`.
+export fn Toml::as_i64(ref<Toml, shared> t) : Option<i64>
+{
+    match (t)
+    {
+        TomlInteger(i) : Some(*i),
+        _              : None,
+    }
+}
+
+/// The float `t` holds, or `None` when `t` is not `TomlFloat`; an integer is not converted.
+export fn Toml::as_f64(ref<Toml, shared> t) : Option<f64>
+{
+    match (t)
+    {
+        TomlFloat(x) : Some(*x),
+        _            : None,
+    }
+}
+
+/// The boolean `t` holds, or `None` when `t` is not `TomlBool`.
+export fn Toml::as_bool(ref<Toml, shared> t) : Option<bool>
+{
+    match (t)
+    {
+        TomlBool(b) : Some(*b),
+        _           : None,
+    }
+}
+
+/// The date-time `t` holds, or `None` when `t` is not `TomlDateTime`.
+export fn Toml::as_datetime(ref<Toml, shared> t) : Option<TomlDateTime>
+{
+    match (t)
+    {
+        TomlDateTime(d) : Some(*d),
+        _               : None,
+    }
+}
+
+/// The elements of `t` when it is an array, or `None` for another kind of value.
+export fn Toml::as_array(ref<Toml, shared> t) : Option<ref<Vec<Toml>, shared>>
+{
+    match (t)
+    {
+        TomlArray(items) : Some(items),
+        _                : None,
+    }
+}
+
+/// The members of `t`, in order, when it is a table, or `None` for another kind of value.
+export fn Toml::as_table(ref<Toml, shared> t) : Option<ref<Vec<TomlMember>, shared>>
+{
+    match (t)
+    {
+        TomlTable(members) : Some(members),
+        _                  : None,
+    }
+}
+
+// ---- building a tree ----
+
+// Sets member `key` of a table to `v`: the member of that name replaced,
+// or a new member appended. On a value that is not a table:
+// `diag.assert-failed`.
+/// Sets member `key` of the table `t` to `v`.
+///
+/// The member of that name is replaced, or else a new member appended. Faults (`diag.assert-failed`) when
+/// `t` is not a table.
+export fn Toml::set(ref<Toml, exclusive> t, StringView key, Toml v)
+{
+    match (t)
+    {
+        TomlTable(members) :
+        {
+            for (usize i = 0; i < Vec::len(members); i += 1)
+            {
+                if (members[i].key == key)
+                {
+                    overwrite(&mut members[i].value, v);
+                    return;
+                }
+            }
+            Vec::push(members, TomlMember { .key = String::from_view(key), .value = v });
+        },
+        _                  : assert(false, "Toml::set on a value that is not a table"),
+    }
+}
+
+// Appends `v` to an array. On a value that is not an array:
+// `diag.assert-failed`.
+/// Appends `v` to the array `t`.
+///
+/// Faults (`diag.assert-failed`) when `t` is not an array.
+export fn Toml::push(ref<Toml, exclusive> t, Toml v)
+{
+    match (t)
+    {
+        TomlArray(items) : Vec::push(items, v),
+        _                : assert(false, "Toml::push on a value that is not an array"),
+    }
+}
+
+/// A document built member by member and written out.
+unittest "Toml::set: building a document"
+{
+    Toml doc = TomlTable(Vec::new());
+    Toml::set(&mut doc, "name", TomlString(String::from_str("demo")));
+    Toml ports = TomlArray(Vec::new());
+    Toml::push(&mut ports, TomlInteger(8080));
+    Toml::push(&mut ports, TomlInteger(8081));
+    Toml server = TomlTable(Vec::new());
+    Toml::set(&mut server, "ports", ports);
+    Toml::set(&mut server, "debug", TomlBool(false));
+    Toml::set(&mut doc, "server", server);
+    Toml::set(&mut doc, "name", TomlString(String::from_str("demo 2")));
+    assert(Toml::text(&doc) == "name = \"demo 2\"\n\n[server]\nports = [8080, 8081]\ndebug = false\n");
+}

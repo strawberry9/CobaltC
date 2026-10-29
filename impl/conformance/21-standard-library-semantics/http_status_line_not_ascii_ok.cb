@@ -1,0 +1,51 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Response] (D-0173); conf.hostile-http-status-line (D-0211, CHG-0249)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 737461747573203230302c20726561736f6e204f4b0a7468652048545450206d657373616765206973206d616c666f726d65640a7468652048545450206d657373616765206973206d616c666f726d65640a737461747573203230302c20726561736f6e2044c3a96ac3a020f09f98800a
+//
+// A status line whose version, status code or the spaces around the code
+// hold a byte that is not ASCII is a malformed message (BadMessage), not
+// a place to cut a character in two: the client used to take the code as
+// bytes 9 to 12 and the reason from byte 13 and fault diag.not-char-boundary
+// when a multi-byte character straddled those offsets (found by the
+// hostile-input round, D-0211). A reason phrase in any UTF-8 is kept.
+
+import std;
+
+fn answer(TcpListener l, String status_line) : usize
+{
+    TcpStream c = Result::unwrap(TcpListener::accept(&mut l));
+    Vec<u8> head = Vec::new();
+    _ = TcpStream::read(&mut c, &mut head, 4096);
+    Vec<u8> reply = Vec::new();
+    Vec::extend_from(&mut reply, StringView::as_bytes(String::as_view(&status_line)));
+    Vec::extend_from(&mut reply, StringView::as_bytes("\r\nContent-Length: 2\r\n\r\nok"));
+    _ = TcpStream::write(&mut c, &reply[0..$]);
+    Vec::len(&reply)
+}
+
+fn fetch(str status_line)
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String url = String::from_str("http://");
+    String::append(&mut url, &SocketAddr::text(&TcpListener::local_addr(&l)));
+    String::append(&mut url, "/");
+    auto a = spawn(answer, l, String::from_str(status_line));
+    match (http_get(String::as_view(&url)))
+    {
+        Ok(r)  : printf("status %v, reason %v\n", r.status, &r.reason),
+        Err(e) : printf("%s\n", HttpError::text(&e)),
+    }
+    _ = join(a);
+}
+
+fn main() : u8
+{
+    fetch("HTTP/1.1 200 OK");
+    fetch("HTTP/1.1 2\u{e9}0 OK");
+    fetch("HTTP/1.1 200\u{1F600}Fine");
+    fetch("HTTP/1.1 200 D\u{e9}j\u{e0} \u{1F600}");
+    0
+}

@@ -1,0 +1,308 @@
+// The native `std` bodies (D-0274 stage 5; cobc's `lower_fn` native branch
+// and the helpers the native_*.rs files share): `lower_native`, which
+// writes a native body and its variants where one exists.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import stage1a;
+import bodies;
+import native_vec;
+import native_misc;
+import native_text;
+
+// D-0192: the `Vec` calls whose unchecked form a confined vector uses
+// (`nc_variant`), and those `lower_vec_checked_once` serves (`once_variant`).
+fn is_confining_call(StringView n) : bool
+{
+    StringView::eq_str(
+        n,
+        "std::Vec::swap",
+    ) || StringView::eq_str(n, "std::Vec::reverse") || StringView::eq_str(n, "std::Vec::insert") || StringView::eq_str(
+        n,
+        "std::Vec::remove",
+    ) || StringView::eq_str(
+        n,
+        "std::Vec::truncate",
+    ) || StringView::eq_str(n, "std::Vec::clear") || StringView::eq_str(n, "std::Vec::contains") || StringView::eq_str(
+        n,
+        "std::Vec::index_of",
+    ) || StringView::eq_str(n, "std::Vec::binary_search") || StringView::eq_str(n, "std::Vec::sort")
+}
+
+fn is_once_call(StringView n) : bool
+{
+    StringView::eq_str(
+        n,
+        "std::Vec::swap",
+    ) || StringView::eq_str(n, "std::Vec::reverse") || StringView::eq_str(n, "std::Vec::insert") || StringView::eq_str(
+        n,
+        "std::Vec::remove",
+    ) || StringView::eq_str(
+        n,
+        "std::Vec::truncate",
+    ) || StringView::eq_str(n, "std::Vec::clear") || StringView::eq_str(n, "std::Vec::pop") || StringView::eq_str(
+        n,
+        "std::Vec::contains",
+    ) || StringView::eq_str(n, "std::Vec::index_of") || StringView::eq_str(n, "std::Vec::binary_search")
+}
+
+// A line that checks through the vector's own path (`p_v`).
+fn checks_p_v(StringView l) : bool
+{
+    StringView t = StringView::trim_start(l);
+    StringView::contains(
+        l,
+        StringView::of("p_v.tok"),
+    ) && (StringView::starts_with(t, StringView::of("cb_read(")) || StringView::starts_with(
+        t,
+        StringView::of("cb_write("),
+    ) || StringView::starts_with(t, StringView::of("cb_borrow_check(")))
+}
+
+// The body less its checks through `p_v` (cobc's `once_variant`).
+export fn once_variant(ref<String, shared> body) : String
+{
+    String out = String::new();
+    foreach (l in StringView::lines(String::as_view(body)))
+    {
+        if (!checks_p_v(l))
+        {
+            String::appendf(&mut out, "%v\n", l);
+        }
+    }
+    out
+}
+
+// The unchecked form for a confined vector: no check through `p_v`, no
+// `cb_live_in` test (cobc's `nc_variant`).
+export fn nc_variant(ref<String, shared> body) : String
+{
+    String out = String::new();
+    foreach (l in StringView::lines(String::as_view(body)))
+    {
+        if (!checks_p_v(l) && !StringView::contains(l, StringView::of("cb_live_in")))
+        {
+            String::appendf(&mut out, "%v\n", l);
+        }
+    }
+    out
+}
+
+// A plain element, or a resource holding no reference and no `fn` (cobc's
+// `movable_elem`).
+export fn movable_elem(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
+{
+    plain_data(g, t) || (is_resource(g, t) && !has_refs(g, t) && !holds_fn(g, t) && !is_ref_ty(t))
+}
+
+fn is_ref_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(_) : true,
+        _             : false,
+    }
+}
+
+// D-0200: a type an objectless local may hold (cobc's `objectless_type`).
+export fn objectless_type(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
+{
+    Vec<String> seen = Vec::new();
+    objectless_type_in(g, t, &mut seen)
+}
+
+fn ol_elem(ref<Gen, exclusive> g, ref<Type, shared> x, ref<Vec<String>, exclusive> seen) : bool
+{
+    (plain_data(g, x) && !has_refs(g, x) && !holds_fn(g, x)) || objectless_type_in(g, x, seen)
+}
+
+// `seen`: the struct types being answered, by type code; a type holding
+// itself is answered no there.
+export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec<String>, exclusive> seen) : bool
+{
+    String code = type_code(t);
+    foreach (s in seen)
+    {
+        if (String::eq(s, &code))
+        {
+            return false;
+        }
+    }
+    match (t)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            usize k = Vec::len(&nt.args);
+            if (String::eq_str(&nt.name, "std::String") && k == 0)
+            {
+                return true;
+            }
+            if ((String::eq_str(
+                &nt.name,
+                "std::Vec",
+            ) || String::eq_str(&nt.name, "std::Queue") || String::eq_str(&nt.name, "std::HashSet")) && k == 1)
+            {
+                return ol_elem(g, &nt.args[0], seen);
+            }
+            if (String::eq_str(&nt.name, "std::HashMap") && k == 2)
+            {
+                return ol_elem(g, &nt.args[0], seen) && ol_elem(g, &nt.args[1], seen);
+            }
+            if (String::starts_with(&nt.name, StringView::of("std::")))
+            {
+                return false;
+            }
+            match (struct_decl(g, &nt.name))
+            {
+                Some(sd) :
+                {
+                    if (sd.resource_ || Option::is_some(&sd.bits))
+                    {
+                        return false;
+                    }
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+                    Vec::push(seen, String::clone(&code));
+                    bool ok = true;
+                    foreach (fd in &sd.fields)
+                    {
+                        if (ok)
+                        {
+                            Type ft = apply(&fd.ty, &sub);
+                            ok = ol_elem(g, &ft, seen);
+                        }
+                    }
+                    Vec::pop(seen);
+                    ok
+                },
+                None     : false,
+            }
+        },
+        _               : false,
+    }
+}
+
+// D-0192: whether parameter `pos` of `key` is a pure direct reference (cobc's
+// `pure_direct`): never under `--all-checks`, which the bootstrap form
+// implies (stage 1).
+export fn pure_direct(ref<Gen, exclusive> g, ref<String, shared> key, usize pos) : bool
+{
+    if (all_checks(g))
+    {
+        return false;
+    }
+    Vec<String> visiting = Vec::new();
+    pure_direct_in(g, key, pos, &mut visiting)
+}
+
+// D-0196: whether `key` gets a `__raw` form (cobc's `raw_ret_ok`): a
+// non-generic function returning a value an objectless local may hold, not a
+// dual body; its `__raw` form ends its result's record where it returns, and
+// the caller binds the value objectless.
+export fn raw_ret_ok(ref<Gen, exclusive> g, ref<String, shared> key) : bool
+{
+    if (boot(g, 4))
+    {
+        return false;
+    }
+    FnDecl f = match (HashMap::get(&g.prog.table.fns, key))
+    {
+        Some(f) :
+        {
+            if (Vec::len(&f.type_params) > 0)
+            {
+                return false;
+            }
+            clone(f)
+        },
+        None    : return false,
+    };
+    if (String::eq_str(key, "main") || !objectless_type(g, &f.ret))
+    {
+        return false;
+    }
+    HashMap<String, Type> no_subst = HashMap::new();
+    Option::is_none(&dual_eligible(g, &f, &no_subst)) && Option::is_none(&field_dual_eligible(g, &f, &no_subst))
+}
+
+// cobc's `lower_fn` native branch: when `name` has a native body, writes it
+// (and its `__raw`, `_once` and `_nc` forms) after the prototype `sig`, and
+// says so.
+export fn lower_native(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<String, shared> cname,
+    ref<String, shared> ret_c,
+    ref<String, shared> sig,
+) : bool
+{
+    // D-0274: no native body in the bootstrap form.
+    if (boot(g, 5))
+    {
+        return false;
+    }
+    g.native_ctx = Some(NativeCtx { .name = String::clone(name), .f = clone(f), .targs = clone(targs), .ret_c = String::clone(ret_c), .sig = String::clone(sig) });
+    Option<String> native = native_vec_index(g, name, f, targs, cname);
+    g.native_ctx = None;
+    String body = match (native)
+    {
+        Some(b) : b,
+        None    : return false,
+    };
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, &body);
+    usize open = Option::expect(StringView::find(String::as_view(sig), StringView::of("(")), "a signature");
+    StringView rest = StringView::sub(String::as_view(sig), open, String::len(sig));
+    // D-0200: the `__raw` form a caller binding the result objectless calls.
+    if (Vec::len(targs) == 0 && !String::eq_str(name, "main") && raw_ret_ok(g, name))
+    {
+        String raw_sig = sprintf("%s %s__raw%v", ret_c, cname, rest);
+        String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+        String raw = match (native_raw_body(g, name, &body))
+        {
+            Some(b) : b,
+            None    :
+            {
+                // The native called and its result's record ended at once.
+                Vec<String> args = Vec::new();
+                foreach (p in &f.params)
+                {
+                    Vec::push(&mut args, sprintf("p_%s", &san(String::as_view(&p.name))));
+                }
+                sprintf(
+                    "    %s r = %s(%s);\n    cb_forget_obj(cb_recv(&r));\n    return r;\n",
+                    ret_c,
+                    cname,
+                    &String::join(&args[0..$], ", "),
+                )
+            },
+        };
+        String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &raw_sig, &raw);
+    }
+    // `sort`'s unchecked form only for its integer and `bool` body.
+    bool nc_shape = !String::eq_str(name, "std::Vec::sort") || (Vec::len(targs) == 1 && match (&targs[0])
+    {
+        Type::TInt(_) : true,
+        Type::TBool   : true,
+        _             : false,
+    });
+    if (is_once_call(String::as_view(name)))
+    {
+        String once_sig = sprintf("%s %s_once%v", ret_c, cname, rest);
+        String::appendf(&mut g.protos, "%s;\n", &once_sig);
+        String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &once_sig, &once_variant(&body));
+    }
+    if (is_confining_call(String::as_view(name)) && nc_shape)
+    {
+        String nc_sig = sprintf("%s %s_nc%v", ret_c, cname, rest);
+        String::appendf(&mut g.protos, "%s;\n", &nc_sig);
+        String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &nc_sig, &nc_variant(&body));
+    }
+    true
+}
