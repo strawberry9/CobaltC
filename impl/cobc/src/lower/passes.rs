@@ -322,6 +322,148 @@ pub(super) fn fold_zero_tokens(out: &str) -> String {
     s
 }
 
+// D-0294: in a decided program a record that nothing reads is not kept. An
+// object made (`uint64_t o = cb_new(&v, …);`), perhaps bound and taken back
+// (`cb_bind`, `cb_take`), moved (`cb_move_to`), promoted (`cb_result`) and
+// ended (`cb_forget_obj`, `cb_absorb`, `cb_raw_move_in`) in one straight
+// run of statements -- no branch, no call that could fault (a destructor
+// run at the fault is observable) and no frame's end between, a scope's end
+// only once the object was promoted past it or is bound -- with its ids
+// named nowhere else, is a record no check reads (every path entry is a
+// constant there) whose end comes before any scope's that could destroy
+// the value: a struct or variant literal that leaves as a result or an
+// argument, a `std` body's result bound and taken back. The statements go.
+// Run before the scopes are resolved, so they open no scope for it.
+pub(super) fn elide_record_chains(out: &str) -> String {
+    fn ident_char(c: u8) -> bool {
+        c.is_ascii_alphanumeric() || c == b'_'
+    }
+    fn count_in(text: &str, x: &str) -> usize {
+        let b = text.as_bytes();
+        let mut n = 0;
+        let mut at = 0;
+        while let Some(k) = text[at..].find(x) {
+            let i = at + k;
+            let j = i + x.len();
+            if (i == 0 || !ident_char(b[i - 1])) && (j >= b.len() || !ident_char(b[j])) {
+                n += 1;
+            }
+            at = j;
+        }
+        n
+    }
+    // `uint64_t NAME = CALL(ARG…);`: (NAME, the text after `CALL(`).
+    fn decl<'l>(t: &'l str, call: &str) -> Option<(&'l str, &'l str)> {
+        let rest = t.strip_prefix("uint64_t ")?;
+        let eq = rest.find(" = ")?;
+        let name = &rest[..eq];
+        if name.is_empty() || !name.bytes().all(ident_char) {
+            return None;
+        }
+        let args = rest[eq + 3..].strip_prefix(call)?.strip_prefix('(')?.strip_suffix(");")?;
+        Some((name, args))
+    }
+    fn first_arg(args: &str) -> &str {
+        args.split(',').next().unwrap_or("").trim()
+    }
+    const CONTROL: &[&str] = &["if ", "if(", "else", "while ", "while(", "for ", "for(", "switch", "case ", "default:", "do ", "do{", "return", "goto ", "break;", "continue;"];
+    let mut lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+    let mut drop: Vec<usize> = Vec::new();
+    for i in 0..lines.len() {
+        let Some((start, _)) = decl(lines[i].trim(), "cb_new") else { continue };
+        let start = start.to_string();
+        let mut live = start.clone();
+        let mut ids: Vec<String> = vec![start.clone()];
+        let mut chain: Vec<usize> = vec![i];
+        let mut root: Option<String> = None;
+        let mut promoted = false;
+        let mut ok = false;
+        for j in i + 1..lines.len() {
+            let t = lines[j].trim();
+            if t.is_empty() || t.starts_with("#line") {
+                continue;
+            }
+            let named = ids.iter().any(|x| count_in(t, x) > 0);
+            if !named {
+                if t == "cb_stmt_pop();" {
+                    if root.is_none() && !promoted {
+                        break;
+                    }
+                    promoted = false;
+                    continue;
+                }
+                // A statement that could fault (any call: a destructor the
+                // fault would run on the value is observable) ends the run;
+                // a plain store or declaration, a position, a scope's start
+                // cannot.
+                let plain = !t.contains('(') || t.starts_with("cb_at(") || t.starts_with("cb_stmt_push_at(");
+                if !plain || t.contains('{') || t.contains('}') || !t.ends_with(';') || CONTROL.iter().any(|k| t.starts_with(k)) {
+                    break;
+                }
+                continue;
+            }
+            if let Some((r, args)) = decl(t, "cb_bind") {
+                if root.is_some() || args != live {
+                    break;
+                }
+                root = Some(r.to_string());
+                ids.push(r.to_string());
+                chain.push(j);
+                continue;
+            }
+            if let Some((x, args)) = decl(t, "cb_take") {
+                if root.as_deref() != Some(first_arg(args)) {
+                    break;
+                }
+                root = None;
+                live = x.to_string();
+                ids.push(x.to_string());
+                promoted = false;
+                chain.push(j);
+                continue;
+            }
+            if root.is_some() {
+                break;
+            }
+            if t == format!("cb_result({});", live) {
+                promoted = true;
+                chain.push(j);
+                continue;
+            }
+            if t.strip_prefix("cb_move_to(").and_then(|a| a.strip_suffix(");")).map_or(false, |a| first_arg(a) == live && a.contains(", &")) {
+                chain.push(j);
+                continue;
+            }
+            if t == format!("cb_forget_obj({});", live) || t == format!("cb_absorb({});", live) || t.strip_prefix("cb_raw_move_in(").and_then(|a| a.strip_suffix(");")).map_or(false, |a| first_arg(a) == live) {
+                chain.push(j);
+                ok = true;
+                break;
+            }
+            break;
+        }
+        if !ok {
+            continue;
+        }
+        // Every id named only in the chain's own statements.
+        let in_chain = |x: &str| chain.iter().map(|&k| count_in(&lines[k], x)).sum::<usize>();
+        if ids.iter().any(|x| count_in(out, x) != in_chain(x)) {
+            continue;
+        }
+        drop.extend(chain);
+    }
+    if drop.is_empty() {
+        return out.to_string();
+    }
+    for &i in &drop {
+        lines[i] = String::from(";");
+    }
+    let mut s = lines.join("\n");
+    if out.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
 pub(super) fn elide_implied_checks(out: &str) -> String {
     // (base, projection, exclusive) checked, and bases whose object's
     // initialization was checked.

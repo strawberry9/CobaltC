@@ -300,6 +300,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0291 — The real programs decided: wrapped handles, `?`, lent slices, and facts that outlive their reference
 - D-0292 — Light references: a decided function's references carry no record, in any program
 - D-0293 — The token-kind tests inline: a decided function's references cost no call in any program
+- D-0294 — The objectless remainder: a decided program's values keep no object where no check could read it
 
 ---
 
@@ -8448,6 +8449,43 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0389: the objectless remainder, a decided program's values keep no object where no check could read it (D-0294, 2026-10-29)
+
+- D-0281 §24 (the amendment of Update 148): D-0286's option C. In a decided program no path exists and every path
+  entry of the runtime is a constant, yet every resource value that was not an objectless local still got an
+  object, bound or stamped, moved and ended; the self-hosted `cbc` spent 60% of its instructions there. Now the
+  lowering places none where no check could read it: `objectless_type` is coinductive (a recursive type over
+  objectless parts is objectless; the program's enums reach D-0286's rule, which a struct arm taking every name
+  had kept from them since D-0286; a `Box` over such a value, and any value with no resource and no `fn` in it,
+  are such values in a decided program); an objectless local may be assigned (a quiet type: the write destroys the
+  old value, `cb_write_quiet`, unless its moved flag says it was moved away), its fields written (plain or quiet),
+  moved into a place, propagated with `?`, a nested block's or arm's tail, sliced, its elements borrowed, and
+  matched in place (an arm moving a payload out sets its flag); a literal or `Box::new` that is the result is
+  built with no object, and `Box::new` takes a call's result with none; every reference parameter the body never
+  assigns, borrows, captures or shadows is unstored, whatever their count and modes; the frozen twins are one
+  body; and a text pass (`elide_record_chains`, before `resolve_scopes`, on bodies and on `std`'s texts) removes
+  an object's straight run of record-only statements (made, bound and taken back, moved, promoted, ended) whose
+  ids nothing else names, with no call that could fault between (a destructor the fault runs is observable: the
+  gate caught two programs whose destructor prints before that condition was added).
+- Over `cbc`'s decided lowering (`COBC_DEBUG_W`, which now names a rejected argument's callee and marks the decided
+  pass): 165 resource bindings keep objects (were 2,362); its C makes 13,724 objects (were 24,261), binds 2,862 in
+  frames (were 8,637), moves 10,164 (were 15,670). `cbc --emit-c showcase/tier6/anagrams.cb`: 6.86 G → 3.51 G
+  instructions (0.51); `cbparse` 0.48, `cobfmt` 0.55, `anagrams` 0.71, `static_site` 0.74, `password_store` 0.87,
+  `wordpar` 0.92, `extsort` 0.95; the tracked `b`, `d0`, `d`, `h` unchanged (1.00). Its profile after: `cb_stmt_pop` 8.5%, `cb_frame_pop` 6.3%, `drop_in_place_tail` 5.7%,
+  `end_identity_in` 5.5%, `make_pending` 5.0%, `detach` 4.4%, `frame_push_with` 3.7%, `new_obj` 3.0%: the scopes
+  and frames kept for the objects that remain (arm binders over payloads the analysis rejects, the 165 locals,
+  argument temporaries), a next round of the same work. The full table: `stress/d0281/phase3/BENCH.md`,
+  `runs/objl`.
+- Gates: `stress/d0281/objectless/dgate.sh` (the decided build against the pathless-only build) over `s300.list`
+  (299 SAME, one throughput print) and `s1500.list` (1,474 SAME, 18 timing prints and stack-address prints, 8
+  programs that were never decided); the sweep `undecided_sweep.sh` over the 8,854 programs of `decided.list`
+  (8,824 lowered decided, the 29 others never were: it found the two showcases the first form had lost and the
+  `match` case); the three-way differential over the 996 programs that keep paths (941 SAME; the 54 that differ
+  are the thread races of Update 148's run and the same address print and `coby` timeout: repeated runs 11 AGREE,
+  43 OVERLAP, 0 DISJOINT, and `cobmodel compare` over the 46 with a model: 0 with an outcome outside the model's
+  set); `cargo +1.77.2 check --workspace --tests`.
+- Release suites `stress/suites/runs/u149`: passed.
 
 ## CHG-0388: the token-kind tests inline, a decided function's references cost no call in any program (D-0293, 2026-10-29)
 

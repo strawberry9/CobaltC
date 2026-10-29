@@ -327,8 +327,15 @@ impl<'g, 'a> Fx<'g, 'a> {
             return Ok(None);
         }
         self.objectless = self.inert_expr(&args[0])?;
+        // D-0294: in a decided program a call's result goes into the box
+        // with no object, when its end frees memory alone (the allocation
+        // between it and the store can fault, `objectless_type`).
+        if self.g.objectless_type(&t) {
+            self.arm_inert(&args[0], true);
+        }
         let v = self.lower_expr(&args[0], Some(&t));
         self.objectless = false;
+        self.inert_result = None;
         let v = v?;
         if matches!(v.ty, Type::Never) {
             return Ok(Some(never()));

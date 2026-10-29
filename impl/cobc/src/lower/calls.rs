@@ -256,9 +256,13 @@ impl<'g, 'a> Fx<'g, 'a> {
                 self.temp_root = false;
                 let p = p?;
                 let p = self.auto_deref(p)?;
-                let Some(b) = p.base.clone() else { return internal("a view of a String with no access path") };
                 let tok = self.g.fresh("tok");
-                self.emit(&format!("uint64_t {} = cb_borrow({}, {}, CB_SHARED, {});", tok, b, Self::projs_args(&p.projs), loc));
+                match p.base.clone() {
+                    Some(b) => self.emit(&format!("uint64_t {} = cb_borrow({}, {}, CB_SHARED, {});", tok, b, Self::projs_args(&p.projs), loc)),
+                    // D-0294: an objectless local's text in a decided program: token 0.
+                    None if self.g.decided && p.raw.is_none() && self.objectless_root(base) => self.emit(&format!("uint64_t {} = 0;", tok)),
+                    None => return internal("a view of a String with no access path"),
+                }
                 // The whole text, `&s[0..$]` (`String::as_view` and the
                 // `String` helpers that hand their text to a `StringView`
                 // one): `String::view(&s, 0, len)` made in place. Both ends
@@ -278,6 +282,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                     self.emit(&format!("cb_store_ref(&{}.bytes.src, {});", t, rt));
                     self.emit(&format!("{}.bytes.data = ({}).bytes.ptr;", t, p.c));
                     self.emit(&format!("{}.bytes.len = ({}).bytes.len;", t, p.c));
+                    // D-0294: in a decided program a view holds nothing the
+                    // runtime follows (`has_refs`): no object.
+                    if self.g.decided {
+                        return Ok(V { c: t, ty: vty, obj: None });
+                    }
                     self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", o, t, tid, loc));
                     return Ok(V { c: t, ty: vty, obj: Some(o) });
                 }

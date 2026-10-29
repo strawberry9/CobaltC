@@ -589,6 +589,10 @@ fn real_main() -> ExitCode {
         // `--all-checks` (the generator refuses it) and COBALTC_PATHLESS=0 keep it.
         lowering.pathless = std::env::var("COBALTC_PATHLESS").map_or(true, |v| v != "0");
         lowering.decided = decided;
+        // `COBC_DEBUG_W`: where the decided lowering's trace begins.
+        if decided && std::env::var_os("COBC_DEBUG_W").is_some() {
+            eprintln!("W pass decided");
+        }
         lowering.generate()
     };
     let gen = match lower_as(false) {

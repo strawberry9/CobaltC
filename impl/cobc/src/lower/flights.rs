@@ -47,6 +47,18 @@ impl<'g, 'a> Fx<'g, 'a> {
         }
     }
 
+    // D-0294: `e` is `Box::new(…)`, `std`'s (`lower_box_new`).
+    pub(super) fn box_new_expr(&self, e: &Expr) -> bool {
+        let ExprKind::Call(c, args) = &strip_parens(e).kind else { return false };
+        let ExprKind::Path(segs, _) = &c.kind else { return false };
+        if args.len() != 1 || (segs.len() == 1 && self.lookup(&segs[0]).is_some()) {
+            return false;
+        }
+        let k = segs.join("::");
+        let k = if self.g.items.fns.contains_key(&k) { k } else { format!("std::{}", k) };
+        k == "std::Box::new" && self.g.items.fns.get(&k).map_or(false, |f| in_prelude(f))
+    }
+
     // D-0286: `e` is `x.f…` for an objectless local `x`.
     pub(super) fn objectless_root(&self, e: &Expr) -> bool {
         let mut e = strip_parens(e);
@@ -143,6 +155,9 @@ pub(super) fn ground_native(text: &str, tids: &[(String, u32)]) -> Result<String
         return Err("a native receives what is no parameter".to_string());
     }
     let s = ground_sends(&s);
+    // D-0294: the body's own records that nothing reads (a result bound
+    // and taken back, say).
+    let s = super::passes::elide_record_chains(&s);
     Ok(tidy(&s))
 }
 

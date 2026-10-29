@@ -268,6 +268,16 @@ impl<'a> Gen<'a> {
         let tail = &sig[sig.find('(').expect("a signature")..];
         let frz_sig = format!("{} {}{}", ret_c, frz, tail);
         let chk_sig = format!("{} {}{}", ret_c, chk, tail);
+        // D-0294: in a decided program the entry test is the constant 1
+        // (`cb_frozen_ok` under `CB_PATHLESS`): the frozen body is the
+        // function, with no twin and no dispatcher.
+        if self.decided {
+            self.frozen_mode = true;
+            self.pending_raw_ret = raw;
+            let r = self.emit_fn_body(name, f, targs, 0, sig, None);
+            self.frozen_mode = false;
+            return r;
+        }
         let start = self.fns.len();
         self.frozen_mode = true;
         self.pending_raw_ret = raw;
@@ -880,6 +890,14 @@ pub(super) fn dump_pass(pass: &str, parts: &[(&str, &str)]) {
 pub(super) fn dumped_text_passes(text: &str, marks: bool, decided: bool) -> String {
     let z = fold_zero_tokens(text);
     dump_pass("fold_zero_tokens", &[("in", text), ("out", &z)]);
+    // D-0294: a decided program's records that nothing reads.
+    let z = if decided {
+        let n = elide_record_chains(&z);
+        dump_pass("elide_record_chains", &[("in", &z), ("out", &n)]);
+        n
+    } else {
+        z
+    };
     let s = resolve_scopes_in(&z, decided);
     dump_pass(if decided { "resolve_scopes_decided" } else { "resolve_scopes" }, &[("in", &z), ("out", &s)]);
     let d = drop_dead_locations(&s, marks);

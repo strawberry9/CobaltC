@@ -83,7 +83,10 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   the full record (the differential oracle) and `COBALTC_RECORD=check` aborts where a light reference reaches
   what should have recorded it. The token's kind is tested inline (D-0293): a light reference, and an owner's
   binding whose object has no recorded reference on it, make no runtime call for a check, a read or (in a
-  decided function) a borrow. `--all-checks` keeps every
+  decided function) a borrow. In a decided program the lowering places no object where no check could read it
+  (D-0294): recursive types are objectless, an objectless local may be assigned, matched, sliced and moved like
+  any other, results built in place leave with no object, every reference parameter is unstored, and a record
+  nothing reads is removed from the C; the self-hosted compiler runs in half the instructions. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

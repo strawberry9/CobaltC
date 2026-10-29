@@ -180,8 +180,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                     }
                     // D-0286: a call's result returned with no object.
                     self.arm_inert(t, true);
-                    if raw_sink {
-                        self.objectless = self.literal_expr(t);
+                    // D-0294: in a decided program a literal, or a `Box` of a
+                    // value, that is the result leaves with no object: the
+                    // one made would be forgotten at once (`emit_return`).
+                    if raw_sink || self.g.decided {
+                        self.objectless = self.literal_expr(t) || (self.g.decided && self.box_new_expr(t));
                     }
                 }
                 let v = self.lower_expr(t, expected);

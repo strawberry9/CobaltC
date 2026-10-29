@@ -225,6 +225,9 @@ impl<'g, 'a> Fx<'g, 'a> {
         // moving a payload out of a field, an element or `*r`), and an arm
         // that moves nothing leaves any place as it was.
         let mut place_root: Option<String> = None;
+        // D-0294: the moved flag of an objectless binding matched in place
+        // ("" when it has none).
+        let mut scrut_flag: Option<String> = None;
         let mut datum_tok: Option<String> = None;
         let mut acc_ptr: Option<String> = None;
         let res_place = match &strip_parens(scrut).kind {
@@ -288,6 +291,13 @@ impl<'g, 'a> Fx<'g, 'a> {
                 if p.is_binding && p.projs.is_empty() && p.raw.is_none() {
                     place_root = Some(base);
                 }
+            } else if p.is_binding && p.projs.is_empty() && p.raw.is_none() && self.objectless_c.contains(&p.c) {
+                // D-0294: an objectless binding matched in place (decided):
+                // stale if moved away; an arm that moves its payload out
+                // sets its flag (`bind_match_arm`), as `cb_take` would mark
+                // the binding's object.
+                self.objectless_use(&p.c.clone(), line);
+                scrut_flag = Some(self.moved_flag.get(&p.c).cloned().unwrap_or_default());
             }
             V { c: p.c, ty: p.ty, obj: None }
         } else if let (ExprKind::Call(_, cargs), true) = (&strip_parens(scrut).kind, !self.g.boot(4) && arms.iter().all(|a| a.nested.is_empty() && a.lit.is_none() && !(a.variant.is_none() && a.binder.is_some()))) {
@@ -453,7 +463,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.ind += 1;
             self.push_frame();
             self.scopes.push(HashMap::new());
-            let moved_out = self.bind_match_arm(arm, &inner_ty, &slot_path, &cross_slot, below, vis.len(), &crosses, &by_ref, &by_ref_prefix, &place_root, &acc_ptr, line)?;
+            let moved_out = self.bind_match_arm(arm, &inner_ty, &slot_path, &cross_slot, below, vis.len(), &crosses, &by_ref, &by_ref_prefix, &place_root, &scrut_flag, &acc_ptr, line)?;
             if scrut_res {
                 match s.obj.as_ref() {
                     // D-0049: consumed only by an arm that moved the payload
@@ -518,7 +528,8 @@ impl<'g, 'a> Fx<'g, 'a> {
     // (D-0046, D-0109), else by value, moving a resource payload out
     // (D-0049; whether it did is the result).
     #[allow(clippy::too_many_arguments)]
-    fn bind_match_arm(&mut self, arm: &Arm, inner_ty: &Option<Type>, slot_path: &str, cross_slot: &Option<String>, below: usize, vis_len: usize, crosses: &[(usize, Mode, Type)], by_ref: &Option<(Mode, String)>, by_ref_prefix: &[String], place_root: &Option<String>, acc_ptr: &Option<String>, line: usize) -> R<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn bind_match_arm(&mut self, arm: &Arm, inner_ty: &Option<Type>, slot_path: &str, cross_slot: &Option<String>, below: usize, vis_len: usize, crosses: &[(usize, Mode, Type)], by_ref: &Option<(Mode, String)>, by_ref_prefix: &[String], place_root: &Option<String>, scrut_flag: &Option<String>, acc_ptr: &Option<String>, line: usize) -> R<bool> {
         let mut moved_out = false;
         // D-0109: through a reference the pattern crossed, the binder
         // borrows from that reference (in the weaker mode).
@@ -602,6 +613,14 @@ impl<'g, 'a> Fx<'g, 'a> {
                     self.store(&cname, &pty, &fv)?;
                     if let Some(o) = taken {
                         self.emit(&format!("cb_end_moved_out({});", o));
+                    }
+                    // D-0294: the payload left an objectless binding: moved
+                    // away (its flag), so its drop runs nothing.
+                    if let (None, Some(fl)) = (place_root, scrut_flag) {
+                        if fl.is_empty() {
+                            return internal("a payload moved out of an objectless binding that has no moved flag");
+                        }
+                        self.emit(&format!("{} = 1;", fl));
                     }
                     let tid = self.tid(&pty)?;
                     let arm_id = arm as *const Arm as usize;

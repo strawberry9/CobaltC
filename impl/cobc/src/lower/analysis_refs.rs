@@ -134,7 +134,11 @@ impl<'a> Gen<'a> {
         let tys: Vec<Type> = f.params.iter().map(|p| apply(&p.ty, subst)).collect();
         let holding: Vec<&Type> = tys.iter().filter(|t| self.has_refs(t) || self.holds_fn(t)).collect();
         let all_shared = holding.iter().all(|t| matches!(t, Type::Ref(_, Mode::Shared)));
-        if holding.is_empty() || (holding.len() > 1 && !all_shared) {
+        // D-0294: in a decided program no path is checked, so the count and
+        // the modes of the references into the function decide nothing:
+        // every reference parameter the body never assigns, borrows,
+        // captures or shadows is unstored (no object, no slot).
+        if holding.is_empty() || (holding.len() > 1 && !all_shared && !self.decided) {
             return Ok(out);
         }
         let assigned = assigned_names(&f.body);

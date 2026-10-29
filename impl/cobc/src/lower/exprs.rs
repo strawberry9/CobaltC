@@ -379,7 +379,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                         self.raw_return_path = (self.raw_ret || self.g.decided) && matches!(strip_parens(x).kind, ExprKind::Path(..));
                         // D-0286: a call's result returned with no object.
                         self.arm_inert(x, true);
+                        // D-0294: a literal returned in a decided program
+                        // gets none either (as a block's tail, `lower_block_body`).
+                        self.objectless = self.g.decided && (self.literal_expr(x) || self.box_new_expr(x));
                         let v = self.lower_expr(x, Some(&ret));
+                        self.objectless = false;
                         self.raw_return_path = false;
                         self.inert_result = None;
                         v?
@@ -736,6 +740,40 @@ impl<'g, 'a> Fx<'g, 'a> {
                 format!("cb_owns(&({}), {}u)", p.c, tid)
             };
             self.emit(&format!("cb_write({}, {}, {}, {});", base, Self::projs_args(&p.projs), target, loc));
+        } else if self.is_res(&p.ty) && p.raw.is_none() && self.g.decided && self.objectless_root(place) {
+            // D-0294: a write into an objectless local, whole or a field
+            // (`objectless_strings`, decided): the old value, live unless
+            // the whole binding was moved away (its flag), is destroyed by
+            // the write, a quiet type's in place (`cb_write_quiet`), any
+            // other's a fault as a direct parameter's below; the binding
+            // holds the new value after.
+            let tid = self.tid(&p.ty)?;
+            let root_c = {
+                let mut e = strip_parens(place);
+                while let ExprKind::Field(a, _) = &e.kind {
+                    e = strip_parens(a);
+                }
+                path_name(e).and_then(|n| self.lookup(n)).map(|b| b.c).unwrap_or_default()
+            };
+            let whole = p.projs.is_empty() && matches!(strip_parens(place).kind, ExprKind::Path(..));
+            let flag = self.moved_flag.get(&root_c).cloned();
+            if !whole {
+                // A field of a moved-away binding is stale (`objectless_use`).
+                self.objectless_use(&root_c, e.line);
+            }
+            let destroy = if coby::typecheck::quiet_ty(&self.g.items, &p.ty) {
+                format!("cb_write_quiet(0, NULL, 0, (void *)&({}), {}u, {});", p.c, tid, loc)
+            } else {
+                let target = if coby::typecheck::always_owns(&self.g.items, &p.ty) { "1".to_string() } else { format!("cb_owns(&({}), {}u)", p.c, tid) };
+                format!("if ({}) cb_fault(\"diag.overwrite-of-live-resource\", {});", target, loc)
+            };
+            match (&flag, whole) {
+                (Some(fl), true) => {
+                    self.emit(&format!("if (!{}) {{ {} }}", fl, destroy));
+                    self.emit(&format!("{} = 0;", fl));
+                }
+                _ => self.emit(&destroy),
+            }
         } else if self.is_res(&p.ty) && p.raw.is_none() && self.direct_place(place) && coby::typecheck::quiet_ty(&self.g.items, &p.ty) {
             // D-0194: the same through a direct parameter: no path,
             // and the place always holds its value.

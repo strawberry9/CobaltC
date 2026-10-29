@@ -834,3 +834,11 @@ does not cover (D-0286's remainder: 60% of `cbc`'s), and so does what is left of
 the objectless remainder (drops the compiler places, D-0286's option C) comes next, then phase 3 steps 6–7
 (frame shadows, block objects: the programs that keep paths only), then the single port of the self-hosted
 compiler and its measurement.
+
+**Amended 2026-10-29 (D-0294, Update 149).** The objectless remainder is done for this round: in a decided program
+the lowering places no object where no check could read it (recursive types objectless, the uses of an objectless
+local widened to assignment, `match`, slices and moves, results built in place with no object, every reference
+parameter unstored, one body per function, a text pass removing a record nothing reads), and the self-hosted
+compiler runs in half the instructions (6.86 G → 3.51 G). What it still pays is the statement scopes and frames of
+the objects that remain (arm binders over rejected payloads, 165 locals, argument temporaries): a next round of
+the same kind, after phase 3 steps 6–7 (the programs that keep paths) and the single port.

@@ -489,22 +489,36 @@ impl<'g, 'a> Fx<'g, 'a> {
         // accesses are only bounds-checked.
         let plain_vec = matches!(ty, Type::Named(n, a) if n == "std::Vec" && a.len() == 1 && self.g.plain_data(&a[0]) && !self.has_refs(&a[0]) && !self.holds_fn(&a[0]));
         // D-0286: a field read by value is plain data (no field is moved out).
+        // D-0294: a field written (`=f`) is plain data or of a quiet type,
+        // whose old value the write destroys (`lower_assign`).
         let fields_plain = self.objectless_fields.get(&id).map_or(true, |fs| match ty {
             Type::Named(n, a) => match self.g.struct_decl(n) {
                 Some(sd) => {
                     let sub = subst_of(&sd.type_params, a);
-                    fs.iter().all(|f| sd.fields.iter().any(|fd| &fd.name == f && { let t = apply(&fd.ty, &sub); self.g.plain_data(&t) && !self.has_refs(&t) && !self.holds_fn(&t) }))
+                    fs.iter().all(|f| {
+                        let (written, name) = match f.strip_prefix('=') {
+                            Some(n) => (true, n),
+                            None => (false, f.as_str()),
+                        };
+                        sd.fields.iter().any(|fd| fd.name == name && {
+                            let t = apply(&fd.ty, &sub);
+                            (self.g.plain_data(&t) && !self.has_refs(&t) && !self.holds_fn(&t)) || (written && coby::typecheck::quiet_ty(&self.g.items, &t))
+                        })
+                    })
                 }
                 None => false,
             },
             _ => false,
         });
+        // D-0294: assigned whole (`id | 4`) only as a quiet type.
+        let assigned_ok = !self.objectless_names.contains(&(id | 4)) || coby::typecheck::quiet_ty(&self.g.items, ty);
         let ok = self.objectless_names.contains(&id)
             && fields_plain
+            && assigned_ok
             && (!self.objectless_names.contains(&(id | 2)) || plain_vec)
             && (is_string || (self.g.objectless_type(ty) && !self.objectless_names.contains(&(id | 1))));
         if !ok && std::env::var_os("COBC_DEBUG_W").is_some() && self.g.is_resource(ty) {
-            let why = if !self.objectless_names.contains(&id) { "bad" } else if !fields_plain { "fields" } else if self.objectless_names.contains(&(id | 2)) && !plain_vec { "indexed" } else if !is_string && !self.g.objectless_type(ty) { "type" } else { "compared" };
+            let why = if !self.objectless_names.contains(&id) { "bad" } else if !fields_plain { "fields" } else if !assigned_ok { "assigned" } else if self.objectless_names.contains(&(id | 2)) && !plain_vec { "indexed" } else if !is_string && !self.g.objectless_type(ty) { "type" } else { "compared" };
             eprintln!("OB reject id {} {} {}", id, why, super::cnames::mangle(ty));
         }
         ok

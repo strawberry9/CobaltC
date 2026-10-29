@@ -41,6 +41,8 @@ impl<'a> Gen<'a> {
             moved: HashSet<usize>,
             compared: HashSet<usize>,
             indexed: HashSet<usize>,
+            // D-0294: the candidates assigned whole (`x = e`, decided).
+            assigned: HashSet<usize>,
             names: HashMap<usize, String>,
             depth: usize,
             fields: HashMap<usize, HashSet<String>>,
@@ -51,6 +53,8 @@ impl<'a> Gen<'a> {
             // `COBC_DEBUG_W`: the expression walked, and the one it sits in.
             parent: String,
             outer: String,
+            // `COBC_DEBUG_W`: the callee of the call being walked.
+            callee: String,
             dbg: bool,
         }
         // `std`'s `String` builders, which change the `String` they are lent
@@ -82,7 +86,8 @@ impl<'a> Gen<'a> {
                 if let Some(id) = self.id(n) {
                     if id != 0 {
                         if self.dbg && !self.bad.contains(&id) {
-                            eprintln!("W bad {} in {} id {}", n, self.outer, id);
+                            let callee = if self.outer == "Call" { format!("({})", self.callee) } else { String::new() };
+                            eprintln!("W bad {} in {}{} id {}", n, self.outer, callee, id);
                         }
                         self.bad.insert(id);
                     }
@@ -178,6 +183,31 @@ impl<'a> Gen<'a> {
                 }
                 false
             }
+            fn match_arms(&mut self, arms: &[Arm]) {
+                for a in arms {
+                    self.depth += 1;
+                    self.scopes.push(HashMap::new());
+                    // D-0200: an arm's binder is a candidate as a `let`
+                    // is, by the arm's address (`Fx::lower_match`
+                    // binds it objectless when it takes a payload
+                    // of such a type by value).
+                    if let Some(b) = &a.binder {
+                        let id = a as *const Arm as usize;
+                        self.names.insert(id, b.clone());
+                        self.scopes.last_mut().unwrap().insert(b.clone(), id);
+                    }
+                    if let Some(l) = &a.lit {
+                        self.expr(l);
+                    }
+                    // D-0294 (decided): an arm whose body is a candidate
+                    // alone moves it out, as a block's tail does.
+                    if !(self.g.decided && self.move_out(&a.body)) {
+                        self.expr(&a.body);
+                    }
+                    self.scopes.pop();
+                    self.depth -= 1;
+                }
+            }
             // A block inside the body: its last expression is not the
             // function's.
             fn nested(&mut self, b: &Block) {
@@ -228,7 +258,9 @@ impl<'a> Gen<'a> {
                     if let Some(ib) = inner.filter(|_| self.g.decided) {
                         self.tail_next = true;
                         self.nested(ib);
-                    } else if !(at_tail && self.move_out(t)) {
+                    } else if !((at_tail || self.g.decided) && self.move_out(t)) {
+                        // (D-0294: in a decided program any block's tail that
+                        // is a candidate alone moves it out, `read_place`.)
                         self.expr(t);
                     }
                 }
@@ -253,6 +285,12 @@ impl<'a> Gen<'a> {
             fn expr_in(&mut self, e: &Expr) {
                 match &e.kind {
                     ExprKind::Call(c, args) => {
+                        if self.dbg {
+                            self.callee = match &c.kind {
+                                ExprKind::Path(segs, _) => segs.join("::"),
+                                _ => "?".to_string(),
+                            };
+                        }
                         let mut handled = vec![false; args.len()];
                         let fmt = matches!(&c.kind, ExprKind::Path(segs, _) if segs.len() == 1 && segs[0] == "$fmt");
                         // D-0200: a candidate moved away by value -- an
@@ -321,6 +359,14 @@ impl<'a> Gen<'a> {
                             self.expr(a);
                         }
                     }
+                    // D-0294 (decided): `&x[i]` of a candidate is a borrow of
+                    // `x` (its address, token 0) and a bounds check.
+                    ExprKind::Borrow(_, x) if self.g.decided && matches!(&strip_parens(x).kind, ExprKind::Index(a, _) if path_name(a).and_then(|n| self.id(n)).map_or(false, |id| id != 0)) => {
+                        let ExprKind::Index(a, i) = &strip_parens(x).kind else { unreachable!() };
+                        let id = self.id(path_name(a).unwrap()).unwrap();
+                        self.seen.insert(id);
+                        self.expr(i);
+                    }
                     ExprKind::Borrow(_, x) if matches!(&strip_parens(x).kind, ExprKind::Index(a, _) if path_name(a).is_some()) => {
                         let ExprKind::Index(a, i) = &strip_parens(x).kind else { unreachable!() };
                         self.mark_bad(path_name(a).unwrap());
@@ -340,11 +386,56 @@ impl<'a> Gen<'a> {
                             self.fields.entry(id).or_default().insert(f);
                         }
                     }
-                    // A field written: not this.
+                    // D-0294: in a decided program a field of a candidate
+                    // written (recorded as `=f`: `Fx::objectless_binding`
+                    // allows it of plain data and quiet types, whose old
+                    // value the write destroys, `lower_assign`), or the
+                    // candidate assigned whole (`id | 4`, a quiet type).
                     ExprKind::Assign(a, b) if self.g.decided && matches!(strip_parens(a).kind, ExprKind::Field(..)) && self.field_root(a).is_some() => {
-                        let (id, _) = self.field_root(a).unwrap();
-                        self.bad.insert(id);
+                        let (id, f) = self.field_root(a).unwrap();
+                        self.seen.insert(id);
+                        if let Some(f) = f {
+                            self.fields.entry(id).or_default().insert(format!("={}", f));
+                        }
                         self.expr(b);
+                    }
+                    ExprKind::Assign(a, b) if self.g.decided && path_name(a).and_then(|n| self.id(n)).map_or(false, |id| id != 0) => {
+                        let id = self.id(path_name(a).unwrap()).unwrap();
+                        self.seen.insert(id);
+                        self.assigned.insert(id);
+                        if !(path_name(b).map_or(false, |n| Some(n) != path_name(a)) && self.move_out(b)) {
+                            self.expr(b);
+                        }
+                    }
+                    // D-0294 (decided): a candidate moved into a place
+                    // (`p.f = x`), the place not naming it; `x?`; `&x[a..b]`, a
+                    // read of `x` (its slice carries token 0).
+                    ExprKind::Assign(a, b) if self.g.decided && path_name(b).map_or(false, |n| !mentions(a, n)) && self.move_out(b) => {
+                        self.expr(a);
+                    }
+                    ExprKind::Propagate(a) if self.g.decided && self.move_out(a) => {}
+                    ExprKind::SliceOf(_, a, lo, hi) if self.g.decided && path_name(a).and_then(|n| self.id(n)).map_or(false, |id| id != 0) => {
+                        let id = self.id(path_name(a).unwrap()).unwrap();
+                        self.seen.insert(id);
+                        self.expr(lo);
+                        self.expr(hi);
+                    }
+                    // D-0294 (decided): a candidate matched in place
+                    // (`lower_match`'s place scrutinee): moved away when an arm
+                    // binds a payload (the arm sets its flag).
+                    // Not an arm binding the whole value (`other : …`), which
+                    // moves it out of the binding's object (`lower_match_scalar`).
+                    ExprKind::Match(sc, arms) if self.g.decided && path_name(sc).and_then(|n| self.id(n)).map_or(false, |id| id != 0) => {
+                        let id = self.id(path_name(sc).unwrap()).unwrap();
+                        if arms.iter().any(|a| a.variant.is_none() && a.binder.is_some()) {
+                            self.mark_bad(path_name(sc).unwrap());
+                        } else {
+                            self.seen.insert(id);
+                            if arms.iter().any(|a| a.binder.is_some()) {
+                                self.moved.insert(id);
+                            }
+                        }
+                        self.match_arms(arms);
                     }
                     ExprKind::ArrayRepeat(a, _) | ExprKind::Unary(_, a) | ExprKind::Borrow(_, a) | ExprKind::Deref(a) | ExprKind::Field(a, _) | ExprKind::Propagate(a) | ExprKind::Paren(a) => self.expr(a),
                     // D-0200: a candidate compared (`==`, `<`, …): read where it
@@ -420,25 +511,7 @@ impl<'a> Gen<'a> {
                     }
                     ExprKind::Match(sc, arms) => {
                         self.expr(sc);
-                        for a in arms {
-                            self.depth += 1;
-                            self.scopes.push(HashMap::new());
-                            // D-0200: an arm's binder is a candidate as a `let`
-                            // is, by the arm's address (`Fx::lower_match`
-                            // binds it objectless when it takes a payload
-                            // of such a type by value).
-                            if let Some(b) = &a.binder {
-                                let id = a as *const Arm as usize;
-                                self.names.insert(id, b.clone());
-                                self.scopes.last_mut().unwrap().insert(b.clone(), id);
-                            }
-                            if let Some(l) = &a.lit {
-                                self.expr(l);
-                            }
-                            self.expr(&a.body);
-                            self.scopes.pop();
-                            self.depth -= 1;
-                        }
+                        self.match_arms(arms);
                     }
                     ExprKind::Closure { captures, params, body, .. } => {
                         for c in captures {
@@ -464,7 +537,7 @@ impl<'a> Gen<'a> {
         }
         let bound: HashSet<String> = bound_names(body).into_iter().chain(params.iter().cloned()).collect();
         let top: HashMap<String, usize> = params.iter().map(|p| (p.clone(), cands.iter().find(|(n, _)| n == p).map_or(0, |c| c.1))).collect();
-        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), names: HashMap::new(), depth: 0, fields: HashMap::new(), tail_next: false, parent: String::new(), outer: String::new(), dbg: std::env::var_os("COBC_DEBUG_W").is_some() };
+        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), assigned: HashSet::new(), names: HashMap::new(), depth: 0, fields: HashMap::new(), tail_next: false, parent: String::new(), outer: String::new(), callee: String::new(), dbg: std::env::var_os("COBC_DEBUG_W").is_some() };
         w.block(body);
         *fields = std::mem::take(&mut w.fields);
         // A candidate moved away is recorded twice (`id` and `!id`): its
@@ -483,6 +556,9 @@ impl<'a> Gen<'a> {
                 if w.indexed.contains(&x) {
                     v.push(x | 2);
                 }
+                if w.assigned.contains(&x) {
+                    v.push(x | 4);
+                }
                 v
             })
             .collect()
@@ -498,18 +574,32 @@ impl<'a> Gen<'a> {
         self.objectless_type_in(t, &mut Vec::new())
     }
 
-    // `objectless_type`, `seen` the struct types being answered: a type
-    // holding itself (`struct N { Vec<N> kids; }`) is answered no there.
+    // `objectless_type`, `seen` the struct and enum types being answered.
+    // D-0294: a type met again on the walk (`struct N { Vec<N> kids; }`, a
+    // syntax tree through `Box`) is answered yes there: the whole's answer
+    // is its other parts' (coinductively; before D-0294 it was no, and a
+    // recursive type never objectless).
     pub(super) fn objectless_type_in(&self, t: &Type, seen: &mut Vec<Type>) -> bool {
         if seen.contains(t) {
-            return false;
+            return true;
         }
-        let elem = |x: &Type, seen: &mut Vec<Type>| (self.plain_data(x) && !self.has_refs(x) && !self.holds_fn(x)) || self.objectless_type_in(x, seen);
+        // D-0294: in a decided program no reference inside a value is
+        // tracked (`has_refs`), so a value with no resource and no `fn` in
+        // it is as plain data here.
+        let elem = |x: &Type, seen: &mut Vec<Type>| (self.plain_data(x) && !self.has_refs(x) && !self.holds_fn(x)) || (self.decided && self.decided_plain(x)) || self.objectless_type_in(x, seen);
         match t {
             Type::Named(n, a) if n == "std::String" && a.is_empty() => true,
+            // D-0294: in a decided program a `Box`, whose end the runtime
+            // makes natively from the type descriptor (`box_of`), over such
+            // a value (in a tracked one its contents' paths would need the
+            // object `cb_raw_move_in` keeps).
+            Type::Named(n, a) if n == "std::Box" && a.len() == 1 && self.decided => elem(&a[0], seen),
             Type::Named(n, a) if (n == "std::Vec" || n == "std::Queue" || n == "std::HashSet") && a.len() == 1 => elem(&a[0], seen),
             Type::Named(n, a) if n == "std::HashMap" && a.len() == 2 => elem(&a[0], seen) && elem(&a[1], seen),
-            Type::Named(n, a) if !n.starts_with("std::") => match self.struct_decl(n) {
+            // (D-0294: a struct's; before, this arm took every name of the
+            // program's, and an enum of the program's never reached the
+            // next, D-0286's.)
+            Type::Named(n, a) if !n.starts_with("std::") && self.struct_decl(n).is_some() => match self.struct_decl(n) {
                 Some(sd) if !sd.resource && sd.bits.is_none() => {
                     let sub = subst_of(&sd.type_params, a);
                     seen.push(t.clone());
@@ -532,6 +622,29 @@ impl<'a> Gen<'a> {
                 }
                 _ => false,
             },
+            _ => false,
+        }
+    }
+
+    // D-0294: `plain_data` for a decided program (`Gen::decided`): a
+    // reference or slice, which no runtime state follows there, counts as
+    // plain, in a value as alone; a struct or enum the program declares
+    // (not a type parameter's bare name) over such values too.
+    pub(super) fn decided_plain(&self, t: &Type) -> bool {
+        match t {
+            Type::Int(_) | Type::F32 | Type::F64 | Type::Bool | Type::Str | Type::Rawptr(_) | Type::Ref(..) | Type::Slice(..) => true,
+            Type::Array(inner, _) | Type::Simd(inner, _) => self.decided_plain(inner),
+            Type::Named(n, args) => {
+                if let Some(sd) = self.struct_decl(n) {
+                    let sub = subst_of(&sd.type_params, args);
+                    !sd.resource && sd.fields.iter().all(|f| self.decided_plain(&apply(&f.ty, &sub)))
+                } else if let Some(ed) = self.enum_decl(n) {
+                    let sub = subst_of(&ed.type_params, args);
+                    !ed.resource && ed.variants.iter().all(|v| v.payload.as_ref().map_or(true, |p| self.decided_plain(&apply(p, &sub))))
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }

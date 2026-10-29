@@ -246,10 +246,14 @@ impl<'g, 'a> Fx<'g, 'a> {
         self.emit(&format!("if ((uint64_t){} > (uint64_t){} || (uint64_t){} > {}) cb_fault(\"diag.index-out-of-bounds\", {});", at.c, bt.c, bt.c, lenv, loc));
         // D-0292: the container's place and type, for a light base.
         let ptid = self.tid(&pb.ty)?;
+        // D-0294: a slice of an objectless local in a decided program: the
+        // bounds above, and token 0 (no path exists to clash with).
+        let objectless_src = self.g.decided && pb.base.is_none() && parent.is_none() && pb.raw.is_none() && self.objectless_root(base);
         if !minted {
             match (&parent, &pb.base) {
                 (Some(t0), _) => self.emit(&format!("cb_borrow_range_unminted({}, NULL, 0u, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", t0, at.c, bt.c, m, loc)),
                 (None, Some(base)) => self.emit(&format!("cb_borrow_range_unminted({}, (void *)&({}), {}u, {}, (uint64_t){}, (uint64_t){}, {}, {});", base, pb.c, ptid, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
+                (None, None) if objectless_src => {}
                 (None, None) => return internal("slice of an unchecked place"),
             }
             let sty = Type::Slice(Box::new(elem), mode.clone());
@@ -267,6 +271,7 @@ impl<'g, 'a> Fx<'g, 'a> {
         match (&parent, &pb.base) {
             (Some(t0), _) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, NULL, 0u, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", tok, t0, at.c, bt.c, m, loc)),
             (None, Some(base)) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, (void *)&({}), {}u, {}, (uint64_t){}, (uint64_t){}, {}, {});", tok, base, pb.c, ptid, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
+            (None, None) if objectless_src => self.emit(&format!("uint64_t {} = 0;", tok)),
             (None, None) => return internal("slice of an unchecked place"),
         }
         let sty = Type::Slice(Box::new(elem), mode.clone());
