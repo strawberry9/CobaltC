@@ -772,3 +772,36 @@ and faults at the later read. §13 row 2 is met by invalidation at release and a
 forbids the push. Two lines of §14 cannot be met literally: a stored reference is 8 bytes (`[Repr-Ref]`), so moving
 a tracked aggregate cannot be free of metadata; and raw-pointer code with no base keeps a per-heap page lookup.
 Both are marked provisional when the table moves into `spec/14`.
+
+## 24. Phase 1 closed (2026-10-28), and phase 4's O5 decided
+
+**What landed.** D-0290 (Update 145, `CHG-0385`): a local that keeps references in data and holds no `fn` value,
+guard, lock or handle is a holder of the frame, with facts, as a view binding is; what is read out of it holds
+them; through a reference parameter `q` what `*q` keeps is a root `**q` of its own; what the frame cannot see (a
+holder moved out, a result holding more than the parameters reach, a store through a reference the caller does
+not see) is the run's, function by function. `cobc`'s whole-program type test keeps only `fn` values, guards,
+locks and handles in data. The cost contract of §14 is in `spec/14` §6 with its tier-D lines provisional (§23's
+corrections), and the conformance cases headed `decided: yes` are the cost cases, checked by
+`impl/cobc/tests/driver.rs` `cost_cases_are_decided`. Over the 11,022 programs of `stress/d0281/why/` (`new8.why`)
+9,942 are decided (Update 144: 9,810), 322 keep paths, and none decided before keeps them now.
+
+**O3 (`tracked`) is not adopted**, neither on aggregates nor on parameters (§15 rule 1). An aggregate is tier D by
+where a value of it is, not by its type, and the static pass finds that per function; an escape through a
+parameter is sound without a marker, because every call adds what it may store to a holder it gives exclusively
+and leaves any other exclusive target to the run (D-0290 rule 4). The visible boundary the review asked for (§12)
+is `cobc -v`'s note and `--report-tracking`, which name the function and line a program leaves to the run.
+
+**O5 (no stored references) is not adopted.** The phase 4 study's evidence (§23 item 2) and D-0290's results agree:
+references kept in aggregates that a frame holds are tier S, which covers the idioms the study rewrote (a parser
+holding a view, a `Vec` of a line's fields, `Once`'s run guard); what remains tier D is data reached through
+references and heap structures, a minority (3.6% of hand-written programs before D-0290; of the 95 hand-written
+programs that kept paths after Update 144, 36 are decided now), and its rewrites without stored references were
+markedly harder to read in five of fourteen cases. Tier D stays, checked by the run, and phase 3 makes it cheap.
+
+**Per-function lowering moves to phase 3.** Lowering a non-decided program's tier-S functions pathless needs the
+boundary phase 3 builds: a reference a pathless function forms and passes to a tracked one has no path for the
+tracked one to check against. With the owner-side marks of phase 3 (§15 rule 2, the study's holder lists) the
+boundary is a check at formation, and per-function lowering follows.
+
+**What remains, in order:** phase 3's tier-D runtime with per-function lowering (Update 146); the single port of
+the self-hosted compiler and its measurement (Update 147).

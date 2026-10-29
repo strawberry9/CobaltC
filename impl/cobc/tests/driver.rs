@@ -222,6 +222,72 @@ fn worker_pools_in_a_vec_leave_a_program_decided() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// D-0281 §6's cost cases: every conformance case whose header says
+// `decided: yes` is decided, so `cobc` lowers it keeping no record of
+// references (no C is compiled).
+#[test]
+fn cost_cases_are_decided() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../conformance");
+    let mut cases = Vec::new();
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().map_or(false, |x| x == "cb") {
+                let src = fs::read_to_string(&p).unwrap_or_default();
+                if src.lines().take_while(|l| l.starts_with("//")).any(|l| l.trim_start_matches('/').trim() == "decided: yes") {
+                    cases.push(p);
+                }
+            }
+        }
+    }
+    assert!(cases.len() >= 10, "only {} cost cases", cases.len());
+    let out = std::env::temp_dir().join(format!("cobc-cost-{}", std::process::id()));
+    let mut failures = Vec::new();
+    for p in &cases {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", "/bin/true", "-o"]).arg(&out).arg(p.file_name().unwrap()).current_dir(p.parent().unwrap()).output().expect("run cobc");
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        if !note.contains("lowered pathless and decided (D-0284, D-0285)") {
+            failures.push(format!("{}: {}", p.display(), note.lines().find(|l| l.starts_with("cobc:")).unwrap_or(note.trim())));
+        }
+    }
+    let _ = fs::remove_file(&out);
+    assert!(failures.is_empty(), "cost cases not decided:\n{}", failures.join("\n"));
+}
+
+// D-0290: a local that keeps references in data is a holder of the frame.
+// A program whose `Vec<StringView>` of a line's fields, struct of views and
+// `Vec<ref<…>>` stay in their frames is decided, under both C compilers; one
+// that returns a `Vec` of views of a local, or stores a reference through a
+// parameter where the caller does not see it, leaves the function to the run.
+#[test]
+fn frame_held_aggregates_leave_a_program_decided() {
+    let dir = std::env::temp_dir().join(format!("cobc-aggs-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let held = "import std;\n\nstruct Pair\n{\n    StringView key;\n    StringView value;\n}\n\nfn pair(ref<String, shared> line) : Pair\n{\n    Vec<StringView> f = String::split(line, \"=\");\n    Pair { .key = f[0], .value = f[Vec::len(&f) - 1] }\n}\n\nfn main()\n{\n    String s = String::from_str(\"a=1\");\n    Pair p = pair(&s);\n    i64 x = 3;\n    Vec<ref<i64, shared>> rs = Vec::new();\n    Vec::push(&mut rs, &x);\n    Vec::push(&mut rs, &x);\n    i64 t = 0;\n    foreach (r in &rs)\n    {\n        t += **r;\n    }\n    printf(\"%v %v %v\\n\", p.key, p.value, t);\n}\n";
+    let dangling = "import std;\n\nfn words() : Vec<StringView>\n{\n    String s = String::from_str(\"a b\");\n    String::split(&s, \" \")\n}\n\nfn main()\n{\n    printf(\"%v\\n\", Vec::len(&words()));\n}\n";
+    let stored = "import std;\n\nfn keep(ref<Vec<ref<i64, shared>>, exclusive> out)\n{\n    i64 y = 2;\n    Vec::push(out, &y);\n}\n\nfn main()\n{\n    Vec<ref<i64, shared>> rs = Vec::new();\n    keep(&mut rs);\n    printf(\"%v\\n\", Vec::len(&rs));\n}\n";
+    for (f, src) in [("held", held), ("dangling", dangling), ("stored", stored)] {
+        fs::write(dir.join(format!("{}.cb", f)), src).unwrap();
+    }
+    for cc in ["gcc", "clang"] {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", cc, "-o", "held", "held.cb"]).current_dir(&dir).output().expect("run cobc");
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success() && note.contains("lowered pathless and decided (D-0284, D-0285)"), "{}: {}", cc, note);
+        let run = Command::new(dir.join("held")).current_dir(&dir).output().expect("run prog");
+        assert_eq!((run.status.code(), String::from_utf8_lossy(&run.stdout).into_owned()), (Some(0), "a 1 6\n".to_string()), "{}", cc);
+    }
+    for (f, why) in [("dangling", "the result holds references to what is not a parameter's"), ("stored", "a reference may be stored where this frame does not hold it")] {
+        let o = Command::new(cobc_exe()).args(["-v", "--cc", "gcc", "-o", f, &format!("{}.cb", f)]).current_dir(&dir).output().expect("run cobc");
+        let note = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(note.contains("kept paths") && note.contains(why), "{}: {}", f, note);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // D-0286: in a decided program values pass between functions with no
 // object: past the runtime's header the C neither sends nor receives one,
 // a `String` taken by value is bound objectless and none is bound in the

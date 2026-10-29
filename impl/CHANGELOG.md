@@ -8380,3 +8380,65 @@ crossing to C by value.
   `impl/cobc/tests/driver.rs` `worker_pools_in_a_vec_leave_a_program_decided`. `conf.handle-moved-into-vec-then-referent-written`
   is static: the handle moved into the `Vec` hands it its fact (release suites `u144b` ran it as dynamic and failed).
 - Release suites `stress/suites/runs/u144c`: passed.
+
+## CHG-0385: frame-held aggregates (D-0290, 2026-10-28)
+
+- A local that keeps references in data (a struct with a reference field, a `Vec<StringView>`, a `Vec<ref<T>>`)
+  and holds no `fn` value, guard, lock or handle is a holder of the frame: it holds the facts of what was stored
+  into it (a literal's parts, `Vec::push`, a call's reference arguments, `?` when it may hold none), and what is
+  read out of it holds them, `?`. Through a reference parameter `q`, what `*q` keeps is a root of its own, `**q`.
+  Moving a holder out, returning one that holds more than the parameters reach, and storing a reference through
+  a reference where the caller does not see it are the run's. `cobc`'s whole-program type test keeps only the
+  types holding a `fn` value, guard, lock or handle in data.
+- Found on the way: a holder copied (`H h2 = h`) must keep its facts, since a struct of references is copied, not
+  moved; a call's facts on a holder must be kept on every pass over a loop, not only the reported one; a call
+  given `&mut lit` beside a `BitReader` cannot store it there (`ref_leaves`, `kept_from`: what an argument gives
+  is read from the types); `swap(v, &mut out)` gives `out`'s contents, not `&mut out`.
+- `stress/d0281/why/new8.why` (11,022 programs): 132 programs decided that kept paths (9,942 decided in all), none
+  the other way, 19 that the run faulted refuted before it. Pathless gate over the newly decided (gcc and clang):
+  every one ends as its tracked run does; six that coby could not finish in the gate's 60 s were rerun with 15
+  minutes (four identical) or against `cobc`'s tracked build (`minisql`, `q1`, whose only difference under coby
+  is its measure of memory growth).
+- Found by the model and `coby` statics sweep: a holder given a reference binding `r` held `*r`, cleared when `r`
+  ended; it holds what `r` holds (`through_refs`), as the model does (`impl/model/sample/hand-r02.cb` is static).
+- Found by the first release suites (`stress/suites/runs/u145`, failed) and a soundness sweep (each of 14,592
+  programs the static pass decides run under `coby`; every reference fault left is one `cobc` reports too, or an
+  outcome the model permits): an access through a reference read out of a holder (`*s.inner = 5` while `r =
+  &*s.inner` or `give(&s)` lives) was decided (`holder_deref_access`); a holder dead by last use but reached by a
+  live one (`auto hr = &h`) was taken for dead (`holder_live_from`); and, older, a move of a place a fact `?`
+  names was decided since D-0284 (`flow_solitary`), and a thread lent an exclusive reference through a shared one
+  (`spawn(f, &r)`, a struct keeping one, a closure's capture) was decided since D-0289 (`excl_under_shared`).
+  `cobc` checks, at a call's point check, the paths a struct argument keeps, as `coby` does (`kept_ref_tokens`).
+  Thirteen dynamic conformance cases that relied on a struct or `Vec` of references being tier D store their
+  reference by a call (`keep_in`, `hold`), which the frame holds as `?`, and stay the run's; so do
+  `ex_e2e_vec_pop_push_reuse_stale_ref`, `ex_e2e_vec_realloc_stale_ref` and `returned_view_inlined.rs`.
+  `conf.write-through-kept-ref-beside-reborrow`, `conf.move-while-maybe-borrowed`,
+  `conf.thread-lent-exclusive-through-shared`, `conf.thread-closure-lent-exclusive-through-shared`. Over
+  `stress/d0281/why/new9.why` (10,930 programs) the repairs change no program's decision but one that kept paths
+  for another reason (`p002468`).
+- Found by the second release suites (`stress/suites/runs/u145b`, failed): a generic call's result was read with
+  its type parameters unbound (`value_shape`), so `Vec::push(&mut h, Vec::index_exclusive(&mut v, 0))` added
+  nothing to what `h` held, and a later read of `v` was decided where the run faults. The result type is now the
+  declared one with the parameters bound from the arguments. `conf.vec-element-read-while-element-exclusively-
+  held-dynamic`, `conf.vec-element-write-while-element-shared-held-dynamic`, `conf.vec-element-access-beside-
+  held-element-ref` (the frame holds a pushed element reference as a borrow of the whole `Vec`, as it does a
+  reference binding's), `conf.direct-param-element-grown-by-other-thread`, `conf.frozen-param-element-grown-by-
+  other-thread` and the two `ex.e2e-vec-*-stale-ref` examples (`spec/examples.md` 3.20.0) store their reference by
+  a call.
+  Over `stress/d0281/why/new9.why` (10,930 programs) no program's outcome changes (decided, kept or refuted). A
+  soundness sweep over the corpus and every conformance case (13,397 programs, 10,635 decided) finds no reference
+  fault in a decided program that `cobc` does not report too, but `hand-x03`, whose model permits it.
+  `cobc` checking the selfhost `cbc` takes 36.7 s (Update 144: 34.4 s); binding the type parameters adds about 1 s.
+- Release suites `stress/suites/runs/u145c`: passed.
+- Model: a `Hold` and a `Vec<ref<…>>` of the frame hold what they were made from or given; the headers of 17
+  model-enumerated programs follow (static where they faulted).
+- `conf.vec-of-refs-holds-pushed-ref`, `conf.struct-of-ref-copy-keeps-borrow` (static),
+  `conf.popped-vec-of-refs-frees-referent`, `conf.split-parts-hold-text`, `conf.split-parts-read`;
+  `conf.move-capture-beside-exclusive-ref` is static; `impl/cobc/tests/driver.rs`
+  `frame_held_aggregates_leave_a_program_decided`.
+- No `tracked` keyword (D-0290): what a function leaves to the run, `cobc -v` names.
+- Cost of the static pass: `cobc` on the self-hosted compiler (`impl/selfhost/cbc/main.cb`, no C compiled) took
+  47 s against Update 144's 34 s at first; with the storability test skipped for data that keeps no references,
+  the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
+  (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
+  and reads now hold.

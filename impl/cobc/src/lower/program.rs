@@ -264,9 +264,8 @@ impl<'a> Gen<'a> {
     // D-0281 step 4c: why the program must keep its paths, if it must: it
     // is a library (C callers keep what they like), it asks for every
     // check, a function it lowers has a conflict the static pass left to
-    // the run (`Items::tracking_needed`), a type it uses keeps references
-    // in data (tier D), or it spawns a thread (references lent to a
-    // thread are tier D until scoped lending).
+    // the run (`Items::tracking_needed`), or a type it uses keeps references
+    // in data the static pass does not follow (a `fn` value's, D-0290).
     fn pathless_blocker(&self) -> Option<String> {
         if self.lib {
             return Some("a library (`--lib`)".to_string());
@@ -296,7 +295,11 @@ impl<'a> Gen<'a> {
         // may then be one. In a frame the static pass holds what such a
         // closure reaches as a borrow (D-0288), so only data keeps paths.
         let fn_refs = self.closures.values().any(|c| (!c.is_move && !c.fields.is_empty()) || c.fields.iter().any(|(_, t)| coby::typecheck::keeps_refs_in_data(self.items, t, true) || matches!(t, Type::Ref(..) | Type::Slice(..)) || matches!(t, Type::Named(n, _) if n == "std::StringView")));
-        let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data(self.items, t, fn_refs)).map(|t| t.to_string()).collect();
+        // D-0290: a type whose values the static pass follows as holders
+        // (no `fn` value, guard, lock or handle in it) is checked where it
+        // is used: a function that keeps one where the facts do not see it
+        // is in `tracking_needed` above.
+        let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data(self.items, t, fn_refs) && !coby::typecheck::frame_holdable(self.items, t)).map(|t| t.to_string()).collect();
         tys.sort();
         if let Some(t) = tys.first() {
             return Some(format!("the type `{}` keeps references in data (tier D)", t));

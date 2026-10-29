@@ -852,11 +852,30 @@ impl<'g, 'a> Fx<'g, 'a> {
                 _ => None,
             }
         };
-        let held: Vec<String> = argv.iter().filter_map(tok_of).collect();
+        // A struct argument (D-0290: a frame-held aggregate): the paths of
+        // the references kept in its fields, each checked as a read, as the
+        // run does in `coby`.
+        let mut kept: Vec<Vec<String>> = Vec::new();
+        for v in argv {
+            let mut out = Vec::new();
+            let lvalue = !v.c.is_empty() && v.c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if lvalue {
+                self.kept_ref_tokens(&v.c, &v.ty, &mut out, 0);
+            }
+            kept.push(out);
+        }
+        let mut held: Vec<String> = argv.iter().filter_map(tok_of).collect();
+        held.extend(kept.iter().flatten().cloned());
         let held_c = if held.is_empty() { "NULL, 0".to_string() } else { format!("(uint64_t[]){{ {} }}, {}", held.join(", "), held.len()) };
         for pc in pcs {
             let Some(v) = argv.get(pc.arg) else { continue };
-            let Some(tok) = tok_of(v) else { continue };
+            let Some(tok) = tok_of(v) else {
+                let msg = pc.message();
+                for tok in &kept[pc.arg] {
+                    self.emit(&format!("cb_point_check({}, {}, NULL, 0, 0u, (const uint8_t *)\"{}\", {}u, {});", held_c, tok, super::passes::c_escape(&msg), msg.len(), loc));
+                }
+                continue;
+            };
             let mut projs = Vec::new();
             if let Type::Ref(inner, _) = &v.ty {
                 let mut t = (**inner).clone();
@@ -877,5 +896,29 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.emit(&format!("cb_point_check({}, {}, {}, {}u, (const uint8_t *)\"{}\", {}u, {});", held_c, tok, ps, excl, super::passes::c_escape(&msg), msg.len(), loc));
         }
         Ok(())
+    }
+
+    // The paths of the references a struct value `c` of type `t` keeps in
+    // its fields, nested structs' included.
+    fn kept_ref_tokens(&self, c: &str, t: &Type, out: &mut Vec<String>, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        let Type::Named(n, args) = t else { return };
+        if n.starts_with("std::") {
+            return;
+        }
+        let Some(sd) = self.g.struct_decl(n) else { return };
+        let sub = subst_of(&sd.type_params, args);
+        for fd in &sd.fields {
+            let fc = format!("{}.{}", c, san(&fd.name));
+            match apply(&fd.ty, &sub) {
+                Type::Ref(..) => out.push(format!("cb_load_ref(&{})", fc)),
+                Type::Slice(..) => out.push(format!("cb_load_ref(&({}).src)", fc)),
+                Type::Named(m, a) if m == "std::StringView" && a.is_empty() => out.push(format!("cb_load_ref(&({}).bytes.src)", fc)),
+                ft @ Type::Named(..) => self.kept_ref_tokens(&fc, &ft, out, depth + 1),
+                _ => {}
+            }
+        }
     }
 }

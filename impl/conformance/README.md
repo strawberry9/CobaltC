@@ -128,6 +128,11 @@ fn main()
   `coby` the case must be refused (exit 3, `unsupported: …`); `cobc`
   runs it and checks `expect:` and `expect-stdout-hex:`, since there is
   no interpreter output to compare with (CHG-0039).
+- `decided: yes` (optional) — a *cost case* (D-0281 §6, D-0290): the
+  program must be decided (`spec/14` §6), so `cobc` builds it keeping no
+  record of references; `impl/cobc/tests/driver.rs`
+  `cost_cases_are_decided` checks that `cobc -v` says so. The runners
+  ignore the field.
 - `stdin-hex:` (optional) — lowercase hex, the bytes fed to the case as
   standard input, by every runner and to both implementations; empty for
   empty input (CHG-0038, D-0050). A case without it gets no input.

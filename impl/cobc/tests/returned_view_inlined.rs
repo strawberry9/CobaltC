@@ -5,7 +5,8 @@
 // named that storage until the statement ended, forgot `h`'s slot at its
 // end, and the write beside the view went unreported. The conformance case
 // is rejected before the run since D-0282, so the run's part is tested on
-// the same program with the view held in a struct (tier D: the static pass
+// the same program with the view held in a struct that may be given another
+// view on some paths (D-0290: what it holds is then `?`, and the static pass
 // leaves its conflicts to the run), compiled at -O1 and -O2 under both C
 // compilers, with the fault expected each time.
 
@@ -20,7 +21,7 @@ fn returned_subview_keeps_its_holder_when_the_callee_is_inlined() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let case = dir.join("held.cb");
-    let src = "import std;\n\nstruct Held\n{\n    StringView v;\n}\n\nfn head(StringView v) : StringView\n{\n    &v[0 .. 1]\n}\n\nfn main()\n{\n    String s = \"hello\";\n    Held h = Held { .v = head(String::as_view(&s)) };\n    printf(\"%v\\n\", h.v);\n    String::append(&mut s, \"!\");\n    printf(\"%v\\n\", h.v);\n}\n";
+    let src = "import std;\n\nstruct Held\n{\n    StringView v;\n}\n\nfn head(StringView v) : StringView\n{\n    &v[0 .. 1]\n}\n\nfn main()\n{\n    String s = \"hello\";\n    Held h = Held { .v = head(String::as_view(&s)) };\n    if (arg_count() > 9)\n    {\n        h = Held { .v = \"x\" };\n    }\n    printf(\"%v\\n\", h.v);\n    String::append(&mut s, \"!\");\n    printf(\"%v\\n\", h.v);\n}\n";
     std::fs::write(&case, src).unwrap();
     for cc in ["gcc", "clang"] {
         for opt in ["-O1", "-O2"] {

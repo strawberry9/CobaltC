@@ -687,6 +687,21 @@ impl<'a> Cx<'a> {
                     },
                     _ => None,
                 };
+                // D-0290: a `Vec<ref<…>>` of this frame is a holder: a push
+                // adds what the element holds; any other operation that
+                // takes it exclusively may remove some, which then hold on
+                // some paths only.
+                let vec_holder = match args.first() {
+                    Some(Expr::Borrow(Mode::Excl, v)) => match &**v {
+                        Expr::Var(n) if matches!(self.ty_of(n), Some(Ty::VecR)) && !self.caps.contains(n) => Some(n.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let vec_added = match (&vec_holder, f.as_str(), args.get(1)) {
+                    (Some(_), "Vec::push", Some(x)) => Some(self.inherit(fl, x).0),
+                    _ => None,
+                };
                 for (i, a) in args.iter().enumerate() {
                     if i == 0 && elided {
                         self.rvalue_into(fl, a, line, holder);
@@ -706,6 +721,23 @@ impl<'a> Cx<'a> {
                     }
                 }
                 self.call_site(fl, e, f, args, line, holder);
+                if let Some(v) = &vec_holder {
+                    match vec_added {
+                        Some(facts) => {
+                            for (sp, m, t) in facts {
+                                let e = fl.deriv.entry((v.clone(), sp, m)).or_insert(Tri::F);
+                                *e = if *e == Tri::T || t == Tri::T { Tri::T } else { Tri::Q };
+                            }
+                        }
+                        None => {
+                            for (k, t) in fl.deriv.iter_mut() {
+                                if &k.0 == v && *t == Tri::T {
+                                    *t = Tri::Q;
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some((hs, facts)) = pushed {
                     for (sp, m, v) in facts {
                         fl.deriv.insert((hs.clone(), sp, m), v);
@@ -1122,6 +1154,13 @@ impl<'a> Cx<'a> {
                         fl.deriv.insert((name.clone(), p, m), v);
                     }
                 }
+                // D-0290: a `Hold` of this frame is a holder of what its field
+                // was made from; a copy of one holds what it holds.
+                if t == Ty::Hold && self.d0282() {
+                    for (p, m, v) in self.hold_facts(fl, init) {
+                        fl.deriv.insert((name.clone(), p, m), v);
+                    }
+                }
                 self.binds.entry(name.clone()).or_default().push(Binding { ty: t, block, id });
                 if let Some(r) = self.regions.last_mut() {
                     r.insert(name.clone());
@@ -1154,6 +1193,15 @@ impl<'a> Cx<'a> {
                     // `x = e`: a whole-object write (`spec/11`).
                     if let Some(p) = self.splace(place) {
                         self.check_access(fl, &p, Mode::Excl, line);
+                    }
+                    // D-0290: a `Hold` assigned whole holds what the new value
+                    // does.
+                    if self.ty_of(&n) == Some(Ty::Hold) && self.d0282() {
+                        let facts = self.hold_facts(fl, value);
+                        fl.forget_holder(&n);
+                        for (p, m, v) in facts {
+                            fl.deriv.insert((n.clone(), p, m), v);
+                        }
                     }
                     if let Some(Ty::Fn(_)) = self.ty_of(&n) {
                         if let Expr::Closure(c) = value {
@@ -1973,6 +2021,16 @@ impl<'a> Cx<'a> {
         }
     }
 
+    // D-0290: what a `Hold` made from `e` holds: a literal what its field's
+    // value holds; a copy of a `Hold` binding what that one holds.
+    fn hold_facts(&self, fl: &Flow, e: &Expr) -> Vec<(SPlace, Mode, Tri)> {
+        match e {
+            Expr::HoldLit(a) => self.inherit(fl, a).0,
+            Expr::Var(q) if self.ty_of(q) == Some(Ty::Hold) && !self.caps.contains(q) => fl.deriv_facts(q),
+            _ => Vec::new(),
+        }
+    }
+
     fn param_kinds(&self, f: &str) -> Vec<PK> {
         match self.prog.func(f) {
             Some(func) => func.params.iter().map(|p| frames::ty_pk(&p.0)).collect(),
@@ -1994,7 +2052,7 @@ impl<'a> Cx<'a> {
         // A handle or a `Vec` of handles is not ended at its last mention:
         // its end waits for its threads (CHG-0384), so it holds its facts to
         // its scope's end.
-        let waits = |n: &str| matches!(self.ty_of(n), Some(Ty::Handle(_)) | Some(Ty::VecH));
+        let waits = |n: &str| matches!(self.ty_of(n), Some(Ty::Handle(_)) | Some(Ty::VecH) | Some(Ty::VecR));
         let mut live: BTreeSet<String> = held.iter().filter(|(n, id)| self.pos.live_after(*id, p) || waits(n)).map(|(n, _)| n.clone()).collect();
         loop {
             let more: Vec<String> = held

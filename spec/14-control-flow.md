@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.38.0
+Version: 1.39.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -699,10 +699,17 @@ instance is ill-formed with the diagnostic named below, marked *static*.
 or `StringView` type, of `Option`/`Result` of one, or of a closure or
 `fn` type (D-0281: a closure passed and called is tier S). The other
 bindings §6 gives `deriv` facts, a spawn's handle among them, are holders
-with those facts. A binding of any other type that holds a reference (a
-struct, an array, an enum other than `Option`/`Result` of a reference)
-keeps it inside data (tier D): this rule gives it no facts and never
-refutes on its account; the run checks it.
+with those facts. A local of any other type that keeps references in
+data, its elements' among them (a struct with a reference field, an
+array, an enum other than `Option`/`Result` of a reference, a
+`Vec<StringView>`, a `Vec<ref<T>>`), and holds no `fn` value, guard,
+lock or thread handle, is a *holder of the frame* (D-0290): not a
+parameter or a capture, it holds the facts of what is stored into it
+(**Frame-held aggregates**, below). A value of such a type anywhere
+else — a parameter's, a field's of data reached through a reference,
+one holding a `fn` value — keeps its references inside data (tier D):
+this rule gives it no facts and never refutes on its account; the run
+checks it.
 
 **Inherited facts.** Where a declaration, assignment or `match` binder of
 a frame-held reference `r = e` forms no `deriv` fact by §6's rows, `r`
@@ -715,14 +722,63 @@ inherits the facts of `e`:
 | `*b`, and `b.f` for a frame-held `b` | the facts of `b` |
 | `&_m p` or a slice of `p` | the fact §6 forms for it (`p`'s place, literal indices and ranges included) where it forms one; otherwise the facts of `p`'s root, extended by `p`'s fields up to its first index, in mode `m`; when `p`'s root is the result of a call that is not a reference, holds none and is not a constant: the temporary of that statement |
 | `String::view(s, lo, hi)`, `StringView::sub(s, lo, hi)` | the facts of `s`, each extended by the range `[lo, hi)` |
-| a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088); none when no parameter is, and none (static data) when that argument is static data; tier D when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them) |
+| a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088), in the parameter's mode; none when no parameter is, and none (static data) when that argument is static data; when the result keeps references in data, each `?` (it may hold none), and when several arguments are or hold references, the facts of all of them, each `?`; when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them), what that storage keeps (below), and tier D when that is not known; a call given no reference holds what its values hold (`Vec::new()`: nothing) |
 | a hidden `foreach` binding | the facts of the collection it walks; over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap; under `[Foreach-Parts]`, the facts of the text |
 | `if`, a block, `match` | the facts of the results of the branches that complete (a `match` arm's binder stands for the scrutinee); facts from two or more branches are `?` |
-| an element of a container, or a reference read out of a field of an aggregate that holds references | tier D: no facts |
+| an element of a container, or a reference read out of a field of an aggregate that holds references | what that aggregate keeps (below), each `?`; tier D, no facts, when that is not known |
+| a literal (`S { .f = e, … }`, `[e, …]`) | the facts of its parts that are or hold references, together |
+| a range of a view's bytes (`&v.bytes[i .. j]`) | the facts of `v`, each extended by the range |
 | a name of no local, a literal | none: static data |
 
 A binding whose inherited facts name a temporary, and which is live
-after its statement, is refuted: `diag.destroy-while-aliased` (D-0135).
+after its statement, is refuted: `diag.destroy-while-aliased` (D-0135);
+a holder of the frame, which may hold none of the temporary, is decided
+by the run. In `r = e`, a fact of `e` rooted at `*r` stands for what `r`
+held before the assignment (CHG-0384); where `r` held nothing, for
+static data, or for a parameter `r` for what its caller gave, `*r`.
+
+**Frame-held aggregates.** A holder `a` of the frame (D-0290) holds:
+made from a literal, the facts of its parts; from a call, the call's
+inherited facts above; copied from another holder, that one's (a holder
+that owns no resource is copied, and keeps its own); a fact it would take
+rooted at `*q`, for a reference binding `q` of the frame that holds facts,
+is `q`'s facts, which it keeps after `q` ends. `Vec::push(&mut a,
+e)` and `Vec::insert` add the facts of `e`; a field or element of `a`
+assigned (`a.f = e`, `a[i] = e`) adds the facts of `e` and leaves the
+old ones `?`; `a = e` replaces them. Any other call given `&mut a` (or
+an exclusive reference to a part of it) may store into it what its other
+arguments give and remove what it held: it adds those facts, each `?`,
+and leaves `a`'s own `?`; what an argument gives is the reference it is,
+when `a`'s type can keep a reference of that type, and what the
+references kept where it reaches reach, when `a`'s type can keep those
+(`swap(v, &mut out)` gives `out`'s contents, not `&mut out`). A holder
+that owns no resource ends at its last use (`[Ref-Binding-Last-Use]`);
+a `Vec` holds its facts to its scope's end, as the run holds the
+references it keeps until they are removed or it is destroyed.
+
+What an aggregate keeps, read out of it (an element, a field, a result
+of `Vec::pop` or `Vec::get`, a `foreach` binder over it): for a holder of
+the frame, its facts, each `?`; through a reference parameter `q`, `**q`,
+a root of its own, disjoint from the frame's places and from what the
+other parameters reach, as `*q` is (`?` when it may be exclusive); through
+another reference of the frame, what the roots its facts name keep.
+
+The run checks, and the program is not decided, when a holder holding
+facts is moved where its facts do not follow (an argument, a field, a
+capture); when a result that keeps references in data holds anything but
+what the parameters reach (`*q`), which is what the caller takes it to
+hold; and when a value holding references is stored through a reference
+(`p.f = r`, `*(v.ptr + i) = x`, a call given an exclusive reference to
+data that keeps references and is no holder of the frame, beside an
+argument whose references that data can keep), unless what is stored is
+static data, or reaches only what parameters reach (`*q`, `**q`) — what
+the caller sees given, and adds to a holder it gives exclusively, as
+above. An access through a reference read out of an aggregate (`*s.inner
+= e`, `*v[i]`) is the run's when, in a mode that does not permit it, a
+live holder other than the aggregate holds a fact meeting what the
+aggregate keeps, or rooted at the aggregate itself (`auto r =
+&*s.inner`, `give(&s)` returning `s.inner`): the reference read may be any
+of those kept.
 
 **A block's end.** When a block ends, a frame-held reference declared
 outside it that holds a fact `T` rooted at a binding the block declares,
@@ -735,7 +791,8 @@ the program is not decided.
 **Liveness.** A frame-held reference `h` is *live* at a point `P` when
 the binding of that name in scope at `P` is mentioned (read, borrowed,
 passed, captured or assigned) after `P` in the source, or anywhere in a loop that encloses `P` and that its declaration
-precedes; also while another live binding holds a fact rooted at `*h`.
+precedes; also while another live binding holds a fact rooted at `*h`,
+or at `h` itself (`auto hr = &h`: what `h` holds lives while `hr` does).
 A mention resolves to the binding in scope where it is written, so a
 later binding of the same name does not keep `h` live. A holder that is not live has
 ended (`[Ref-Binding-Last-Use]`, D-0111) and conflicts with nothing.
@@ -775,7 +832,11 @@ has a body (an empty one included) and the parameter is a reference or
 slice, `W(ai)` extended by each
 projection of `reads(F, pi)` (shared) and of `writes(F, pi)` (exclusive
 for an exclusive parameter, shared for a shared one: a write through a
-shared reference is interior mutability), and otherwise `W(ai)`. Two
+shared reference is interior mutability), and otherwise `W(ai)`. Both
+include, unextended, what the references kept where a key of `W(ai)` is
+rooted reach (a holder's facts, `**q` through a parameter `q`), in no
+stronger mode than `m`, the holder they come from counting as one the
+argument is formed through (D-0290). Two
 keys *certainly overlap* when their roots are equal, their paths agree
 step by step (fields equal; literal indices equal; a literal index
 inside a literal range; literal ranges that intersect) and the longer
@@ -808,7 +869,9 @@ runs, each key of `E(ai)` such a pair names is checked as an access
 through `ai`'s path at that projection, in that key's mode: `[Read]`'s
 or `[Write]`'s `¬clash` premise (`spec/08`), `ai`'s own path and its
 ancestors excluded, every live path counted, the other arguments'
-included. A clash faults there, `diag.aliasing-conflict`, located at the
+included; for an argument that keeps references in data (a struct
+holding a reference), each path it keeps is checked so, as a read
+(D-0290). A clash faults there, `diag.aliasing-conflict`, located at the
 call, whether or not the body would make the access: the callee's
 summary decides, not the path its body takes on this run. A path whose
 range is empty (`s[k .. k]`) reaches nothing and meets nothing here; the
@@ -863,11 +926,38 @@ run in conflict, so an implementation may execute it keeping no record
 of references (paths), with the same outcome (D-0284). A program is not
 decided when one of its functions has a conflict left to the run (a may-
 overlap, a fact `?`, a binding of unknown origin, a point check at a call),
-when a type it uses keeps references in data (tier D, D-0281; a `fn`
-value, a thread's handle and a lock's guard do so only in data: one a
-frame holds is its facts, D-0288, D-0289), or when it forms a reference
+when a type it uses keeps a `fn` value, a thread's handle or a lock's
+guard in data (tier D, D-0281; one a frame holds is its facts, D-0288,
+D-0289; an aggregate of references is checked where it is, D-0290), or
+when it forms a reference
 to a reclaimed object in its own code (`[Reclaim]`: the run checks it
 against the record of raw storage).
+
+**The cost contract** (D-0281 §14, D-0290). What a reference costs at run
+time is promised as properties, not instruction counts; an
+implementation may do better, not worse. A reference of a decided
+program (tier S), held by a frame or kept in a holder of the frame:
+
+| operation | promise |
+|---|---|
+| form, copy, pass, return, end | no run-time state; no allocation; no call into a runtime |
+| an access through it | the access itself, and a bounds check where an index is involved |
+| a call given two or more reference arguments into one root | at most one point check per pair of arguments whose overlap depends on values, O(1) each (D-0283) |
+| a fault it can cause | decided before the run, or by a point check; its position from a static table |
+
+A reference the run checks (tier D: kept in data the static pass does not
+follow, lent where no binding holds the handle, in a function that leaves a
+conflict to the run) has, in this edition, the record of references
+`spec/08` describes: forming one into an owner, copying an aggregate that
+keeps k of them (O(k)), reading through one, ending one and destroying or
+moving an owner each record or consult it, and may allocate. The tier-D
+promises of D-0281 §14 (O(1) with no allocation and no address-keyed
+lookup, counts kept in the owner) are *provisional*, D-0281 phase 3: a
+stored reference is 8 bytes (`[Repr-Ref]`), so moving an aggregate that
+keeps one cannot be free of metadata, and raw-pointer code with no base
+keeps a per-heap page lookup. The conformance cases headed `decided: yes`
+(*cost cases*) are programs whose compiled form must keep no record of
+references.
 
 **Scoped lending.** What a spawn lends — its borrowed arguments, the
 references it passes, what its closure captured — is held as `deriv`
@@ -882,7 +972,12 @@ holding facts is moved anywhere but `join` or `drop` (returned, passed,
 captured), when a spawned thread runs a `fn` value (whose captures are
 not known before the run), and when a spawned closure captures a guard
 or a thread is given one as an argument (a lock's path stays its
-locking thread's, D-0240).
+locking thread's, D-0240), and when a thread is lent, as an argument or
+a closure's capture, a shared reference through which an exclusive one
+is reached (`ref<ref<T, exclusive>, shared>`, a shared reference to a
+struct keeping one): `[Thread-Lend]` lends only the exclusive paths in an
+argument's own value, so that path stays the lender's, and the thread's
+access through it faults while the lender runs (`spec/19`).
 
 A `Vec` of handles a binding of the lending frame holds is such a
 binding for every spawn pushed onto it (`Vec::push(&mut hs, spawn(…))`)
@@ -912,6 +1007,7 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.39.0 — `CHG-0385` (D-0290): §6 "The cost contract" (D-0281 §14, the tier-D lines provisional; cost cases); §6 holders: a local that keeps references in data is a holder of the frame; "Frame-held aggregates"; inherited facts of calls whose result keeps references in data, of reads out of an aggregate (`**q` through a parameter), of literals and of a view's bytes; `r = e` where `r` held nothing; what is the run's (a holder moved out, a result holding more than the parameters reach, a store through a reference); decided programs no longer exclude every type that keeps references in data; an access through a reference read out of an aggregate; liveness while a binding reaches a holder; a struct argument's kept paths at a point check; scoped lending of an exclusive reference through a shared one.
 - 1.38.0 — `CHG-0384` (D-0289): §6 scoped lending: a guard given to a thread as an argument is the run's; a `Vec` of handles the frame holds holds what its threads were lent, and a handle taken out of it holds that too; a holder whose end waits or releases holds its facts to its scope's end.
 - 1.37.0 — `CHG-0383` (D-0289): §6 decided programs: scoped lending, a thread's handle and a lock's guard held by a frame are its facts; the spawn rows (a bound spawn's handle holds its closure's facts and escapes nothing); the paragraph no longer lists closures (D-0288) or spawns.
 - 1.36.0 — `CHG-0382`: §6 `rule.control.frame-references`, evaluation order: only an argument that is or may hold a reference is formed early; a later argument acts on it only through an exclusive borrow of an overlapping place evaluated before the call, an assignment or a move of its root, and a later argument that is itself a borrow is not one.

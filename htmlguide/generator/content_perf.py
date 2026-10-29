@@ -54,8 +54,9 @@ one of them before it runs, is <em>decided</em>, and `cobc` builds it with no tr
 record of references, nothing retired at the end of a statement (D-0284). The outcome is the one
 the tracked build gives. A program stops being decided as soon as one function leaves a conflict to
 the run: a reference whose origin the compiler cannot follow, an overlap that depends on values, a
-type that keeps references in data (a `Vec` of views, a struct holding a reference), a thread
-whose handle leaves the frame that lent it something. `cobc -v`
+`Vec` of views or a struct holding a reference that leaves the function that made it (passed on,
+returned holding what is not a parameter's, stored where a parameter reaches), a thread whose
+handle leaves the frame that lent it something. `cobc -v`
 says which: "lowered pathless", or "kept paths" with the file and line of the first such conflict.
 A decided program is also lowered a second time knowing it (D-0285): a view, or any value that only
 holds references, is then plain data with no runtime record at all, and `-v` says "lowered pathless
@@ -70,6 +71,11 @@ it was lent (`Vec::push(&mut hs, spawn(work, &shared))`), and a handle taken out
 or `Vec::pop` holds it as well, until it is joined (CHG-0384). A handle passed around while it lends,
 a `Vec` of handles given to another function, or a thread that runs a `fn` value, leaves the program
 to the run.""")
+b += p("""A local that keeps references in data, such as the `Vec<StringView>` that `String::split` gives or
+a struct of views built and read in one function, is checked the same way (D-0290): it holds what
+was stored into it, and a view read out of it holds that, so writing the text while the `Vec` still
+lives is refused, or left to the run when the `Vec` may hold nothing. A `Vec` holds what it keeps
+until its scope ends; a struct that owns nothing, until its last use.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
 the run, then lists the lines whose generated C still calls the runtime's tracking, with the
@@ -79,15 +85,16 @@ how to rewrite what it finds.""")
 b += p("""The other direction is `cobc --all-checks prog.cb`: it compiles the program with every proof about a function's reference parameters switched off, so every access through a parameter is checked where it is made. It is slower, and it exists for comparison: a program must behave the same both ways, and the project's test battery runs its whole file suite under it (D-0209).""")
 
 b += h3("Loop over a splitter's call", anchor="perf-parts")
-b += p("""A `Vec` of views keeps references in data, so a program that holds one is not decided. The
-commonest text loop, `foreach (l in StringView::lines(v))`, would hold one; written that way, with
-the splitter's call as the loop's collection, it holds none: the loop walks the text and finds each
+b += p("""A `Vec` of views is still made: an allocation, and a view stored for each part. The
+commonest text loop, `foreach (l in StringView::lines(v))`, would make one; written that way, with
+the splitter's call as the loop's collection, it makes none: the loop walks the text and finds each
 part as it reaches it, a view of the text like any other (D-0287). That covers `split`, `lines`,
 `split_whitespace` and `chars`, of a `StringView` or a `String`. The parts, their order and the
 program's outcome are the `Vec`'s; only the `Vec` is not made. Binding the result first
 (`Vec<StringView> words = StringView::split_whitespace(l);`), to take its length or index it, keeps
 the `Vec` and its cost. A word count over a 13.7 MB text (400,000 lines) took 9.8 s and 160 MB with
-the `Vec`s, and takes 0.47 s and 42 MB with the loops over the calls.""")
+the `Vec`s, when they kept the program tracked (D-0287), and takes 0.47 s and 42 MB with the loops
+over the calls.""")
 b += code("""
 import std;
 

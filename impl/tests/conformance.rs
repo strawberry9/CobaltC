@@ -1634,8 +1634,9 @@ fn ex_e2e_vec_realloc_stale_ref() {
     // escape` (their facts are defined only over a plain binding's own
     // projections). D-0282 relates them at the call (`Vec::push` writes
     // `*v` while `r` borrows it), so the frame-held form is refuted before
-    // the run; kept in a struct (tier D), the reference is the run's to
-    // check, and the reallocation makes it stale.
+    // the run; kept in a struct a call makes (D-0290: what it holds is
+    // `?`), the reference is the run's to check, and the reallocation makes
+    // it stale.
     expect_diag_static(
         "fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32 { auto r = Vec::index_shared(&*v, 0); Vec::push(v, 20); *r } fn main() { Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); hold_across_grow(&mut v); }",
         "diag.aliasing-conflict",
@@ -1643,9 +1644,10 @@ fn ex_e2e_vec_realloc_stale_ref() {
     expect_diag_dynamic_only(
         r#"
         struct Held { ref<i32, shared> r; }
+        fn hold(ref<i32, shared> r) : Held { Held { .r = r } }
         fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32
         {
-            Held h = Held { .r = Vec::index_shared(&*v, 0) };
+            Held h = hold(Vec::index_shared(&*v, 0));
             Vec::push(v, 20);
             Vec::push(v, 30);
             Vec::push(v, 40);
@@ -1761,8 +1763,8 @@ fn ex_e2e_vec_pop_push_reuse_stale_ref() {
     // → `conf.e2e-vec-pop-push-reuse-stale-ref` (closes finding F-05,
     // `CHG-0019`: `Vec::pop` releases its slot for every element type,
     // so the reused slot's hazard is caught dynamically, never silent).
-    // D-0282: kept in a struct (tier D), as the frame-held form is refuted
-    // before the run.
+    // D-0282: kept in a struct a call makes (D-0290: what it holds is `?`),
+    // as the frame-held form is refuted before the run.
     expect_diag_static(
         "fn hazard(ref<Vec<i32>, exclusive> v) : i32 { auto r = Vec::index_shared(&*v, 2); Vec::pop(v); *r } fn main() { Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); hazard(&mut v); }",
         "diag.aliasing-conflict",
@@ -1770,9 +1772,10 @@ fn ex_e2e_vec_pop_push_reuse_stale_ref() {
     expect_diag_dynamic_only(
         r#"
         struct Held { ref<i32, shared> r; }
+        fn hold(ref<i32, shared> r) : Held { Held { .r = r } }
         fn hazard(ref<Vec<i32>, exclusive> v) : i32
         {
-            Held h = Held { .r = Vec::index_shared(&*v, 2) };
+            Held h = hold(Vec::index_shared(&*v, 2));
             Vec::pop(v);
             Vec::push(v, 99);
             *h.r
