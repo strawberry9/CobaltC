@@ -1,0 +1,477 @@
+// cobfmt-cb — cobfmt written in CobaltC: the first self-hosted piece of
+// the toolchain. It formats exactly as the Rust cobfmt (impl/cobfmt)
+// does, a module of this program for each of its modules, and is
+// compared with it byte for byte on every `.cb` file in the repository
+// (impl/selfhost/compare.sh). Whether a text parses is decided by coby's
+// parser written in CobaltC (impl/selfhost/front, CHG-0350), which
+// refuses what coby's refuses with the same messages
+// (impl/selfhost/compare_parser.sh).
+
+import std;
+
+module lexer "../front/lexer.cb";
+module ast "../front/ast.cb";
+module prelude "../front/prelude.cb";
+module parser "../front/parser.cb";
+module dump "../front/dump.cb";
+module loader "../front/loader.cb";
+module derive "../front/derive.cb";
+module modres "../front/modres.cb";
+module consts "../front/consts.cb";
+module views "../front/views.cb";
+module items "../front/items.cb";
+module each "../front/each.cb";
+module fmtcheck "../front/fmtcheck.cb";
+module typecheck "../front/typecheck.cb";
+module consteval "../front/consteval.cb";
+module check "../front/check.cb";
+module format "./format.cb";
+module width "./width.cb";
+module verify "./verify.cb";
+module diff "./diff.cb";
+module files "./files.cb";
+
+import check;
+import format;
+import width;
+import verify;
+import diff;
+import files;
+
+// The line width lines are broken at when no `--width` or `--no-wrap` is given.
+const usize DEFAULT_WIDTH = 120;
+
+const str USAGE = "cobfmt-cb — formats CobaltC source files (cobfmt, written in CobaltC)\n"
+    "\n"
+    "usage: cobfmt-cb [OPTIONS] PATH...\n"
+    "       cobfmt-cb [OPTIONS] -          (standard input to standard output)\n"
+    "\n"
+    "A PATH is a .cb file, or a directory searched for .cb files (hidden\n"
+    "directories and target/ are skipped). Files are rewritten in place.\n"
+    "\n"
+    "options:\n"
+    "  --check       write nothing; list the files that would change, exit 1 if any\n"
+    "  --diff        write nothing; show what would change, as a unified diff\n"
+    "  --stdout      write the result to standard output instead (one file only)\n"
+    "  --backup      keep each changed file's previous contents beside it, as\n"
+    "                NAME.cb.format.bak (then .format.bak.1, .format.bak.2, ...)\n"
+    "  --width N     break lines longer than N characters (default 120)\n"
+    "  --no-wrap     never break a line, whatever its length\n"
+    "  --quiet, -q   print nothing but errors\n"
+    "  --version, -V print the version\n"
+    "  --help, -h    print this text\n"
+    "\n"
+    "exit status: 0 done, 1 --check or --diff found changes, 2 a usage error or\n"
+    "a file that cannot be read or does not parse, 3 an internal error (the\n"
+    "file is left as it was; please report it).\n"
+    "\n"
+    "example: cobfmt-cb --backup src/        format every .cb file under src/\n";
+
+struct Opts
+{
+    bool check;
+    bool diff;
+    bool stdout;
+    bool backup;
+    bool quiet;
+    usize width;                      // 0: never break a line
+    Vec<String> paths;
+}
+
+// A failure: the exit status and the message.
+struct Failure
+{
+    u8 code;
+    String msg;
+}
+
+fn fail(u8 code, String msg) : Failure
+{
+    Failure { .code = code, .msg = msg }
+}
+
+fn usage_error(StringView msg) : u8
+{
+    eprintf("cobfmt: %v\n", msg);
+    eprintf("run `cobfmt-cb --help` for the options\n");
+    2
+}
+
+fn format_checked(ref<Opts, shared> o, StringView src, StringView name, StringView origin) : Result<String, Failure>
+{
+    // A file that does not parse is not formatted: its structure is unknown.
+    match (syntax(src, origin))
+    {
+        None    : {},
+        Some(e) : return Err(fail(2, sprintf("does not parse: %s", &e))),
+    }
+    String out = match (format_source(src))
+    {
+        Ok(f)  : f,
+        Err(m) : return Err(fail(2, sprintf("%v: %s", name, &m))),
+    };
+    // Breaking a long line can leave text the style puts differently, so
+    // breaking and formatting repeat until neither changes anything: the
+    // result is then what formatting it again gives.
+    if (o.width > 0)
+    {
+        for (usize round = 0; round < 8; round += 1)
+        {
+            String broken = break_long_lines(String::as_view(&out), o.width);
+            String again = match (format_source(String::as_view(&broken)))
+            {
+                Ok(f)  : f,
+                Err(_) : broken,
+            };
+            if (again == out)
+            {
+                break;
+            }
+            out = again;
+        }
+    }
+    StringView result = String::as_view(&out);
+    match (same_tokens(src, result, o.width > 0))
+    {
+        Ok(_)    : {},
+        Err(why) : return Err(internal(name, &why)),
+    }
+    // The original was found to parse; the same text parses again.
+    if (!StringView::eq(src, result) && Option::is_some(&syntax(result, origin)))
+    {
+        return Err(internal(name, &String::from_str("the result does not parse")));
+    }
+    if (is_crlf(src) != is_crlf(result))
+    {
+        return Err(internal(name, &String::from_str("the line endings changed")));
+    }
+    Ok(out)
+}
+
+fn internal(StringView name, ref<String, shared> why) : Failure
+{
+    fail(3, sprintf("%v: internal error, file left as it was: %s (please report it)", name, why))
+}
+
+fn run_stdin(ref<Opts, shared> o) : u8
+{
+    String src = match (read_all())
+    {
+        Ok(s)  : s,
+        Err(_) :
+        {
+            eprintf("cobfmt: standard input is not readable UTF-8 text\n");
+            return 2;
+        },
+    };
+    String out = match (format_checked(o, String::as_view(&src), "<stdin>", ""))
+    {
+        Ok(out) : out,
+        Err(f)  :
+        {
+            eprintf("cobfmt: %s\n", &f.msg);
+            return f.code;
+        },
+    };
+    if (o.check)
+    {
+        if (out != src)
+        {
+            if (!o.quiet)
+            {
+                printf("<stdin>\n");
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if (o.diff)
+    {
+        if (out != src)
+        {
+            printf("%s", &unified(String::as_view(&src), String::as_view(&out), "<stdin>"));
+            return 1;
+        }
+        return 0;
+    }
+    printf("%s", &out);
+    0
+}
+
+fn run_file(ref<Opts, shared> o, StringView path, ref<usize, exclusive> changed) : u8
+{
+    Vec<u8> bytes = match (read_bytes(path))
+    {
+        Ok(b)  : b,
+        Err(e) :
+        {
+            eprintf("cobfmt: %v: cannot read: %s\n", path, FileError::text(&e));
+            return 2;
+        },
+    };
+    String src = match (String::from_utf8(bytes))
+    {
+        Ok(s)  : s,
+        Err(_) :
+        {
+            eprintf("cobfmt: %v: not UTF-8 (a CobaltC source file is UTF-8)\n", path);
+            return 2;
+        },
+    };
+    String out = match (format_checked(o, String::as_view(&src), path, path))
+    {
+        Ok(out) : out,
+        Err(f)  :
+        {
+            eprintf("cobfmt: %s\n", &f.msg);
+            return f.code;
+        },
+    };
+    if (o.stdout)
+    {
+        printf("%s", &out);
+        return 0;
+    }
+    if (out == src)
+    {
+        return 0;
+    }
+    *changed += 1;
+    if (o.check)
+    {
+        if (!o.quiet)
+        {
+            printf("%v\n", path);
+        }
+        return 1;
+    }
+    if (o.diff)
+    {
+        printf("%s", &unified(String::as_view(&src), String::as_view(&out), path));
+        return 1;
+    }
+    if (o.backup)
+    {
+        match (backup(path, String::as_view(&src)))
+        {
+            Ok(b)  :
+            {
+                if (!o.quiet)
+                {
+                    eprintf("cobfmt: %v: previous contents kept as %s\n", path, &b);
+                }
+            },
+            Err(e) :
+            {
+                eprintf("cobfmt: %v: cannot write the backup (%s); file left as it was\n", path, &e);
+                return 2;
+            },
+        }
+    }
+    match (replace_file(path, String::as_view(&out)))
+    {
+        Ok(_)  : {},
+        Err(e) :
+        {
+            eprintf("cobfmt: %v: cannot write: %s\n", path, &e);
+            return 2;
+        },
+    }
+    if (!o.quiet && !o.backup)
+    {
+        eprintf("cobfmt: formatted %v\n", path);
+    }
+    0
+}
+
+// `--width`'s number: at least 20.
+fn width_value(StringView v) : Option<usize>
+{
+    match (StringView::parse<usize>(v))
+    {
+        Ok(n)  : if (n >= 20) { Some(n) } else { None },
+        Err(_) : None,
+    }
+}
+
+fn main() : u8
+{
+    Vec<String> args = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(a)  : Vec::push(&mut args, a),
+            Err(_) : return usage_error("an argument is not UTF-8"),
+        }
+    }
+    if (Vec::len(&args) == 0)
+    {
+        eprintf("%s", USAGE);
+        return 2;
+    }
+    // Lines are broken at 120 characters unless `--width N` says
+    // otherwise or `--no-wrap` asks for lines to be left as they are.
+    Opts o = Opts {
+        .check = false,
+        .diff = false,
+        .stdout = false,
+        .backup = false,
+        .quiet = false,
+        .width = DEFAULT_WIDTH,
+        .paths = Vec::new(),
+    };
+    usize i = 0;
+    bool only_paths = false;
+    while (i < Vec::len(&args))
+    {
+        String a = String::clone(&args[i]);
+        i += 1;
+        if (only_paths || a == "-" || !String::starts_with(&a, "-"))
+        {
+            Vec::push(&mut o.paths, a);
+            continue;
+        }
+        if (a == "--")
+        {
+            only_paths = true;
+        }
+        else if (a == "--help" || a == "-h")
+        {
+            printf("%s", USAGE);
+            return 0;
+        }
+        else if (a == "--version" || a == "-V")
+        {
+            printf("cobfmt-cb 0.1.0 (CobaltC, the formatting of the guide, showcases and examples; written in CobaltC)\n");
+            return 0;
+        }
+        else if (a == "--check")
+        {
+            o.check = true;
+        }
+        else if (a == "--diff")
+        {
+            o.diff = true;
+        }
+        else if (a == "--stdout")
+        {
+            o.stdout = true;
+        }
+        else if (a == "--backup")
+        {
+            o.backup = true;
+        }
+        else if (a == "--quiet" || a == "-q")
+        {
+            o.quiet = true;
+        }
+        else if (a == "--no-wrap")
+        {
+            o.width = 0;
+        }
+        else if (a == "--width")
+        {
+            if (i >= Vec::len(&args))
+            {
+                return usage_error("--width needs a number");
+            }
+            StringView v = String::as_view(&args[i]);
+            i += 1;
+            match (width_value(v))
+            {
+                Some(n) : o.width = n,
+                None : return usage_error(String::as_view(&sprintf(
+                    "--width wants a number of at least 20, not `%v`",
+                    v,
+                ))),
+            }
+        }
+        else if (String::starts_with(&a, "--width="))
+        {
+            StringView v = String::view(&a, 8, String::len(&a));
+            match (width_value(v))
+            {
+                Some(n) : o.width = n,
+                None : return usage_error(String::as_view(&sprintf(
+                    "--width wants a number of at least 20, not `%v`",
+                    v,
+                ))),
+            }
+        }
+        else
+        {
+            return usage_error(String::as_view(&sprintf("unknown option `%s`", &a)));
+        }
+    }
+    if (Vec::len(&o.paths) == 0)
+    {
+        return usage_error("no file given (use `-` for standard input)");
+    }
+    if (o.check && o.diff)
+    {
+        return usage_error("--check and --diff cannot be used together");
+    }
+    if (o.stdout && (o.check || o.diff || o.backup))
+    {
+        return usage_error("--stdout cannot be combined with --check, --diff or --backup");
+    }
+    bool stdin = false;
+    foreach (p in &o.paths)
+    {
+        if (*p == "-")
+        {
+            stdin = true;
+        }
+    }
+    if (stdin)
+    {
+        if (Vec::len(&o.paths) > 1)
+        {
+            return usage_error("`-` (standard input) must be the only path");
+        }
+        if (o.backup)
+        {
+            return usage_error("--backup has no file to keep when reading standard input");
+        }
+        return run_stdin(&o);
+    }
+    // The files: each path, directories searched.
+    Vec<String> list = Vec::new();
+    foreach (p in &o.paths)
+    {
+        StringView pv = String::as_view(p);
+        if (is_dir(pv))
+        {
+            collect(pv, &mut list);
+        }
+        else if (exists(pv))
+        {
+            Vec::push(&mut list, String::clone(p));
+        }
+        else
+        {
+            eprintf("cobfmt: %s: no such file or directory\n", p);
+            return 2;
+        }
+    }
+    if (o.stdout && Vec::len(&list) != 1)
+    {
+        return usage_error("--stdout formats exactly one file");
+    }
+    u8 worst = 0;
+    usize changed = 0;
+    foreach (f in &list)
+    {
+        u8 st = run_file(&o, String::as_view(f), &mut changed);
+        if (st > worst)
+        {
+            worst = st;
+        }
+    }
+    if (!o.quiet && !o.stdout && !o.check && !o.diff && Vec::len(&list) > 1)
+    {
+        eprintf("cobfmt: %v file(s), %v changed\n", Vec::len(&list), changed);
+    }
+    worst
+}

@@ -1,0 +1,464 @@
+// Whether a text parses, and why not, as `coby::check::syntax` answers
+// (impl/src/check.rs): its file-backed modules expanded (relative to
+// `origin`), then parsed after the prelude; a program the parser builds
+// but rejects for a reason other than its syntax parses. The error is
+// `PLACE: MESSAGE (column C)`, PLACE a `FILE:LINE` or `line N`; or
+// `PLACE: ID` for a diagnostic.
+
+import std;
+import ast;
+import parser;
+import loader;
+import dump;
+import derive;
+import modres;
+import consts;
+import views;
+import items;
+import typecheck;
+import consteval;
+
+// `s` without the byte-order marks it begins with.
+fn strip_bom(StringView s) : StringView
+{
+    StringView r = s;
+    while (StringView::starts_with(r, "\u{feff}"))
+    {
+        r = StringView::sub(r, 3, StringView::len(r));
+    }
+    r
+}
+
+fn place(ref<Expansion, shared> ex, usize l) : String
+{
+    // A line inside `std` (`STD_LINE`): coby's lines before the program's.
+    if (l >= STD_LINE)
+    {
+        return String::from_str("line 0");
+    }
+    if (Option::is_none(&ex.error))
+    {
+        match (resolve_line(ex, l))
+        {
+            Some(o) : return sprintf("%s:%v", &o.file, o.line),
+            None    : {},
+        }
+    }
+    sprintf("line %v", l)
+}
+
+// `parse error at 3:13: expected …` as `3: expected … (column 13)`, and a
+// diagnostic `diag.x@N` as `N: diag.x`, each line placed.
+fn describe(ref<String, shared> e, ref<Expansion, shared> ex) : String
+{
+    foreach (prefix in ["parse error at ", "lex error at "])
+    {
+        match (String::strip_prefix(e, StringView::of(prefix)))
+        {
+            Some(rest) :
+            {
+                match (StringView::find(rest, ": "))
+                {
+                    Some(k) :
+                    {
+                        StringView pos = StringView::sub(rest, 0, k);
+                        StringView msg = StringView::sub(rest, k + 2, StringView::len(rest));
+                        match (StringView::find(pos, ":"))
+                        {
+                            Some(m) :
+                            {
+                                match (StringView::parse<usize>(StringView::sub(pos, 0, m)))
+                                {
+                                    Ok(l)  :
+                                    {
+                                        return sprintf(
+                                            "%s: %v (column %v)",
+                                            &place(ex, l),
+                                            msg,
+                                            StringView::sub(pos, m + 1, StringView::len(pos)),
+                                        );
+                                    },
+                                    Err(_) : {},
+                                }
+                            },
+                            None    : {},
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            None       : {},
+        }
+    }
+    Diag { id, detail, line } = split_diag(e);
+    match (line)
+    {
+        Some(l) : sprintf("%s: %s", &place(ex, l), &id),
+        None    : id,
+    }
+}
+
+// A diagnostic `diag.x\u{1}detail@N` (or `@N:C`) in its parts, as
+// `split_location` takes it apart: the id before the last `@N`, the
+// detail after `\u{1}`.
+struct Diag
+{
+    String id;
+    Option<String> detail;
+    Option<usize> line;
+}
+
+fn split_diag(ref<String, shared> e) : Diag
+{
+    StringView raw = String::as_view(e);
+    StringView body = raw;
+    Option<usize> at_line = None;
+    match (last_at(raw))
+    {
+        Some(k) :
+        {
+            StringView n = StringView::sub(raw, k + 1, StringView::len(raw));
+            StringView lpart = match (StringView::find(n, ":"))
+            {
+                Some(m) : StringView::sub(n, 0, m),
+                None    : n,
+            };
+            bool col_ok = match (StringView::find(n, ":"))
+            {
+                Some(m) : Result::is_ok(&StringView::parse<usize>(StringView::sub(n, m + 1, StringView::len(n)))),
+                None    : true,
+            };
+            match (StringView::parse<usize>(lpart))
+            {
+                Ok(l)  :
+                {
+                    if (col_ok)
+                    {
+                        body = StringView::sub(raw, 0, k);
+                        at_line = Some(l);
+                    }
+                },
+                Err(_) : {},
+            }
+        },
+        None    : {},
+    }
+    match (StringView::find(body, "\u{1}"))
+    {
+        Some(k) : Diag {
+            .id = String::from_view(StringView::sub(body, 0, k)),
+            .detail = Some(String::from_view(StringView::sub(body, k + 1, StringView::len(body)))),
+            .line = at_line,
+        },
+        None : Diag { .id = String::from_view(body), .detail = None, .line = at_line },
+    }
+}
+
+// `diag.x\u{1}message@N` as `PLACE: diag.x: message` (`--dump-resolved`,
+// which compares the messages too); a module file's error is placed by
+// the expansion's own lines.
+fn describe_diagnostic(ref<String, shared> e, ref<Expansion, shared> ex, bool loading) : String
+{
+    Diag d = split_diag(e);
+    String shown = match (&d.detail)
+    {
+        Some(t) : sprintf("%s: %s", &d.id, t),
+        None    : String::clone(&d.id),
+    };
+    match (d.line)
+    {
+        Some(l) :
+        {
+            String at = if (loading)
+            {
+                match (resolve_line(ex, l))
+                {
+                    Some(o) : sprintf("%s:%v", &o.file, o.line),
+                    None    : sprintf("line %v", if (l >= STD_LINE) { 0 } else { l }),
+                }
+            }
+            else
+            {
+                place(ex, l)
+            };
+            sprintf("%s: %s", &at, &shown)
+        },
+        None    : shown,
+    }
+}
+
+fn last_at(StringView s) : Option<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    usize k = StringView::len(s);
+    while (k > 0)
+    {
+        k -= 1;
+        if (b[k] == b'@')
+        {
+            return Some(k);
+        }
+    }
+    None
+}
+
+// The text the parser reads, and how its lines map back.
+fn prepared(StringView src, StringView origin) : Expansion
+{
+    StringView body = strip_bom(src);
+    Expansion ex = expand(body, origin);
+    if (Option::is_some(&ex.error))
+    {
+        // A module file that cannot be read is the other files' problem,
+        // not this one's syntax: the file is parsed on its own instead,
+        // its file-backed modules empty.
+        ex.text = stub_modules(body);
+    }
+    ex
+}
+
+// Whether `src` parses: `None`, or why not.
+export fn syntax(StringView src, StringView origin) : Option<String>
+{
+    Expansion ex = prepared(src, origin);
+    match (parse_text(&ex.text))
+    {
+        Ok(_)  : None,
+        Err(e) :
+        {
+            if (String::starts_with(&e, "diag.") && !String::starts_with(&e, "diag.syntax-error"))
+            {
+                return None;
+            }
+            Some(describe(&e, &ex))
+        },
+    }
+}
+
+// `coby --dump-resolved`'s text of `src` (CHG-0352): the program's own
+// part once `[Item-Duplicate]`, the derived functions and name resolution
+// have run over it and the prelude's declarations, or the error; with
+// `folded` (`--dump-folded`, CHG-0354), once the constants are folded and
+// the text literals viewed too: what the type checker reads.
+export fn dump_resolved_text(StringView src, StringView origin, bool folded) : Result<String, String>
+{
+    Expansion ex = expand(strip_bom(src), origin);
+    match (&ex.error)
+    {
+        Some(e) : return Err(describe_diagnostic(e, &ex, true)),
+        None    : {},
+    }
+    Program user = match (parse_text(&ex.text))
+    {
+        Ok(p)  : p,
+        Err(e) : return Err(failure(&e, &ex)),
+    };
+    Program program = parse_prelude();
+    Program { items, tests } = user;
+    Vec::append(&mut program.items, items);
+    program.tests = tests;
+    match (check_duplicates(&program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(failure(&e, &ex)),
+    }
+    add_derived(&mut program);
+    match (resolve_program(&mut program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(failure(&e, &ex)),
+    }
+    if (folded)
+    {
+        match (consts::process(&mut program))
+        {
+            Ok(_)  : {},
+            Err(e) : return Err(failure(&e, &ex)),
+        }
+        views::process(&mut program);
+    }
+    Ok(dump_program(&program, 1, 0))
+}
+
+// `coby --dump-checked`'s text of `src` (CHG-0355): `ok` once the whole
+// static pass accepts the program, or its error.
+// What the back end lowers: the checked program's items and the facts the
+// type checker recorded about them, and the map from its lines to files.
+export struct Checked
+{
+    export Items table;
+    export Facts facts;
+    export Expansion ex;
+    // What `check_more` needs to load and check a `std` body later.
+    export Front front;
+}
+
+// `coby --dump-checked`'s text: `ok` once the whole static pass accepts the
+// program, or the diagnostic.
+export fn checked_text(StringView src, StringView origin) : Result<String, String>
+{
+    match (check_text(src, origin))
+    {
+        Ok(_)  : Ok(String::from_str("ok\n")),
+        Err(e) : Err(e),
+    }
+}
+
+// The whole static pass over `src`: the checked program, or the diagnostic
+// as `coby` gives it.
+export fn check_text(StringView src, StringView origin) : Result<Checked, String>
+{
+    Parsed p = match (parse_user(src, origin))
+    {
+        Ok(p)  : p,
+        Err(r) : return Err(shown(&r)),
+    };
+    match (check_parsed(p, false))
+    {
+        Ok(c)  : Ok(c),
+        Err(r) : Err(shown(&r)),
+    }
+}
+
+// A rejection, raw (`diag.x\u{1}detail@N`, `parse error at L:C: …`, its
+// lines the expansion's), with the expansion that places it: what cobc's
+// driver renders as `coby` does (`render_located`). `loading` for the
+// loader's own.
+export struct Rejected
+{
+    export String raw;
+    export Expansion ex;
+    export bool loading;
+}
+
+// The program's own text expanded and parsed (after the prelude's tokens),
+// before the rest of the static pass (`check_parsed`): cobc's `--unittest`
+// adds its runner here.
+export struct Parsed
+{
+    export Program user;
+    export Expansion ex;
+}
+
+fn shown(ref<Rejected, shared> r) : String
+{
+    if (r.loading)
+    {
+        return describe_diagnostic(&r.raw, &r.ex, true);
+    }
+    failure(&r.raw, &r.ex)
+}
+
+fn rejected(String raw, Expansion ex) : Rejected
+{
+    Rejected { .raw = raw, .ex = ex, .loading = false }
+}
+
+export fn parse_user(StringView src, StringView origin) : Result<Parsed, Rejected>
+{
+    Expansion ex = expand(strip_bom(src), origin);
+    Option<String> error = clone(&ex.error);
+    match (error)
+    {
+        Some(raw) : return Err(Rejected { .raw = raw, .ex = ex, .loading = true }),
+        None      : {},
+    }
+    match (parse_text(&ex.text))
+    {
+        Ok(p)  : Ok(Parsed { .user = p, .ex = ex }),
+        Err(e) : Err(rejected(e, ex)),
+    }
+}
+
+// The rest of the static pass over a parsed program. `warn_shadow`
+// (`--warn-shadow`, CHG-0333): once its names are resolved, a note on
+// standard error for each item of the program that hides an imported one.
+export fn check_parsed(Parsed parsed, bool warn_shadow) : Result<Checked, Rejected>
+{
+    Parsed { user, ex } = parsed;
+    Program program = parse_prelude();
+    Program { items, tests } = user;
+    Vec::append(&mut program.items, items);
+    program.tests = tests;
+    match (check_duplicates(&program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(rejected(e, ex)),
+    }
+    add_derived(&mut program);
+    Resolver resolver = match (resolve_program(&mut program))
+    {
+        Ok(r)  : r,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    if (warn_shadow)
+    {
+        Vec<ShadowNote> notes = shadow_notes(&resolver, &program);
+        foreach (n in &notes)
+        {
+            match (resolve_line(&ex, n.line))
+            {
+                Some(o) : eprintf("%s\n  --> %s:%v\n", &n.text, &o.file, o.line),
+                None    : eprintf("%s\n", &n.text),
+            }
+        }
+    }
+    HashMap<String, Expr> lits = match (consts::process(&mut program))
+    {
+        Ok(l)  : l,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    Sigs sigs = views::process(&mut program);
+    Front front = Front { .resolver = resolver, .lits = lits, .sigs = sigs, .std_base = std_base() };
+    Items table = build_items(program);
+    number(&mut table);
+    Facts facts = new_facts();
+    Vec<StaticAssert> asserts = match (check_program(&mut table, &front, &mut facts))
+    {
+        Ok(a)  : a,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    // D-0162: the literals typed `String` through a generic, and the other
+    // rewrites, applied; the program is then checked again.
+    if (apply_rewrites(&mut table, &mut facts))
+    {
+        number(&mut table);
+        Facts again = new_facts();
+        asserts = match (check_program(&mut table, &front, &mut again))
+        {
+            Ok(a)  : a,
+            Err(e) : return Err(rejected(e, ex)),
+        };
+        if (literal_still_string(&again))
+        {
+            String m = String::from_str("diag.type-mismatch\u{1}a text literal here is a `String` in one instantiation of the generic function around it and another type in another; write `String::from_str(\"…\")` where a `String` is meant");
+            return Err(rejected(m, ex));
+        }
+        facts = again;
+    }
+    match (check_static_asserts(&table, &asserts))
+    {
+        Ok(_)  : Ok(Checked { .table = table, .facts = facts, .ex = ex, .front = front }),
+        Err(e) : Err(rejected(e, ex)),
+    }
+}
+
+fn failure(ref<String, shared> e, ref<Expansion, shared> ex) : String
+{
+    if (String::starts_with(e, "diag."))
+    {
+        return describe_diagnostic(e, ex, false);
+    }
+    describe(e, ex)
+}
+
+// `coby --dump-ast`'s text of `src`, or the error it prints.
+export fn dump_text(StringView src, StringView origin) : Result<String, String>
+{
+    Expansion ex = prepared(src, origin);
+    match (parse_text(&ex.text))
+    {
+        Ok(p)  : Ok(dump_program(&p, 0, 0)),
+        Err(e) : Err(describe(&e, &ex)),
+    }
+}

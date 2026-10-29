@@ -1,0 +1,74 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.atomic `Atomic::fetch_max`, `fetch_min`, `fetch_update`; D-0253; conf.atomic-max-min-update
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 313530202d3436332065786163740a6d6178206b6570742034302034300a757064617465642066726f6d20343020746f2038300a726566757365642061742038300a
+//
+// Three threads raise a high-water mark with `fetch_max` and lower a low
+// one with `fetch_min`; the results are the true extremes. `fetch_update`
+// stores `f`'s value when it gives one and reports the value it saw.
+
+import std;
+
+fn observe(ref<Atomic<i64>, shared> hi, ref<Atomic<i64>, shared> lo, i64 base)
+{
+    for (i64 k = 0; k < 50; k += 1)
+    {
+        i64 v = (base * 37 + k * 11) % 1000 - 500;
+        _ = Atomic::fetch_max(hi, v);
+        _ = Atomic::fetch_min(lo, v);
+    }
+}
+
+fn main()
+{
+    Atomic<i64> hi = Atomic::new(min_value<i64>());
+    Atomic<i64> lo = Atomic::new(max_value<i64>());
+    {
+        handle<void> a = spawn(observe, &hi, &lo, 1: i64);
+        handle<void> b = spawn(observe, &hi, &lo, 2: i64);
+        handle<void> c = spawn(observe, &hi, &lo, 3: i64);
+    }
+    i64 want_hi = min_value<i64>();
+    i64 want_lo = max_value<i64>();
+    for (i64 base = 1; base <= 3; base += 1)
+    {
+        for (i64 k = 0; k < 50; k += 1)
+        {
+            i64 v = (base * 37 + k * 11) % 1000 - 500;
+            want_hi = max(want_hi, v);
+            want_lo = min(want_lo, v);
+        }
+    }
+    printf(
+        "%d %d %s\n",
+        Atomic::load(&hi),
+        Atomic::load(&lo),
+        if (Atomic::load(&hi) == want_hi && Atomic::load(&lo) == want_lo) { "exact" } else { "wrong" },
+    );
+    Atomic<u32> n = Atomic::new(40: u32);
+    printf("max kept %d %d\n", Atomic::fetch_max(&n, 10), Atomic::load(&n));
+    u32 limit = 100;
+    fn(u32) : Option<u32> double_below = move [limit](u32 x) : Option<u32>
+    {
+        if (x * 2 <= limit)
+        {
+            Some(x * 2)
+        }
+        else
+        {
+            None
+        }
+    };
+    match (Atomic::fetch_update(&n, double_below))
+    {
+        Ok(p)  : printf("updated from %d to %d\n", p, Atomic::load(&n)),
+        Err(p) : printf("refused at %d\n", p),
+    }
+    match (Atomic::fetch_update(&n, double_below))
+    {
+        Ok(p)  : printf("updated from %d\n", p),
+        Err(p) : printf("refused at %d\n", p),
+    }
+}

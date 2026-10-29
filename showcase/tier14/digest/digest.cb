@@ -1,0 +1,168 @@
+// A library C calls (D-0257). There is no `main`: each `extern fn` with a
+// body is an entry point C calls by that name, and `cobc --lib` builds
+// `libdigest.a` with `digest.h`, which declares `struct Digest` as C sees
+// it (its layout asserted), every entry point, and a `_try` form of each
+// that contains a fault instead of ending the process. The entry points
+// are thin: each turns C's pointer and length into a `Vec` (a copy, so
+// nothing C does later can change it under the library), hands it to an
+// ordinary CobaltC function, and copies a result back into C's buffer
+// with `copy_to_raw`. Those ordinary functions are what the `unittest`
+// blocks test, under either tool: `coby --unittest digest.cb`. Every
+// check stays on inside the library: a C caller that hands over a buffer
+// too small for the answer is a fault at the `assert`, not an overrun
+// (`main.c` contains one with `digest_hex_try`). Nothing is kept between
+// calls, so C threads may call in at once. `make` builds and runs it.
+import std;
+
+/// A SHA-256 digest, passed and returned by value; C sees
+/// `struct Digest { uint8_t bytes[32]; }`.
+struct Digest
+{
+    array<u8, 32> bytes;
+}
+
+// The bytes C passed, as a `Vec` of their own.
+fn bytes_in(rawptr<u8> data, usize len) : Vec<u8>
+{
+    unsafe { Vec::from_raw(data, len) }
+}
+
+// `text` and a NUL into C's buffer of `cap` bytes, for `who`; the
+// text's length. Too small a buffer is the caller's bug: a fault.
+fn text_out(str who, ref<String, shared> text, rawptr<u8> out, usize cap) : usize
+{
+    usize n = String::len(text);
+    assert(cap > n, "%s: the buffer holds %v bytes, %v are needed", who, cap, n + 1);
+    Vec<u8> bytes = Vec::new();
+    Vec::extend_from(&mut bytes, StringView::as_bytes(&text[0 .. $]));
+    Vec::push(&mut bytes, 0);
+    unsafe
+    {
+        copy_to_raw(&bytes[0 .. $], out);
+    }
+    n
+}
+
+fn hex_of(ref<Digest, shared> d) : String
+{
+    to_hex(&d.bytes[0 .. $])
+}
+
+// 1 when `text` is the digest in hex, 0 when it is another digest, -1
+// when it is not 64 hex digits at all.
+fn check_hex(ref<Digest, shared> d, StringView text) : i32
+{
+    match (from_hex(text))
+    {
+        Ok(bytes) :
+        {
+            if (Vec::len(&bytes) != 32)
+            {
+                return -1;
+            }
+            if (digest_eq(&d.bytes[0 .. $], &bytes[0 .. $])) { 1 } else { 0 }
+        },
+        Err(_)    : -1,
+    }
+}
+
+/// The SHA-256 digest of `len` bytes at `data`.
+extern fn digest_sha256(rawptr<u8> data, usize len) : Digest
+{
+    Vec<u8> bytes = bytes_in(data, len);
+    Digest { .bytes = sha256(&bytes[0 .. $]) }
+}
+
+/// HMAC-SHA-256 of `len` bytes at `data` under the `key_len`-byte key.
+extern fn digest_hmac(rawptr<u8> key, usize key_len, rawptr<u8> data, usize len) : Digest
+{
+    Vec<u8> k = bytes_in(key, key_len);
+    Vec<u8> bytes = bytes_in(data, len);
+    Digest { .bytes = hmac_sha256(&k[0 .. $], &bytes[0 .. $]) }
+}
+
+/// The CRC-32 (IEEE, as zlib computes it) of `len` bytes at `data`.
+extern fn digest_crc32(rawptr<u8> data, usize len) : u32
+{
+    Vec<u8> bytes = bytes_in(data, len);
+    crc32(&bytes[0 .. $])
+}
+
+/// The digest as 64 lower-case hex digits and a NUL, into `out`, which
+/// holds `cap` bytes (65 are needed); the 64.
+extern fn digest_hex(Digest d, rawptr<u8> out, usize cap) : usize
+{
+    String text = hex_of(&d);
+    text_out("digest_hex", &text, out, cap)
+}
+
+/// `len` bytes at `data` as base64 text and a NUL, into `out`, which
+/// holds `cap` bytes (4 * ceil(len / 3) + 1 are needed); the text's length.
+extern fn digest_base64(rawptr<u8> data, usize len, rawptr<u8> out, usize cap) : usize
+{
+    Vec<u8> bytes = bytes_in(data, len);
+    String text = base64_encode(&bytes[0 .. $]);
+    text_out("digest_base64", &text, out, cap)
+}
+
+/// Whether two digests are the same, in time that does not depend on
+/// where they differ.
+extern fn digest_equal(Digest a, Digest b) : bool
+{
+    digest_eq(&a.bytes[0 .. $], &b.bytes[0 .. $])
+}
+
+/// Whether the C string `text` is `d` in hex: 1 when it is, 0 when it is
+/// another digest, -1 when it is not 64 hex digits (or not UTF-8).
+extern fn digest_check_hex(Digest d, rawptr<u8> text) : i32
+{
+    match (unsafe { String::from_c(text) })
+    {
+        Ok(s)  : check_hex(&d, &s[0 .. $]),
+        Err(_) : -1,
+    }
+}
+
+unittest "sha256 and hex of abc"
+{
+    Vec<u8> abc = Vec::new();
+    Vec::extend_from(&mut abc, StringView::as_bytes("abc"));
+    Digest d = Digest { .bytes = sha256(&abc[0 .. $]) };
+    assert(hex_of(&d) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+unittest "check_hex tells a match, another digest and bad text apart"
+{
+    Vec<u8> abc = Vec::new();
+    Vec::extend_from(&mut abc, StringView::as_bytes("abc"));
+    Digest d = Digest { .bytes = sha256(&abc[0 .. $]) };
+    assert(check_hex(&d, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 1);
+    assert(check_hex(&d, "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD") == 1);
+    assert(check_hex(&d, "0000000000000000000000000000000000000000000000000000000000000000") == 0);
+    assert(check_hex(&d, "ba7816bf") == -1);
+    assert(check_hex(&d, "not hex") == -1);
+}
+
+unittest "text_out writes the text and a NUL"
+{
+    String text = String::from_str("hello");
+    match (allocate(8, 1))
+    {
+        Ok(p)  :
+        {
+            unsafe
+            {
+                for (isize i = 0; i < 8; i += 1)
+                {
+                    *(p + i) = 0xff;
+                }
+                usize n = text_out("test", &text, p, 8);
+                assert(n == 5);
+                Vec<u8> back = Vec::from_raw(p, 8);
+                assert(back[0] == b'h' && back[4] == b'o' && back[5] == 0 && back[6] == 0xff);
+                deallocate(p, 8, 1);
+            }
+        },
+        Err(_) : assert(false, "no memory for the test"),
+    }
+}

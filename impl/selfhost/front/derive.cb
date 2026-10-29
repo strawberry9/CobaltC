@@ -1,0 +1,383 @@
+// D-0116 and D-0118, as impl/src/derive.rs writes them: a derived
+// `T::clone` for every struct or enum that declares none, is not marked
+// `resource` and has a field that may own a resource, and a `bitstruct`'s
+// `Name::bits` and `Name::from_bits`; ordinary functions added to the
+// program before its names are resolved.
+
+import std;
+import ast;
+
+export fn add_derived(ref<Program, exclusive> p)
+{
+    add_in(&mut p.items);
+}
+
+fn add_in(ref<Vec<Item>, exclusive> items)
+{
+    HashSet<String> declared = HashSet::new();
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(f) :
+            {
+                ref<FnDecl, shared> d = Box::get(f);
+                match (&d.assoc_type)
+                {
+                    Some(t) :
+                    {
+                        if (String::eq_str(&d.name, "clone"))
+                        {
+                            HashSet::insert(&mut declared, String::clone(t));
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            _            : {},
+        }
+    }
+    Vec<Item> made = Vec::new();
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IStruct(b) :
+            {
+                ref<StructDecl, shared> s = Box::get(b);
+                if (Option::is_some(&s.bits))
+                {
+                    Vec::push(&mut made, Item::IFn(Box::new(bitstruct_bits(s))));
+                    Vec::push(&mut made, Item::IFn(Box::new(bitstruct_from_bits(s))));
+                }
+                else if (!s.resource_ && !HashSet::contains(&declared, &s.name) && fields_may_own(&s.fields))
+                {
+                    Vec::push(&mut made, Item::IFn(Box::new(struct_clone(s))));
+                }
+            },
+            Item::IEnum(b)   :
+            {
+                ref<EnumDecl, shared> e = Box::get(b);
+                if (!e.resource_ && !HashSet::contains(&declared, &e.name) && payloads_may_own(&e.variants))
+                {
+                    Vec::push(&mut made, Item::IFn(Box::new(enum_clone(e))));
+                }
+            },
+            _                : {},
+        }
+    }
+    Vec::append(items, made);
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IModule(m) : add_in(&mut Box::get_mut(m).items),
+            _                : {},
+        }
+    }
+}
+
+fn fields_may_own(ref<Vec<FieldDecl>, shared> fs) : bool
+{
+    for (usize i = 0; i < Vec::len(fs); i += 1)
+    {
+        if (may_own(&fs[i].ty))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn payloads_may_own(ref<Vec<VariantDecl>, shared> vs) : bool
+{
+    for (usize i = 0; i < Vec::len(vs); i += 1)
+    {
+        match (&vs[i].payload)
+        {
+            Some(t) :
+            {
+                if (may_own(t))
+                {
+                    return true;
+                }
+            },
+            None    : {},
+        }
+    }
+    false
+}
+
+// A field type that may own a resource, so a read is not a copy: a named
+// type (a struct, an enum, `String`, `Vec<…>`, …) or an array of one.
+fn may_own(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(_) : true,
+        Type::TArray(s) : may_own(&Box::get(s).inner),
+        _               : false,
+    }
+}
+
+fn self_type(ref<String, shared> name, ref<Vec<String>, shared> params) : Type
+{
+    Vec<Type> args = Vec::new();
+    for (usize i = 0; i < Vec::len(params); i += 1)
+    {
+        Vec::push(&mut args, named(String::as_view(&params[i]), Vec::new()));
+    }
+    named(String::as_view(name), args)
+}
+
+fn path_of(Vec<String> segs, usize line) : Expr
+{
+    mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), line, 0)
+}
+
+fn path_word(str w, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::from_str(w));
+    path_of(segs, line)
+}
+
+fn call_of(Expr callee, Vec<Expr> args, usize line) : Expr
+{
+    mk(ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = args })), line, 0)
+}
+
+fn clone_of(Expr arg, usize line) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, arg);
+    call_of(path_word("clone", line), args, line)
+}
+
+fn field_of(Expr e, ref<String, shared> name, usize line) : Expr
+{
+    mk(ExprKind::EField(Box::new(FieldExpr { .e = e, .name = String::clone(name) })), line, 0)
+}
+
+fn header(ref<String, shared> name, ref<Vec<String>, shared> params, usize line, Block body, bool export_) : FnDecl
+{
+    Vec<Option<Bound>> bounds = Vec::new();
+    for (usize i = 0; i < Vec::len(params); i += 1)
+    {
+        Vec::push(&mut bounds, Some(Bound::BClone));
+    }
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl {
+        .ty = Type::TRef(Box::new(ModedTy { .inner = self_type(name, params), .mode = Mode::Shared })),
+        .name = String::from_str("self"),
+    });
+    FnDecl {
+        .export_ = export_,
+        .assoc_type = Some(String::clone(name)),
+        .name = String::from_str("clone"),
+        .type_params = Vec::clone(params),
+        .type_bounds = bounds,
+        .params = ps,
+        .ret = self_type(name, params),
+        .body = body,
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+    }
+}
+
+// D-0118: `fn Name::bits(Name v) : uN { widen<uN>(v.f0) << 0 | … }` and
+// `fn Name::from_bits(uN b) : Name { Name { .f0 = narrow<t0>(b & m0), … } }`,
+// the fields low bit first; a field as wide as the backing type is taken
+// as it is.
+fn lit_of(u128 v, IntTy ty, usize line) : Expr
+{
+    mk(ExprKind::EInt(Box::new(IntLit { .v = v, .sfx = Some(String::from_str(int_ty_name(ty))) })), line, 0)
+}
+
+fn call_generic(str name, Type targ, Expr arg, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::from_str(name));
+    Vec<Type> targs = Vec::new();
+    Vec::push(&mut targs, targ);
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, arg);
+    call_of(mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = targs })), line, 0), args, line)
+}
+
+fn bin(BinOp op, Expr a, Expr b, usize line) : Expr
+{
+    binary(op, a, b, line, 0)
+}
+
+fn is_int(ref<Type, shared> t, IntTy it) : bool
+{
+    match (t)
+    {
+        Type::TInt(i) : *i == it,
+        _             : false,
+    }
+}
+
+fn bitstruct_bits(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    IntTy backing = Option::expect(s.bits, "bitstruct");
+    Option<Expr> acc = None;
+    u32 off = 0;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<FieldDecl, shared> f = &s.fields[i];
+        u32 w = Option::expect(f.width, "width");
+        Expr field = field_of(path_word("v", line), &f.name, line);
+        Expr wide = if (is_int(
+            &f.ty,
+            backing,
+        )) { field } else { call_generic("widen", Type::TInt(backing), field, line) };
+        Expr placed = if (off == 0) { wide } else
+        {
+            bin(
+                BinOp::Shl,
+                wide,
+                lit_of(widen<u128>(off), IntTy::U32, line),
+                line,
+            )
+        };
+        acc = match (acc)
+        {
+            None    : Some(placed),
+            Some(a) : Some(bin(BinOp::BitOr, a, placed, line)),
+        };
+        off += w;
+    }
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl { .ty = self_type(&s.name, &Vec::new()), .name = String::from_str("v") });
+    FnDecl {
+        .export_ = s.export_,
+        .assoc_type = Some(String::clone(&s.name)),
+        .name = String::from_str("bits"),
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = ps,
+        .ret = Type::TInt(backing),
+        .body = block_of(Vec::new(), Some(Option::expect(acc, "a bitstruct has fields"))),
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+    }
+}
+
+fn bitstruct_from_bits(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    IntTy backing = Option::expect(s.bits, "bitstruct");
+    Vec<FieldInit> fields = Vec::new();
+    u32 off = 0;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<FieldDecl, shared> f = &s.fields[i];
+        u32 w = Option::expect(f.width, "width");
+        u128 one = 1;
+        u128 mask = if (w >= 128) { max_value<u128>() } else { (one << w) - 1 };
+        Expr shifted = if (off == 0)
+        {
+            path_word(
+                "b",
+                line,
+            )
+        }
+        else { bin(BinOp::Shr, path_word("b", line), lit_of(widen<u128>(off), IntTy::U32, line), line) };
+        Expr masked = bin(BinOp::BitAnd, shifted, lit_of(mask, backing, line), line);
+        Expr value = if (is_int(&f.ty, backing)) { masked } else { call_generic("narrow", clone(&f.ty), masked, line) };
+        Vec::push(&mut fields, FieldInit { .name = String::clone(&f.name), .value = value });
+        off += w;
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    Expr lit = mk(
+        ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })),
+        line,
+        0,
+    );
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl { .ty = Type::TInt(backing), .name = String::from_str("b") });
+    FnDecl {
+        .export_ = s.export_,
+        .assoc_type = Some(String::clone(&s.name)),
+        .name = String::from_str("from_bits"),
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = ps,
+        .ret = self_type(&s.name, &Vec::new()),
+        .body = block_of(Vec::new(), Some(lit)),
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+    }
+}
+
+fn struct_clone(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    Vec<FieldInit> fields = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<String, shared> name = &s.fields[i].name;
+        Expr place = field_of(path_word("self", line), name, line);
+        Expr borrowed = mk(ExprKind::EBorrow(Box::new(BorrowExpr { .mode = Mode::Shared, .e = place })), line, 0);
+        Vec::push(&mut fields, FieldInit { .name = String::clone(name), .value = clone_of(borrowed, line) });
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    Expr lit = mk(
+        ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })),
+        line,
+        0,
+    );
+    header(&s.name, &s.type_params, line, block_of(Vec::new(), Some(lit)), s.export_)
+}
+
+fn enum_clone(ref<EnumDecl, shared> e) : FnDecl
+{
+    usize line = e.line;
+    Vec<Arm> arms = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[i];
+        Vec<String> segs = Vec::new();
+        Vec::push(&mut segs, String::clone(&e.name));
+        Vec::push(&mut segs, String::clone(&v.name));
+        Expr make = path_of(segs, line);
+        if (Option::is_some(&v.payload))
+        {
+            Vec<Expr> args = Vec::new();
+            Vec::push(&mut args, clone_of(path_word("p", line), line));
+            Vec::push(&mut arms, Arm {
+                .variant = Some(String::clone(&v.name)),
+                .nested = Vec::new(),
+                .binder = Some(String::from_str("p")),
+                .lit = None,
+                .body = Box::new(call_of(make, args, line)),
+            });
+        }
+        else
+        {
+            Vec::push(&mut arms, Arm {
+                .variant = Some(String::clone(&v.name)),
+                .nested = Vec::new(),
+                .binder = None,
+                .lit = None,
+                .body = Box::new(make),
+            });
+        }
+    }
+    Expr m = mk(ExprKind::EMatch(Box::new(MatchExpr { .scrut = path_word("self", line), .arms = arms })), line, 0);
+    header(&e.name, &e.type_params, line, block_of(Vec::new(), Some(m)), e.export_)
+}

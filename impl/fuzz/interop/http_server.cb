@@ -1,0 +1,84 @@
+// Interop (WI-7): std::http's server for curl. Usage: http_server COUNT.
+// Listens on a loopback port, prints `port N`, and answers COUNT requests
+// (several may share a kept-alive connection): `/hello` with a line,
+// `/big` with 100000 bytes, `/echo` with the length of the body it was
+// sent (curl sends it chunked when asked), `/headers` with the number of
+// header bytes it received; anything else is 404.
+import std;
+
+fn main() : u8
+{
+    usize count = Result::unwrap(StringView::parse<usize>(String::as_view(&Result::unwrap(arg(0)))));
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    printf("port %v\n", HttpServer::local_addr(&s).port);
+    flush_stdout();
+    usize served = 0;
+    while (served < count)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c)  : c,
+            Err(e) :
+            {
+                printf("accept failed: %v\n", HttpError::text(&e));
+                flush_stdout();
+                served += 1;
+                continue;
+            },
+        };
+        while (served < count)
+        {
+            Request req = match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) : r,
+                Ok(None)    : break,
+                Err(e)      :
+                {
+                    printf("request failed: %v\n", HttpError::text(&e));
+                    served += 1;
+                    break;
+                },
+            };
+            served += 1;
+            Vec<Header> h = Vec::new();
+            String body = String::new();
+            u16 status = 200;
+            if (String::eq_str(&req.url, "/hello"))
+            {
+                String::append(&mut body, "hello\n");
+            }
+            else if (String::eq_str(&req.url, "/big"))
+            {
+                for (usize i = 0; i < 100000; i += 1)
+                {
+                    String::push_ascii(&mut body, b'a' + narrow<u8>(i % 26));
+                }
+            }
+            else if (String::eq_str(&req.url, "/echo"))
+            {
+                String::append(&mut body, Vec::len(&req.body));
+                String::append(&mut body, "\n");
+            }
+            else if (String::eq_str(&req.url, "/headers"))
+            {
+                usize n = 0;
+                foreach (x in &req.headers)
+                {
+                    n += String::len(&x.name) + String::len(&x.value);
+                }
+                String::append(&mut body, n);
+                String::append(&mut body, "\n");
+            }
+            else
+            {
+                status = 404;
+                String::append(&mut body, "not found\n");
+            }
+            printf("%v %v %v\n", &req.method, &req.url, status);
+            flush_stdout();
+            _ = HttpConnection::respond(&mut c, status, &h[0..$], &String::as_bytes(&body)[0..$]);
+        }
+        HttpConnection::close(&mut c);
+    }
+    0
+}

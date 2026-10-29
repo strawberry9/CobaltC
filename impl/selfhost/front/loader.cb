@@ -1,0 +1,304 @@
+// File-backed module declarations (spec/17 §5, `rule.module.file`), as
+// impl/src/loader.rs expands them: `[export] module m "p";` replaced by
+// `[export] module m {` + the named file's own (recursively expanded) text
+// + `}`, before the program is parsed; a map from each expanded line back
+// to its file and line; the three static rejections raised here.
+
+import std;
+import lexer;
+
+export struct Origin
+{
+    export String file;
+    export usize line;
+}
+
+export struct Expansion
+{
+    export String text;
+    export Vec<Origin> map;
+    // `"diag.xxx@N"`, N a line in `text`, when a declaration could not be expanded.
+    export Option<String> error;
+    // The files read as file-backed modules, canonical, sorted (loader.rs's
+    // `loaded`).
+    export Vec<String> loaded;
+}
+
+struct Out
+{
+    Vec<u8> text;
+    Vec<Origin> map;
+    bool has_cur;
+    Origin cur;
+}
+
+struct Ctx
+{
+    Vec<String> stack;
+    HashSet<String> seen;
+    Out out;
+}
+
+// Appends `s`, whose first character sits at `line` of `name`.
+fn out_write(ref<Out, exclusive> o, StringView s, ref<String, shared> name, usize first_line)
+{
+    usize line = first_line;
+    foreach (b in StringView::as_bytes(s))
+    {
+        if (!o.has_cur)
+        {
+            o.cur = Origin { .file = String::clone(name), .line = line };
+            o.has_cur = true;
+        }
+        Vec::push(&mut o.text, *b);
+        if (*b == b'\n')
+        {
+            Vec::push(&mut o.map, replace(&mut o.cur, Origin { .file = String::new(), .line = 0 }));
+            o.has_cur = false;
+            line += 1;
+        }
+    }
+}
+
+fn out_end_line(ref<Out, exclusive> o)
+{
+    if (o.has_cur)
+    {
+        Vec::push(&mut o.text, b'\n');
+        Vec::push(&mut o.map, replace(&mut o.cur, Origin { .file = String::new(), .line = 0 }));
+        o.has_cur = false;
+    }
+}
+
+// The file and line expanded line `line` (1-based) came from.
+export fn resolve_line(ref<Expansion, shared> ex, usize line) : Option<Origin>
+{
+    if (line == 0 || line > Vec::len(&ex.map))
+    {
+        return None;
+    }
+    Some(clone(&ex.map[line - 1]))
+}
+
+fn parent_dir(StringView p) : String
+{
+    match (path_parent(p))
+    {
+        Some(d) : if (String::len(&d) == 0) { String::from_str(".") } else { d },
+        None    : String::from_str("."),
+    }
+}
+
+fn canonical(StringView p) : Option<String>
+{
+    Result::ok(path_canonical(p))
+}
+
+// `origin` is the entry file's own path (empty for none: a program given
+// as text, resolved against the working directory).
+// `text` with each file-backed module declaration's path and `;` turned
+// into an empty body (`module m {   }`), every line and column kept: what
+// a parse check reads when the files cannot be loaded (`check::syntax`).
+export fn stub_modules(StringView text) : String
+{
+    String owned = String::from_view(text);
+    Vec<PTok> toks = match (lex_tokens(&owned))
+    {
+        Ok(t)  : t,
+        Err(_) :
+        {
+            return owned;
+        },
+    };
+    Vec<usize> line_starts = Vec::new();
+    Vec::push(&mut line_starts, 0);
+    Vec<u8> out = Vec::new();
+    slice<u8, shared> bytes = StringView::as_bytes(text);
+    for (usize k = 0; k < StringView::len(text); k += 1)
+    {
+        Vec::push(&mut out, bytes[k]);
+        if (bytes[k] == b'\n')
+        {
+            Vec::push(&mut line_starts, k + 1);
+        }
+    }
+    usize n = Vec::len(&toks);
+    for (usize i = 0; i + 3 < n; i += 1)
+    {
+        if (toks[i].tok == Tok::Module && toks[i + 1].tok == Tok::Ident && toks[i + 2].tok == Tok::Str && toks[i + 3].tok == Tok::Semi)
+        {
+            usize from = line_starts[toks[i + 2].line - 1] + toks[i + 2].col - 1;
+            usize to = line_starts[toks[i + 3].line - 1] + toks[i + 3].col - 1;
+            for (usize k = from; k <= to; k += 1)
+            {
+                if (out[k] != b'\n')
+                {
+                    out[k] = b' ';
+                }
+            }
+            out[from] = b'{';
+            out[to] = b'}';
+        }
+    }
+    Result::expect(String::from_utf8(out), "a module path is replaced by spaces only")
+}
+
+export fn expand(StringView src, StringView origin) : Expansion
+{
+    bool has = StringView::len(origin) > 0;
+    Option<String> entry = None;
+    String name = if (has) { String::from_view(origin) } else { String::from_str("<input>") };
+    String dir = if (has) { parent_dir(origin) } else { String::from_str(".") };
+    Ctx ctx = Ctx {
+        .stack = Vec::new(),
+        .seen = HashSet::new(),
+        .out = Out { .text = Vec::new(), .map = Vec::new(), .has_cur = false, .cur = Origin { .file = String::new(), .line = 0 } },
+    };
+    if (has)
+    {
+        match (canonical(origin))
+        {
+            Some(c) :
+            {
+                HashSet::insert(&mut ctx.seen, String::clone(&c));
+                entry = Some(String::clone(&c));
+                Vec::push(&mut ctx.stack, c);
+            },
+            None    : {},
+        }
+    }
+    Option<String> error = match (expand_text(&mut ctx, src, &name, String::as_view(&dir)))
+    {
+        Ok(_)  : None,
+        Err(e) : Some(e),
+    };
+    Ctx { stack, seen, out } = ctx;
+    Out { text, map, has_cur, cur } = out;
+    Vec<String> loaded = Vec::new();
+    for (usize i = 0; i < HashSet::len(&seen); i += 1)
+    {
+        ref<String, shared> f = HashSet::key_at(&seen, i);
+        bool is_entry = match (&entry)
+        {
+            Some(e) : *e == *f,
+            None    : false,
+        };
+        if (!is_entry)
+        {
+            Vec::push(&mut loaded, String::clone(f));
+        }
+    }
+    Vec::sort(&mut loaded);
+    Expansion { .text = Result::expect(
+        String::from_utf8(text),
+        "the expanded text is UTF-8",
+    ), .map = map, .error = error, .loaded = loaded }
+}
+
+fn expand_text(
+    ref<Ctx, exclusive> ctx,
+    StringView text,
+    ref<String, shared> name,
+    StringView dir,
+) : Result<void, String>
+{
+    String owned = String::from_view(text);
+    Vec<PTok> toks = match (lex_tokens(&owned))
+    {
+        Ok(t)  : t,
+        // The parser reports lexical errors; pass the text through untouched.
+        Err(_) :
+        {
+            out_write(&mut ctx.out, text, name, 1);
+            out_end_line(&mut ctx.out);
+            return Ok(());
+        },
+    };
+    Vec<usize> line_starts = Vec::new();
+    Vec::push(&mut line_starts, 0);
+    slice<u8, shared> bytes = StringView::as_bytes(text);
+    for (usize k = 0; k < StringView::len(text); k += 1)
+    {
+        if (bytes[k] == b'\n')
+        {
+            Vec::push(&mut line_starts, k + 1);
+        }
+    }
+    usize cursor = 0;
+    usize cursor_line = 1;
+    usize i = 0;
+    usize n = Vec::len(&toks);
+    while (i < n)
+    {
+        usize j = if (toks[i].tok == Tok::Export) { i + 1 } else { i };
+        bool decl = j + 3 < n && toks[j].tok == Tok::Module && toks[j + 1].tok == Tok::Ident && toks[j + 2].tok == Tok::Str && toks[j + 3].tok == Tok::Semi;
+        if (!decl)
+        {
+            i += 1;
+            continue;
+        }
+        usize at = line_starts[toks[i].line - 1] + toks[i].col - 1;
+        out_write(&mut ctx.out, StringView::sub(text, cursor, at), name, cursor_line);
+        String head = sprintf("%smodule %s {\n", if (j > i) { "export " } else { "" }, &toks[j + 1].text);
+        out_write(&mut ctx.out, String::as_view(&head), name, toks[i].line);
+        usize decl_line = Vec::len(&ctx.out.map);
+        load(ctx, String::as_view(&toks[j + 2].text), dir, decl_line)?;
+        out_end_line(&mut ctx.out);
+        out_write(&mut ctx.out, "}", name, toks[j + 3].line);
+        cursor = line_starts[toks[j + 3].line - 1] + toks[j + 3].col;
+        cursor_line = toks[j + 3].line;
+        i = j + 4;
+    }
+    out_write(&mut ctx.out, StringView::sub(text, cursor, StringView::len(text)), name, cursor_line);
+    out_end_line(&mut ctx.out);
+    Ok(())
+}
+
+fn load(ref<Ctx, exclusive> ctx, StringView path, StringView dir, usize decl_line) : Result<void, String>
+{
+    StringView rel = Option::unwrap_or(StringView::strip_prefix(path, "./"), path);
+    String joined = if (path_is_absolute(rel) || StringView::eq_str(
+        dir,
+        ".",
+    )) { String::from_view(rel) } else { path_join(dir, rel) };
+    StringView jv = String::as_view(&joined);
+    bool is_file = match (path_kind(jv))
+    {
+        Ok(File(_)) : true,
+        _           : false,
+    };
+    String canon = match (canonical(jv))
+    {
+        Some(c) : if (is_file) { c } else { String::new() },
+        None    : String::new(),
+    };
+    if (String::len(&canon) == 0)
+    {
+        return Err(sprintf(
+            "diag.module-file-not-found\u{1}no file `%s` (a module file's path is relative to the file that declares it)@%v",
+            &joined,
+            decl_line,
+        ));
+    }
+    if (Vec::contains(&ctx.stack, &canon))
+    {
+        return Err(sprintf("diag.module-cycle@%v", decl_line));
+    }
+    if (!HashSet::insert(&mut ctx.seen, String::clone(&canon)))
+    {
+        return Err(sprintf(
+            "diag.module-file-duplicate\u{1}`%s` is already a module of this program; declare each file once -- a module declared in an enclosing module (the root, say) is visible here already, so `import` it by name instead@%v",
+            &joined,
+            decl_line,
+        ));
+    }
+    String text = match (read_file(String::as_view(&canon)))
+    {
+        Ok(t)  : t,
+        Err(_) : return Err(sprintf("diag.module-file-not-found@%v", decl_line)),
+    };
+    Vec::push(&mut ctx.stack, canon);
+    Result<void, String> r = expand_text(ctx, String::as_view(&text), &joined, String::as_view(&parent_dir(jv)));
+    Vec::pop(&mut ctx.stack);
+    r
+}

@@ -1,0 +1,2098 @@
+// cbc's compiler driver: impl/cobc/src/main.rs written in CobaltC, so that
+// `cbc` takes cobc's command line and does what cobc does with it.
+//
+//   cbc [--run] [--keep-c] [-v] [-s] [-O LEVEL] [-march=CPU] [--cc COMPILER] [-o OUT] FILE.cb
+//   cbc --check PATH...
+//   cbc --check-syntax [--origin PATH] (FILE | -)
+//   cbc --help
+//
+// Front end: impl/selfhost/front (`frontend.cb`) -- a statically rejected
+// program prints what `coby` prints and exits 1. Back end: impl/selfhost/back
+// emits the C (`generate_parts`), `cc` compiles it against the `cbrt` static
+// library (beside this executable, or where `build_info::CBRT_DIR` says).
+// `--run` compiles to a temporary directory and runs the result, forwarding
+// its exit status and streams. Its messages are cobc's, word for word, `cobc`
+// in them included: cbc is cobc's drop-in.
+
+import std;
+import ast;
+import loader;
+import items;
+import check;
+import state;
+import gen;
+import build_info;
+import driverbase;
+import host;
+import target;
+import diags;
+import link;
+import cc;
+import passes;
+import report;
+import frontend;
+
+// The header of `--help`: the project's ASCII title.
+const str BANNER =
+    "                            C O B A L T C\n"
+    "                        Programming Language\n";
+
+// What cobc is, next to `coby`, for `--about`, under the banner.
+const str ABOUT =
+    "\n"
+    "cobc -- the CobaltC compiler\n"
+    "\n"
+    "cobc turns a CobaltC program into a native executable. Its front end is\n"
+    "coby's -- the parser, name resolution and static checks -- so it\n"
+    "accepts and rejects exactly the programs coby does, with the same\n"
+    "diagnostics. It then translates the program to C and compiles that with\n"
+    "the system's C compiler, cc, or another named by --cc (such as clang),\n"
+    "linked against cbrt, its run-time library.\n"
+    "\n"
+    "A compiled program keeps every run-time check the specification\n"
+    "requires, except those the compiler proves can never fail. The\n"
+    "tracking of objects, references and access paths that coby does for\n"
+    "every operation is kept only where the compiler cannot prove it\n"
+    "unnecessary, and the rest is plain C, so compiled programs run many\n"
+    "times faster.\n"
+    "\n"
+    "coby, the reference interpreter, runs a program straight from its\n"
+    "source on an abstract machine that follows the specification as\n"
+    "written. The test suites require cobc's executables to match coby on\n"
+    "every program's output and diagnostics, under both GCC and Clang.\n"
+    "\n"
+    "Use cobc to build an executable, or to see how fast a program can be;\n"
+    "use coby to run a program at once, with no build step.\n"
+    "\n"
+    "  cobc FILE.cb          build FILE (see -o)\n"
+    "  cobc --run FILE.cb    build in a temporary directory and run\n"
+    "  cobc --check PATH...  check programs statically; build nothing\n"
+    "  cobc --help           every option\n"
+    "  coby --about          the interpreter\n";
+
+const str USAGE =
+    "usage: cobc [--explain] [--warn-shadow] [--unittest [--unittest-filter TEXT] [--unittest-std]] [--ru"
+    "n] [--explore N] [--schedule-seed S] [--keep-c] [--no-line-directives] [-g] [--report-tracking] [--a"
+    "ll-checks] [--bootstrap-form] [-v] [-s] [-O LEVEL] [-march=CPU] [--target TRIPLE] [--cc COMPILER] [-"
+    "o OUT] FILE.cb [ARG...]\n"
+    "       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n"
+    "       cobc [--explain] [--warn-shadow] --check PATH...\n"
+    "       cobc --check-syntax [--origin PATH] (FILE | -)\n"
+    "       cobc --emit-c [--c-name NAME] FILE";
+
+const str HELP =
+    "Compile a CobaltC program to a native executable.\n"
+    "\n"
+    "Checks FILE.cb with the same front end as `coby`, lowers it to C, and\n"
+    "compiles that C with `cc` (or the compiler --cc names) against the\n"
+    "`cbrt` runtime library found beside this executable.\n"
+    "\n"
+    "Options:\n"
+    "  -o OUT       Write the executable to OUT. Default: FILE.cb without its\n"
+    "               extension (`foo.cb` -> `foo`). A program whose modules sit\n"
+    "               in a directory of that name (`foo/`) needs -o.\n"
+    "  --run        Compile to a temporary directory, run the program, forward\n"
+    "               its exit status and output, then delete the directory. With\n"
+    "               `-o`, the executable is written to OUT instead and kept.\n"
+    "               Every ARG after FILE.cb is passed to the program (its\n"
+    "               argument 0 is the first), so options go before FILE.cb.\n"
+    "  --explore N  Compile, then run the program N times, each under another\n"
+    "               order of its threads chosen by a seed (1 to N), and group\n"
+    "               the runs by outcome: exit status, output and errors. One\n"
+    "               thread runs at a time; the turn passes at a `spawn`, a\n"
+    "               wait, a mutex released, a thread's end, a call outside the\n"
+    "               program (a socket, input, sleeping) and now and then\n"
+    "               between two of the program's checks. Each outcome is shown\n"
+    "               with a seed that gives it; the exit status is 1 when the\n"
+    "               runs differ. Implies --run; ARGs and standard input (read\n"
+    "               once, unless a terminal) go to every run.\n"
+    "  --schedule-seed S\n"
+    "               Run once (implies --run) under the order seed S gives, as\n"
+    "               `--explore` ran it: the same seed, the same order, so a\n"
+    "               run that ended differently can be replayed. Setting\n"
+    "               COBALTC_SCHEDULE_SEED=S in a compiled program's\n"
+    "               environment does the same.\n"
+    "  --lib        Build a library (D-0257): the program's `extern fn` definitions\n"
+    "               as a static archive (default libNAME.a beside the source), the\n"
+    "               runtime libcbrt.a copied beside it, and NAME.h with the C\n"
+    "               prototypes, the structs that cross by value, and the link line.\n"
+    "               A library has no `main`; nothing runs.\n"
+    "  --keep-c     Keep the generated C file instead of deleting it after\n"
+    "               `cc`. It sits beside the executable with the extension\n"
+    "               replaced by `.c` (`-o prog` -> `prog.c`, `a.out` -> `a.c`).\n"
+    "               Under `--run` without `-o` it lives in the temporary\n"
+    "               directory and is deleted with it. When `cc` fails the C is\n"
+    "               always kept and its path printed.\n"
+    "  --no-line-directives\n"
+    "               Leave the `#line` directives out of the generated C. By\n"
+    "               default each line of C made from one of the program's own\n"
+    "               statements is preceded by `#line N \"FILE.cb\"`, so the C\n"
+    "               compiler's messages, a debugger and a sanitizer name the\n"
+    "               program's file and line rather than the C's; code made for\n"
+    "               `std` keeps the C's own lines.\n"
+    "  -g           Compile the generated C with debug information (`cc -g`)\n"
+    "               and keep it in the executable. With `-O0 -g` a debugger\n"
+    "               such as gdb steps through the program's `.cb` lines, and a\n"
+    "               sanitizer's report (`--cc` naming a compiler wrapper that\n"
+    "               adds `-fsanitize=address`) names them.\n"
+    "  --report-tracking\n"
+    "               Compile nothing: list the lines of the program's own files\n"
+    "               whose generated C still calls the runtime's tracking (paths,\n"
+    "               objects, checked accesses), those inside loops first, with\n"
+    "               the kinds of call on each. Bounds and overflow checks are\n"
+    "               not listed. Chapter P of the guide says what each form\n"
+    "               costs and how to write code the compiler can see through.\n"
+    "  --all-checks\n"
+    "               Use no proof about a function's reference parameters: every\n"
+    "               access through one is checked where it is made (D-0209). For\n"
+    "               comparing against the elided forms; slower.\n"
+    "  --bootstrap-form\n"
+    "               Emit the general checked form only: --all-checks, no\n"
+    "               elisions (D-0274). The reference for the code\n"
+    "               generator written in CobaltC; much slower.\n"
+    "               COBALTC_BOOTSTRAP_UPTO=N switches off D-0274's stages 1..N\n"
+    "               only (0 the default form, 10 this one; CHG-0368).\n"
+    "  --warn-shadow\n"
+    "               Note, on standard error, each item of the program whose name\n"
+    "               hides an imported one (a `struct Vec` beside `import std;`):\n"
+    "               the program's own item is the one used (`spec/17`), and this\n"
+    "               is the only place that says so. Exit status unchanged.\n"
+    "  -v, --verbose\n"
+    "               Print each command cobc runs, on standard error, before it\n"
+    "               runs it: the C compiler on the generated C, `cc -c` on each\n"
+    "               C file named by `extern \"…\";`, and with --run the program.\n"
+    "               Each is a line beginning `+ `, quoted so that it can be\n"
+    "               pasted into a shell. Also where the generated C is written,\n"
+    "               and whether it is kept or removed.\n"
+    "  -s, --strip  Leave the symbol table out of the executable too (the\n"
+    "               linker's --strip-all),\n"
+    "               for the smallest file: a hello world is about 0.6 MB\n"
+    "               instead of 0.8 MB. The program runs the same -- its fault\n"
+    "               messages come from the locations compiled into it, not\n"
+    "               from symbols -- but a profiler or debugger can no longer\n"
+    "               name its functions.\n"
+    "  -O LEVEL     Optimization level passed to `cc`: 0, 1, 2, 3, s, or g.\n"
+    "               Also accepted joined: -O0, -O2, -Os, ... Default: 2.\n"
+    "               Given more than once, the last one wins.\n"
+    "  -march=CPU   Target CPU passed to `cc`, e.g. `native`, `x86-64-v3`,\n"
+    "               `haswell`. Default: `cc`'s own (baseline x86-64), which runs\n"
+    "               on any x86-64 machine; `native` may not run on an older CPU\n"
+    "               than the one that compiled it. Given more than once, the\n"
+    "               last one wins.\n"
+    "  --cc COMPILER\n"
+    "               The C compiler to use instead of `cc`: a name found on\n"
+    "               PATH, such as `gcc` or `clang`, or a path. Also accepted\n"
+    "               as --cc=COMPILER. It is given the same options as `cc`,\n"
+    "               which GCC and Clang both accept. Which is faster depends\n"
+    "               on the program (bench/RESULTS.md). Given more than once,\n"
+    "               the last one wins.\n"
+    "  --target TRIPLE\n"
+    "               The platform to compile for (D-0255): x86_64-unknown-linux-gnu\n"
+    "               or x86_64-pc-windows-gnu. Default: the one cobc runs on. For\n"
+    "               Windows from Linux the C compiler is MinGW-w64's\n"
+    "               (`x86_64-w64-mingw32-gcc`, or --cc), the runtime is the one in\n"
+    "               target/x86_64-pc-windows-gnu/release (built with Rust 1.77.2),\n"
+    "               and the executable is FILE.exe. --run and --explore run it with\n"
+    "               the program named by COBALTC_RUNNER, such as `wine64`.\n"
+    "  --check PATH...\n"
+    "               Check each program statically and build nothing: each FILE.cb\n"
+    "               named, and each `.cb` file in each directory named (hidden\n"
+    "               directories and `target/` skipped). It must be the first\n"
+    "               argument; no other option goes with it. A rejected program\n"
+    "               prints the diagnostic a build would print, and a file named\n"
+    "               by `extern \"./…\";` that is missing is reported, but no C is\n"
+    "               written or compiled. In a directory, a file another program\n"
+    "               there loads as a module (`module m \"./m.cb\";`) is checked\n"
+    "               as part of that program, not on its own. Nothing is printed\n"
+    "               for an accepted program. `coby --check` does the same\n"
+    "               without the `extern` files.\n"
+    "  --emit-c [--c-name NAME] FILE\n"
+    "               The program's C on standard output, nothing compiled or\n"
+    "               linked: the file `--keep-c` keeps, NAME the name its `#line`\n"
+    "               directives give it (default a.c). A program the static pass\n"
+    "               rejects gets its diagnostic and status 1.\n"
+    "  --check-syntax [--origin PATH] (FILE | -)\n"
+    "               Whether one text parses, and nothing else: FILE, or standard\n"
+    "               input for `-`, its `module m \"./m.cb\";` files found\n"
+    "               relative to PATH (FILE by default). Exit 0 it parses, 1 it\n"
+    "               does not (the error, `PLACE: MESSAGE (column C)`, on\n"
+    "               standard error), 2 it cannot be read. A program the parser\n"
+    "               builds but the static pass would reject parses. For the\n"
+    "               formatter written in CobaltC (impl/selfhost/cobfmt), which\n"
+    "               refuses what this refuses; `coby --check-syntax` is the same.\n"
+    "  --unittest   Build the program's tests instead of the program (D-0230):\n"
+    "               each `unittest` block in its files, run in order by a\n"
+    "               `main` of their own, each in a thread of its own, its\n"
+    "               fault reported and the next one run; the program's own\n"
+    "               `main` is checked but not run, and a file of tests needs\n"
+    "               none. The executable prints `test FILE:LINE NAME ... ok`\n"
+    "               (or `FAILED` and the fault) for each and a summary, and\n"
+    "               exits 1 when one failed. With --run, run them now: `cobc\n"
+    "               --unittest --run lib.cb`; with -o, keep the test program.\n"
+    "  --unittest-filter TEXT\n"
+    "               With --unittest: only the tests whose name contains TEXT\n"
+    "               (an unnamed test matches none); a filter that matches no\n"
+    "               test is an error.\n"
+    "  --unittest-std\n"
+    "               Run `std`'s own tests, the examples of the std reference,\n"
+    "               in place of the program's (implies --unittest).\n"
+    "  --explain    Show each diagnostic with its full entry from the\n"
+    "               specification's registry: the rule, the invariant, what was\n"
+    "               required and observed, the provenance and the examples, after\n"
+    "               the short form (the message, the location with the source line\n"
+    "               and a caret, and the repair). A compiled program shows its\n"
+    "               faults that way when COBALTC_EXPLAIN=1 is set in its\n"
+    "               environment, which --explain sets for --run.\n"
+    "  --about      What cobc is, next to the interpreter coby, and exit.\n"
+    "  -h, --help   Print this help and exit.\n"
+    "\n"
+    "The program's own C code: `extern \"./shapes.c\";` (or a `.o`, `.a` or\n"
+    "`.so` file) links a file, its path relative to the file that declares\n"
+    "it; `extern \"z\";` links an installed library, as `cc -lz`. A `.c` file\n"
+    "is compiled on its own with the C compiler's warnings shown; a `.so` is\n"
+    "found from any working directory. Each is linked once, and a missing\n"
+    "one is reported at its declaration.\n"
+    "\n"
+    "The executable: on Linux the linker is given `-Wl,--gc-sections` and\n"
+    "`-Wl,--strip-debug`, so it holds only the parts of the runtime the\n"
+    "program uses and no debug information (the generated C is compiled\n"
+    "without `-g` unless -g is given, which also keeps it); its symbol table\n"
+    "stays, for profilers and debuggers, unless -s removes it.\n"
+    "\n"
+    "Floating point: the C compiler is always given `-ffp-contract=off`, so every float\n"
+    "operation is rounded on its own as the specification requires (spec/06),\n"
+    "even where -march enables fused multiply-add instructions; and\n"
+    "`-fno-optimize-sibling-calls`, so a tail call is still a call and a\n"
+    "recursion too deep for the stack faults (diag.stack-exhausted) whatever\n"
+    "the C compiler and optimization level.\n"
+    "\n"
+    "Exit status:\n"
+    "  0    compiled (with --run: the program's own exit status, which is\n"
+    "       main's value for `fn main() : u8`; with --check: every program\n"
+    "       accepted)\n"
+    "  1    the program (with --check: one of them) was rejected statically;\n"
+    "       the diagnostic is on stderr\n"
+    "  2    usage error, unreadable file, C compiler failure, or C code\n"
+    "       named by `extern \"…\";` that is missing or does not compile\n"
+    "  3    unsupported: a construct the compiler cannot compile yet, or an\n"
+    "       `extern fn` naming a function not in libc, libm or the\n"
+    "       program's C code\n"
+    "  4    internal error: a bug in cobc, reported as one line (with Rust's\n"
+    "       backtrace when RUST_BACKTRACE is set); please report it with\n"
+    "       the program\n";
+
+fn usage() : u8
+{
+    eprintf("%v\n", USAGE);
+    eprintf("Try `cobc --help` for more information.\n");
+    2
+}
+
+fn opt_level(StringView level) : Option<String>
+{
+    foreach (l in ["0", "1", "2", "3", "s", "g"])
+    {
+        if (StringView::eq_str(level, l))
+        {
+            return Some(sprintf("-O%v", level));
+        }
+    }
+    None
+}
+
+fn march(StringView cpu) : Option<String>
+{
+    bool ok = StringView::len(cpu) > 0;
+    foreach (b in StringView::as_bytes(cpu))
+    {
+        u8 c = *b;
+        if (!((c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'-' || c == b'_' || c == b'.'))
+        {
+            ok = false;
+        }
+    }
+    if (ok) { Some(sprintf("-march=%v", cpu)) } else { None }
+}
+
+fn parse_count(ref<Option<String>, shared> s) : Option<u64>
+{
+    match (s)
+    {
+        Some(t) :
+        {
+            match (StringView::parse<u64>(String::as_view(t)))
+            {
+                Ok(n)  : if (n > 0) { Some(n) } else { None },
+                Err(_) : None,
+            }
+        },
+        None    : None,
+    }
+}
+
+fn ms_since(u64 start) : u64
+{
+    (monotonic_ns() - start) / 1_000_000
+}
+
+// cobc's internal-error test point (`coby::internal::test_point`): with
+// COBALTC_TEST_INTERNAL_ERROR set, the one-line report and status 4 cobc's
+// panic hook gives (with no Rust backtrace to add under RUST_BACKTRACE).
+fn test_point() : bool
+{
+    match (env_var("COBALTC_TEST_INTERNAL_ERROR"))
+    {
+        Ok(Some(_)) :
+        {
+            // The place: the caller, as `#[track_caller]` names it (a line
+            // number cbc cannot know of itself).
+            eprintf("internal error in cobc: COBALTC_TEST_INTERNAL_ERROR is set (selfhost/cbc/driver.cb:driver_main); please report it with the program\n");
+            // cobc's hook adds Rust's backtrace when RUST_BACKTRACE asks for
+            // one; cbc has none to give, and says so.
+            match (env_var("RUST_BACKTRACE"))
+            {
+                Ok(Some(v)) :
+                {
+                    if (v != "0")
+                    {
+                        eprintf("note: no backtrace: cbc is written in CobaltC, and RUST_BACKTRACE asks for Rust's\n");
+                    }
+                },
+                _           : {},
+            }
+            true
+        },
+        _           : false,
+    }
+}
+
+// The program's arguments (`std::env::args_os().skip(1)`), each UTF-8 or
+// not; cbc can neither read a file nor pass an argument whose name is not
+// UTF-8 (std's paths and commands take text).
+struct Arg
+{
+    Option<String> text;
+}
+
+fn arg_list() : Vec<Arg>
+{
+    Vec<Arg> out = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(a)  : Vec::push(&mut out, Arg { .text = Some(a) }),
+            Err(_) : Vec::push(&mut out, Arg { .text = None }),
+        }
+    }
+    out
+}
+
+fn is_arg(ref<Arg, shared> a, str s) : bool
+{
+    match (&a.text)
+    {
+        Some(t) : *t == s,
+        None    : false,
+    }
+}
+
+// cobc's `main`/`real_main`. The checker and the lowering recurse on the
+// program's nesting; a compiled program's `main` already runs on a thread
+// whose stack is reserved large (D-0077), as cobc's compiler thread.
+export fn driver_main() : u8
+{
+    if (test_point())
+    {
+        return 4;
+    }
+    // `--check`: the front end and the `extern "…";` files only.
+    Vec<Arg> all = arg_list();
+    // `--explain` before `--check` (WI-9).
+    while (Vec::len(&all) > 0 && (is_arg(&all[0], "--explain") || is_arg(&all[0], "--warn-shadow")))
+    {
+        set_env_flag(if (is_arg(&all[0], "--explain")) { "COBALTC_EXPLAIN" } else { "COBALTC_WARN_SHADOW" });
+        _ = Vec::remove(&mut all, 0);
+    }
+    if (Vec::len(&all) > 0 && is_arg(&all[0], "--check-syntax"))
+    {
+        Vec<String> rest = Vec::new();
+        for (usize i = 1; i < Vec::len(&all); i += 1)
+        {
+            match (&all[i].text)
+            {
+                Some(t) : Vec::push(&mut rest, String::clone(t)),
+                // `to_string_lossy`: a name that is not UTF-8 names no file.
+                None    : Vec::push(&mut rest, String::from_str("\u{fffd}")),
+            }
+        }
+        return run_syntax(&rest, "cobc");
+    }
+    if (Vec::len(&all) > 0 && is_arg(&all[0], "--check"))
+    {
+        // `--warn-shadow` may follow `--check` too (CHG-0333).
+        Vec<String> paths = Vec::new();
+        for (usize i = 1; i < Vec::len(&all); i += 1)
+        {
+            if (is_arg(&all[i], "--warn-shadow"))
+            {
+                set_env_flag("COBALTC_WARN_SHADOW");
+                continue;
+            }
+            match (&all[i].text)
+            {
+                Some(t) : Vec::push(&mut paths, String::clone(t)),
+                None    : return usage(),
+            }
+        }
+        if (Vec::len(&paths) == 0)
+        {
+            return usage();
+        }
+        foreach (p in &paths)
+        {
+            if (String::starts_with(p, "-"))
+            {
+                return usage();
+            }
+        }
+        return run_check(&paths, "cobc");
+    }
+    bool run = false;
+    Option<u64> explore = None;
+    Option<u64> seed = None;
+    bool keep_c = false;
+    bool lib = false;
+    bool report_tracking = false;
+    bool strip = false;
+    bool debug = false;
+    bool line_directives = true;
+    Option<UnitMode> unit_mode = None;
+    String opt = String::from_str("-O2");
+    Option<String> arch = None;
+    Option<String> cc_arg = None;
+    Option<Target> target_arg = None;
+    Option<String> out = None;
+    Option<String> file_arg = None;
+    Vec<String> prog_args = Vec::new();
+    Vec<Arg> args = arg_list();
+    // Where the program's arguments start (`arg` numbering), and whether one
+    // is not UTF-8: only `host::run_raw` passes such an argument on.
+    usize prog_first = Vec::len(&args);
+    bool prog_raw = false;
+    usize ai = 0;
+    while (ai < Vec::len(&args))
+    {
+        ai += 1;
+        // With --run, everything after FILE.cb is the program's.
+        if (run && Option::is_some(&file_arg))
+        {
+            if (Vec::len(&prog_args) == 0)
+            {
+                prog_first = ai - 1;
+            }
+            match (&args[ai - 1].text)
+            {
+                Some(t) : Vec::push(&mut prog_args, String::clone(t)),
+                None    :
+                {
+                    Vec::push(&mut prog_args, String::new());
+                    prog_raw = true;
+                },
+            }
+            continue;
+        }
+        String a = match (&args[ai - 1].text)
+        {
+            Some(t) : String::clone(t),
+            None    :
+            {
+                // A file name that is not UTF-8: cobc takes it; std reads
+                // only files named in text.
+                return usage();
+            },
+        };
+        // The next argument, when it is text.
+        Option<String> next = None;
+        bool takes = a == "--explore" || a == "--schedule-seed" || a == "--unittest-filter" || a == "-o" || a == "-O" || a == "--cc"
+            || a == "--target";
+        if (takes && ai < Vec::len(&args))
+        {
+            next = clone(&args[ai].text);
+            ai += 1;
+        }
+        if (a == "--about")
+        {
+            return if (print_out(String::as_view(&sprintf("%v%v", BANNER, ABOUT)))) { 0 } else { 1 };
+        }
+        else if (a == "-h" || a == "--help")
+        {
+            return if (print_out(String::as_view(&sprintf("%v\n%v\n\n%v", BANNER, USAGE, HELP)))) { 0 } else { 1 };
+        }
+        else if (a == "--run")
+        {
+            run = true;
+        }
+        else if (a == "--explore")
+        {
+            match (parse_count(&next))
+            {
+                Some(n) :
+                {
+                    explore = Some(n);
+                    run = true;
+                },
+                None    : return usage(),
+            }
+        }
+        else if (a == "--schedule-seed")
+        {
+            match (parse_count(&next))
+            {
+                Some(n) :
+                {
+                    seed = Some(n);
+                    run = true;
+                },
+                None    : return usage(),
+            }
+        }
+        else if (a == "--keep-c")
+        {
+            keep_c = true;
+        }
+        else if (a == "--lib")
+        {
+            lib = true;
+        }
+        else if (a == "--report-tracking")
+        {
+            report_tracking = true;
+        }
+        else if (a == "--all-checks")
+        {
+            set_env_flag("COBALTC_ALL_CHECKS");
+        }
+        else if (a == "--bootstrap-form")
+        {
+            set_env_flag("COBALTC_BOOTSTRAP_FORM");
+        }
+        else if (a == "--warn-shadow")
+        {
+            set_env_flag("COBALTC_WARN_SHADOW");
+        }
+        else if (a == "--explain")
+        {
+            set_env_flag("COBALTC_EXPLAIN");
+        }
+        else if (a == "--unittest")
+        {
+            if (Option::is_none(&unit_mode))
+            {
+                unit_mode = Some(UnitMode { .filter = None, .std_tests = false });
+            }
+        }
+        else if (a == "--unittest-std")
+        {
+            UnitMode m = Option::unwrap_or(unit_mode, UnitMode { .filter = None, .std_tests = false });
+            m.std_tests = true;
+            unit_mode = Some(m);
+        }
+        else if (a == "--unittest-filter")
+        {
+            match (next)
+            {
+                Some(t) :
+                {
+                    UnitMode m = Option::unwrap_or(unit_mode, UnitMode { .filter = None, .std_tests = false });
+                    m.filter = Some(t);
+                    unit_mode = Some(m);
+                },
+                None    : return usage(),
+            }
+        }
+        else if (a == "-v" || a == "--verbose")
+        {
+            set_verbose();
+        }
+        else if (a == "-s" || a == "--strip")
+        {
+            strip = true;
+        }
+        else if (a == "-g")
+        {
+            debug = true;
+        }
+        else if (a == "--no-line-directives")
+        {
+            line_directives = false;
+        }
+        else if (a == "-o")
+        {
+            match (next)
+            {
+                Some(o) : out = Some(o),
+                None    : return usage(),
+            }
+        }
+        else if (a == "-O")
+        {
+            match (next)
+            {
+                Some(l) :
+                {
+                    match (opt_level(String::as_view(&l)))
+                    {
+                        Some(o) : opt = o,
+                        None    : return usage(),
+                    }
+                },
+                None    : return usage(),
+            }
+        }
+        else if (String::starts_with(&a, "-O"))
+        {
+            match (opt_level(String::view(&a, 2, String::len(&a))))
+            {
+                Some(o) : opt = o,
+                None    : return usage(),
+            }
+        }
+        else if (String::starts_with(&a, "-march="))
+        {
+            match (march(String::view(&a, 7, String::len(&a))))
+            {
+                Some(m) : arch = Some(m),
+                None    : return usage(),
+            }
+        }
+        else if (a == "--cc")
+        {
+            match (next)
+            {
+                Some(c) :
+                {
+                    if (String::len(&c) == 0)
+                    {
+                        return usage();
+                    }
+                    cc_arg = Some(c);
+                },
+                None    : return usage(),
+            }
+        }
+        else if (String::starts_with(&a, "--cc=") && String::len(&a) > 5)
+        {
+            cc_arg = Some(String::from_view(String::view(&a, 5, String::len(&a))));
+        }
+        else if (a == "--target")
+        {
+            match (next)
+            {
+                Some(t) :
+                {
+                    match (Target::parse(String::as_view(&t)))
+                    {
+                        Some(tt) : target_arg = Some(tt),
+                        None     : return bad_target(String::as_view(&t)),
+                    }
+                },
+                None    : return usage(),
+            }
+        }
+        else if (String::starts_with(&a, "--target="))
+        {
+            StringView t = String::view(&a, 9, String::len(&a));
+            match (Target::parse(t))
+            {
+                Some(tt) : target_arg = Some(tt),
+                None     : return bad_target(t),
+            }
+        }
+        else if (String::starts_with(&a, "-"))
+        {
+            return usage();
+        }
+        else if (Option::is_some(&file_arg))
+        {
+            return usage();
+        }
+        else
+        {
+            file_arg = Some(a);
+        }
+    }
+    String file = match (file_arg)
+    {
+        Some(f) : f,
+        None    : return usage(),
+    };
+    // D-0255: the target, and the C compiler it implies unless --cc names one.
+    Option<Target> host = Target::host();
+    Target target = match (target_arg)
+    {
+        Some(t) : t,
+        None : match (host)
+        {
+            Some(h) : h,
+            None    :
+            {
+                eprintf("cobc: this cobc was built for a platform it cannot compile natively for (build it for x86_64-pc-windows-gnu on Windows); name one with --target\n");
+                return 2;
+            },
+        },
+    };
+    String cc = match (cc_arg)
+    {
+        Some(c) : c,
+        None    : String::from_str(Target::default_cc(target, host)),
+    };
+    bool foreign = !is_host(target);
+    String src = match (read_file(String::as_view(&file)))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("error reading %s: %v\n", &file, io_text(&e));
+            return 2;
+        },
+    };
+
+    u8 level = driver_level();
+    Checked prog = match (analyze(String::as_view(&src), String::as_view(&file), &unit_mode))
+    {
+        Ok(c)  : c,
+        Err(r) :
+        {
+            eprintf("%s", &for_stderr(String::as_view(&render_located(String::as_view(&r.raw), "static", &r.ex))));
+            return 1;
+        },
+    };
+    // D-0257: a library is functions C calls (`extern fn` with a body) and no
+    // `main`, built with `--lib`; a program is built without it.
+    bool has_main = HashMap::contains(&prog.table.fns, &String::from_str("main"));
+    bool has_entries = false;
+    for (usize i = 0; i < HashMap::len(&prog.table.fns); i += 1)
+    {
+        if (HashMap::value_at(&prog.table.fns, i).c_entry)
+        {
+            has_entries = true;
+        }
+    }
+    if (lib && has_main)
+    {
+        eprintf("cobc: --lib builds a library, which has no `main`: remove `main`, or build the program without --lib\n");
+        return 2;
+    }
+    if (lib && !has_entries)
+    {
+        eprintf(
+            "cobc: --lib builds a library of functions C calls, and %s defines none (`extern fn name(…) : τ { … }`)\n",
+            &file,
+        );
+        return 2;
+    }
+    if (!lib && !has_main)
+    {
+        eprintf(
+            "cobc: %s is a library (it defines functions C calls and no `main`): build it with `cobc --lib -o lib%s.a %s`\n",
+            &file,
+            &stem_of(String::as_view(&file)),
+            &file,
+        );
+        return 2;
+    }
+    if (lib && (run || Option::is_some(&explore)))
+    {
+        eprintf("cobc: --lib builds a library; nothing runs (--run, --explore)\n");
+        return 2;
+    }
+    // The program's own C code (`extern "…";`), checked before any C is
+    // written: a missing file is reported at its declaration.
+    Vec<Code> code = match (link::resolve(&prog.table.extern_code, &prog.ex))
+    {
+        Ok(c)  : c,
+        Err(e) :
+        {
+            eprintf("cobc: %s\n", &e);
+            return 2;
+        },
+    };
+    Vec<ExternCode> extern_code = clone(&prog.table.extern_code);
+    Expansion ex = clone(&prog.ex);
+
+    u64 t_lower = monotonic_ns();
+    Gen lowering = new_gen(prog);
+    lowering.bootstrap = level;
+    // `--all-checks` is in the driver's flags, not the environment `new_gen` reads.
+    lowering.all_checks = lowering.all_checks || env_flag("COBALTC_ALL_CHECKS") || lowering.bootstrap > 0;
+    lowering.line_directives = line_directives && !report_tracking;
+    Generated gen = generate_parts(&mut lowering, lib);
+    if (report_tracking)
+    {
+        String text = report::report(String::as_view(&combined(&gen, "report.c")), String::as_view(&file));
+        return if (print_out(String::as_view(&text))) { 0 } else { 1 };
+    }
+    note(String::as_view(&sprintf("lowered to C in %v ms (%v units)", ms_since(t_lower), Vec::len(&gen.units))));
+
+    Option<String> scratch = None;
+    if (run)
+    {
+        String d = pjoin(String::as_view(&temp_dir()), String::as_view(&sprintf("cobc-%v-%v", process_id(), unique())));
+        Result::expect(make_dir_all(String::as_view(&d)), "temp dir");
+        scratch = Some(d);
+    }
+    String exe = match (&out)
+    {
+        Some(o) : String::clone(o),
+        None : match (&scratch)
+        {
+            Some(d) : pjoin(String::as_view(d), if (Target::windows(target)) { "a.exe" } else { "a.out" }),
+            None    :
+            {
+                if (lib)
+                {
+                    with_file_name(
+                        String::as_view(&file),
+                        String::as_view(&sprintf("lib%s.a", &stem_of(String::as_view(&file)))),
+                    )
+                }
+                else
+                {
+                    Target::exe_name(target, String::as_view(&with_extension(String::as_view(&file), "")))
+                }
+            },
+        },
+    };
+    // The default name (`tinyos.cb` -> `tinyos`) can be a directory beside
+    // the source, such as one holding its module files; say so before
+    // writing anything, rather than leave it to the linker.
+    if (is_dir(String::as_view(&exe)))
+    {
+        String hint = if (Option::is_none(&out))
+        {
+            sprintf(
+                "; choose another name with -o, e.g. `cobc -o %s.out %s`",
+                &exe,
+                &file,
+            )
+        }
+        else { String::new() };
+        eprintf("cobc: cannot write the executable to %s: that is a directory%s\n", &exe, &hint);
+        return 2;
+    }
+    String c_path = with_extension(String::as_view(&exe), "c");
+    // D-0277: the program's single C file, compiled every time; kept for
+    // inspection with `--keep-c`, and when something fails.
+    Result::expect(
+        write_file(String::as_view(&c_path), String::as_view(&combined(&gen, String::as_view(&c_path)))),
+        "write C",
+    );
+    note(String::as_view(&sprintf("wrote the generated C to %s", &c_path)));
+
+    String obj_dir = pjoin(
+        String::as_view(&temp_dir()),
+        String::as_view(&sprintf("cobc-obj-%v-%v", process_id(), unique())),
+    );
+    CcFacts facts = cc_facts(String::as_view(&cc));
+    Result<Output, String> linked = link_all(
+        &gen,
+        &code,
+        String::as_view(&cc),
+        String::as_view(&opt),
+        &arch,
+        debug,
+        strip,
+        lib,
+        String::as_view(&obj_dir),
+        String::as_view(&exe),
+        String::as_view(&c_path),
+        target,
+        &facts,
+    );
+    _ = remove_dir_all(String::as_view(&obj_dir));
+    Output output = match (linked)
+    {
+        Ok(o)  : o,
+        Err(e) :
+        {
+            eprintf("cobc: %s\n", &e);
+            return 2;
+        },
+    };
+    if (lib && output.status == 0)
+    {
+        match (write_header(String::as_view(&exe), String::as_view(&gen.header_text), &code, target))
+        {
+            Ok(p)  : note(String::as_view(&sprintf("wrote the header %s", &p))),
+            Err(e) :
+            {
+                eprintf("cobc: %s\n", &e);
+                return 2;
+            },
+        }
+    }
+    if (output.status != 0)
+    {
+        String err = lossy(&output.stderr[0..$]);
+        // An `extern fn` naming a function the C libraries do not have is
+        // reported as the interpreter reports it: unsupported, exit 3.
+        match (segment_after(String::as_view(&err), "undefined reference to `"))
+        {
+            Some(rest) :
+            {
+                StringView name = match (StringView::find(rest, "'"))
+                {
+                    Some(k) : StringView::sub(rest, 0, k),
+                    None    : rest,
+                };
+                if (!StringView::starts_with(name, "cb_"))
+                {
+                    str also = if (Vec::len(&code) == 0) { "" } else { " or the program's C code" };
+                    eprintf("unsupported: no C function `%v` in libc, libm%v\n", name, also);
+                    _ = remove_file(String::as_view(&c_path));
+                    return 3;
+                }
+            },
+            None       : {},
+        }
+        // A library named by `extern "…";` that the linker cannot find (GNU
+        // ld: `cannot find -lNAME`; lld: `unable to find library -lNAME`) is
+        // reported at its declaration, like a missing file.
+        Option<StringView> missing = match (segment_after(String::as_view(&err), "find -l"))
+        {
+            Some(r) : Some(r),
+            None    : segment_after(String::as_view(&err), "find library -l"),
+        };
+        match (missing)
+        {
+            Some(rest) :
+            {
+                slice<u8, shared> rb = StringView::as_bytes(rest);
+                usize e = 0;
+                while (e < StringView::len(rest) && rb[e] != b' ' && rb[e] != b'\t' && rb[e] != b'\n' && rb[e] != b'\r' && rb[e] != b':')
+                {
+                    e += 1;
+                }
+                StringView name = StringView::sub(rest, 0, e);
+                for (usize k = 0; k < Vec::len(&extern_code); k += 1)
+                {
+                    ref<ExternCode, shared> c = &extern_code[k];
+                    if (String::eq_view(&c.code, name))
+                    {
+                        String at = match (locate(c.line, &ex))
+                        {
+                            Some(p) : sprintf("\n  at %s:%v", &p.file, p.line),
+                            None    : String::new(),
+                        };
+                        eprintf("cobc: extern \"%v\": the C compiler found no library `lib%v`%s\n", name, name, &at);
+                        _ = remove_file(String::as_view(&c_path));
+                        return 2;
+                    }
+                }
+            },
+            None       : {},
+        }
+        eprintf("%s", &err);
+        eprintf("cobc: %s failed on %s (kept for inspection)\n", &cc, &c_path);
+        return 2;
+    }
+    if (!keep_c)
+    {
+        _ = remove_file(String::as_view(&c_path));
+        note(String::as_view(&sprintf("removed %s (--keep-c keeps it)", &c_path)));
+    }
+    else if (Option::is_some(&scratch) && Option::is_none(&out))
+    {
+        note(String::as_view(&sprintf("kept %s until the temporary directory is deleted after the run", &c_path)));
+    }
+    else
+    {
+        note(String::as_view(&sprintf("kept %s", &c_path)));
+    }
+
+    // A program for another platform runs under COBALTC_RUNNER (`wine64`).
+    Option<Vec<String>> runner = None;
+    if (foreign && (run || Option::is_some(&explore)))
+    {
+        Option<String> r = match (env_var("COBALTC_RUNNER"))
+        {
+            Ok(Some(v)) : if (StringView::len(String::trim(&v)) > 0) { Some(v) } else { None },
+            _           : None,
+        };
+        match (r)
+        {
+            Some(v) :
+            {
+                Vec<String> words = Vec::new();
+                Vec<StringView> ws = String::split_whitespace(&v);
+                foreach (w in &ws)
+                {
+                    Vec::push(&mut words, String::from_view(*w));
+                }
+                runner = Some(words);
+            },
+            None    :
+            {
+                eprintf(
+                    "cobc: built %s for %v; running it here needs COBALTC_RUNNER, the program that runs it (such as `wine64`)\n",
+                    &exe,
+                    Target::triple(target),
+                );
+                return 2;
+            },
+        }
+    }
+    // std's commands take text: an argument that is not UTF-8 reaches the
+    // program only through `host::run_raw` (Unix, no runner).
+    bool raw_run = Option::is_none(&runner) && !Target::windows(Option::unwrap_or(host, Target::LinuxX64));
+    if (prog_raw && (Option::is_some(&explore) || !raw_run))
+    {
+        return usage();
+    }
+    match (explore)
+    {
+        Some(n) :
+        {
+            u8 status = explore_runs(String::as_view(&exe), &prog_args, n, String::as_view(&file), &runner);
+            match (&scratch)
+            {
+                Some(d) :
+                {
+                    _ = remove_dir_all(String::as_view(d));
+                },
+                None    : {},
+            }
+            return status;
+        },
+        None    : {},
+    }
+    i32 code_out = 0;
+    if (run)
+    {
+        Cmd cmd = run_command(String::as_view(&exe), &runner);
+        foreach (a in &prog_args)
+        {
+            Cmd::arg(&mut cmd, String::as_view(a));
+        }
+        match (seed)
+        {
+            Some(s) : Cmd::env(&mut cmd, "COBALTC_SCHEDULE_SEED", String::as_view(&sprintf("%v", s))),
+            None    : {},
+        }
+        show(&cmd);
+        // On Windows std runs a program with this one's streams only to its
+        // end (`Command::status`), with no hook before it starts and no
+        // number for it: cobc's `job_guard` is not applied there.
+        // What cbc wrote is out before the program writes (Rust's `print!`
+        // writes at once; a CobaltC program's standard output is buffered).
+        flush_stdout();
+        i32 st = if (raw_run)
+        {
+            // Unix: started as cobc's `child_guard` starts it, its arguments
+            // byte for byte.
+            Option::expect(run_raw(String::as_view(&exe), prog_first, cpu_limit(), seed), "run compiled program")
+        }
+        else
+        {
+            Result::expect(Command::status(&Cmd::to_command(&cmd)), "run compiled program")
+        };
+        if (st < 0 && !Target::windows(Option::unwrap_or(host, Target::LinuxX64)))
+        {
+            if (st == -24)
+            {
+                eprintf("cobc: the program used up its CPU time limit (COBALTC_CPU_LIMIT) and was stopped\n");
+            }
+            else
+            {
+                eprintf("cobc: the program was stopped by signal %v\n", -st);
+            }
+        }
+        match (&scratch)
+        {
+            Some(d) :
+            {
+                _ = remove_dir_all(String::as_view(d));
+            },
+            None    : {},
+        }
+        // `st.code().unwrap_or(1)`: a signal (Unix) has no code.
+        code_out = if (st < 0 && !Target::windows(Option::unwrap_or(host, Target::LinuxX64))) { 1 } else { st };
+    }
+    narrow<u8>(code_out & 255)
+}
+
+// The bootstrap level of D-0274 (cobc's `bootstrap_level`, with
+// `--bootstrap-form` as cobc's `set_var`): `COBALTC_BOOTSTRAP_UPTO=N` stages
+// 1..=N off, `COBALTC_BOOTSTRAP_FORM` all ten; by default none.
+fn driver_level() : u8
+{
+    match (env_value("COBALTC_BOOTSTRAP_UPTO"))
+    {
+        Some(v) :
+        {
+            match (StringView::parse<u8>(StringView::trim(String::as_view(&v))))
+            {
+                Ok(n)  : return if (n > BOOTSTRAP_STAGES) { BOOTSTRAP_STAGES } else { n },
+                Err(_) : {},
+            }
+        },
+        None    : {},
+    }
+    if (env_flag("COBALTC_BOOTSTRAP_FORM"))
+    {
+        return BOOTSTRAP_STAGES;
+    }
+    0
+}
+
+// `text.split(sep).nth(1)`: what follows the first `sep`, up to the next.
+fn segment_after(StringView text, str sep) : Option<StringView>
+{
+    usize k = match (StringView::find(text, StringView::of(sep)))
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    StringView rest = StringView::sub(text, k + StringView::len(StringView::of(sep)), StringView::len(text));
+    match (StringView::find(rest, StringView::of(sep)))
+    {
+        Some(e) : Some(StringView::sub(rest, 0, e)),
+        None    : Some(rest),
+    }
+}
+
+// cobc's chain from the object directory to the linked output (`linked`):
+// the program's own C code compiled (`link_args`), then the one C file
+// compiled and linked, or compiled and archived for `--lib`.
+fn link_all(
+    ref<Generated, shared> gen,
+    ref<Vec<Code>, shared> code,
+    StringView cc,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    bool debug,
+    bool strip,
+    bool lib,
+    StringView obj_dir,
+    StringView exe,
+    StringView c_path,
+    Target target,
+    ref<CcFacts, shared> facts,
+) : Result<Output, String>
+{
+    match (make_dir_all(obj_dir))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(sprintf("cannot create %v: %v", obj_dir, io_text(&e))),
+    }
+    Vec<String> extra = link_args(code, cc, opt, arch, obj_dir, target)?;
+    u64 t = monotonic_ns();
+    Result<Output, String> r = if (lib)
+    {
+        String obj = pjoin(obj_dir, "program.o");
+        compile_one(cc, opt, arch, debug, facts, c_path, String::as_view(&obj))?;
+        Vec<String> objs = Vec::new();
+        Vec::push(&mut objs, obj);
+        archive(cc, &objs, &extra, exe, target)
+    }
+    else
+    {
+        build_exe(gen, cc, c_path, exe, opt, arch, &extra, strip, debug, obj_dir, target, facts)
+    };
+    note(String::as_view(&sprintf("compiled and linked in %v ms", ms_since(t))));
+    r
+}
+
+// D-0255: the command that runs a built program: itself, or its target's
+// runner with it as the first argument.
+fn run_command(StringView exe, ref<Option<Vec<String>>, shared> runner) : Cmd
+{
+    match (runner)
+    {
+        Some(words) :
+        {
+            if (Vec::len(words) > 0)
+            {
+                Cmd c = Cmd::new(String::as_view(&words[0]));
+                for (usize i = 1; i < Vec::len(words); i += 1)
+                {
+                    Cmd::arg(&mut c, String::as_view(&words[i]));
+                }
+                Cmd::arg(&mut c, exe);
+                return c;
+            }
+        },
+        None        : {},
+    }
+    Cmd::new(exe)
+}
+
+fn bad_target(StringView t) : u8
+{
+    Vec<str> all = triples();
+    String names = String::new();
+    for (usize i = 0; i < Vec::len(&all); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut names, " and ");
+        }
+        String::append(&mut names, all[i]);
+    }
+    eprintf("cobc: --target %v: not a target cobc compiles for; it compiles for %s\n", t, &names);
+    2
+}
+
+// One outcome of `--explore`: (status, stdout, stderr), how many runs gave
+// it, and the first seed that did.
+struct Outcome
+{
+    Option<i32> status;
+    Vec<u8> stdout;
+    Vec<u8> stderr;
+    u64 count;
+    u64 seed;
+}
+
+fn same_bytes(ref<Vec<u8>, shared> a, ref<Vec<u8>, shared> b) : bool
+{
+    if (Vec::len(a) != Vec::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(a); i += 1)
+    {
+        if (a[i] != b[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn same_status(Option<i32> a, Option<i32> b) : bool
+{
+    match (a)
+    {
+        Some(x) : match (b)
+        {
+            Some(y) : x == y,
+            None    : false,
+        },
+        None : Option::is_none(&b),
+    }
+}
+
+// A run's input, fed until the input ends (its pipe then closed) or the run
+// does (`over`).
+fn feeder(ChildInput w, ref<AtomicBool, shared> over) : u8
+{
+    usize sent = 0;
+    while (true)
+    {
+        InputState st = input_wait(sent, 50);
+        if (AtomicBool::load(over))
+        {
+            return 0;
+        }
+        if (st.len > sent)
+        {
+            Vec<u8> more = input_bytes(sent, st.len);
+            if (Result::is_err(&ChildInput::write(&mut w, &more[0..$])))
+            {
+                return 0;
+            }
+            sent = st.len;
+        }
+        if (st.ended && sent >= st.len)
+        {
+            return 0;
+        }
+    }
+    0
+}
+
+// A run's standard output, read to its end.
+fn reader(ChildOutput r) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    while (true)
+    {
+        match (ChildOutput::read(&mut r, &mut out, 65536))
+        {
+            Ok(n)  :
+            {
+                if (n == 0)
+                {
+                    break;
+                }
+            },
+            Err(_) : break,
+        }
+    }
+    out
+}
+
+fn cpu_limit() : Option<i64>
+{
+    match (env_var("COBALTC_CPU_LIMIT"))
+    {
+        Ok(Some(v)) : Result::ok(StringView::parse<i64>(StringView::trim(String::as_view(&v)))),
+        _           : None,
+    }
+}
+
+// `--explore N`: the compiled program run under seeds 1..=N
+// (`COBALTC_SCHEDULE_SEED`), the runs grouped by outcome, as `coby
+// --explore` groups them. Every run reads the same standard input, gathered
+// as it arrives by a thread of its own (`host::input_start`), and each run is
+// given what has arrived and then the rest as it comes, its end only at the
+// input's end.
+fn explore_runs(
+    StringView exe,
+    ref<Vec<String>, shared> prog_args,
+    u64 runs,
+    StringView file,
+    ref<Option<Vec<String>>, shared> runner,
+) : u8
+{
+    input_start();
+    Vec<Outcome> seen = Vec::new();
+    for (u64 s = 1; s <= runs; s += 1)
+    {
+        Cmd cmd = run_command(exe, runner);
+        foreach (a in prog_args)
+        {
+            Cmd::arg(&mut cmd, String::as_view(a));
+        }
+        Cmd::env(&mut cmd, "COBALTC_SCHEDULE_SEED", String::as_view(&sprintf("%v", s)));
+        Child child = match (Command::spawn(&Cmd::to_command(&cmd)))
+        {
+            Ok(c)  : c,
+            Err(e) :
+            {
+                eprintf("cobc --explore: %v\n", io_text(&e));
+                return 2;
+            },
+        };
+        u64 job = guard_child(Child::id(&child), cpu_limit());
+        AtomicBool over = AtomicBool::new(false);
+        Option<ChildInput> input = Child::take_input(&mut child);
+        Option<ChildOutput> output = Child::take_output(&mut child);
+        Vec<u8> so = Vec::new();
+        Vec<u8> se = Vec::new();
+        i32 status = 0;
+        {
+            Option<handle<u8>> fed = match (input)
+            {
+                Some(w) : Some(spawn(feeder, w, &over)),
+                None    : None,
+            };
+            Option<handle<Vec<u8>>> read = match (output)
+            {
+                Some(r) : Some(spawn(reader, r)),
+                None    : None,
+            };
+            while (true)
+            {
+                match (Child::read_error(&mut child, &mut se, 65536))
+                {
+                    Ok(n)  :
+                    {
+                        if (n == 0)
+                        {
+                            break;
+                        }
+                    },
+                    Err(_) : break,
+                }
+            }
+            match (read)
+            {
+                Some(h) : so = join(h),
+                None    : {},
+            }
+            match (Child::wait(&mut child))
+            {
+                Ok(st) : status = st,
+                Err(e) :
+                {
+                    AtomicBool::store(&over, true);
+                    match (fed)
+                    {
+                        Some(h) :
+                        {
+                            _ = join(h);
+                        },
+                        None    : {},
+                    }
+                    unguard_child(job);
+                    eprintf("cobc --explore: %v\n", io_text(&e));
+                    return 2;
+                },
+            }
+            AtomicBool::store(&over, true);
+            match (fed)
+            {
+                Some(h) :
+                {
+                    _ = join(h);
+                },
+                None    : {},
+            }
+        }
+        unguard_child(job);
+        Option<i32> code = if (status < 0) { None } else { Some(status) };
+        bool found = false;
+        for (usize k = 0; k < Vec::len(&seen); k += 1)
+        {
+            if (same_status(
+                seen[k].status,
+                code,
+            ) && same_bytes(&seen[k].stdout, &so) && same_bytes(&seen[k].stderr, &se))
+            {
+                seen[k].count += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            Vec::push(&mut seen, Outcome { .status = code, .stdout = so, .stderr = se, .count = 1, .seed = s });
+        }
+    }
+    String report_text = String::new();
+    String::appendf(
+        &mut report_text,
+        "explored %v schedules of %v: %v distinct outcome%v\n",
+        runs,
+        file,
+        Vec::len(&seen),
+        if (Vec::len(&seen) == 1) { "" } else { "s" },
+    );
+    foreach (o in &seen)
+    {
+        String st = match (o.status)
+        {
+            Some(c) : sprintf("exit %v", c),
+            None    : String::from_str("killed"),
+        };
+        String::appendf(
+            &mut report_text,
+            "\n%v run%v, %s -- replay: cobc --schedule-seed %v %v\n",
+            o.count,
+            if (o.count == 1) { "" } else { "s" },
+            &st,
+            o.seed,
+            file,
+        );
+        String out_text = lossy(&o.stdout[0..$]);
+        Vec<StringView> ol = String::lines(&out_text);
+        for (usize k = 0; k < Vec::len(&ol) && k < 8; k += 1)
+        {
+            String::appendf(&mut report_text, "  | %v\n", ol[k]);
+        }
+        String err_text = lossy(&o.stderr[0..$]);
+        Vec<StringView> el = String::lines(&err_text);
+        for (usize k = 0; k < Vec::len(&el) && k < 3; k += 1)
+        {
+            String::appendf(&mut report_text, "  ! %v\n", el[k]);
+        }
+    }
+    if (!print_out(String::as_view(&report_text)))
+    {
+        return 1;
+    }
+    if (Vec::len(&seen) == 1) { 0 } else { 1 }
+}
+
+// cobc's `print!`: `text` on standard output; false where standard output is
+// a pipe nobody reads any more, where cobc's print fails and it ends quietly
+// with status 1 (`coby::internal`'s hook).
+fn print_out(StringView text) : bool
+{
+    if (stdout_closed())
+    {
+        return false;
+    }
+    printf("%v", text);
+    flush_stdout();
+    !stdout_closed()
+}
+
+// Nanoseconds, as cobc's `SystemTime::now()` gives them: the wall clock's
+// milliseconds and the monotonic clock's finer part.
+fn unique() : u64
+{
+    wrapping_add(wrapping_mul(reinterpret<u64>(unix_ms()), 1_000_000), monotonic_ns() % 1_000_000)
+}
+
+// The runtime beside this executable must be the one built from the
+// sources this cbc was built with (`build_info::CBRT_STAMP`; empty: any): a
+// stale runtime links without complaint and misbehaves.
+fn check_runtime(StringView lib, Target t) : Result<void, String>
+{
+    Vec<u8> bytes = match (read_bytes(lib))
+    {
+        Ok(b)  : b,
+        Err(e) : return Err(sprintf("cannot read %v: %v", lib, io_text(&e))),
+    };
+    String marker = sprintf("CBRT-STAMP:%v", CBRT_STAMP);
+    if (contains_bytes(&bytes, String::as_view(&marker)))
+    {
+        return Ok(());
+    }
+    Err(sprintf(
+        "%v is stale: it was not built from the sources this cobc was (rebuild it: %s)",
+        lib,
+        &Target::runtime_build(t),
+    ))
+}
+
+fn contains_bytes(ref<Vec<u8>, shared> hay, StringView needle) : bool
+{
+    slice<u8, shared> nb = StringView::as_bytes(needle);
+    usize n = StringView::len(needle);
+    usize h = Vec::len(hay);
+    if (n == 0)
+    {
+        return true;
+    }
+    if (n > h)
+    {
+        return false;
+    }
+    u8 first = nb[0];
+    for (usize i = 0; i + n <= h; i += 1)
+    {
+        if (hay[i] != first)
+        {
+            continue;
+        }
+        usize k = 1;
+        while (k < n && hay[i + k] == nb[k])
+        {
+            k += 1;
+        }
+        if (k == n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// `link_trim`: linker options that leave out of the executable what it does
+// not use (GNU ld; MinGW-w64's GNU ld for Windows): `--gc-sections` drops
+// every section nothing references, `--strip-debug` the debug information.
+// With `-s`, `--strip-all` instead of `--strip-debug`: the symbol table goes
+// too.
+fn link_trim(bool strip, bool debug, Target t) : Vec<str>
+{
+    // GNU ld on both targets (MinGW's for Windows).
+    Vec<str> v = Vec::new();
+    Vec::push(&mut v, "-Wl,--gc-sections");
+    if (strip)
+    {
+        Vec::push(&mut v, "-Wl,--strip-all");
+    }
+    else if (!debug)
+    {
+        Vec::push(&mut v, "-Wl,--strip-debug");
+    }
+    v
+}
+
+// D-0257 (`--lib`): the program's objects, and the objects of its own C and
+// assembly files, into one static archive; the runtime stays its own
+// archive, `libcbrt.a`, copied beside the output so that a C build has both
+// at hand. A library name the program links or a shared library cannot go
+// into an archive: the header names them for the C build.
+fn archive(
+    StringView cc,
+    ref<Vec<String>, shared> objects,
+    ref<Vec<String>, shared> extra,
+    StringView out,
+    Target t,
+) : Result<Output, String>
+{
+    String home = runtime_home()?;
+    String lib_dir = Target::runtime_dir(t, String::as_view(&home));
+    String runtime = pjoin(String::as_view(&lib_dir), StringView::of(Target::lib_file(t)));
+    if (!exists(String::as_view(&runtime)))
+    {
+        return Err(sprintf(
+            "the runtime for %v, %v, is not in %s (build it: %s)",
+            Target::triple(t),
+            Target::lib_file(t),
+            &lib_dir,
+            &Target::runtime_build(t),
+        ));
+    }
+    check_runtime(String::as_view(&runtime), t)?;
+    // The archiver beside the C compiler: a cross compiler's own.
+    Option<StringView> prefix = match (rfind(cc, "-gcc"))
+    {
+        Some(k) : Some(StringView::sub(cc, 0, k)),
+        None : match (rfind(cc, "-clang"))
+        {
+            Some(k) : Some(StringView::sub(cc, 0, k)),
+            None    : None,
+        },
+    };
+    String ar = match (prefix)
+    {
+        Some(p) : if (StringView::contains(p, "mingw32")) { sprintf("%v-ar", p) } else { String::from_str("ar") },
+        None    : String::from_str("ar"),
+    };
+    _ = remove_file(out);
+    Cmd cmd = Cmd::new(String::as_view(&ar));
+    Cmd::arg(&mut cmd, "rcs");
+    Cmd::arg(&mut cmd, out);
+    foreach (o in objects)
+    {
+        Cmd::arg(&mut cmd, String::as_view(o));
+    }
+    foreach (e in extra)
+    {
+        if (String::ends_with(e, ".o"))
+        {
+            Cmd::arg(&mut cmd, String::as_view(e));
+        }
+    }
+    show(&cmd);
+    Output output = match (Cmd::output(&cmd))
+    {
+        Ok(o)  : o,
+        Err(e) : return Err(sprintf("cannot run the archiver `%s`: %v", &ar, io_text(&e))),
+    };
+    if (output.status == 0)
+    {
+        String dir = match (parent(out))
+        {
+            Some(d) : d,
+            None    : String::from_str("."),
+        };
+        String dest = pjoin(String::as_view(&dir), StringView::of(Target::lib_file(t)));
+        Option<String> a = canonical(String::as_view(&dest));
+        Option<String> b = canonical(String::as_view(&runtime));
+        bool same = match (&a)
+        {
+            Some(x) : match (&b)
+            {
+                Some(y) : *x == *y,
+                None    : false,
+            },
+            None : Option::is_none(&b),
+        };
+        if (!same)
+        {
+            match (copy_file(String::as_view(&runtime), String::as_view(&dest)))
+            {
+                Ok(_)  : {},
+                Err(e) : return Err(sprintf("cannot copy %s to %s: %v", &runtime, &dest, io_text(&e))),
+            }
+            note(String::as_view(&sprintf("copied the runtime to %s", &dest)));
+        }
+    }
+    Ok(output)
+}
+
+// The last `pat` in `s` (`str::rsplit_once`).
+fn rfind(StringView s, str pat) : Option<usize>
+{
+    Option<usize> last = None;
+    usize from = 0;
+    usize pl = StringView::len(StringView::of(pat));
+    while (from <= StringView::len(s))
+    {
+        match (StringView::find(StringView::sub(s, from, StringView::len(s)), StringView::of(pat)))
+        {
+            Some(k) :
+            {
+                last = Some(from + k);
+                from = from + k + if (pl == 0) { 1 } else { pl };
+            },
+            None    : break,
+        }
+    }
+    last
+}
+
+// D-0257: the header beside the library: a guard, the link line for its
+// target, and what the lowering declared (`Generated::header_text`).
+fn write_header(StringView out, StringView text, ref<Vec<Code>, shared> code, Target t) : Result<String, String>
+{
+    String stem = match (path_stem(out))
+    {
+        Some(s) : s,
+        None    : String::from_str("cobalt"),
+    };
+    String short = match (String::strip_prefix(&stem, "lib"))
+    {
+        Some(r) : String::from_view(r),
+        None    : String::clone(&stem),
+    };
+    String path = with_file_name(out, String::as_view(&sprintf("%s.h", &short)));
+    String guard_name = String::from_str("COBALT_");
+    String up = String::to_ascii_upper(&short);
+    foreach (b in String::as_bytes(&up))
+    {
+        u8 c = *b;
+        bool alnum = (c >= b'A' && c <= b'Z') || (c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9');
+        String::push_ascii(&mut guard_name, if (alnum) { c } else { b'_' });
+    }
+    String::append(&mut guard_name, "_H");
+    Vec<String> libs = Vec::new();
+    Vec::push(&mut libs, sprintf("-l%s", &short));
+    Vec::push(&mut libs, String::from_str("-lcbrt"));
+    foreach (c in code)
+    {
+        match (c)
+        {
+            CName(n) : Vec::push(&mut libs, sprintf("-l%s", n)),
+            CFile(f) :
+            {
+                if (is_kind(c, Kind::KStatic) || is_kind(c, Kind::KShared))
+                {
+                    Vec::push(&mut libs, String::clone(&f.path));
+                }
+            },
+        }
+    }
+    Vec<str> sys = Target::link_libs(t);
+    foreach (l in &sys)
+    {
+        Vec::push(&mut libs, sprintf("-l%v", *l));
+    }
+    String h = String::new();
+    String::appendf(
+        &mut h,
+        "/* %s: the C interface of %s, written by cobc (D-0257).\n",
+        &name_of(String::as_view(&path)),
+        &name_of(out),
+    );
+    String::appendf(
+        &mut h,
+        "   Link, with this file's directory on the library path (-L): %s\n",
+        &String::join(&libs[0..$], " "),
+    );
+    String::appendf(
+        &mut h,
+        "   The runtime, %v, is beside the library; a program that links two CobaltC libraries links it once. */\n",
+        Target::lib_file(t),
+    );
+    String::appendf(&mut h, "#ifndef %s\n#define %s\n\n", &guard_name, &guard_name);
+    String::append(&mut h, text);
+    String::appendf(&mut h, "\n#endif /* %s */\n", &guard_name);
+    match (write_file(String::as_view(&path), String::as_view(&h)))
+    {
+        Ok(_)  : Ok(path),
+        Err(e) : Err(sprintf("cannot write %s: %v", &path, io_text(&e))),
+    }
+}
+
+// Compiles and links `inputs` (the program's C file) into `exe`. `extra` links the program's own C code: after the
+// generated program, before the runtime and the system libraries. Many
+// inputs go through a response file in `work_dir`: a command line has a
+// length limit (Windows: 32 K).
+// The runtime's directory for `t`, checked present and current (cobc's
+// `runtime_dir`).
+fn checked_runtime_dir(Target t) : Result<String, String>
+{
+    String home = runtime_home()?;
+    String lib_dir = Target::runtime_dir(t, String::as_view(&home));
+    String runtime = pjoin(String::as_view(&lib_dir), StringView::of(Target::lib_file(t)));
+    if (!exists(String::as_view(&runtime)))
+    {
+        return Err(sprintf(
+            "the runtime for %v, %v, is not in %s (build it: %s)",
+            Target::triple(t),
+            Target::lib_file(t),
+            &lib_dir,
+            &Target::runtime_build(t),
+        ));
+    }
+    check_runtime(String::as_view(&runtime), t)?;
+    Ok(lib_dir)
+}
+
+// A part's compile, on a thread of its own (`build_exe`).
+fn run_part(Cmd c) : Result<Output, FileError>
+{
+    Cmd::output(&c)
+}
+
+// D-0277 (cobc's `build_exe`): the program's C compiled and linked into
+// `exe`. A large program's C is compiled in parts (`part_count`,
+// `split_parts`), all at once, each written into `work_dir` under its own
+// name, then linked; with link-time optimisation where the C compiler has it
+// (`Lto`). One part is the C file itself, compiled and linked in one command.
+fn build_exe(
+    ref<Generated, shared> gen,
+    StringView cc,
+    StringView c_path,
+    StringView exe,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<Vec<String>, shared> extra,
+    bool strip,
+    bool debug,
+    StringView work_dir,
+    Target t,
+    ref<CcFacts, shared> facts,
+) : Result<Output, String>
+{
+    String lib_dir = checked_runtime_dir(t)?;
+    usize units_len = 0;
+    foreach (u in &gen.units)
+    {
+        units_len += String::len(&u.text);
+    }
+    usize k = part_count(units_len);
+    Lto lto = Lto::Off;
+    if (!StringView::eq_str(opt, "-O0"))
+    {
+        if (is_gcc(facts))
+        {
+            lto = Lto::Gcc;
+        }
+        else if (is_clang(facts) && k > 1)
+        {
+            // `lld` only when it is the Clang installation's own.
+            Vec<str> lds = Vec::new();
+            if (own_lld(cc, facts))
+            {
+                Vec::push(&mut lds, "-fuse-ld=lld");
+            }
+            Vec::push(&mut lds, "-fuse-ld=gold");
+            foreach (ld in &lds)
+            {
+                if (lto_probe(cc, opt, arch, facts, *ld, String::as_view(&lib_dir), work_dir, t))
+                {
+                    lto = Lto::Thin(*ld);
+                    break;
+                }
+            }
+        }
+    }
+    Vec<str> link_lto = Lto::link_flags(lto);
+    if (k == 1)
+    {
+        Vec<String> inputs = Vec::new();
+        Vec::push(&mut inputs, String::from_view(c_path));
+        return compile(cc, &inputs, exe, opt, arch, extra, strip, debug, work_dir, t, facts, &link_lto);
+    }
+    Vec<str> part_lto = Lto::part_flags(lto);
+    Vec<String> parts_c = Vec::new();
+    Vec<String> objects = Vec::new();
+    Vec<handle<Result<Output, FileError>>> hs = Vec::new();
+    Vec<String> texts = split_parts(gen, k);
+    for (usize i = 0; i < Vec::len(&texts); i += 1)
+    {
+        String part = pjoin(work_dir, String::as_view(&sprintf("part%v.c", i)));
+        String obj = pjoin(work_dir, String::as_view(&sprintf("part%v.o", i)));
+        match (write_file(String::as_view(&part), String::as_view(&settle_lines(&texts[i], String::as_view(&part)))))
+        {
+            Ok(_)  : {},
+            Err(e) : return Err(sprintf("cannot write %s: %v", &part, io_text(&e))),
+        }
+        Cmd cmd = Cmd::new(cc);
+        foreach (f in &facts.flags)
+        {
+            Cmd::arg(&mut cmd, String::as_view(f));
+        }
+        Cmd::arg(&mut cmd, opt);
+        match (arch)
+        {
+            Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+            None    : {},
+        }
+        if (debug)
+        {
+            Cmd::arg(&mut cmd, "-g");
+        }
+        foreach (f in &part_lto)
+        {
+            Cmd::arg(&mut cmd, StringView::of(*f));
+        }
+        Cmd::arg(&mut cmd, "-c");
+        Cmd::arg(&mut cmd, "-o");
+        Cmd::arg(&mut cmd, String::as_view(&obj));
+        Cmd::arg(&mut cmd, String::as_view(&part));
+        show(&cmd);
+        Vec::push(&mut hs, spawn(run_part, cmd));
+        Vec::push(&mut parts_c, part);
+        Vec::push(&mut objects, obj);
+    }
+    Option<String> failed = None;
+    usize n = 0;
+    while (Vec::len(&hs) > 0)
+    {
+        handle<Result<Output, FileError>> h = Vec::remove(&mut hs, 0);
+        Result<Output, FileError> r = join(h);
+        match (r)
+        {
+            Ok(o)  :
+            {
+                if (o.status != 0 && Option::is_none(&failed))
+                {
+                    failed = Some(sprintf("%s%v failed on %s", &lossy(&o.stderr[0..$]), cc, &parts_c[n]));
+                }
+            },
+            Err(e) :
+            {
+                if (Option::is_none(&failed))
+                {
+                    failed = Some(sprintf("cannot run the C compiler `%v`: %v", cc, io_text(&e)));
+                }
+            },
+        }
+        n += 1;
+    }
+    match (failed)
+    {
+        Some(e) : return Err(e),
+        None    : {},
+    }
+    compile(cc, &objects, exe, opt, arch, extra, strip, debug, work_dir, t, facts, &link_lto)
+}
+
+// Whether the C compiler links a program calling into the runtime
+// (`LTO_PROBE`) with ThinLTO through `ld` (cobc's `build_exe` probe).
+fn lto_probe(
+    StringView cc,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<CcFacts, shared> facts,
+    str ld,
+    StringView lib_dir,
+    StringView work_dir,
+    Target t,
+) : bool
+{
+    String src = pjoin(work_dir, "lto-probe.c");
+    if (Result::is_err(&write_file(String::as_view(&src), LTO_PROBE)))
+    {
+        return false;
+    }
+    Cmd cmd = Cmd::new(cc);
+    foreach (f in &facts.flags)
+    {
+        Cmd::arg(&mut cmd, String::as_view(f));
+    }
+    Cmd::arg(&mut cmd, opt);
+    match (arch)
+    {
+        Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+        None    : {},
+    }
+    Cmd::arg(&mut cmd, "-flto=thin");
+    Cmd::arg(&mut cmd, StringView::of(ld));
+    Cmd::arg(&mut cmd, "-o");
+    Cmd::arg(&mut cmd, String::as_view(&pjoin(work_dir, "lto-probe")));
+    Cmd::arg(&mut cmd, String::as_view(&src));
+    Cmd::arg(&mut cmd, "-L");
+    Cmd::arg(&mut cmd, lib_dir);
+    Cmd::arg(&mut cmd, "-lcbrt");
+    Vec<str> sys = Target::link_libs(t);
+    foreach (l in &sys)
+    {
+        Cmd::arg(&mut cmd, String::as_view(&sprintf("-l%v", *l)));
+    }
+    show(&cmd);
+    match (Cmd::output(&cmd))
+    {
+        Ok(o)  : o.status == 0,
+        Err(_) : false,
+    }
+}
+
+fn compile(
+    StringView cc,
+    ref<Vec<String>, shared> inputs,
+    StringView exe,
+    StringView opt,
+    ref<Option<String>, shared> arch,
+    ref<Vec<String>, shared> extra,
+    bool strip,
+    bool debug,
+    StringView work_dir,
+    Target t,
+    ref<CcFacts, shared> facts,
+    ref<Vec<str>, shared> lto,
+) : Result<Output, String>
+{
+    String lib_dir = checked_runtime_dir(t)?;
+    // `-ffp-contract=off`: spec/06 rounds each operation on its own.
+    // `-fno-optimize-sibling-calls`: every call stays one, so a recursion
+    // too deep for the stack faults. The runtime's system libraries are the
+    // runtime's own knowledge (`link_libs_for`). `link_trim`: the executable
+    // without what nothing in it uses.
+    Cmd cmd = Cmd::new(cc);
+    foreach (f in &facts.flags)
+    {
+        Cmd::arg(&mut cmd, String::as_view(f));
+    }
+    Cmd::arg(&mut cmd, opt);
+    match (arch)
+    {
+        Some(a) : Cmd::arg(&mut cmd, String::as_view(a)),
+        None    : {},
+    }
+    if (debug)
+    {
+        Cmd::arg(&mut cmd, "-g");
+    }
+    foreach (f in lto)
+    {
+        Cmd::arg(&mut cmd, StringView::of(*f));
+    }
+    Cmd::arg(&mut cmd, "-o");
+    Cmd::arg(&mut cmd, exe);
+    if (Vec::len(inputs) == 1)
+    {
+        Cmd::arg(&mut cmd, String::as_view(&inputs[0]));
+    }
+    else
+    {
+        String resp = pjoin(work_dir, "objects.rsp");
+        String text = String::new();
+        foreach (p in inputs)
+        {
+            String::push_ascii(&mut text, b'"');
+            String::append(&mut text, &String::replace(p, "\\", "/"));
+            String::append(&mut text, "\"\n");
+        }
+        match (write_file(String::as_view(&resp), String::as_view(&text)))
+        {
+            Ok(_)  : {},
+            Err(e) : return Err(sprintf("cannot write %s: %v", &resp, io_text(&e))),
+        }
+        Cmd::arg(&mut cmd, String::as_view(&sprintf("@%s", &resp)));
+    }
+    foreach (e in extra)
+    {
+        Cmd::arg(&mut cmd, String::as_view(e));
+    }
+    Cmd::arg(&mut cmd, "-L");
+    Cmd::arg(&mut cmd, String::as_view(&lib_dir));
+    Cmd::arg(&mut cmd, "-lcbrt");
+    Vec<str> sys = Target::link_libs(t);
+    foreach (l in &sys)
+    {
+        Cmd::arg(&mut cmd, String::as_view(&sprintf("-l%v", *l)));
+    }
+    Vec<str> trim = link_trim(strip, debug, t);
+    foreach (l in &trim)
+    {
+        Cmd::arg(&mut cmd, StringView::of(*l));
+    }
+    show(&cmd);
+    match (Cmd::output(&cmd))
+    {
+        Ok(o)  : Ok(o),
+        Err(e) : Err(sprintf("cannot run the C compiler `%v`: %v", cc, io_text(&e))),
+    }
+}

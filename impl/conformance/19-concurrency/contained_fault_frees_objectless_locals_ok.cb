@@ -1,0 +1,58 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.contained-fault-frees-objectless-locals; [Fault-Contain], [Fault-Unwind] (D-0269, CHG-0341)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 5b656e6420315d5b646961672e696e6465782d6f75742d6f662d626f756e64735d5b656e6420325d5b656e6420335d5b646961672e696e6465782d6f75742d6f662d626f756e64735d5b656e6420345d5b656e6420355d5b646961672e696e6465782d6f75742d6f662d626f756e64735d5b656e6420365d0a6f6b203135206661696c656420330a
+//
+// A contained fault's unwind runs every destructor [Fault-Unwind] would
+// run, the ends of the frames' container locals among them: `work`'s
+// `Vec<i64>` and `String` have no runtime object under `cobc` (D-0200,
+// their ends are C statements the unwind never reaches), and a job that
+// faults three times in a pool must not leak three buffers. The program
+// observes the resource's destructor; the buffers' release is observed
+// by `cobc`'s sanitizer test (`driver.rs`, `contained_fault_frees_
+// objectless_locals`) and by round 10's pool under LeakSanitizer.
+
+import std;
+
+resource struct Job
+{
+    i64 id;
+}
+
+fn Job::drop(ref<Job, exclusive> self)
+{
+    printf("[end %v]", self.id);
+}
+
+fn work(i64 x) : i64
+{
+    Vec<i64> cells = Vec::filled(4, x);
+    String name = String::from_str("job ");
+    String::append(&mut name, x);
+    Job j = Job { .id = x };
+    if (x % 2 == 1)
+    {
+        return cells[narrow<usize>(x + 9)];    // diag.index-out-of-bounds
+    }
+    Vec::push(&mut cells, narrow<i64>(String::len(&name)));
+    cells[4]
+}
+
+fn main()
+{
+    i64 ok = 0;
+    i64 failed = 0;
+    i64 i = 1;
+    while (i <= 6)
+    {
+        match (try_join(spawn(work, i)))
+        {
+            Ok(v)  : { ok = ok + v; },
+            Err(f) : { failed = failed + 1; printf("[%v]", &ThreadFailure::diagnostic(&f)); },
+        }
+        i = i + 1;
+    }
+    printf("\nok %v failed %v\n", ok, failed);
+}

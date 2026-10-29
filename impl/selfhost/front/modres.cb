@@ -1,0 +1,2147 @@
+// Module visibility and name resolution (spec/17), as impl/src/modres.rs
+// does them, function for function: the module tree built from the whole
+// program (its items' qualified keys, `export` flags and kinds, the
+// imports and re-exports), every import validated once, and every item
+// reference in a body, a field, a payload or a signature resolved by
+// `[Resolve-Unqualified]` and `[Resolve-Qualified]` from the module it is
+// written in and rewritten in place to its qualified key. The two checks
+// only this pass makes: `diag.name-not-visible` and `diag.ambiguous-name`.
+// Also `[Item-Duplicate]` (impl/src/lib.rs's `check_duplicate_items`),
+// which runs first. `--warn-shadow`'s notes are not made here.
+
+import std;
+import ast;
+import prelude;
+
+export enum Kind
+{
+    KFn,
+    KExtern,
+    KStatic,
+    KStruct,
+    KEnum,
+    KModule,
+}
+
+// What a module's simple name stands for.
+struct Entry
+{
+    String key;
+    bool export_;
+    Kind kind;
+}
+
+struct ImportDecl
+{
+    Vec<String> segs;
+    usize line;
+}
+
+struct ModuleNode
+{
+    Option<String> parent;
+    HashMap<String, Entry> items;
+    Vec<ImportDecl> imports;
+    // The `export import p;` among them (D-0136).
+    Vec<ImportDecl> reexports;
+    // The enums among `items` (named simply) with a variant of each name:
+    // an index of what `enums_with` would find by reading every item.
+    HashMap<String, Vec<Entry>> by_variant;
+}
+
+struct ItemInfo
+{
+    bool export_;
+    Kind kind;
+    String home;
+}
+
+// What one `import p;` of a module resolved to.
+struct Target
+{
+    Vec<String> imp;
+    String key;
+    Kind kind;
+}
+
+struct Hit
+{
+    String key;
+    Kind kind;
+}
+
+export struct Resolver
+{
+    HashMap<String, ModuleNode> modules;
+    HashMap<String, ItemInfo> all_items;
+    HashMap<String, HashSet<String>> enum_variants;
+    // Empty while `build` validates the imports themselves.
+    HashMap<String, Vec<Target>> import_targets;
+    HashSet<String> consts;
+    // How many enums have a variant of each name.
+    HashMap<String, usize> variant_owners;
+}
+
+// The `"diag.xxx@N"` tagging the passes share; an already tagged string
+// keeps its own, so the innermost site wins.
+fn tag(String d, usize line) : String
+{
+    if (String::contains(&d, "@"))
+    {
+        return d;
+    }
+    sprintf("%s@%v", &d, line)
+}
+
+// A diagnostic with a message naming what it is about (D-0072).
+fn named(str id, ref<String, shared> msg) : String
+{
+    sprintf("%s\u{1}%s", id, msg)
+}
+
+fn segments(StringView s) : Vec<String>
+{
+    Vec<StringView> parts = StringView::split(s, "::");
+    Vec<String> out = Vec::new();
+    for (usize i = 0; i < Vec::len(&parts); i += 1)
+    {
+        Vec::push(&mut out, String::from_view(parts[i]));
+    }
+    out
+}
+
+fn joined(ref<Vec<String>, shared> v) : String
+{
+    String::join(&v[0..$], "::")
+}
+
+fn last_seg(ref<Vec<String>, shared> v) : StringView
+{
+    if (Vec::len(v) == 0)
+    {
+        return StringView::of("");
+    }
+    String::as_view(&v[Vec::len(v) - 1])
+}
+
+// An intrinsic's name (`spec/21` §0); a `$`-name is internal, never an item.
+fn is_intrinsic_name(StringView name) : bool
+{
+    if (StringView::contains(name, "::") || StringView::starts_with(name, "$"))
+    {
+        return false;
+    }
+    String spaced = sprintf(" %s ", name);
+    StringView::contains(PRELUDE_INTRINSICS, String::as_view(&spaced))
+}
+
+// An item's key: `std`'s submodules' items by their short path (D-0136),
+// but not `std::extensions`' (D-0187); a root item named as an intrinsic
+// apart from the intrinsic (D-0055).
+export fn qualify(ref<Vec<String>, shared> path, StringView simple) : String
+{
+    if (Vec::len(path) > 1 && String::eq_str(&path[0], "std") && !String::eq_str(&path[1], "extensions"))
+    {
+        return sprintf("std::%s", simple);
+    }
+    if (Vec::len(path) == 0)
+    {
+        if (is_intrinsic_name(simple))
+        {
+            return sprintf("%s$", simple);
+        }
+        return String::from_view(simple);
+    }
+    sprintf("%s::%s", &joined(path), simple)
+}
+
+// A module's key: its full path.
+fn module_key(ref<Vec<String>, shared> path, ref<String, shared> name) : String
+{
+    if (Vec::len(path) == 0)
+    {
+        return String::clone(name);
+    }
+    sprintf("%s::%s", &joined(path), name)
+}
+
+// ---- `[Item-Duplicate]` ----
+
+fn add_name(ref<HashSet<String>, exclusive> seen, String name, usize line) : Result<void, String>
+{
+    if (HashSet::insert(seen, name))
+    {
+        return Ok(());
+    }
+    Err(sprintf("diag.duplicate-item@%v", line))
+}
+
+fn duplicates_in(
+    ref<Vec<Item>, shared> items,
+    ref<Vec<String>, exclusive> path,
+    ref<HashSet<String>, exclusive> seen,
+) : Result<void, String>
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(b)         :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                String simple = match (&f.assoc_type)
+                {
+                    Some(t) : sprintf("%s::%s", t, &f.name),
+                    None    : String::clone(&f.name),
+                };
+                add_name(seen, qualify(path, String::as_view(&simple)), f.line)?;
+            },
+            Item::IExtern(b)     : add_name(seen, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line)?,
+            Item::IStatic(b)     : add_name(seen, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line)?,
+            Item::IStruct(b)     : add_name(seen, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line)?,
+            Item::IEnum(b)       :
+            {
+                ref<EnumDecl, shared> e = Box::get(b);
+                add_name(seen, qualify(path, String::as_view(&e.name)), e.line)?;
+                for (usize k = 0; k < Vec::len(&e.variants); k += 1)
+                {
+                    String v = sprintf("%s::%s", &e.name, &e.variants[k].name);
+                    add_name(seen, qualify(path, String::as_view(&v)), e.line)?;
+                }
+            },
+            Item::IModule(b)     :
+            {
+                ref<ModuleItem, shared> m = Box::get(b);
+                add_name(seen, module_key(path, &m.name), m.line)?;
+                Vec::push(path, String::clone(&m.name));
+                duplicates_in(&m.items, path, seen)?;
+                Vec::pop(path);
+            },
+            Item::IImport(_)     : {},
+            Item::IExternCode(_) : {},
+        }
+    }
+    Ok(())
+}
+
+// `rule.module.resolve` `[Item-Duplicate]` (`CHG-0032`): every qualified
+// name is added by at most one declaration.
+export fn check_duplicates(ref<Program, shared> p) : Result<void, String>
+{
+    HashSet<String> seen = HashSet::new();
+    Vec<String> path = Vec::new();
+    duplicates_in(&p.items, &mut path, &mut seen)
+}
+
+// ---- the module tree ----
+
+fn enter(ref<Resolver, exclusive> r, ref<String, shared> here, String simple, String key, bool export_, Kind kind)
+{
+    Entry e = Entry { .key = String::clone(&key), .export_ = export_, .kind = kind };
+    Vec<String> vs = variants_of(r, &simple, &e);
+    ref<ModuleNode, exclusive> node = Option::expect(HashMap::get_mut(&mut r.modules, here), "the module is entered");
+    index_entry(node, &vs, &e);
+    HashMap::insert(&mut node.items, simple, e);
+    HashMap::insert(&mut r.all_items, key, ItemInfo { .export_ = export_, .kind = kind, .home = String::clone(here) });
+}
+
+// The variants an entry adds to its module's `by_variant`: an enum's,
+// when it is named simply.
+fn variants_of(ref<Resolver, shared> r, ref<String, shared> simple, ref<Entry, shared> e) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    if (e.kind != Kind::KEnum || String::contains(simple, "::"))
+    {
+        return out;
+    }
+    match (HashMap::get(&r.enum_variants, &e.key))
+    {
+        Some(vs) :
+        {
+            for (usize i = 0; i < HashSet::len(vs); i += 1)
+            {
+                Vec::push(&mut out, String::clone(HashSet::key_at(vs, i)));
+            }
+        },
+        None     : {},
+    }
+    out
+}
+
+fn index_entry(ref<ModuleNode, exclusive> node, ref<Vec<String>, shared> vs, ref<Entry, shared> e)
+{
+    for (usize i = 0; i < Vec::len(vs); i += 1)
+    {
+        ref<Vec<Entry>, exclusive> list = HashMap::entry(&mut node.by_variant, String::clone(&vs[i]), Vec::new());
+        Vec::push(list, clone(e));
+    }
+}
+
+struct AssocUse
+{
+    String module_;
+    String type_;
+    usize line;
+}
+
+fn walk_items(
+    ref<Vec<Item>, shared> items,
+    ref<Vec<String>, exclusive> path,
+    ref<Resolver, exclusive> r,
+    ref<Vec<AssocUse>, exclusive> assoc,
+)
+{
+    String here = joined(path);
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(b)         :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                String simple = match (&f.assoc_type)
+                {
+                    Some(t) :
+                    {
+                        Vec::push(
+                            assoc,
+                            AssocUse { .module_ = String::clone(&here), .type_ = String::clone(t), .line = f.line },
+                        );
+                        sprintf("%s::%s", t, &f.name)
+                    },
+                    None    : String::clone(&f.name),
+                };
+                String qk = qualify(path, String::as_view(&simple));
+                if (f.is_const)
+                {
+                    HashSet::insert(&mut r.consts, String::clone(&qk));
+                }
+                enter(r, &here, simple, qk, f.export_, Kind::KFn);
+            },
+            // D-0258: a static is an item of its module.
+            Item::IStatic(b)     :
+            {
+                ref<StaticDecl, shared> s = Box::get(b);
+                enter(
+                    r,
+                    &here,
+                    String::clone(&s.name),
+                    qualify(path, String::as_view(&s.name)),
+                    s.export_,
+                    Kind::KStatic,
+                );
+            },
+            Item::IExtern(b)     :
+            {
+                ref<ExternDecl, shared> e = Box::get(b);
+                enter(
+                    r,
+                    &here,
+                    String::clone(&e.name),
+                    qualify(path, String::as_view(&e.name)),
+                    e.export_,
+                    Kind::KExtern,
+                );
+            },
+            Item::IStruct(b)     :
+            {
+                ref<StructDecl, shared> s = Box::get(b);
+                enter(
+                    r,
+                    &here,
+                    String::clone(&s.name),
+                    qualify(path, String::as_view(&s.name)),
+                    s.export_,
+                    Kind::KStruct,
+                );
+            },
+            Item::IEnum(b)       :
+            {
+                ref<EnumDecl, shared> e = Box::get(b);
+                String qk = qualify(path, String::as_view(&e.name));
+                HashSet<String> vs = HashSet::new();
+                for (usize k = 0; k < Vec::len(&e.variants); k += 1)
+                {
+                    HashSet::insert(&mut vs, String::clone(&e.variants[k].name));
+                }
+                for (usize k = 0; k < HashSet::len(&vs); k += 1)
+                {
+                    *HashMap::entry(&mut r.variant_owners, String::clone(HashSet::key_at(&vs, k)), 0) += 1;
+                }
+                HashMap::insert(&mut r.enum_variants, String::clone(&qk), vs);
+                enter(r, &here, String::clone(&e.name), qk, e.export_, Kind::KEnum);
+            },
+            Item::IModule(b)     :
+            {
+                ref<ModuleItem, shared> m = Box::get(b);
+                String qk = module_key(path, &m.name);
+                enter(r, &here, String::clone(&m.name), String::clone(&qk), m.export_, Kind::KModule);
+                HashMap::insert(&mut r.modules, qk, ModuleNode {
+                    .parent = Some(String::clone(&here)),
+                    .items = HashMap::new(),
+                    .imports = Vec::new(),
+                    .reexports = Vec::new(),
+                    .by_variant = HashMap::new(),
+                });
+                Vec::push(path, String::clone(&m.name));
+                walk_items(&m.items, path, r, assoc);
+                Vec::pop(path);
+            },
+            Item::IImport(b)     :
+            {
+                ref<ImportItem, shared> im = Box::get(b);
+                Vec<String> segs = segments(String::as_view(&im.path));
+                ref<ModuleNode, exclusive> node = Option::expect(
+                    HashMap::get_mut(&mut r.modules, &here),
+                    "the module is entered",
+                );
+                if (im.export_)
+                {
+                    Vec::push(&mut node.reexports, ImportDecl { .segs = Vec::clone(&segs), .line = im.line });
+                }
+                Vec::push(&mut node.imports, ImportDecl { .segs = segs, .line = im.line });
+            },
+            Item::IExternCode(_) : {},
+        }
+    }
+}
+
+// `std`'s functions both implementations realise natively (`spec/21` §0):
+// entered where a declaration would be.
+fn native(ref<Resolver, exclusive> r, str module_, StringView simple, bool export_)
+{
+    String m = if (HashMap::contains(
+        &r.modules,
+        &String::from_str(module_),
+    )) { String::from_str(module_) } else { String::from_str("std") };
+    enter(r, &m, String::from_view(simple), sprintf("std::%s", simple), export_, Kind::KFn);
+}
+
+fn build(ref<Program, shared> program) : Result<Resolver, String>
+{
+    Resolver r = Resolver {
+        .modules = HashMap::new(),
+        .all_items = HashMap::new(),
+        .enum_variants = HashMap::new(),
+        .import_targets = HashMap::new(),
+        .consts = HashSet::new(),
+        .variant_owners = HashMap::new(),
+    };
+    HashMap::insert(&mut r.modules, String::new(), ModuleNode {
+        .parent = None,
+        .items = HashMap::new(),
+        .imports = Vec::new(),
+        .reexports = Vec::new(),
+        .by_variant = HashMap::new(),
+    });
+    Vec<AssocUse> assoc = Vec::new();
+    Vec<String> path = Vec::new();
+    walk_items(&program.items, &mut path, &mut r, &mut assoc);
+    if (HashMap::contains(&r.modules, &String::from_str("std")))
+    {
+        native(&mut r, "std::core", "Result::map_err", true);
+        native(&mut r, "std", "print", false);
+        native(&mut r, "std::io", "printf", true);
+        native(&mut r, "std::text", "sprintf", true);
+        native(&mut r, "std::io", "eprintf", true);
+        native(&mut r, "std::text", "String::appendf", true);
+        native(&mut r, "std::io", "File::printf", true);
+        native(&mut r, "std::net", "TcpStream::printf", true);
+        native(&mut r, "std::core", "assert", true);
+        native(&mut r, "std::process", "exit", true);
+        Vec<StringView> fs = StringView::split_whitespace(PRELUDE_FLOAT_FNS);
+        for (usize i = 0; i < Vec::len(&fs); i += 1)
+        {
+            native(&mut r, "std::math", fs[i], true);
+        }
+    }
+    // `[Assoc-Fn-Foreign-Type]` (CHG-0033): `fn T::name` in `M` only where
+    // `T` is a struct or enum declared in `M` itself.
+    for (usize i = 0; i < Vec::len(&assoc); i += 1)
+    {
+        ref<AssocUse, shared> a = &assoc[i];
+        bool here = match (HashMap::get(&r.modules, &a.module_))
+        {
+            Some(node) : match (HashMap::get(&node.items, &a.type_))
+            {
+                Some(e) : e.kind == Kind::KStruct || e.kind == Kind::KEnum,
+                None    : false,
+            },
+            None : false,
+        };
+        if (!here)
+        {
+            return Err(tag(String::from_str("diag.foreign-associated-fn"), a.line));
+        }
+    }
+    reexport(&mut r)?;
+    // Every `import` target, once, in the modules' order (CHG-0352).
+    Vec<String> order = Vec::new();
+    for (usize i = 0; i < HashMap::len(&r.modules); i += 1)
+    {
+        Vec::push(&mut order, String::clone(HashMap::key_at(&r.modules, i)));
+    }
+    Vec::sort(&mut order);
+    HashMap<String, Vec<Target>> targets = HashMap::new();
+    for (usize i = 0; i < Vec::len(&order); i += 1)
+    {
+        ref<String, shared> m = &order[i];
+        Vec<ImportDecl> imports = clone(&Option::expect(HashMap::get(&r.modules, m), "a module").imports);
+        for (usize k = 0; k < Vec::len(&imports); k += 1)
+        {
+            ref<ImportDecl, shared> imp = &imports[k];
+            match (resolve_qualified(&r, &imp.segs, m))
+            {
+                Ok(Some(hit)) :
+                {
+                    Vec::push(HashMap::entry(&mut targets, String::clone(m), Vec::new()), Target {
+                        .imp = Vec::clone(&imp.segs),
+                        .key = String::clone(&hit.key),
+                        .kind = hit.kind,
+                    });
+                },
+                Ok(None)      :
+                {
+                    String msg = sprintf("`import %s` names nothing", &joined(&imp.segs));
+                    return Err(tag(named("diag.unbound-name", &msg), imp.line));
+                },
+                Err(d)        : return Err(tag(d, imp.line)),
+            }
+        }
+    }
+    r.import_targets = targets;
+    Ok(r)
+}
+
+fn shown(StringView k) : StringView
+{
+    Option::unwrap_or(StringView::strip_suffix(k, "$"), k)
+}
+
+struct Brought
+{
+    String name;
+    String key;
+    Kind kind;
+    Vec<String> variants;
+}
+
+// `rule.module.use`'s re-export (D-0136): each `export import p;` in `M`
+// enters what `p` brings in under its own name, exported, as an alias of
+// the item itself; repeated until nothing changes.
+fn reexport(ref<Resolver, exclusive> r) : Result<void, String>
+{
+    Vec<String> order = Vec::new();
+    for (usize i = 0; i < HashMap::len(&r.modules); i += 1)
+    {
+        if (Vec::len(&HashMap::value_at(&r.modules, i).reexports) > 0)
+        {
+            Vec::push(&mut order, String::clone(HashMap::key_at(&r.modules, i)));
+        }
+    }
+    Vec::sort(&mut order);
+    while (true)
+    {
+        bool changed = false;
+        Option<ImportDecl> unresolved = None;
+        for (usize i = 0; i < Vec::len(&order); i += 1)
+        {
+            ref<String, shared> m = &order[i];
+            Vec<ImportDecl> res = clone(&Option::expect(HashMap::get(&r.modules, m), "a module").reexports);
+            for (usize k = 0; k < Vec::len(&res); k += 1)
+            {
+                ref<ImportDecl, shared> p = &res[k];
+                Vec<Brought> brought = Vec::new();
+                match (resolve_qualified(r, &p.segs, m))
+                {
+                    Err(d)        : return Err(tag(d, p.line)),
+                    Ok(None)      :
+                    {
+                        if (Option::is_none(&unresolved))
+                        {
+                            unresolved = Some(clone(p));
+                        }
+                        continue;
+                    },
+                    Ok(Some(hit)) :
+                    {
+                        if (hit.kind == Kind::KModule)
+                        {
+                            ref<ModuleNode, shared> src = Option::expect(
+                                HashMap::get(&r.modules, &hit.key),
+                                "a module",
+                            );
+                            Vec<String> names = Vec::new();
+                            for (usize j = 0; j < HashMap::len(&src.items); j += 1)
+                            {
+                                if (HashMap::value_at(&src.items, j).export_)
+                                {
+                                    Vec::push(&mut names, String::clone(HashMap::key_at(&src.items, j)));
+                                }
+                            }
+                            Vec::sort(&mut names);
+                            for (usize j = 0; j < Vec::len(&names); j += 1)
+                            {
+                                ref<Entry, shared> e = Option::expect(HashMap::get(&src.items, &names[j]), "an item");
+                                Vec::push(
+                                    &mut brought,
+                                    Brought { .name = String::clone(&names[j]), .key = String::clone(&e.key), .kind = e.kind, .variants = variants_of(
+                                        r,
+                                        &names[j],
+                                        e,
+                                    ) },
+                                );
+                            }
+                        }
+                        else
+                        {
+                            Vec::push(
+                                &mut brought,
+                                Brought {
+                                    .name = String::from_view(last_seg(&p.segs)),
+                                    .key = String::clone(&hit.key),
+                                    .kind = hit.kind,
+                                    .variants = variants_of(
+                                        r,
+                                        &String::from_view(last_seg(&p.segs)),
+                                        &Entry { .key = String::clone(&hit.key), .export_ = true, .kind = hit.kind },
+                                    ),
+                                },
+                            );
+                        }
+                    },
+                }
+                for (usize j = 0; j < Vec::len(&brought); j += 1)
+                {
+                    ref<Brought, shared> b = &brought[j];
+                    ref<ModuleNode, exclusive> node = Option::expect(HashMap::get_mut(&mut r.modules, m), "a module");
+                    match (HashMap::get(&node.items, &b.name))
+                    {
+                        Some(have) :
+                        {
+                            if (!String::eq(&have.key, &b.key))
+                            {
+                                String msg = sprintf(
+                                    "`export import %s` brings in `%s`, but `%s` already names `%s` here",
+                                    &joined(&p.segs),
+                                    shown(String::as_view(&b.key)),
+                                    &b.name,
+                                    shown(String::as_view(&have.key)),
+                                );
+                                return Err(tag(named("diag.duplicate-item", &msg), p.line));
+                            }
+                        },
+                        None       :
+                        {
+                            Entry e = Entry { .key = String::clone(&b.key), .export_ = true, .kind = b.kind };
+                            index_entry(node, &b.variants, &e);
+                            HashMap::insert(&mut node.items, String::clone(&b.name), e);
+                            changed = true;
+                        },
+                    }
+                }
+            }
+        }
+        if (!changed)
+        {
+            return match (unresolved)
+            {
+                Some(p) :
+                {
+                    String msg = sprintf("`export import %s` names nothing", &joined(&p.segs));
+                    Err(tag(named("diag.unbound-name", &msg), p.line))
+                },
+                None    : Ok(()),
+            };
+        }
+    }
+    Ok(())
+}
+
+fn parent_of(ref<Resolver, shared> r, ref<String, shared> m) : Option<String>
+{
+    match (HashMap::get(&r.modules, m))
+    {
+        Some(node) : clone(&node.parent),
+        None       : None,
+    }
+}
+
+fn visible(ref<Resolver, shared> r, StringView decl_module, bool export_, ref<String, shared> from) : bool
+{
+    if (export_)
+    {
+        return true;
+    }
+    // `std`'s submodules share one privacy (`spec/21` §0, D-0136).
+    StringView decl = if (StringView::starts_with(decl_module, "std::")) { "std" } else { decl_module };
+    Option<String> cur = Some(String::clone(from));
+    while (true)
+    {
+        match (cur)
+        {
+            Some(m) :
+            {
+                if (String::eq_view(&m, decl))
+                {
+                    return true;
+                }
+                cur = parent_of(r, &m);
+            },
+            None    : return false,
+        }
+    }
+    false
+}
+
+fn hit_of(ref<Entry, shared> e) : Hit
+{
+    Hit { .key = String::clone(&e.key), .kind = e.kind }
+}
+
+fn has_key(ref<Vec<Hit>, shared> hits, ref<String, shared> key) : bool
+{
+    for (usize i = 0; i < Vec::len(hits); i += 1)
+    {
+        if (String::eq(&hits[i].key, key))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn names_of(ref<Vec<Hit>, shared> hits) : String
+{
+    Vec<String> parts = Vec::new();
+    for (usize i = 0; i < Vec::len(hits); i += 1)
+    {
+        Vec::push(&mut parts, sprintf("`%s`", &hits[i].key));
+    }
+    String::join(&parts[0..$], " and ")
+}
+
+fn own_item(ref<Resolver, shared> r, ref<String, shared> m, ref<String, shared> name) : Option<Hit>
+{
+    match (HashMap::get(&r.modules, m))
+    {
+        Some(node) : match (HashMap::get(&node.items, name))
+        {
+            Some(e) : Some(hit_of(e)),
+            None    : None,
+        },
+        None : None,
+    }
+}
+
+// The resolved targets of `from`'s imports of one kind.
+fn imported(ref<Resolver, shared> r, ref<String, shared> from, Kind kind) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    match (HashMap::get(&r.import_targets, from))
+    {
+        Some(ts) :
+        {
+            for (usize i = 0; i < Vec::len(ts); i += 1)
+            {
+                if (ts[i].kind == kind)
+                {
+                    Vec::push(&mut out, String::clone(&ts[i].key));
+                }
+            }
+        },
+        None     : {},
+    }
+    out
+}
+
+// `[Resolve-Unqualified]`: `None` when nothing yields an item.
+fn resolve_unqualified(
+    ref<Resolver, shared> r,
+    ref<String, shared> name,
+    ref<String, shared> from,
+) : Result<Option<Hit>, String>
+{
+    // clause (1): from's own items.
+    match (own_item(r, from, name))
+    {
+        Some(h) : return Ok(Some(h)),
+        None    : {},
+    }
+    // clause (2): an `import p;` in from whose last segment is `name`.
+    Vec<Hit> import_hits = Vec::new();
+    match (HashMap::get(&r.import_targets, from))
+    {
+        Some(ts) :
+        {
+            for (usize i = 0; i < Vec::len(ts); i += 1)
+            {
+                if (String::eq_view(name, last_seg(&ts[i].imp)) && !has_key(&import_hits, &ts[i].key))
+                {
+                    Vec::push(&mut import_hits, Hit { .key = String::clone(&ts[i].key), .kind = ts[i].kind });
+                }
+            }
+        },
+        None     :
+        {
+            if (HashMap::len(&r.import_targets) == 0)
+            {
+                ref<Vec<ImportDecl>, shared> imps = &Option::expect(HashMap::get(&r.modules, from), "a module").imports;
+                for (usize i = 0; i < Vec::len(imps); i += 1)
+                {
+                    if (String::eq_view(name, last_seg(&imps[i].segs)) && Vec::len(&imps[i].segs) > 1)
+                    {
+                        match (resolve_qualified(r, &imps[i].segs, from)?)
+                        {
+                            Some(h) :
+                            {
+                                bool seen = false;
+                                for (usize k = 0; k < Vec::len(&import_hits); k += 1)
+                                {
+                                    if (String::eq(&import_hits[k].key, &h.key) && import_hits[k].kind == h.kind)
+                                    {
+                                        seen = true;
+                                    }
+                                }
+                                if (!seen)
+                                {
+                                    Vec::push(&mut import_hits, h);
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                }
+            }
+        },
+    }
+    if (Vec::len(&import_hits) > 1)
+    {
+        String msg = sprintf(
+            "`%s` names more than one imported item: %s; write the one you mean in full",
+            name,
+            &names_of(&import_hits),
+        );
+        return Err(named("diag.ambiguous-name", &msg));
+    }
+    match (Vec::pop(&mut import_hits))
+    {
+        Some(h) : return Ok(Some(h)),
+        None    : {},
+    }
+    // clause (2b), CHG-0033: an exported item `name` of a module an
+    // `import p;` in from names; never one of its submodules (D-0136).
+    Vec<Hit> module_hits = Vec::new();
+    Vec<String> mods = imported(r, from, Kind::KModule);
+    for (usize i = 0; i < Vec::len(&mods); i += 1)
+    {
+        match (HashMap::get(&r.modules, &mods[i]))
+        {
+            Some(node) : match (HashMap::get(&node.items, name))
+            {
+                Some(e) :
+                {
+                    if (e.export_ && e.kind != Kind::KModule && !has_key(&module_hits, &e.key))
+                    {
+                        Vec::push(&mut module_hits, hit_of(e));
+                    }
+                },
+                None    : {},
+            },
+            None : {},
+        }
+    }
+    if (Vec::len(&module_hits) > 1)
+    {
+        String msg = sprintf(
+            "`%s` is exported by more than one imported module: %s; qualify it",
+            name,
+            &names_of(&module_hits),
+        );
+        return Err(named("diag.ambiguous-name", &msg));
+    }
+    match (Vec::pop(&mut module_hits))
+    {
+        Some(h) : return Ok(Some(h)),
+        None    : {},
+    }
+    // clause (3): the enclosing modules, outward; never for an intrinsic's
+    // name (D-0055).
+    Option<String> cur = if (is_intrinsic_name(String::as_view(name))) { None } else { parent_of(r, from) };
+    while (true)
+    {
+        match (cur)
+        {
+            Some(m) :
+            {
+                match (own_item(r, &m, name))
+                {
+                    Some(h) : return Ok(Some(h)),
+                    None    : {},
+                }
+                cur = parent_of(r, &m);
+            },
+            None    : break,
+        }
+    }
+    resolve_variant(r, name, from)
+}
+
+fn has_variant(ref<Resolver, shared> r, ref<String, shared> enum_key, ref<String, shared> name) : bool
+{
+    match (HashMap::get(&r.enum_variants, enum_key))
+    {
+        Some(vs) : HashSet::contains(vs, name),
+        None     : false,
+    }
+}
+
+// The enums among `m`'s own items with a variant `name`, appended to
+// `out` (only the exported ones when `exported`).
+fn enums_with(
+    ref<Resolver, shared> r,
+    ref<String, shared> m,
+    ref<String, shared> name,
+    bool exported,
+    ref<Vec<String>, exclusive> out,
+)
+{
+    match (HashMap::get(&r.modules, m))
+    {
+        Some(node) : match (HashMap::get(&node.by_variant, name))
+        {
+            Some(list) :
+            {
+                for (usize i = 0; i < Vec::len(list); i += 1)
+                {
+                    ref<Entry, shared> e = &list[i];
+                    if ((e.export_ || !exported) && !Vec::contains(out, &e.key))
+                    {
+                        Vec::push(out, String::clone(&e.key));
+                    }
+                }
+            },
+            None       : {},
+        },
+        None : {},
+    }
+}
+
+// Clauses (4) and (4b) of `[Resolve-Unqualified]` (CHG-0041).
+fn resolve_variant(
+    ref<Resolver, shared> r,
+    ref<String, shared> name,
+    ref<String, shared> from,
+) : Result<Option<Hit>, String>
+{
+    Vec<String> own = Vec::new();
+    Option<String> cur = Some(String::clone(from));
+    while (true)
+    {
+        match (cur)
+        {
+            Some(m) :
+            {
+                enums_with(r, &m, name, false, &mut own);
+                if (Vec::len(&own) > 0)
+                {
+                    break;
+                }
+                cur = parent_of(r, &m);
+            },
+            None    : break,
+        }
+    }
+    Vec<String> candidates = own;
+    if (Vec::len(&candidates) == 0)
+    {
+        // CHG-0033: enums an import brings in.
+        Vec<String> enums = imported(r, from, Kind::KEnum);
+        for (usize i = 0; i < Vec::len(&enums); i += 1)
+        {
+            if (has_variant(r, &enums[i], name) && !Vec::contains(&candidates, &enums[i]))
+            {
+                Vec::push(&mut candidates, String::clone(&enums[i]));
+            }
+        }
+        Vec<String> mods = imported(r, from, Kind::KModule);
+        for (usize i = 0; i < Vec::len(&mods); i += 1)
+        {
+            enums_with(r, &mods[i], name, true, &mut candidates);
+        }
+    }
+    if (Vec::len(&candidates) > 1)
+    {
+        Vec::sort(&mut candidates);
+        Vec<String> parts = Vec::new();
+        for (usize i = 0; i < Vec::len(&candidates); i += 1)
+        {
+            Vec::push(&mut parts, sprintf("`%s::%s`", &candidates[i], name));
+        }
+        String msg = sprintf(
+            "`%s` is a variant of more than one enum in scope: %s; qualify it",
+            name,
+            &String::join(&parts[0..$], " and "),
+        );
+        return Err(named("diag.ambiguous-name", &msg));
+    }
+    if (Vec::len(&candidates) == 1)
+    {
+        // A name more than one enum of the program has is written `E::name`,
+        // and so is one that is also an item's key (CHG-0353).
+        usize owners = owners_of(r, name);
+        String key = if (owners > 1 || HashMap::contains(
+            &r.all_items,
+            name,
+        )) { sprintf("%s::%s", &candidates[0], name) } else { String::clone(name) };
+        return Ok(Some(Hit { .key = key, .kind = Kind::KEnum }));
+    }
+    Ok(None)
+}
+
+// `[Resolve-Qualified]` for `q1::…::qk::name`; one segment is
+// `[Resolve-Unqualified]`. Every hop's visibility is checked.
+fn resolve_qualified(
+    ref<Resolver, shared> r,
+    ref<Vec<String>, shared> segs,
+    ref<String, shared> from,
+) : Result<Option<Hit>, String>
+{
+    if (Vec::len(segs) == 1)
+    {
+        return resolve_unqualified(r, &segs[0], from);
+    }
+    // An associated function's own simple key is `Type::name`.
+    match (resolve_unqualified(r, &joined(segs), from))
+    {
+        Ok(Some(h)) : return Ok(Some(h)),
+        _           : {},
+    }
+    Hit first = match (resolve_unqualified(r, &segs[0], from)?)
+    {
+        Some(h) : h,
+        None    : return Ok(None),
+    };
+    String cur_key = String::clone(&first.key);
+    Kind cur_kind = first.kind;
+    for (usize i = 1; i < Vec::len(segs); i += 1)
+    {
+        ref<String, shared> seg = &segs[i];
+        String candidate = sprintf("%s::%s", &cur_key, seg);
+        // `E::V`: a variant of the enum reached so far.
+        if (cur_kind == Kind::KEnum && has_variant(r, &cur_key, seg))
+        {
+            cur_key = candidate;
+            continue;
+        }
+        Option<ItemInfo> found = None;
+        String found_key = String::new();
+        if (cur_kind == Kind::KModule)
+        {
+            match (HashMap::get(&r.modules, &cur_key))
+            {
+                Some(node) : match (HashMap::get(&node.items, seg))
+                {
+                    Some(e) :
+                    {
+                        found = Some(ItemInfo { .export_ = e.export_, .kind = e.kind, .home = String::clone(&cur_key) });
+                        found_key = String::clone(&e.key);
+                    },
+                    None    : {},
+                },
+                None : {},
+            }
+        }
+        else
+        {
+            match (HashMap::get(&r.all_items, &candidate))
+            {
+                Some(info) :
+                {
+                    found = Some(clone(info));
+                    found_key = String::clone(&candidate);
+                },
+                None       : {},
+            }
+        }
+        match (found)
+        {
+            Some(info) :
+            {
+                if (!visible(r, String::as_view(&info.home), info.export_, from))
+                {
+                    StringView sh = Option::unwrap_or(
+                        StringView::strip_prefix(String::as_view(&candidate), "std::"),
+                        String::as_view(&candidate),
+                    );
+                    String msg = sprintf("`%s` is not exported from its module", sh);
+                    return Err(named("diag.name-not-visible", &msg));
+                }
+                cur_key = found_key;
+                cur_kind = info.kind;
+            },
+            None       :
+            {
+                // `m::V`: a variant of an enum declared directly in `m`.
+                if (cur_kind == Kind::KModule)
+                {
+                    Vec<String> owners = Vec::new();
+                    enums_with(r, &cur_key, seg, false, &mut owners);
+                    if (Vec::len(&owners) == 1)
+                    {
+                        if (!visible(r, String::as_view(&cur_key), enum_exported(r, &cur_key, &owners[0]), from))
+                        {
+                            StringView ek = String::as_view(&owners[0]);
+                            StringView sh = Option::unwrap_or(StringView::strip_prefix(ek, "std::"), ek);
+                            String msg = sprintf(
+                                "`%s` is a variant of `%s`, which is not exported from its module",
+                                seg,
+                                sh,
+                            );
+                            return Err(named("diag.name-not-visible", &msg));
+                        }
+                    }
+                }
+                return Ok(None);
+            },
+        }
+    }
+    Ok(Some(Hit { .key = cur_key, .kind = cur_kind }))
+}
+
+// Whether module `m`'s entry naming the enum `key` is exported.
+fn enum_exported(ref<Resolver, shared> r, ref<String, shared> m, ref<String, shared> key) : bool
+{
+    ref<ModuleNode, shared> node = Option::expect(HashMap::get(&r.modules, m), "a module");
+    for (usize i = 0; i < HashMap::len(&node.items); i += 1)
+    {
+        ref<Entry, shared> e = HashMap::value_at(&node.items, i);
+        if (e.kind == Kind::KEnum && String::eq(
+            &e.key,
+            key,
+        ) && !String::contains(HashMap::key_at(&node.items, i), "::"))
+        {
+            return e.export_;
+        }
+    }
+    false
+}
+
+// ---- the rewrite ----
+
+struct Ctx
+{
+    String module_;
+    Vec<HashSet<String>> locals;
+    HashSet<String> type_params;
+}
+
+fn is_local(ref<Ctx, shared> c, ref<String, shared> name) : bool
+{
+    for (usize i = Vec::len(&c.locals); i > 0; i -= 1)
+    {
+        if (HashSet::contains(&c.locals[i - 1], name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_scope(ref<Ctx, exclusive> c)
+{
+    Vec::push(&mut c.locals, HashSet::new());
+}
+
+fn pop_scope(ref<Ctx, exclusive> c)
+{
+    Vec::pop(&mut c.locals);
+}
+
+fn declare(ref<Ctx, exclusive> c, ref<String, shared> name)
+{
+    usize n = Vec::len(&c.locals);
+    HashSet::insert(&mut c.locals[n - 1], String::clone(name));
+}
+
+fn type_params_of(ref<Vec<String>, shared> tps) : HashSet<String>
+{
+    HashSet<String> s = HashSet::new();
+    for (usize i = 0; i < Vec::len(tps); i += 1)
+    {
+        HashSet::insert(&mut s, String::clone(&tps[i]));
+    }
+    s
+}
+
+fn is_type_kind(Kind k) : bool
+{
+    k == Kind::KStruct || k == Kind::KEnum
+}
+
+fn resolve_type(ref<Resolver, shared> r, ref<Ctx, shared> c, ref<Type, exclusive> ty) : Result<void, String>
+{
+    match (ty)
+    {
+        Type::TNamed(b)  :
+        {
+            ref<NamedTy, exclusive> n = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&n.args); i += 1)
+            {
+                resolve_type(r, c, &mut n.args[i])?;
+            }
+            if (HashSet::contains(&c.type_params, &n.name))
+            {
+                return Ok(());
+            }
+            Vec<String> segs = segments(String::as_view(&n.name));
+            match (resolve_qualified(r, &segs, &c.module_)?)
+            {
+                Some(h) :
+                {
+                    if (is_type_kind(h.kind))
+                    {
+                        n.name = String::clone(&h.key);
+                    }
+                },
+                // `[Resolve-Unbound]`: a type name that yields no item.
+                None    : return Err(named("diag.unbound-name", &unbound_type(r, &n.name))),
+            }
+            Ok(())
+        },
+        Type::TRef(b)    : resolve_type(r, c, &mut Box::get_mut(b).inner),
+        Type::TSlice(b)  : resolve_type(r, c, &mut Box::get_mut(b).inner),
+        Type::TRawptr(b) : resolve_type(r, c, Box::get_mut(b)),
+        Type::TArray(b)  : resolve_type(r, c, &mut Box::get_mut(b).inner),
+        Type::THandle(b) : resolve_type(r, c, Box::get_mut(b)),
+        Type::TMutex(b)  : resolve_type(r, c, Box::get_mut(b)),
+        Type::TGuard(b)  : resolve_type(r, c, Box::get_mut(b)),
+        Type::TFn(b)     :
+        {
+            ref<FnTy, exclusive> f = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&f.params); i += 1)
+            {
+                resolve_type(r, c, &mut f.params[i])?;
+            }
+            resolve_type(r, c, &mut f.ret)
+        },
+        _                : Ok(()),
+    }
+}
+
+// The message for a type name that names nothing: a private type of the
+// same name in another module (not `std`'s), or `std`'s, is named.
+fn unbound_type(ref<Resolver, shared> r, ref<String, shared> name) : String
+{
+    Option<String> hidden = None;
+    for (usize i = 0; i < HashMap::len(&r.all_items); i += 1)
+    {
+        ref<String, shared> k = HashMap::key_at(&r.all_items, i);
+        ref<ItemInfo, shared> info = HashMap::value_at(&r.all_items, i);
+        if (!info.export_ && is_type_kind(info.kind) && !String::eq_str(
+            &info.home,
+            "std",
+        ) && !String::starts_with(
+            &info.home,
+            "std::",
+        ) && String::contains(k, "::") && String::eq_view(name, last_seg(&segments(String::as_view(k)))))
+        {
+            bool better = match (&hidden)
+            {
+                Some(h) : String::less(k, h),
+                None    : true,
+            };
+            if (better)
+            {
+                hidden = Some(String::clone(k));
+            }
+        }
+    }
+    match (hidden)
+    {
+        Some(k) : sprintf("no type named `%s` is visible here; `%s` is not exported from its module", name, &k),
+        None    :
+        {
+            if (HashMap::contains(&r.all_items, &sprintf("std::%s", name)))
+            {
+                return sprintf(
+                    "no type named `%s`; the standard library's `%s` is brought in by `import std;`",
+                    name,
+                    name,
+                );
+            }
+            sprintf("no type named `%s`", name)
+        },
+    }
+}
+
+fn resolve_type_name(ref<Resolver, shared> r, ref<Ctx, shared> c, ref<String, exclusive> name) : Result<void, String>
+{
+    if (HashSet::contains(&c.type_params, name))
+    {
+        return Ok(());
+    }
+    match (resolve_unqualified(r, name, &c.module_)?)
+    {
+        Some(h) :
+        {
+            if (is_type_kind(h.kind))
+            {
+                *name = String::clone(&h.key);
+            }
+        },
+        None    : {},
+    }
+    Ok(())
+}
+
+fn walk_block(ref<Resolver, shared> r, ref<Ctx, exclusive> c, ref<Block, exclusive> b) : Result<void, String>
+{
+    push_scope(c);
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        walk_stmt(r, c, &mut b.stmts[i])?;
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : walk_expr(r, c, Box::get_mut(t))?,
+        None    : {},
+    }
+    pop_scope(c);
+    Ok(())
+}
+
+fn walk_stmt(ref<Resolver, shared> r, ref<Ctx, exclusive> c, ref<Stmt, exclusive> s) : Result<void, String>
+{
+    match (s)
+    {
+        Stmt::SLet(b)         :
+        {
+            ref<LetStmt, exclusive> l = Box::get_mut(b);
+            usize line = l.line;
+            match (&mut l.ty)
+            {
+                Some(t) :
+                {
+                    match (resolve_type(r, c, t))
+                    {
+                        Ok(_)  : {},
+                        Err(d) : return Err(tag(d, line)),
+                    }
+                },
+                None    : {},
+            }
+            match (&mut l.init)
+            {
+                Some(e) : walk_expr(r, c, e)?,
+                None    : {},
+            }
+            declare(c, &l.name);
+        },
+        Stmt::SDestructure(b) :
+        {
+            ref<DestructureStmt, exclusive> d = Box::get_mut(b);
+            resolve_type_name(r, c, &mut d.struct_name)?;
+            walk_expr(r, c, &mut d.init)?;
+            for (usize i = 0; i < Vec::len(&d.fields); i += 1)
+            {
+                declare(c, &d.fields[i]);
+            }
+        },
+        Stmt::SExpr(e)        : walk_expr(r, c, Box::get_mut(e))?,
+        Stmt::SBlockLike(e)   : walk_expr(r, c, Box::get_mut(e))?,
+    }
+    Ok(())
+}
+
+fn walk_expr(ref<Resolver, shared> r, ref<Ctx, exclusive> c, ref<Expr, exclusive> e) : Result<void, String>
+{
+    usize line = e.line;
+    match (walk_expr_untagged(r, c, e))
+    {
+        Ok(_)  : Ok(()),
+        Err(d) : Err(tag(d, line)),
+    }
+}
+
+fn path_expr(Vec<String> segs, usize line, usize col) : Expr
+{
+    mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), line, col)
+}
+
+fn path_words(str p, usize line, usize col) : Expr
+{
+    path_expr(segments(StringView::of(p)), line, col)
+}
+
+fn call_expr(Expr callee, Vec<Expr> args, usize line, usize col) : Expr
+{
+    mk(ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = args })), line, col)
+}
+
+fn one(Expr e) : Vec<Expr>
+{
+    Vec<Expr> v = Vec::new();
+    Vec::push(&mut v, e);
+    v
+}
+
+fn two(Expr a, Expr b) : Vec<Expr>
+{
+    Vec<Expr> v = Vec::new();
+    Vec::push(&mut v, a);
+    Vec::push(&mut v, b);
+    v
+}
+
+// The path a value position names: rejected when it is a type; a
+// `const`'s use is a call of it (D-0036); otherwise its qualified key.
+// `Some(kind)` when the expression becomes another.
+fn walk_path(
+    ref<Resolver, shared> r,
+    ref<Ctx, exclusive> c,
+    ref<PathExpr, exclusive> p,
+    usize line,
+    usize col,
+) : Result<Option<ExprKind>, String>
+{
+    for (usize i = 0; i < Vec::len(&p.targs); i += 1)
+    {
+        resolve_type(r, c, &mut p.targs[i])?;
+    }
+    if (Vec::len(&p.segs) == 1 && is_local(c, &p.segs[0]))
+    {
+        return Ok(None);
+    }
+    Hit hit0 = match (resolve_qualified(r, &p.segs, &c.module_)?)
+    {
+        Some(h) : h,
+        None    : return Ok(None),
+    };
+    // CHG-0334 (D-0266): a type is not a value; a bare type name is looked
+    // up again among the variants.
+    bool type0 = hit0.kind == Kind::KStruct || (hit0.kind == Kind::KEnum && HashMap::contains(
+        &r.enum_variants,
+        &hit0.key,
+    ));
+    Hit hit = if (type0 && Vec::len(&p.segs) == 1)
+    {
+        match (resolve_variant(r, &p.segs[0], &c.module_)?)
+        {
+            Some(v) : v,
+            None    : hit0,
+        }
+    }
+    else
+    {
+        hit0
+    };
+    bool is_type = hit.kind == Kind::KStruct || (hit.kind == Kind::KEnum && HashMap::contains(
+        &r.enum_variants,
+        &hit.key,
+    ));
+    // `m::V`, `m` a module declaring an enum with a variant `V`, is that
+    // variant, even beside a struct `V` of `m`.
+    bool module_variant = false;
+    usize n = Vec::len(&p.segs);
+    if (is_type && n >= 2)
+    {
+        Vec<String> prefix = Vec::new();
+        for (usize i = 0; i + 1 < n; i += 1)
+        {
+            Vec::push(&mut prefix, String::clone(&p.segs[i]));
+        }
+        match (resolve_qualified(r, &prefix, &c.module_)?)
+        {
+            Some(m) :
+            {
+                if (m.kind == Kind::KModule)
+                {
+                    Vec<String> owners = Vec::new();
+                    enums_with(r, &m.key, &p.segs[n - 1], false, &mut owners);
+                    module_variant = Vec::len(&owners) > 0;
+                }
+            },
+            None    : {},
+        }
+    }
+    if (is_type && !module_variant)
+    {
+        ref<String, shared> last = &p.segs[n - 1];
+        Vec<String> owners = Vec::new();
+        for (usize i = 0; i < HashMap::len(&r.enum_variants); i += 1)
+        {
+            if (HashSet::contains(HashMap::value_at(&r.enum_variants, i), last))
+            {
+                Vec::push(&mut owners, String::clone(HashMap::key_at(&r.enum_variants, i)));
+            }
+        }
+        Vec::sort(&mut owners);
+        String hint = if (Vec::len(&owners) > 0)
+        {
+            sprintf(
+                "; for the variant, write `%s::%s`",
+                &owners[0],
+                last,
+            )
+        }
+        else { String::new() };
+        str what = if (hit.kind == Kind::KStruct) { "struct" } else { "enum" };
+        String msg = sprintf(
+            "`%s` names the %s `%s` here, which is a type, not a value%s",
+            &joined(&p.segs),
+            what,
+            &hit.key,
+            &hint,
+        );
+        return Err(named("diag.type-mismatch", &msg));
+    }
+    if (HashSet::contains(&r.consts, &hit.key))
+    {
+        Expr callee = path_expr(segments(String::as_view(&hit.key)), line, col);
+        return Ok(Some(ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = Vec::new() }))));
+    }
+    p.segs = segments(String::as_view(&hit.key));
+    Ok(None)
+}
+
+// D-0038, D-0040, D-0039, D-0059, D-0144, D-0065, D-0072: the calls
+// written as others. `Some(kind)` when the call becomes another.
+fn rewrite_call(ref<CallExpr, exclusive> call, usize line, usize col) : Option<ExprKind>
+{
+    String key = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : joined(&Box::get(p).segs),
+        _                  : String::new(),
+    };
+    StringView k = String::as_view(&key);
+    usize n = Vec::len(&call.args);
+    if (StringView::eq_str(k, "checked_neg") && n == 1)
+    {
+        Expr a = Vec::remove(&mut call.args, 0);
+        Expr zero = mk(ExprKind::EInt(Box::new(IntLit { .v = 0, .sfx = None })), line, col);
+        return Some(ExprKind::ECall(Box::new(CallExpr { .callee = path_words(
+            "checked_sub",
+            line,
+            col,
+        ), .args = two(zero, a) })));
+    }
+    str to = match (k)
+    {
+        "std::printf"            : "std::print",
+        "std::eprintf"           : "std::eprint_str",
+        "std::sprintf"           : "std::String::from_str",
+        "std::String::appendf"   : "std::String::append",
+        "std::File::printf"      : "std::File::write_formatted",
+        "std::TcpStream::printf" : "std::TcpStream::write_formatted",
+        "std::assert"            : "assert",
+        _                        : "",
+    };
+    if (StringView::len(StringView::of(to)) == 0)
+    {
+        return None;
+    }
+    bool takes_first = !(StringView::eq_str(
+        k,
+        "std::printf",
+    ) || StringView::eq_str(k, "std::eprintf") || StringView::eq_str(k, "std::sprintf"));
+    if (takes_first && n == 0)
+    {
+        return None;
+    }
+    Vec<Expr> rest = replace(&mut call.args, Vec::new());
+    if (!takes_first)
+    {
+        return Some(ExprKind::ECall(Box::new(CallExpr { .callee = path_words(
+            to,
+            line,
+            col,
+        ), .args = one(fmt_call(rest, line, col)) })));
+    }
+    Expr first = Vec::remove(&mut rest, 0);
+    if (StringView::eq_str(k, "std::assert"))
+    {
+        // `assert(c)` is `if (!(c)) { $assert_fail(); }`, the message
+        // `$fmt(format, a…)` only when `c` is false.
+        Expr paren = mk(ExprKind::EParen(Box::new(first)), line, col);
+        Expr not_c = mk(ExprKind::EUnary(Box::new(UnaryExpr { .op = UnOp::Not, .e = paren })), line, col);
+        Vec<Expr> msg = if (Vec::len(&rest) == 0) { Vec::new() } else { one(fmt_call(rest, line, col)) };
+        Vec<String> fail_segs = Vec::new();
+        Vec::push(&mut fail_segs, String::from_str("$assert_fail"));
+        Expr fail = call_expr(path_expr(fail_segs, line, col), msg, line, col);
+        Vec<Stmt> stmts = Vec::new();
+        Vec::push(&mut stmts, Stmt::SExpr(Box::new(fail)));
+        return Some(ExprKind::EIf(Box::new(IfExpr { .cond = not_c, .then_ = Block { .stmts = stmts, .tail = None }, .else_ = None })));
+    }
+    Some(ExprKind::ECall(Box::new(CallExpr { .callee = path_words(
+        to,
+        line,
+        col,
+    ), .args = two(first, fmt_call(rest, line, col)) })))
+}
+
+fn fmt_call(Vec<Expr> rest, usize line, usize col) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::from_str("$fmt"));
+    call_expr(path_expr(segs, line, col), rest, line, col)
+}
+
+fn owners_of(ref<Resolver, shared> r, ref<String, shared> name) : usize
+{
+    match (HashMap::get(&r.variant_owners, name))
+    {
+        Some(n) : *n,
+        None    : 0,
+    }
+}
+
+fn any_enum_has(ref<Resolver, shared> r, ref<String, shared> name) : bool
+{
+    owners_of(r, name) > 0
+}
+
+fn walk_arm(ref<Resolver, shared> r, ref<Ctx, exclusive> c, ref<Arm, exclusive> arm) : Result<void, String>
+{
+    // D-0056/D-0058: a name in a pattern that resolves to a `const` is
+    // that constant's value; one that names a variant is that variant.
+    match (clone(&arm.binder))
+    {
+        Some(b) :
+        {
+            match (resolve_qualified(r, &segments(String::as_view(&b)), &c.module_))
+            {
+                Ok(Some(h)) :
+                {
+                    if (HashSet::contains(&r.consts, &h.key))
+                    {
+                        usize line = Box::get(&arm.body).line;
+                        usize col = Box::get(&arm.body).col;
+                        Expr callee = path_expr(segments(String::as_view(&h.key)), line, col);
+                        arm.lit = Some(Box::new(call_expr(callee, Vec::new(), line, col)));
+                        arm.binder = None;
+                    }
+                },
+                _           : {},
+            }
+        },
+        None    : {},
+    }
+    match (clone(&arm.binder))
+    {
+        Some(b0) :
+        {
+            Vec<String> parts = segments(String::as_view(&b0));
+            String b = String::from_view(last_seg(&parts));
+            if (Vec::len(&parts) > 1)
+            {
+                arm.binder = Some(String::clone(&b));
+            }
+            if (any_enum_has(r, &b))
+            {
+                if (Option::is_some(&arm.variant))
+                {
+                    Vec::push(&mut arm.nested, b);
+                }
+                else
+                {
+                    arm.variant = Some(b);
+                }
+                arm.binder = None;
+            }
+        },
+        None     : {},
+    }
+    push_scope(c);
+    match (&arm.binder)
+    {
+        Some(b) : declare(c, b),
+        None    : {},
+    }
+    walk_expr(r, c, Box::get_mut(&mut arm.body))?;
+    pop_scope(c);
+    Ok(())
+}
+
+fn walk_expr_untagged(ref<Resolver, shared> r, ref<Ctx, exclusive> c, ref<Expr, exclusive> e) : Result<void, String>
+{
+    usize line = e.line;
+    usize col = e.col;
+    Option<ExprKind> becomes = None;
+    match (&mut e.kind)
+    {
+        ExprKind::EPath(b)        : becomes = walk_path(r, c, Box::get_mut(b), line, col)?,
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, exclusive> s = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&s.targs); i += 1)
+            {
+                resolve_type(r, c, &mut s.targs[i])?;
+            }
+            match (resolve_qualified(r, &s.segs, &c.module_)?)
+            {
+                Some(h) :
+                {
+                    if (h.kind == Kind::KStruct)
+                    {
+                        s.segs = segments(String::as_view(&h.key));
+                    }
+                },
+                None    : {},
+            }
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                walk_expr(r, c, &mut s.fields[i].value)?;
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                walk_expr(r, c, &mut es[i])?;
+            }
+        },
+        ExprKind::EArrayRepeat(b) : walk_expr(r, c, &mut Box::get_mut(b).value)?,
+        ExprKind::EUnary(b)       : walk_expr(r, c, &mut Box::get_mut(b).e)?,
+        ExprKind::EBorrow(b)      : walk_expr(r, c, &mut Box::get_mut(b).e)?,
+        ExprKind::EDeref(x)       : walk_expr(r, c, Box::get_mut(x))?,
+        ExprKind::EField(b)       : walk_expr(r, c, &mut Box::get_mut(b).e)?,
+        ExprKind::EPropagate(x)   : walk_expr(r, c, Box::get_mut(x))?,
+        ExprKind::EParen(x)       : walk_expr(r, c, Box::get_mut(x))?,
+        ExprKind::ESliceOf(b)     :
+        {
+            ref<SliceExpr, exclusive> s = Box::get_mut(b);
+            walk_expr(r, c, &mut s.base)?;
+            walk_expr(r, c, &mut s.lo)?;
+            walk_expr(r, c, &mut s.hi)?;
+        },
+        ExprKind::EBinary(b)      :
+        {
+            ref<BinaryExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.a)?;
+            walk_expr(r, c, &mut x.b)?;
+        },
+        ExprKind::EIndex(b)       :
+        {
+            ref<PairExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.a)?;
+            walk_expr(r, c, &mut x.b)?;
+        },
+        ExprKind::EAssign(b)      :
+        {
+            ref<PairExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.a)?;
+            walk_expr(r, c, &mut x.b)?;
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, exclusive> call = Box::get_mut(b);
+            walk_expr(r, c, &mut call.callee)?;
+            for (usize i = 0; i < Vec::len(&call.args); i += 1)
+            {
+                walk_expr(r, c, &mut call.args[i])?;
+            }
+            becomes = rewrite_call(call, line, col);
+        },
+        ExprKind::EBlock(b)       : walk_block(r, c, b)?,
+        ExprKind::EUnsafe(b)      : walk_block(r, c, b)?,
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.cond)?;
+            walk_block(r, c, &mut x.then_)?;
+            match (&mut x.else_)
+            {
+                Some(el) : walk_expr(r, c, el)?,
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.cond)?;
+            walk_block(r, c, &mut x.body)?;
+            match (&mut x.step)
+            {
+                Some(s) : walk_expr(r, c, s)?,
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            walk_expr(r, c, &mut x.scrut)?;
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                walk_arm(r, c, &mut x.arms[i])?;
+            }
+        },
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) : walk_expr(r, c, Box::get_mut(x))?,
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(b)     :
+        {
+            ref<ClosureExpr, exclusive> x = Box::get_mut(b);
+            push_scope(c);
+            for (usize i = 0; i < Vec::len(&x.params); i += 1)
+            {
+                declare(c, &x.params[i].name);
+            }
+            for (usize i = 0; i < Vec::len(&x.params); i += 1)
+            {
+                resolve_type(r, c, &mut x.params[i].ty)?;
+            }
+            match (&mut x.ret)
+            {
+                Some(t) : resolve_type(r, c, t)?,
+                None    : {},
+            }
+            walk_block(r, c, &mut x.body)?;
+            pop_scope(c);
+        },
+        _                         : {},
+    }
+    match (becomes)
+    {
+        Some(k) : e.kind = k,
+        None    : {},
+    }
+    Ok(())
+}
+
+fn tagged(Result<void, String> res, usize line) : Result<void, String>
+{
+    match (res)
+    {
+        Ok(_)  : Ok(()),
+        Err(d) : Err(tag(d, line)),
+    }
+}
+
+fn ctx_for(ref<Vec<String>, shared> path, ref<Vec<String>, shared> tps) : Ctx
+{
+    Ctx { .module_ = joined(path), .locals = Vec::new(), .type_params = type_params_of(tps) }
+}
+
+fn resolve_items(
+    ref<Vec<Item>, exclusive> items,
+    ref<Vec<String>, exclusive> path,
+    ref<Resolver, shared> r,
+) : Result<void, String>
+{
+    Vec<String> none = Vec::new();
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IFn(b)         :
+            {
+                ref<FnDecl, exclusive> d = Box::get_mut(b);
+                Ctx c = ctx_for(path, &d.type_params);
+                usize line = d.line;
+                for (usize k = 0; k < Vec::len(&d.params); k += 1)
+                {
+                    tagged(resolve_type(r, &c, &mut d.params[k].ty), line)?;
+                }
+                tagged(resolve_type(r, &c, &mut d.ret), line)?;
+                push_scope(&mut c);
+                for (usize k = 0; k < Vec::len(&d.params); k += 1)
+                {
+                    declare(&mut c, &d.params[k].name);
+                }
+                walk_block(r, &mut c, &mut d.body)?;
+                pop_scope(&mut c);
+            },
+            // D-0258: a static's type and its first value.
+            Item::IStatic(b)     :
+            {
+                ref<StaticDecl, exclusive> d = Box::get_mut(b);
+                Ctx c = ctx_for(path, &none);
+                tagged(resolve_type(r, &c, &mut d.ty), d.line)?;
+                push_scope(&mut c);
+                walk_expr(r, &mut c, &mut d.init)?;
+                pop_scope(&mut c);
+            },
+            Item::IExtern(b)     :
+            {
+                ref<ExternDecl, exclusive> d = Box::get_mut(b);
+                Ctx c = ctx_for(path, &none);
+                usize line = d.line;
+                for (usize k = 0; k < Vec::len(&d.params); k += 1)
+                {
+                    tagged(resolve_type(r, &c, &mut d.params[k].ty), line)?;
+                }
+                tagged(resolve_type(r, &c, &mut d.ret), line)?;
+            },
+            Item::IStruct(b)     :
+            {
+                ref<StructDecl, exclusive> d = Box::get_mut(b);
+                Ctx c = ctx_for(path, &d.type_params);
+                usize line = d.line;
+                for (usize k = 0; k < Vec::len(&d.fields); k += 1)
+                {
+                    tagged(resolve_type(r, &c, &mut d.fields[k].ty), line)?;
+                }
+            },
+            Item::IEnum(b)       :
+            {
+                ref<EnumDecl, exclusive> d = Box::get_mut(b);
+                Ctx c = ctx_for(path, &d.type_params);
+                usize line = d.line;
+                for (usize k = 0; k < Vec::len(&d.variants); k += 1)
+                {
+                    match (&mut d.variants[k].payload)
+                    {
+                        Some(t) : tagged(resolve_type(r, &c, t), line)?,
+                        None    : {},
+                    }
+                }
+            },
+            Item::IModule(b)     :
+            {
+                ref<ModuleItem, exclusive> m = Box::get_mut(b);
+                Vec::push(path, String::clone(&m.name));
+                resolve_items(&mut m.items, path, r)?;
+                Vec::pop(path);
+            },
+            Item::IImport(_)     : {},
+            Item::IExternCode(_) : {},
+        }
+    }
+    Ok(())
+}
+
+// Resolves and rewrites every item reference in `p` to its qualified key,
+// enforcing `spec/17`'s visibility rule; the resolver is kept for the
+// functions of `std` parsed later (`items::load_body`, CHG-0355).
+export fn resolve_program(ref<Program, exclusive> p) : Result<Resolver, String>
+{
+    Resolver r = build(p)?;
+    Vec<String> path = Vec::new();
+    resolve_items(&mut p.items, &mut path, &r)?;
+    Ok(r)
+}
+
+// `items`, declared in module `home` (`std::collections`), resolved as
+// `resolve_program` resolved the rest.
+export fn resolve_more(ref<Resolver, shared> r, ref<Vec<Item>, exclusive> items, StringView home) : Result<void, String>
+{
+    Vec<String> path = if (StringView::len(home) == 0) { Vec::new() } else { segments(home) };
+    resolve_items(items, &mut path, r)
+}
+
+// ---- `--warn-shadow` (CHG-0333) ----
+
+// A note `--warn-shadow` prints, at the line of the item it names (0 for
+// none).
+export struct ShadowNote
+{
+    export usize line;
+    export String text;
+}
+
+// The declaration line of each item of `items` (impl/src/modres.rs's
+// `lines`, which `build` fills as it enters them).
+fn item_lines(
+    ref<Vec<Item>, shared> items,
+    ref<Vec<String>, exclusive> path,
+    ref<HashMap<String, usize>, exclusive> lines,
+)
+{
+    foreach (it in items)
+    {
+        match (it)
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                String simple = match (&f.assoc_type)
+                {
+                    Some(t) : sprintf("%s::%s", t, &f.name),
+                    None    : String::clone(&f.name),
+                };
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&simple)), f.line);
+            },
+            Item::IStatic(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IExtern(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IStruct(b) :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IEnum(b)   :
+            {
+                _ = HashMap::insert(lines, qualify(path, String::as_view(&Box::get(b).name)), Box::get(b).line);
+            },
+            Item::IModule(b) :
+            {
+                Vec::push(path, String::clone(&Box::get(b).name));
+                item_lines(&Box::get(b).items, path, lines);
+                _ = Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+fn home_is(ref<Resolver, shared> r, ref<String, shared> key, ref<String, shared> m) : bool
+{
+    match (HashMap::get(&r.all_items, key))
+    {
+        Some(info) : info.home == *m,
+        None       : false,
+    }
+}
+
+// impl/src/modres.rs's `note_shadowing`: a note for each item of the program
+// whose name an imported module also exports, or an `import p::name`
+// targets. `[Resolve-Unqualified]`'s clause (1) makes the program's own item
+// the one used, and nothing else says so. Sorted by line, then text.
+export fn shadow_notes(ref<Resolver, shared> r, ref<Program, shared> p) : Vec<ShadowNote>
+{
+    HashMap<String, usize> lines = HashMap::new();
+    Vec<String> path = Vec::new();
+    item_lines(&p.items, &mut path, &mut lines);
+    Vec<ShadowNote> notes = Vec::new();
+    for (usize mi = 0; mi < HashMap::len(&r.modules); mi += 1)
+    {
+        ref<String, shared> m = HashMap::key_at(&r.modules, mi);
+        if (*m == "std" || String::starts_with(m, "std::"))
+        {
+            continue;
+        }
+        ref<ModuleNode, shared> node = HashMap::value_at(&r.modules, mi);
+        for (usize ii = 0; ii < HashMap::len(&node.items); ii += 1)
+        {
+            ref<String, shared> simple = HashMap::key_at(&node.items, ii);
+            ref<Entry, shared> e = HashMap::value_at(&node.items, ii);
+            // The module's own items (a re-export's alias keys another
+            // module's), not its submodules; an associated function of the
+            // module's own type is covered by the type's note.
+            if (!home_is(r, &e.key, m) || e.kind == Kind::KModule)
+            {
+                continue;
+            }
+            match (String::find(simple, "::"))
+            {
+                Some(k) :
+                {
+                    String t = String::from_view(String::view(simple, 0, k));
+                    bool own_type = match (HashMap::get(&node.items, &t))
+                    {
+                        Some(te) : (te.kind == Kind::KStruct || te.kind == Kind::KEnum) && home_is(r, &te.key, m),
+                        None     : false,
+                    };
+                    if (own_type)
+                    {
+                        continue;
+                    }
+                },
+                None    : {},
+            }
+            Vec<String> hidden = Vec::new();
+            match (HashMap::get(&r.import_targets, m))
+            {
+                Some(ts) :
+                {
+                    foreach (t in ts)
+                    {
+                        if (StringView::eq(
+                            last_seg(&t.imp),
+                            String::as_view(simple),
+                        ) && t.key != e.key && !Vec::contains(&hidden, &t.key))
+                        {
+                            Vec::push(&mut hidden, String::clone(&t.key));
+                        }
+                    }
+                },
+                None     : {},
+            }
+            Vec<String> mods = imported(r, m, Kind::KModule);
+            foreach (im in &mods)
+            {
+                match (HashMap::get(&r.modules, im))
+                {
+                    Some(n) :
+                    {
+                        match (HashMap::get(&n.items, simple))
+                        {
+                            Some(te) :
+                            {
+                                if (te.export_ && te.kind != Kind::KModule && te.key != e.key && !Vec::contains(
+                                    &hidden,
+                                    &te.key,
+                                ))
+                                {
+                                    Vec::push(&mut hidden, String::clone(&te.key));
+                                }
+                            },
+                            None     : {},
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            if (Vec::len(&hidden) > 0)
+            {
+                str what = match (e.kind)
+                {
+                    Kind::KFn     : "fn",
+                    Kind::KStruct : "struct",
+                    Kind::KEnum   : "enum",
+                    Kind::KStatic : "static",
+                    Kind::KExtern : "extern fn",
+                    Kind::KModule : "module",
+                };
+                String whose = if (String::len(m) == 0) { String::from_str("this program") } else
+                {
+                    sprintf(
+                        "module `%s`",
+                        m,
+                    )
+                };
+                usize line = match (HashMap::get(&lines, &e.key))
+                {
+                    Some(l) : *l,
+                    None    : 0,
+                };
+                Vec::push(&mut notes, ShadowNote {
+                    .line = line,
+                    .text = sprintf(
+                        "note: %v `%s` of %s hides `%s`; the program's own is used",
+                        what,
+                        simple,
+                        &whose,
+                        &String::join(&hidden[0..$], "` and `"),
+                    ),
+                });
+            }
+        }
+    }
+    // Sorted by `(line, text)`.
+    for (usize i = 1; i < Vec::len(&notes); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && note_less(&notes[j], &notes[j - 1]))
+        {
+            Vec::swap(&mut notes, j - 1, j);
+            j -= 1;
+        }
+    }
+    notes
+}
+
+fn note_less(ref<ShadowNote, shared> a, ref<ShadowNote, shared> b) : bool
+{
+    a.line < b.line || (a.line == b.line && String::less(&a.text, &b.text))
+}

@@ -1,0 +1,100 @@
+// CONFORMANCE-CASE
+// spec: 12-type-system
+// facility: rule.type.bound `clone`, `[T-Clone]`, rule.agg.derived-clone (D-0116); conf.clone-plain, conf.clone-derived-struct, conf.clone-derived-enum, conf.clone-generic-struct, conf.clone-std-containers, conf.clone-declared-called, conf.clone-bound-generic-fn
+// kind: positive
+// expect: ok
+//
+// `clone(&x)` on a plain struct (a read), a derived struct and enum copy
+// (field by field; a recursive enum through `Rc` shares the cell), a
+// generic struct at `String`, the std containers, a `resource` type's
+// own `clone` (called, and observable), and a generic function under the
+// bound. Every copy is independent of its original.
+
+import std;
+
+struct Point { i32 x; i32 y; }
+struct Person { String name; u32 age; }
+struct Pair<A, B> { A a; B b; }
+struct Cons { Value head; Value tail; }
+enum Value { Nil, Int(i64), Sym(String), Cell(Rc<Cons>), }
+
+resource struct Counter { u32 n; }
+fn Counter::drop(ref<Counter, exclusive> self)
+{
+    printf("drop %d\n", self.n);
+}
+fn Counter::clone(ref<Counter, shared> self) : Counter
+{
+    printf("copy %d\n", self.n);
+    Counter { .n = self.n + 100 }
+}
+
+fn dup<T: clone>(ref<T, shared> x) : T
+{
+    clone(x)
+}
+
+fn main()
+{
+    Point p = Point { .x = 1, .y = 2 };
+    Point q = clone(&p);
+    q.x = 10;
+    assert(p.x == 1 && q.x == 10);
+
+    Person a = Person { .name = "Ada", .age = 36 };
+    Person b = clone(&a);
+    String::push_ascii(&mut b.name, b'!');
+    assert(String::eq_str(&a.name, "Ada") && String::eq_str(&b.name, "Ada!") && b.age == 36);
+
+    Value v = Cell(Rc::new(Cons { .head = Sym(String::from_str("s")), .tail = Int(3) }));
+    Value w = clone(&v);
+    match (&w)
+    {
+        Cell(c) : match (&Rc::get(c).head)
+        {
+            Sym(s) : assert(String::eq_str(
+                s,
+                "s",
+            )), _ : assert(false),
+        }, _ : assert(false),
+    }
+    Value n = Nil;
+    Value n2 = clone(&n);
+    match (&n2) { Nil : {}, _ : assert(false), }
+
+    Pair<String, i32> pr = Pair { .a = String::from_str("k"), .b = 5 };
+    Pair<String, i32> pr2 = dup(&pr);
+    assert(String::eq_str(&pr2.a, "k") && pr2.b == 5);
+    Option<String> os = Some(String::from_str("opt"));
+    Option<String> os2 = clone(&os);
+    assert(Option::is_some(&os2));
+
+    Vec<String> names = Vec::from_fn(2, [](usize i) : String { sprintf("n%d", i) });
+    Vec<String> names2 = Vec::clone(&names);
+    Vec::push(&mut names2, String::from_str("extra"));
+    assert(Vec::len(&names) == 2 && Vec::len(&names2) == 3);
+    Vec<Vec<u8>> grid = Vec::filled(2, Vec::filled(3, 7: u8));
+    grid[1][2] = 9;
+    assert(grid[0][2] == 7 && grid[1][2] == 9);
+    Box<String> bx = Box::new(String::from_str("boxed"));
+    Box<String> bx2 = clone(&bx);
+    HashMap<String, Vec<u8>> m = HashMap::new();
+    HashMap::insert(&mut m, String::from_str("a"), Vec::filled(1, 9: u8));
+    HashMap<String, Vec<u8>> m2 = clone(&m);
+    HashSet<String> hs = HashSet::new();
+    HashSet::insert(&mut hs, String::from_str("z"));
+    HashSet<String> hs2 = clone(&hs);
+    assert(String::eq_str(
+        Box::get(&bx2),
+        "boxed",
+    ) && HashMap::contains_str(&m2, "a") && HashSet::contains_str(&hs2, "z"));
+
+    Counter c = Counter { .n = 1 };
+    Counter d = clone(&c);                              // copy 1
+    Vec<Counter> cs = Vec::filled(2, clone(&d));        // copy 101; then copy 201 twice; drop 201
+    assert(cs[0].n == 301 && cs[1].n == 301);
+    Rc<Counter> rc = Rc::new(Counter { .n = 7 });
+    Rc<Counter> rc2 = clone(&rc);                       // shares: no copy
+    assert(Rc::get(&rc2).n == 7);
+    printf("done\n");                                   // then the drops
+}

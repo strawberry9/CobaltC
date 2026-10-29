@@ -1,0 +1,186 @@
+// todo: a to-do list kept in a text file.
+//
+//   todo [--file PATH] add TEXT...     add a task
+//   todo [--file PATH] list            show the tasks
+//   todo [--file PATH] done N          mark task N as done
+//   todo [--file PATH] remove N        delete task N
+//
+// The file holds one task per line: "[ ] text" or "[x] text".
+
+import std;
+
+// Every way the program can fail, in one place.
+enum TodoError
+{
+    File(FileError),                  // the list could not be read or written
+    BadLine(usize),                   // the file has a line that is not a task
+    NoSuchTask(usize),                // a number no task has
+    Usage(String),                    // the command line made no sense
+}
+
+fn TodoError::text(ref<TodoError, shared> e) : String
+{
+    match (e)
+    {
+        File(f)       : String::from_str(FileError::text(f)),
+        BadLine(n)    : sprintf("line %v of the list is not a task", *n),
+        NoSuchTask(n) : sprintf("there is no task %v", *n),
+        Usage(m)      : String::clone(m),
+    }
+}
+
+// Reading and writing the list file. Nothing else touches the file.
+module store
+{
+    import std;
+
+    export struct Task
+    {
+        export String text;
+        export bool done;
+    }
+
+    export fn load(StringView path) : Result<Vec<Task>, TodoError>
+    {
+        Vec<Task> tasks = Vec::new();
+        String text = match (read_file(path))
+        {
+            Ok(t)         : t,
+            Err(NotFound) : { return Ok(tasks); },      // no file yet: an empty list
+            Err(e)        : { return Err(File(e)); },
+        };
+        foreach (i, line in String::lines(&text))
+        {
+            if (StringView::len(line) == 0)
+            {
+                continue;
+            }
+            if (Some(rest) = StringView::strip_prefix(line, "[x] "))
+            {
+                Vec::push(&mut tasks, Task { .text = String::from_view(rest), .done = true });
+            }
+            else if (Some(rest) = StringView::strip_prefix(line, "[ ] "))
+            {
+                Vec::push(&mut tasks, Task { .text = String::from_view(rest), .done = false });
+            }
+            else
+            {
+                return Err(BadLine(i + 1));
+            }
+        }
+        Ok(tasks)
+    }
+
+    export fn save(StringView path, ref<Vec<Task>, shared> tasks) : Result<void, TodoError>
+    {
+        String out = String::new();
+        foreach (t in tasks)
+        {
+            String::appendf(&mut out, "%v %v\n", if (t.done) { "[x]" } else { "[ ]" }, &t.text);
+        }
+        match (write_file(path, &out[0..$]))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(File(e)),
+        }
+    }
+}
+
+import store::Task;
+
+// The task number given on the command line, checked against the list.
+fn task_index(ref<Vec<String>, shared> args, ref<Vec<Task>, shared> tasks) : Result<usize, TodoError>
+{
+    if (Vec::len(args) != 2)
+    {
+        return Err(Usage(sprintf("%v takes one task number", &args[0])));
+    }
+    usize n = match (String::parse<usize>(&args[1]))
+    {
+        Ok(n)  : n,
+        Err(_) : { return Err(Usage(sprintf("'%v' is not a task number", &args[1]))); },
+    };
+    if (n == 0 || n > Vec::len(tasks))
+    {
+        return Err(NoSuchTask(n));
+    }
+    Ok(n - 1)
+}
+
+fn run(StringView path, Vec<String> args) : Result<void, TodoError>
+{
+    Vec<Task> tasks = store::load(path)?;
+    match (args[0])
+    {
+        "add"    :
+        {
+            if (Vec::len(&args) < 2)
+            {
+                return Err(Usage(String::from_str("add needs the task's text")));
+            }
+            Vec::push(&mut tasks, Task { .text = String::join(&args[1..$], " "), .done = false });
+            store::save(path, &tasks)?;
+            printf("added task %v\n", Vec::len(&tasks));
+        },
+        "list"   :
+        {
+            if (Vec::len(&tasks) == 0)
+            {
+                printf("nothing to do\n");
+            }
+            foreach (i, t in &tasks)
+            {
+                printf("%2d. [%v] %v\n", i + 1, if (t.done) { "x" } else { " " }, &t.text);
+            }
+        },
+        "done"   :
+        {
+            usize i = task_index(&args, &tasks)?;
+            tasks[i].done = true;
+            store::save(path, &tasks)?;
+            printf("done: %v\n", &tasks[i].text);
+        },
+        "remove" :
+        {
+            usize i = task_index(&args, &tasks)?;
+            Task removed = Vec::remove(&mut tasks, i);
+            store::save(path, &tasks)?;
+            printf("removed: %v\n", &removed.text);
+        },
+        _        : { return Err(Usage(sprintf("unknown command '%v'", &args[0]))); },
+    }
+    Ok(())
+}
+
+fn main() : u8
+{
+    Args a = match (Args::new("todo [--file PATH] COMMAND [ARGS]"))
+    {
+        Ok(a)  : a,
+        Err(_) : { eprintf("todo: an argument is not UTF-8\n"); return 2; },
+    };
+    bool help = Args::flag(&mut a, "help", "h", "show this help");
+    String path = Option::unwrap_or(
+        Args::option(&mut a, "file", "f", "PATH", "the list file (default: todo.txt)"),
+        String::from_str("todo.txt"),
+    );
+    Vec<String> rest = match (Args::finish(&mut a))
+    {
+        Ok(r)  : r,
+        Err(m) : { eprintf("todo: %v\n", &m); return 2; },
+    };
+    if (help || Vec::len(&rest) == 0)
+    {
+        printf("%v", &Args::help(&a));
+        return if (help) { 0 } else { 2 };
+    }
+    match (run(&path[0..$], rest))
+    {
+        Ok(_)  : 0,
+        Err(e) :
+        {
+            eprintf("todo: %v\n", &TodoError::text(&e));
+            1
+        },
+    }
+}

@@ -1,0 +1,73 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.process [Spawn-Child] [Child-Streams] [Wait] [Kill] (D-0143); conf.process-spawn-lines, conf.process-kill, conf.process-try-wait
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6c696e65205b6f6e655d0a6c696e65205b74776f5d0a6c696e65205b74687265655d0a63617420656e6465643a20300a72656164203320616e6420332062797465732c2073746174757320300a72756e6e696e673a20747275652c206964206e6f6e2d7a65726f3a20747275650a6b696c6c3a20747275650a6b696c6c65643a202d392c20616761696e3a202d390a7472795f776169742061667465723a20747275650a
+// platform: unix
+//
+// A spawned `cat` echoes what is written to it, line by line; closing its
+// input ends it with status 0. A `sleep 100` is still running (`try_wait`
+// is `None`) until `kill`, after which `wait` gives -9. `read_output`
+// reads raw bytes, and 0 at the end.
+
+import std;
+
+fn main() : u8
+{
+    Command cat = Command::new("/bin/cat");
+    Child c = match (Command::spawn(&cat))
+    {
+        Ok(c)  : c,
+        Err(_) : return 1,
+    };
+    _ = Child::write_input(&mut c, &b"one\ntwo\r\nthree"[0..$]);
+    Child::close_input(&mut c);
+    while (Ok(Some(line)) = Child::read_output_line(&mut c))
+    {
+        printf("line [%s]\n", &line);
+    }
+    printf("cat ended: %d\n", Result::unwrap_or(Child::wait(&mut c), 99));
+    Command sh = Command::new("/bin/sh");
+    Command::arg(&mut sh, "-c");
+    Command::arg(&mut sh, "printf abc; printf xyz >&2");
+    Child s = match (Command::spawn(&sh))
+    {
+        Ok(s)  : s,
+        Err(_) : return 2,
+    };
+    Vec<u8> out = Vec::new();
+    while (Result::unwrap_or(Child::read_output(&mut s, &mut out, 2), 0) > 0)
+    {
+    }
+    Vec<u8> err = Vec::new();
+    while (Result::unwrap_or(Child::read_error(&mut s, &mut err, 100), 0) > 0)
+    {
+    }
+    printf(
+        "read %u and %u bytes, status %d\n",
+        Vec::len(&out),
+        Vec::len(&err),
+        Result::unwrap_or(Child::wait(&mut s), 99),
+    );
+    Command sl = Command::new("/bin/sleep");
+    Command::arg(&mut sl, "100");
+    Child z = match (Command::spawn(&sl))
+    {
+        Ok(z)  : z,
+        Err(_) : return 3,
+    };
+    printf(
+        "running: %v, id non-zero: %v\n",
+        Option::is_none(&Result::unwrap_or(Child::try_wait(&mut z), Some(0))),
+        Child::id(&z) != 0,
+    );
+    printf("kill: %v\n", Result::is_ok(&Child::kill(&mut z)));
+    printf(
+        "killed: %d, again: %d\n",
+        Result::unwrap_or(Child::wait(&mut z), 99),
+        Result::unwrap_or(Child::wait(&mut z), 99),
+    );
+    printf("try_wait after: %v\n", Result::unwrap_or(Child::try_wait(&mut z), None) == Some(-9));
+    0
+}
