@@ -1,0 +1,76 @@
+// CONFORMANCE-CASE
+// spec: 14-control-flow
+// facility: rule.control.if `[If-Pattern]`, rule.control.while `[While-Pattern]` (D-0115); conf.if-pattern-some, conf.if-pattern-else-value, conf.if-pattern-nested, conf.if-pattern-literal, conf.while-pattern-pop-moves, conf.while-pattern-break-continue, conf.if-pattern-qualified-variant
+// kind: positive
+// expect: ok
+//
+// `if (p = e)` and `while (p = e)` as the `match` each stands for: the
+// binder lives in the block; an `if` with `else` is a value; nested and
+// literal patterns; a resource moved out by the pattern each iteration;
+// `break` and `continue` inside the loop body; a qualified variant.
+
+import std;
+
+module shapes
+{
+    export enum Shape
+    {
+        Dot,
+        Disc(u32),
+    }
+}
+import shapes::Shape;
+
+resource struct Noisy
+{
+    u32 id;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("drop %d\n", self.id);
+}
+
+fn main()
+{
+    Option<i32> o = Some(4);
+    if (Some(x) = o)
+    {
+        assert(x == 4);
+    }
+    else
+    {
+        assert(false);
+    }
+    i32 doubled = if (Some(x) = o) { x * 2 } else { 0 };
+    assert(doubled == 8);
+    Option<i32> none = None;
+    i32 fallback = if (Some(x) = none) { x } else { -1 };
+    assert(fallback == -1);
+
+    Result<Option<i32>, str> r = Ok(Some(7));
+    if (Ok(Some(n)) = r) { assert(n == 7); } else { assert(false); }
+    if (Ok(None) = r) { assert(false); }
+    if (Err(_) = r) { assert(false); }
+
+    u32 k = 3;
+    if (3 = k) { k = 10; }
+    assert(k == 10);
+    if (true = k > 5) { k = 11; }
+    assert(k == 11);
+
+    Shape s = shapes::Disc(9);
+    if (shapes::Disc(rad) = s) { assert(rad == 9); } else { assert(false); }
+    if (Disc(rad) = s) { assert(rad == 9); } else { assert(false); }
+
+    Vec<Noisy> stack = Vec::from_fn(3, [](usize i) : Noisy { Noisy { .id = narrow<u32>(i) } });
+    u32 seen = 0;
+    while (Some(top) = Vec::pop(&mut stack))          // moved out; destroyed at the body's end
+    {
+        if (top.id == 0) { break; }                   // drop 0 runs on the way out
+        if (top.id == 1) { continue; }                // drop 1 runs, the loop goes on
+        seen += top.id;                               // drop 2 at the body's end
+    }
+    assert(seen == 2 && Vec::len(&stack) == 0);       // drop 2, drop 1, drop 0
+    printf("done\n");
+}

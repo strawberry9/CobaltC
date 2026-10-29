@@ -1,0 +1,45 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.thread-cancelled-holding-guard; rule.conc.cancel [Cancelled-Wait], [Guard-Drop], [Lock-Poisoned] (D-0204, D-0210, CHG-0248)
+// kind: negative
+// expect: diag.mutex-poisoned (dynamic)
+// expect-stdout-hex: 686f6c6465723a20646961672e7468726561642d63616e63656c6c65640a
+//
+// A thread cancelled while it holds a guard: it has written through the
+// guard and waits on a channel (a cancellation point) when main cancels
+// it. It unwinds through [Guard-Drop] like a faulting thread, so the
+// mutex is poisoned: try_join reports diag.thread-cancelled, and main's
+// own lock then faults diag.mutex-poisoned. The holder tells main it
+// holds the guard (the ready channel) before main cancels, so the
+// outcome does not depend on timing.
+
+import std;
+
+fn holder(ref<mutex<i32>, shared> m, ref<Channel<i32>, shared> ready, ref<Channel<i32>, shared> ch) : i32
+{
+    auto g = lock(m);
+    *g = *g + 1;
+    _ = Channel::send(ready, 1);
+    match (Channel::recv(ch))
+    {
+        Some(v) : v,
+        None    : 0,
+    }
+}
+
+fn main()
+{
+    mutex<i32> m = Mutex::new(5);
+    Channel<i32> ready = Channel::new(1);
+    Channel<i32> ch = Channel::new(1);
+    auto h = spawn(holder, &m, &ready, &ch);
+    _ = Channel::recv(&ready);
+    cancel(&h);
+    match (try_join(h))
+    {
+        Ok(v)  : printf("ok %v\n", v),
+        Err(f) : printf("holder: %v\n", &ThreadFailure::diagnostic(&f)),
+    }
+    auto g = lock(&m);
+    printf("main sees %v\n", *g);
+}

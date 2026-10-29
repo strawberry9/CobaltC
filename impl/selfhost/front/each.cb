@@ -1,0 +1,503 @@
+// `foreach` (D-0042, spec/14 `rule.control.foreach`), as impl/src/each.rs
+// expands it: the parser writes a `foreach` as a counted loop over hidden
+// bindings calling the `$each_*` intrinsics; once the type of the first
+// argument is known, each call becomes ordinary code over `std`'s own
+// functions and fields.
+
+import std;
+import ast;
+
+export fn is_each_name(StringView n) : bool
+{
+    foreach (x in [
+        "$each_drain",
+        "$each_len",
+        "$each_at",
+        "$each_at_mut",
+        "$each_key",
+        "$each_take",
+        "$each_take_key",
+        "$each_range",
+    ])
+    {
+        if (StringView::eq_str(n, x))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+enum Coll
+{
+    CVec,
+    CArray,
+    CSet,
+    CMap,
+    CDrain,
+    CSetDrain,
+    CMapDrain,
+    CSlice,
+}
+
+struct CollOf
+{
+    Coll c;
+    u128 n;
+    Mode mode;
+}
+
+fn coll(ref<Type, shared> t) : Option<CollOf>
+{
+    match (t)
+    {
+        Type::TArray(ab) : Some(CollOf { .c = Coll::CArray, .n = Box::get(ab).n, .mode = Mode::Shared }),
+        Type::TSlice(sb) : Some(CollOf { .c = Coll::CSlice, .n = 0, .mode = Box::get(sb).mode }),
+        Type::TNamed(nb) :
+        {
+            StringView n = String::as_view(&Box::get(nb).name);
+            Coll c = match (n)
+            {
+                "std::Vec"       : Coll::CVec,
+                "std::HashSet"   : Coll::CSet,
+                "std::HashMap"   : Coll::CMap,
+                "std::Drain"     : Coll::CDrain,
+                "std::SetDrain"  : Coll::CSetDrain,
+                "std::HashDrain" : Coll::CMapDrain,
+                _                : return None,
+            };
+            Some(CollOf { .c = c, .n = 0, .mode = Mode::Shared })
+        },
+        _                : None,
+    }
+}
+
+// Whether a literal expression has a floating-point literal in it.
+export fn has_float(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EFloat(_)   : true,
+        ExprKind::EParen(x)   : has_float(Box::get(x)),
+        ExprKind::EUnary(u)   : has_float(&Box::get(u).e),
+        ExprKind::EBinary(bb) : has_float(&Box::get(bb).a) || has_float(&Box::get(bb).b),
+        _                     : false,
+    }
+}
+
+// Whether a literal expression is a negation at its top.
+fn negated(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EUnary(u) : Box::get(u).op == UnOp::Neg,
+        ExprKind::EParen(x) : negated(Box::get(x)),
+        _                   : false,
+    }
+}
+
+fn int_arg(ref<Vec<Expr>, shared> args, usize k) : Option<u128>
+{
+    if (k >= Vec::len(args))
+    {
+        return None;
+    }
+    match (&args[k].kind)
+    {
+        ExprKind::EInt(lb) : Some(Box::get(lb).v),
+        _                  : None,
+    }
+}
+
+fn detail(String m) : Result<Expr, String>
+{
+    Err(sprintf("diag.type-mismatch\u{1}%s", &m))
+}
+
+fn bad() : Result<Expr, String>
+{
+    Err(String::from_str("diag.type-mismatch"))
+}
+
+struct Mk
+{
+    usize line;
+    usize col;
+}
+
+fn at(ref<Mk, shared> m, ExprKind k) : Expr
+{
+    mk(k, m.line, m.col)
+}
+
+fn path_of(ref<Mk, shared> m, str key) : Expr
+{
+    Vec<StringView> parts = StringView::split(StringView::of(key), "::");
+    Vec<String> segs = Vec::new();
+    for (usize i = 0; i < Vec::len(&parts); i += 1)
+    {
+        Vec::push(&mut segs, String::from_view(parts[i]));
+    }
+    at(m, ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })))
+}
+
+fn call1(ref<Mk, shared> m, str key, Expr a) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, a);
+    at(m, ExprKind::ECall(Box::new(CallExpr { .callee = path_of(m, key), .args = args })))
+}
+
+fn call2(ref<Mk, shared> m, str key, Expr a, Expr c) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, a);
+    Vec::push(&mut args, c);
+    at(m, ExprKind::ECall(Box::new(CallExpr { .callee = path_of(m, key), .args = args })))
+}
+
+fn shared(ref<Mk, shared> m, Expr e) : Expr
+{
+    at(m, ExprKind::EBorrow(Box::new(BorrowExpr { .mode = Mode::Shared, .e = e })))
+}
+
+fn excl(ref<Mk, shared> m, Expr e) : Expr
+{
+    at(m, ExprKind::EBorrow(Box::new(BorrowExpr { .mode = Mode::Exclusive, .e = e })))
+}
+
+fn deref(ref<Mk, shared> m, Expr e) : Expr
+{
+    at(m, ExprKind::EDeref(Box::new(e)))
+}
+
+fn field(ref<Mk, shared> m, Expr e, str f) : Expr
+{
+    at(m, ExprKind::EField(Box::new(FieldExpr { .e = e, .name = String::from_str(f) })))
+}
+
+fn index(ref<Mk, shared> m, Expr a, Expr i) : Expr
+{
+    at(m, ExprKind::EIndex(Box::new(PairExpr { .a = a, .b = i })))
+}
+
+// `name`'s expansion, given the type of `args[0]`; an `Err` is the
+// diagnostic.
+export fn each_expand(
+    StringView name0,
+    ref<Type, shared> t0,
+    ref<Vec<Expr>, shared> args,
+    usize line,
+    usize col,
+) : Result<Expr, String>
+{
+    Mk m = Mk { .line = line, .col = col };
+    if (Vec::len(args) == 0)
+    {
+        return bad();
+    }
+    Expr a0 = clone(&args[0]);
+    // `foreach (x in lo .. hi)` (D-0097).
+    if (StringView::eq_str(name0, "$each_range"))
+    {
+        bool names_ok = match (int_arg(args, 2))
+        {
+            Some(v) : v == 1 || v == 2,
+            None    : false,
+        };
+        if (!names_ok)
+        {
+            return detail(String::from_str("a range is looped over with one name, the value, or two: its position and the value"));
+        }
+        bool unsigned_int = match (t0)
+        {
+            Type::TInt(k) : !int_ty_signed(*k),
+            _ : return detail(sprintf(
+                "a range's bounds are integers, but this one is `%s`",
+                &type_display(t0),
+            )),
+        };
+        if (Vec::len(args) < 2)
+        {
+            return bad();
+        }
+        ref<Expr, shared> e = &args[1];
+        match (&e.kind)
+        {
+            ExprKind::EUnit : return Ok(at(&m, ExprKind::EUnit)),
+            _               : {},
+        }
+        if (unsigned_int && negated(e))
+        {
+            // Two literal bounds are typed through a hidden `$z`.
+            bool plain = match (&a0.kind)
+            {
+                ExprKind::EPath(pb) : Vec::len(&Box::get(pb).segs) == 1 && String::starts_with(
+                    &Box::get(pb).segs[0],
+                    "$z",
+                ),
+                _ : false,
+            };
+            if (plain)
+            {
+                return detail(String::from_str("a range of two plain-number bounds counts in `usize`, which cannot be negative; give one bound a signed type: `-3..0: i32`"));
+            }
+            return detail(sprintf("a range of `%s` cannot have a negative bound", &type_display(t0)));
+        }
+        if (has_float(e))
+        {
+            return detail(sprintf(
+                "a range's bounds are integers of one type: the other bound is `%s`, this one a floating-point literal",
+                &type_display(t0),
+            ));
+        }
+        Vec<Stmt> stmts = Vec::new();
+        Vec::push(&mut stmts, let_stmt(Some(clone(t0)), "$r", Some(clone(e)), line, col));
+        return Ok(at(&m, ExprKind::EBlock(Block { .stmts = stmts, .tail = Some(Box::new(path_of(&m, "$r"))) })));
+    }
+    Expr a1 = if (Vec::len(args) > 1) { clone(&args[1]) } else { at(&m, ExprKind::EUnit) };
+    // The borrowed forms hold a reference; the consuming form a holder.
+    Option<Mode> mode = None;
+    ref<Type, shared> inner = t0;
+    match (t0)
+    {
+        Type::TRef(rb) :
+        {
+            mode = Some(Box::get(rb).mode);
+            inner = &Box::get(rb).inner;
+        },
+        _              : {},
+    }
+    CollOf co = match (coll(inner))
+    {
+        Some(c) : c,
+        None    : return bad(),
+    };
+    // A reference written without `&` is looped over as the borrow it is.
+    StringView name = name0;
+    match (mode)
+    {
+        Some(md) :
+        {
+            if (StringView::eq_str(name0, "$each_drain"))
+            {
+                return Ok(a0);
+            }
+            if (StringView::eq_str(name0, "$each_take"))
+            {
+                name = StringView::of(if (md == Mode::Shared) { "$each_at" } else { "$each_at_mut" });
+            }
+            else if (StringView::eq_str(name0, "$each_take_key"))
+            {
+                name = StringView::of("$each_key");
+            }
+        },
+        None     : {},
+    }
+    // A HashMap has a key and a value; three names are for a map only.
+    u128 names = Option::unwrap_or(int_arg(args, 2), 0);
+    if (StringView::eq_str(name, "$each_at") || StringView::eq_str(name, "$each_at_mut"))
+    {
+        bool map = co.c == Coll::CMap;
+        if ((map && names == 1) || (!map && names == 3))
+        {
+            return bad();
+        }
+    }
+    bool none_mode = Option::is_none(&mode);
+    bool shared_mode = match (mode)
+    {
+        Some(md) : md == Mode::Shared,
+        None     : false,
+    };
+    bool excl_mode = match (mode)
+    {
+        Some(md) : md == Mode::Exclusive,
+        None     : false,
+    };
+    Coll c = co.c;
+    if (StringView::eq_str(name, "$each_drain"))
+    {
+        if (!none_mode)
+        {
+            return bad();
+        }
+        if ((c == Coll::CVec || c == Coll::CArray || c == Coll::CSet || c == Coll::CSlice) && Option::unwrap_or(
+            int_arg(args, 1),
+            0,
+        ) == 3)
+        {
+            return bad();
+        }
+        // A slice (D-0047) is a borrow already.
+        if (c == Coll::CSlice || c == Coll::CArray)
+        {
+            return Ok(a0);
+        }
+        if (c == Coll::CVec)
+        {
+            return Ok(call1(&m, "std::Vec::drain", a0));
+        }
+        if (c == Coll::CSet)
+        {
+            return Ok(call1(&m, "std::HashSet::drain", a0));
+        }
+        if (c == Coll::CMap)
+        {
+            u128 k = Option::unwrap_or(int_arg(args, 1), 0);
+            if (k == 2 || k == 3)
+            {
+                return Ok(call1(&m, "std::HashMap::drain", a0));
+            }
+            return bad();
+        }
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_len"))
+    {
+        if (c == Coll::CSlice)
+        {
+            return Ok(call1(&m, "slice_len", a0));
+        }
+        if (c == Coll::CArray)
+        {
+            return Ok(at(&m, ExprKind::EInt(Box::new(IntLit { .v = co.n, .sfx = None }))));
+        }
+        if (!none_mode)
+        {
+            if (c == Coll::CVec)
+            {
+                return Ok(call1(&m, "std::Vec::len", shared(&m, deref(&m, a0))));
+            }
+            if (c == Coll::CSet)
+            {
+                return Ok(call1(&m, "std::HashSet::len", shared(&m, deref(&m, a0))));
+            }
+            if (c == Coll::CMap)
+            {
+                return Ok(call1(&m, "std::HashMap::len", shared(&m, deref(&m, a0))));
+            }
+            return bad();
+        }
+        if (c == Coll::CDrain)
+        {
+            return Ok(call1(&m, "std::Drain::total", shared(&m, a0)));
+        }
+        if (c == Coll::CSetDrain)
+        {
+            return Ok(call1(&m, "std::SetDrain::total", shared(&m, a0)));
+        }
+        if (c == Coll::CMapDrain)
+        {
+            return Ok(call1(&m, "std::HashDrain::total", shared(&m, a0)));
+        }
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_take"))
+    {
+        if (!none_mode)
+        {
+            return bad();
+        }
+        if (c == Coll::CSlice)
+        {
+            Expr ix = index(&m, a0, a1);
+            return Ok(if (co.mode == Mode::Shared) { shared(&m, ix) } else { excl(&m, ix) });
+        }
+        if (c == Coll::CDrain)
+        {
+            return Ok(call1(&m, "std::Drain::take", excl(&m, a0)));
+        }
+        if (c == Coll::CArray)
+        {
+            return Ok(index(&m, a0, a1));
+        }
+        if (c == Coll::CSetDrain)
+        {
+            return Ok(call1(&m, "std::SetDrain::take", excl(&m, a0)));
+        }
+        if (c == Coll::CMapDrain)
+        {
+            return Ok(call1(&m, "std::HashDrain::take_value", excl(&m, a0)));
+        }
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_take_key"))
+    {
+        if (!none_mode)
+        {
+            return bad();
+        }
+        if (c == Coll::CSlice || c == Coll::CDrain || c == Coll::CArray || c == Coll::CSetDrain)
+        {
+            return Ok(a1);
+        }
+        if (c == Coll::CMapDrain)
+        {
+            return Ok(call1(&m, "std::HashDrain::take_key", excl(&m, a0)));
+        }
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_at"))
+    {
+        if (!shared_mode)
+        {
+            return bad();
+        }
+        if (c == Coll::CSlice || c == Coll::CArray)
+        {
+            return Ok(shared(&m, index(&m, deref(&m, a0), a1)));
+        }
+        if (c == Coll::CVec)
+        {
+            return Ok(call2(&m, "std::Vec::index_shared", a0, a1));
+        }
+        if (c == Coll::CSet)
+        {
+            return Ok(call2(&m, "std::HashSet::key_at", a0, a1));
+        }
+        if (c == Coll::CMap)
+        {
+            return Ok(call2(&m, "std::Vec::index_shared", shared(&m, field(&m, deref(&m, a0), "values")), a1));
+        }
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_at_mut"))
+    {
+        if (!excl_mode)
+        {
+            return bad();
+        }
+        if (c == Coll::CSlice || c == Coll::CArray)
+        {
+            return Ok(excl(&m, index(&m, deref(&m, a0), a1)));
+        }
+        if (c == Coll::CVec)
+        {
+            return Ok(call2(&m, "std::Vec::index_exclusive", excl(&m, deref(&m, a0)), a1));
+        }
+        if (c == Coll::CMap)
+        {
+            return Ok(call2(&m, "std::Vec::index_exclusive", excl(&m, field(&m, deref(&m, a0), "values")), a1));
+        }
+        // A set's keys are not changed in place.
+        return bad();
+    }
+    if (StringView::eq_str(name, "$each_key"))
+    {
+        if (none_mode)
+        {
+            return bad();
+        }
+        if (c == Coll::CMap)
+        {
+            return Ok(call2(&m, "std::Vec::index_shared", shared(&m, field(&m, deref(&m, a0), "keys")), a1));
+        }
+        if (c == Coll::CSlice || c == Coll::CVec || c == Coll::CArray || c == Coll::CSet)
+        {
+            return Ok(a1);
+        }
+        return bad();
+    }
+    bad()
+}

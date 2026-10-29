@@ -1,0 +1,1879 @@
+// cobc's stage-1 analyses (D-0274 stage 1, `--all-checks` off), written in
+// CobaltC: syntax.rs's `has_loop`, `field_confined_uses`, `mentions_field`,
+// `confined_fields` and `read_confined_vecs`; analysis_strings.rs's
+// `pure_direct_in` and `pure_direct_ref_arg`; analysis_refs.rs's
+// `direct_ref_params` and `dual_direct_params`.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import direct;
+import uses;
+import refs4;
+import natives;
+
+// ---- small syntax helpers (cobc's uses.rs / syntax.rs) ----
+
+fn strip(ref<Expr, shared> e) : ref<Expr, shared>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(i) : strip(Box::get(i)),
+        _                   : e,
+    }
+}
+
+// A one-segment path's name, through parentheses, whatever its type
+// arguments (cobc's `path_name`).
+fn pname(ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+fn pname_is(ref<Expr, shared> e, ref<String, shared> b) : bool
+{
+    match (pname(e))
+    {
+        Some(n) : String::eq(&n, b),
+        None    : false,
+    }
+}
+
+// A path expression's segments joined (cobc's `path_name_joined`).
+fn pjoined(ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EPath(p) : Some(String::join(&Box::get(p).segs[0..$], "::")),
+        _                  : None,
+    }
+}
+
+fn joined_is(ref<Expr, shared> e, str a, str b) : bool
+{
+    match (pjoined(e))
+    {
+        Some(n) : String::eq_str(&n, a) || String::eq_str(&n, b),
+        None    : false,
+    }
+}
+
+fn is_literal(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(_)   : true,
+        ExprKind::EFloat(_) : true,
+        ExprKind::EStr(_)   : true,
+        ExprKind::EBool(_)  : true,
+        _                   : false,
+    }
+}
+
+// ---- cobc's `visit_exprs`, with the few actions these analyses take ----
+
+enum VisDo
+{
+    // Every one-segment path's name (the analyses' `any_path`).
+    AnyPath,
+    // A `while` (`has_loop`).
+    Loop,
+    // `b.f` or `(*b).f` (`mentions_field`: `a` is `b`, `f` the field).
+    Field,
+    // A path naming `a`, or a closure capturing it (`mentions`).
+    Mentions,
+}
+
+struct Vis
+{
+    VisDo what;
+    String a;
+    String f;
+    bool found;
+    HashSet<String> names;
+}
+
+fn new_vis(VisDo what, ref<String, shared> a, ref<String, shared> f) : Vis
+{
+    Vis { .what = what, .a = String::clone(a), .f = String::clone(f), .found = false, .names = HashSet::new() }
+}
+
+fn vis_act(ref<Expr, shared> e, ref<Vis, exclusive> v)
+{
+    match (v.what)
+    {
+        VisDo::AnyPath  :
+        {
+            match (&e.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1)
+                    {
+                        HashSet::insert(&mut v.names, String::clone(&Box::get(p).segs[0]));
+                    }
+                },
+                _                  : {},
+            }
+        },
+        VisDo::Loop     :
+        {
+            match (&e.kind)
+            {
+                ExprKind::EWhile(_) : v.found = true,
+                _                   : {},
+            }
+        },
+        VisDo::Field    :
+        {
+            ref<Expr, shared> s = strip(e);
+            match (&s.kind)
+            {
+                ExprKind::EField(fe) :
+                {
+                    ref<Expr, shared> a = strip(&Box::get(fe).e);
+                    ref<Expr, shared> base = match (&a.kind)
+                    {
+                        ExprKind::EDeref(p) : strip(Box::get(p)),
+                        _                   : a,
+                    };
+                    if (String::eq(&Box::get(fe).name, &v.f) && pname_is(base, &v.a))
+                    {
+                        v.found = true;
+                    }
+                },
+                _                    : {},
+            }
+        },
+        VisDo::Mentions :
+        {
+            match (&e.kind)
+            {
+                ExprKind::EPath(p)    :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1 && String::eq(&Box::get(p).segs[0], &v.a))
+                    {
+                        v.found = true;
+                    }
+                },
+                ExprKind::EClosure(c) :
+                {
+                    if (Vec::contains(&Box::get(c).captures, &v.a))
+                    {
+                        v.found = true;
+                    }
+                },
+                _                     : {},
+            }
+        },
+    }
+}
+
+// Every expression in `e`, closures' bodies included (cobc's `visit_expr`:
+// a match arm's literal is not visited).
+fn vis_expr(ref<Expr, shared> e, ref<Vis, exclusive> v)
+{
+    vis_act(e, v);
+    match (&e.kind)
+    {
+        ExprKind::EUnary(u)       : vis_expr(&Box::get(u).e, v),
+        ExprKind::EBorrow(b)      : vis_expr(&Box::get(b).e, v),
+        ExprKind::EDeref(a)       : vis_expr(Box::get(a), v),
+        ExprKind::EField(f)       : vis_expr(&Box::get(f).e, v),
+        ExprKind::EPropagate(a)   : vis_expr(Box::get(a), v),
+        ExprKind::EParen(a)       : vis_expr(Box::get(a), v),
+        ExprKind::EBinary(b)      :
+        {
+            vis_expr(&Box::get(b).a, v);
+            vis_expr(&Box::get(b).b, v);
+        },
+        ExprKind::EIndex(p)       :
+        {
+            vis_expr(&Box::get(p).a, v);
+            vis_expr(&Box::get(p).b, v);
+        },
+        ExprKind::EAssign(p)      :
+        {
+            vis_expr(&Box::get(p).a, v);
+            vis_expr(&Box::get(p).b, v);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            vis_expr(&Box::get(s).base, v);
+            vis_expr(&Box::get(s).lo, v);
+            vis_expr(&Box::get(s).hi, v);
+        },
+        ExprKind::ECall(c)        :
+        {
+            vis_expr(&Box::get(c).callee, v);
+            foreach (a in &Box::get(c).args)
+            {
+                vis_expr(a, v);
+            }
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                vis_expr(&f.value, v);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                vis_expr(a, v);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : vis_expr(&Box::get(r).value, v),
+        ExprKind::EBlock(b)       : vis_block(b, v),
+        ExprKind::EUnsafe(b)      : vis_block(b, v),
+        ExprKind::EIf(i)          :
+        {
+            vis_expr(&Box::get(i).cond, v);
+            vis_block(&Box::get(i).then_, v);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : vis_expr(x, v),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            vis_expr(&Box::get(w).cond, v);
+            vis_block(&Box::get(w).body, v);
+            match (&Box::get(w).step)
+            {
+                Some(x) : vis_expr(x, v),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            vis_expr(&Box::get(m).scrut, v);
+            foreach (a in &Box::get(m).arms)
+            {
+                vis_expr(Box::get(&a.body), v);
+            }
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(x) : vis_expr(Box::get(x), v),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(c)     : vis_block(&Box::get(c).body, v),
+        _                         : {},
+    }
+}
+
+// Every expression in `b`, closures' bodies included (cobc's `visit_exprs`).
+fn vis_block(ref<Block, shared> b, ref<Vis, exclusive> v)
+{
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : vis_expr(e, v),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : vis_expr(&Box::get(d).init, v),
+            Stmt::SExpr(e)        : vis_expr(Box::get(e), v),
+            Stmt::SBlockLike(e)   : vis_expr(Box::get(e), v),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : vis_expr(Box::get(t), v),
+        None    : {},
+    }
+}
+
+// Whether `e` names `x` anywhere (a closure's capture included; cobc's
+// `mentions`).
+fn mentions1(ref<Expr, shared> e, ref<String, shared> x) : bool
+{
+    String none = String::new();
+    Vis v = new_vis(VisDo::Mentions, x, &none);
+    vis_expr(e, &mut v);
+    v.found
+}
+
+// Every one-segment path's name in `b` (the analyses' `any_path`).
+fn any_path_names(ref<Block, shared> b) : HashSet<String>
+{
+    String none = String::new();
+    Vis v = new_vis(VisDo::AnyPath, &none, &none);
+    vis_block(b, &mut v);
+    replace(&mut v.names, HashSet::new())
+}
+
+fn add_all(ref<HashSet<String>, exclusive> to, ref<HashSet<String>, shared> from)
+{
+    foreach (n in from)
+    {
+        HashSet::insert(to, String::clone(n));
+    }
+}
+
+// ---- has_loop, field_confined_uses, mentions_field ----
+
+// Whether a body contains a loop (a `while`, which `for` and `foreach`
+// are): where a field dual body's entry test is paid for.
+export fn has_loop(ref<Block, shared> b) : bool
+{
+    String none = String::new();
+    Vis v = new_vis(VisDo::Loop, &none, &none);
+    vis_block(b, &mut v);
+    v.found
+}
+
+// Whether the body names `b.f` at all.
+export fn mentions_field(ref<Block, shared> body, ref<String, shared> b, ref<String, shared> f) : bool
+{
+    Vis v = new_vis(VisDo::Field, b, f);
+    vis_block(body, &mut v);
+    v.found
+}
+
+// `field_confined_uses`' answer: the confined fields, and whether `b` may go
+// unchecked.
+export struct FieldUses
+{
+    export HashSet<String> used;
+    export bool unborrowed;
+}
+
+struct FW
+{
+    String b;
+    Vec<String> fields;
+    HashSet<String> used;
+    HashSet<String> bad_fields;
+    bool out;
+    // Something under `b` other than a confined field's call argument is
+    // borrowed (or matched, which may borrow): `b` then keeps its path in
+    // the fast half.
+    bool borrowed;
+}
+
+// Whether `e` is a place rooted at `b` (`b.g`, `b.g[i].h`, `(*b).g`).
+fn rooted_on_b(ref<FW, shared> w, ref<Expr, shared> e) : bool
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EField(f) : rooted_on_b(w, &Box::get(f).e),
+        ExprKind::EIndex(p) : rooted_on_b(w, &Box::get(p).a),
+        ExprKind::EDeref(p) : pname_is(strip(Box::get(p)), &w.b),
+        ExprKind::EPath(_)  : pname_is(s, &w.b),
+        _                   : false,
+    }
+}
+
+fn field_on_b(ref<FW, shared> w, ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EField(fe) :
+        {
+            ref<Expr, shared> b0 = strip(&Box::get(fe).e);
+            ref<Expr, shared> base = match (&b0.kind)
+            {
+                ExprKind::EDeref(p) : strip(Box::get(p)),
+                _                   : b0,
+            };
+            if (pname_is(base, &w.b))
+            {
+                return Some(String::clone(&Box::get(fe).name));
+            }
+            None
+        },
+        _                    : None,
+    }
+}
+
+fn is_vec_field(ref<FW, shared> w, ref<String, shared> f) : bool
+{
+    Vec::contains(&w.fields, f)
+}
+
+// A vector field of `b`, when `e` is one.
+fn vec_field_on_b(ref<FW, shared> w, ref<Expr, shared> e) : Option<String>
+{
+    match (field_on_b(w, e))
+    {
+        Some(f) : if (is_vec_field(w, &f)) { Some(f) } else { None },
+        None    : None,
+    }
+}
+
+// cobc's `READS`.
+fn is_read(ref<String, shared> n) : bool
+{
+    String::eq_str(n, "std::Vec::len") || String::eq_str(n, "Vec::len") || String::eq_str(
+        n,
+        "std::Vec::contains",
+    ) || String::eq_str(n, "std::Vec::index_of") || String::eq_str(n, "std::Vec::binary_search")
+}
+
+// cobc's `CONFINING_CALLS`.
+fn is_confining(ref<String, shared> n) : bool
+{
+    String::eq_str(n, "std::Vec::swap") || String::eq_str(n, "std::Vec::reverse") || String::eq_str(
+        n,
+        "std::Vec::insert",
+    ) || String::eq_str(n, "std::Vec::remove") || String::eq_str(n, "std::Vec::truncate") || String::eq_str(
+        n,
+        "std::Vec::clear",
+    ) || String::eq_str(n, "std::Vec::contains") || String::eq_str(n, "std::Vec::index_of") || String::eq_str(
+        n,
+        "std::Vec::binary_search",
+    ) || String::eq_str(n, "std::Vec::sort")
+}
+
+fn fw_call_name(ref<Expr, shared> c) : Option<String>
+{
+    match (pjoined(c))
+    {
+        Some(n) :
+        {
+            if (StringView::starts_with(String::as_view(&n), StringView::of("std::")))
+            {
+                Some(n)
+            }
+            else
+            {
+                Some(sprintf("std::%s", &n))
+            }
+        },
+        None    : None,
+    }
+}
+
+fn fw_expr(ref<FW, exclusive> w, ref<Expr, shared> e, bool guarded)
+{
+    if (w.out)
+    {
+        return;
+    }
+    match (field_on_b(w, e))
+    {
+        Some(f) :
+        {
+            // `b.f` alone: a vector field used whole is out; another field
+            // is used as any place is.
+            if (is_vec_field(w, &f))
+            {
+                HashSet::insert(&mut w.bad_fields, f);
+            }
+            return;
+        },
+        None    : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)        :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1 && String::eq(&Box::get(p).segs[0], &w.b))
+            {
+                w.out = true;
+            }
+            else if (mentions1(e, &w.b))
+            {
+                w.out = true;
+            }
+        },
+        ExprKind::EIndex(p)       :
+        {
+            match (vec_field_on_b(w, &Box::get(p).a))
+            {
+                Some(f) :
+                {
+                    HashSet::insert(&mut w.used, f);
+                    fw_expr(w, &Box::get(p).b, true);
+                },
+                None    :
+                {
+                    fw_expr(w, &Box::get(p).a, guarded);
+                    fw_expr(w, &Box::get(p).b, guarded);
+                },
+            }
+        },
+        ExprKind::EAssign(p)      :
+        {
+            ref<Expr, shared> l = strip(&Box::get(p).a);
+            bool target = match (&l.kind)
+            {
+                ExprKind::EIndex(q) : Option::is_some(&vec_field_on_b(w, &Box::get(q).a)),
+                _                   : false,
+            };
+            fw_expr(w, &Box::get(p).a, guarded);
+            fw_expr(w, &Box::get(p).b, guarded || target);
+        },
+        ExprKind::EBorrow(bb)     :
+        {
+            ref<Expr, shared> x = &Box::get(bb).e;
+            if (rooted_on_b(w, x))
+            {
+                w.borrowed = true;
+            }
+            match (field_on_b(w, x))
+            {
+                Some(f) :
+                {
+                    if (is_vec_field(w, &f))
+                    {
+                        HashSet::insert(&mut w.bad_fields, f);
+                    }
+                    return;
+                },
+                None    : {},
+            }
+            ref<Expr, shared> xs = strip(x);
+            match (&xs.kind)
+            {
+                ExprKind::EIndex(q) :
+                {
+                    match (field_on_b(w, &Box::get(q).a))
+                    {
+                        Some(f) :
+                        {
+                            if (is_vec_field(w, &f))
+                            {
+                                HashSet::insert(&mut w.bad_fields, f);
+                            }
+                            fw_expr(w, &Box::get(q).b, guarded);
+                            return;
+                        },
+                        None    : {},
+                    }
+                },
+                _                   : {},
+            }
+            fw_expr(w, x, guarded);
+        },
+        ExprKind::ECall(c)        :
+        {
+            ref<Vec<Expr>, shared> args = &Box::get(c).args;
+            match (fw_call_name(&Box::get(c).callee))
+            {
+                Some(n) :
+                {
+                    bool admitted = String::eq_str(&n, "std::Vec::push") || String::eq_str(
+                        &n,
+                        "std::Vec::pop",
+                    ) || String::eq_str(&n, "std::Vec::reserve") || is_read(&n) || is_confining(&n);
+                    if (admitted && Vec::len(args) > 0)
+                    {
+                        ref<Expr, shared> a0 = strip(&args[0]);
+                        match (&a0.kind)
+                        {
+                            ExprKind::EBorrow(bb) :
+                            {
+                                match (vec_field_on_b(w, &Box::get(bb).e))
+                                {
+                                    Some(f) :
+                                    {
+                                        if (guarded && !is_read(&n))
+                                        {
+                                            HashSet::insert(&mut w.bad_fields, String::clone(&f));
+                                        }
+                                        bool other = false;
+                                        for (usize k = 1; k < Vec::len(args); k += 1)
+                                        {
+                                            if (mentions1(&args[k], &w.b))
+                                            {
+                                                other = true;
+                                                break;
+                                            }
+                                        }
+                                        if (other)
+                                        {
+                                            HashSet::insert(&mut w.bad_fields, String::clone(&f));
+                                        }
+                                        HashSet::insert(&mut w.used, f);
+                                        for (usize k = 1; k < Vec::len(args); k += 1)
+                                        {
+                                            fw_expr(w, &args[k], guarded);
+                                        }
+                                        return;
+                                    },
+                                    None    : {},
+                                }
+                            },
+                            _                     : {},
+                        }
+                    }
+                },
+                None    : {},
+            }
+            fw_expr(w, &Box::get(c).callee, guarded);
+            foreach (a in args)
+            {
+                fw_expr(w, a, guarded);
+            }
+        },
+        ExprKind::EClosure(_)     :
+        {
+            if (mentions1(e, &w.b))
+            {
+                w.out = true;
+            }
+        },
+        ExprKind::EField(f)       : fw_expr(w, &Box::get(f).e, guarded),
+        ExprKind::EUnary(u)       : fw_expr(w, &Box::get(u).e, guarded),
+        ExprKind::EDeref(a)       : fw_expr(w, Box::get(a), guarded),
+        ExprKind::EPropagate(a)   : fw_expr(w, Box::get(a), guarded),
+        ExprKind::EParen(a)       : fw_expr(w, Box::get(a), guarded),
+        ExprKind::EArrayRepeat(r) : fw_expr(w, &Box::get(r).value, guarded),
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(a) : fw_expr(w, Box::get(a), guarded),
+                None    : fw_other(w, e),
+            }
+        },
+        ExprKind::EBinary(b)      :
+        {
+            fw_expr(w, &Box::get(b).a, guarded);
+            fw_expr(w, &Box::get(b).b, guarded);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            fw_expr(w, &Box::get(s).base, guarded);
+            fw_expr(w, &Box::get(s).lo, guarded);
+            fw_expr(w, &Box::get(s).hi, guarded);
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                fw_expr(w, &f.value, guarded);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                fw_expr(w, a, guarded);
+            }
+        },
+        ExprKind::EBlock(bl)      : fw_block(w, bl, guarded),
+        ExprKind::EUnsafe(bl)     : fw_block(w, bl, guarded),
+        ExprKind::EIf(i)          :
+        {
+            fw_expr(w, &Box::get(i).cond, guarded);
+            fw_block(w, &Box::get(i).then_, guarded);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : fw_expr(w, x, guarded),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(wh)      :
+        {
+            fw_expr(w, &Box::get(wh).cond, guarded);
+            fw_block(w, &Box::get(wh).body, guarded);
+            match (&Box::get(wh).step)
+            {
+                Some(x) : fw_expr(w, x, guarded),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            if (rooted_on_b(w, &Box::get(m).scrut))
+            {
+                w.borrowed = true;
+            }
+            fw_expr(w, &Box::get(m).scrut, guarded);
+            foreach (a in &Box::get(m).arms)
+            {
+                match (&a.binder)
+                {
+                    Some(n) :
+                    {
+                        if (String::eq(n, &w.b))
+                        {
+                            w.out = true;
+                        }
+                    },
+                    None    : {},
+                }
+                fw_expr(w, Box::get(&a.body), guarded);
+            }
+        },
+        _                         : fw_other(w, e),
+    }
+}
+
+// Anything else naming `b` that this walk does not know.
+fn fw_other(ref<FW, exclusive> w, ref<Expr, shared> e)
+{
+    if (mentions1(e, &w.b) && !is_literal(e))
+    {
+        w.out = true;
+    }
+}
+
+fn fw_block(ref<FW, exclusive> w, ref<Block, shared> b, bool guarded)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                if (String::eq(&Box::get(l).name, &w.b))
+                {
+                    w.out = true;
+                }
+                match (&Box::get(l).init)
+                {
+                    Some(e) : fw_expr(w, e, guarded),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) :
+            {
+                if (Vec::contains(&Box::get(d).names, &w.b))
+                {
+                    w.out = true;
+                }
+                fw_expr(w, &Box::get(d).init, guarded);
+            },
+            Stmt::SExpr(e)        : fw_expr(w, Box::get(e), guarded),
+            Stmt::SBlockLike(e)   : fw_expr(w, Box::get(e), guarded),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : fw_expr(w, Box::get(t), guarded),
+        None    : {},
+    }
+}
+
+// D-0189: the `Vec` fields among `fields` of the reference parameter `b`
+// that the body uses only as a confined vector is used, or None if `b`
+// itself is used any other way. Admitted: `b.f[i]` read or written (never
+// borrowed); `&b.f` / `&mut b.f` as the first argument of `Vec::len`,
+// `push`, `pop`, `reserve` or a `CONFINING_CALLS` call that no other
+// argument mentions `b` in; and `b.g` for every other field, freely (its
+// paths never overlap `b.f`). Not inside an index or the value assigned to
+// `b.f[i]`: a call that may move or shorten a field there (any but `len`
+// and the searches), whose element address is taken first. A field used
+// any other way is left out; `b` named bare, borrowed whole, shadowed or
+// captured rules the function out.
+export fn field_confined_uses(
+    ref<Block, shared> body,
+    ref<String, shared> b,
+    ref<Vec<String>, shared> fields,
+) : Option<FieldUses>
+{
+    FW w = FW {
+        .b = String::clone(b),
+        .fields = clone(fields),
+        .used = HashSet::new(),
+        .bad_fields = HashSet::new(),
+        .out = false,
+        .borrowed = false,
+    };
+    fw_block(&mut w, body, false);
+    if (w.out)
+    {
+        return None;
+    }
+    HashSet<String> used = HashSet::new();
+    foreach (f in &w.used)
+    {
+        if (!HashSet::contains(&w.bad_fields, f))
+        {
+            HashSet::insert(&mut used, String::clone(f));
+        }
+    }
+    // Every field of `b` but the confined ones must be plain for `b` to go
+    // unchecked: a vector field used otherwise is still reached through
+    // `b`'s path.
+    bool all = true;
+    foreach (f in fields)
+    {
+        if (!(HashSet::contains(&used, f) || !mentions_field(body, b, f)))
+        {
+            all = false;
+            break;
+        }
+    }
+    bool unborrowed = !w.borrowed && HashSet::len(&w.bad_fields) == 0 && all;
+    Some(FieldUses { .used = used, .unborrowed = unborrowed })
+}
+
+// ---- confined_fields ----
+
+// The walk's state; a pair `(h, f)` is kept as `h.f` (neither name holds a
+// dot).
+struct CF
+{
+    HashMap<String, usize> lets;
+    HashSet<String> bad_names;
+    HashSet<String> ok;
+    HashSet<String> bad;
+}
+
+fn count_let(ref<HashMap<String, usize>, exclusive> lets, ref<String, shared> name)
+{
+    usize n = match (HashMap::get(lets, name))
+    {
+        Some(c) : *c,
+        None    : 0,
+    };
+    HashMap::insert(lets, String::clone(name), n + 1);
+}
+
+fn cf_field_of(ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EField(fe) :
+        {
+            match (pname(&Box::get(fe).e))
+            {
+                Some(h) : Some(sprintf("%s.%s", &h, &Box::get(fe).name)),
+                None    : None,
+            }
+        },
+        _                    : None,
+    }
+}
+
+// `field_of` of the place borrowed by `a` (`&h.f`), when `a` is a borrow.
+fn borrowed_field_of(ref<Expr, shared> a) : Option<String>
+{
+    ref<Expr, shared> s = strip(a);
+    match (&s.kind)
+    {
+        ExprKind::EBorrow(bb) : cf_field_of(&Box::get(bb).e),
+        _                     : None,
+    }
+}
+
+fn cf_block(ref<Block, shared> b, ref<CF, exclusive> st)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                count_let(&mut st.lets, &Box::get(l).name);
+                match (&Box::get(l).init)
+                {
+                    Some(e) : cf_expr(e, st),
+                    None    : { HashSet::insert(&mut st.bad_names, String::clone(&Box::get(l).name)); },
+                }
+            },
+            Stmt::SDestructure(d) :
+            {
+                foreach (n in &Box::get(d).names)
+                {
+                    HashSet::insert(&mut st.bad_names, String::clone(n));
+                }
+                cf_expr(&Box::get(d).init, st);
+            },
+            Stmt::SExpr(e)        : cf_expr(Box::get(e), st),
+            Stmt::SBlockLike(e)   : cf_expr(Box::get(e), st),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : cf_expr(Box::get(t), st),
+        None    : {},
+    }
+}
+
+// A borrow's place reaching `h.f[…]` (through fields, parentheses and
+// further indexing; `*Vec::index_*(&h.f, i)` likewise): a path to an element
+// would be formed, so the pair is out. The rest is scanned.
+fn cf_borrowed(ref<Expr, shared> x, ref<CF, exclusive> st)
+{
+    match (&x.kind)
+    {
+        ExprKind::EField(fe) :
+        {
+            if (Option::is_none(&pname(&Box::get(fe).e)))
+            {
+                cf_borrowed(&Box::get(fe).e, st);
+                return;
+            }
+            cf_expr(x, st);
+        },
+        ExprKind::EParen(b)  : cf_borrowed(Box::get(b), st),
+        ExprKind::EIndex(p)  :
+        {
+            match (cf_field_of(&Box::get(p).a))
+            {
+                Some(hf) : { HashSet::insert(&mut st.bad, hf); },
+                None     : cf_borrowed(&Box::get(p).a, st),
+            }
+            cf_expr(&Box::get(p).b, st);
+        },
+        ExprKind::EDeref(c)  :
+        {
+            ref<Expr, shared> cs = strip(Box::get(c));
+            match (&cs.kind)
+            {
+                ExprKind::ECall(call) :
+                {
+                    if (Vec::len(&Box::get(call).args) > 0)
+                    {
+                        match (borrowed_field_of(&Box::get(call).args[0]))
+                        {
+                            Some(hf) : { HashSet::insert(&mut st.bad, hf); },
+                            None     : {},
+                        }
+                    }
+                },
+                _                     : {},
+            }
+            cf_expr(x, st);
+        },
+        _                    : cf_expr(x, st),
+    }
+}
+
+fn cf_expr(ref<Expr, shared> e, ref<CF, exclusive> st)
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(bb) :
+        {
+            cf_borrowed(&Box::get(bb).e, st);
+            return;
+        },
+        _                     : {},
+    }
+    // The admitted forms.
+    match (&e.kind)
+    {
+        ExprKind::EIndex(p) :
+        {
+            match (cf_field_of(&Box::get(p).a))
+            {
+                Some(hf) :
+                {
+                    HashSet::insert(&mut st.ok, hf);
+                    cf_expr(&Box::get(p).b, st);
+                    return;
+                },
+                None     : {},
+            }
+        },
+        ExprKind::EDeref(c) :
+        {
+            ref<Expr, shared> cs = strip(Box::get(c));
+            match (&cs.kind)
+            {
+                ExprKind::ECall(call) :
+                {
+                    ref<Vec<Expr>, shared> args = &Box::get(call).args;
+                    if (joined_is(
+                        &Box::get(call).callee,
+                        "std::Vec::index_shared",
+                        "std::Vec::index_exclusive",
+                    ) && Vec::len(args) == 2)
+                    {
+                        match (borrowed_field_of(&args[0]))
+                        {
+                            Some(hf) :
+                            {
+                                HashSet::insert(&mut st.ok, hf);
+                                cf_expr(&args[1], st);
+                                return;
+                            },
+                            None     : {},
+                        }
+                    }
+                },
+                _                     : {},
+            }
+        },
+        ExprKind::ECall(c)  :
+        {
+            ref<Vec<Expr>, shared> args = &Box::get(c).args;
+            if (joined_is(&Box::get(c).callee, "Vec::len", "std::Vec::len") && Vec::len(args) == 1)
+            {
+                match (borrowed_field_of(&args[0]))
+                {
+                    Some(hf) :
+                    {
+                        HashSet::insert(&mut st.ok, hf);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+        },
+        _                   : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EField(fe)      :
+        {
+            match (pname(&Box::get(fe).e))
+            {
+                Some(h) : { HashSet::insert(&mut st.bad, sprintf("%s.%s", &h, &Box::get(fe).name)); },
+                None    : cf_expr(&Box::get(fe).e, st),
+            }
+        },
+        ExprKind::EPath(p)        :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                HashSet::insert(&mut st.bad_names, String::clone(&Box::get(p).segs[0]));
+            }
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                cf_expr(&f.value, st);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                cf_expr(a, st);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : cf_expr(&Box::get(r).value, st),
+        ExprKind::EUnary(u)       : cf_expr(&Box::get(u).e, st),
+        ExprKind::EBorrow(bb)     : cf_expr(&Box::get(bb).e, st),
+        ExprKind::EDeref(a)       : cf_expr(Box::get(a), st),
+        ExprKind::EPropagate(a)   : cf_expr(Box::get(a), st),
+        ExprKind::EParen(a)       : cf_expr(Box::get(a), st),
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(a) : cf_expr(Box::get(a), st),
+                None    : {},
+            }
+        },
+        ExprKind::EBinary(b)      :
+        {
+            cf_expr(&Box::get(b).a, st);
+            cf_expr(&Box::get(b).b, st);
+        },
+        ExprKind::EIndex(p)       :
+        {
+            cf_expr(&Box::get(p).a, st);
+            cf_expr(&Box::get(p).b, st);
+        },
+        ExprKind::EAssign(p)      :
+        {
+            cf_expr(&Box::get(p).a, st);
+            cf_expr(&Box::get(p).b, st);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            cf_expr(&Box::get(s).base, st);
+            cf_expr(&Box::get(s).lo, st);
+            cf_expr(&Box::get(s).hi, st);
+        },
+        ExprKind::ECall(c)        :
+        {
+            cf_expr(&Box::get(c).callee, st);
+            foreach (a in &Box::get(c).args)
+            {
+                cf_expr(a, st);
+            }
+        },
+        ExprKind::EBlock(b)       : cf_block(b, st),
+        ExprKind::EUnsafe(b)      : cf_block(b, st),
+        ExprKind::EIf(i)          :
+        {
+            cf_expr(&Box::get(i).cond, st);
+            cf_block(&Box::get(i).then_, st);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : cf_expr(x, st),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            cf_expr(&Box::get(w).cond, st);
+            cf_block(&Box::get(w).body, st);
+            match (&Box::get(w).step)
+            {
+                Some(x) : cf_expr(x, st),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            cf_expr(&Box::get(m).scrut, st);
+            foreach (a in &Box::get(m).arms)
+            {
+                match (&a.binder)
+                {
+                    Some(b) : { HashSet::insert(&mut st.bad_names, String::clone(b)); },
+                    None    : {},
+                }
+                match (&a.lit)
+                {
+                    Some(l) : cf_expr(Box::get(l), st),
+                    None    : {},
+                }
+                cf_expr(Box::get(&a.body), st);
+            }
+        },
+        ExprKind::EClosure(c)     :
+        {
+            foreach (n in &Box::get(c).captures)
+            {
+                HashSet::insert(&mut st.bad_names, String::clone(n));
+            }
+            foreach (p in &Box::get(c).params)
+            {
+                HashSet::insert(&mut st.bad_names, String::clone(&p.name));
+            }
+            HashSet<String> names = any_path_names(&Box::get(c).body);
+            add_all(&mut st.bad_names, &names);
+        },
+        // Literals, `()`, `$`, `break`, `continue`.
+        _                         : {},
+    }
+}
+
+// cobc's `confined_fields`: the `(h, f)` pairs, as `h.f`, `h` a local
+// declared once (`let`, with an initializer; no parameter, binder or
+// capture of the name anywhere), whose field `h.f` is named only as `h.f[i]`
+// (`Index`, or the `*Vec::index_*(&h.f, i)` it stands for) and
+// `Vec::len(&h.f)`, and where `h` itself is named only as the base of such
+// fields. Then no path to `h.f` or its elements is ever formed but through
+// `h`'s root, nothing moves, grows, shrinks or replaces `h.f`'s buffer after
+// `h` is declared, and an element address taken for `h.f[i] = e` survives
+// `e` (`confined_field` checks the types). By name, across scopes; anything
+// else -- every other use of `h.f`, any use of `h` whole, any mention in a
+// closure -- rules the pair (or `h`) out. Other fields of `h` are used
+// freely: their paths never overlap `h.f`.
+export fn confined_fields(ref<Block, shared> body, ref<Vec<String>, shared> params) : HashSet<String>
+{
+    CF st = CF { .lets = HashMap::new(), .bad_names = HashSet::new(), .ok = HashSet::new(), .bad = HashSet::new() };
+    foreach (p in params)
+    {
+        HashSet::insert(&mut st.bad_names, String::clone(p));
+    }
+    cf_block(body, &mut st);
+    HashSet<String> out = HashSet::new();
+    foreach (hf in &st.ok)
+    {
+        usize dot = Option::expect(StringView::find(String::as_view(hf), StringView::of(".")), "an h.f pair");
+        String h = String::from_view(StringView::sub(String::as_view(hf), 0, dot));
+        bool once = match (HashMap::get(&st.lets, &h))
+        {
+            Some(c) : *c == 1,
+            None    : false,
+        };
+        if (once && !HashSet::contains(&st.bad_names, &h) && !HashSet::contains(&st.bad, hf))
+        {
+            HashSet::insert(&mut out, String::clone(hf));
+        }
+    }
+    out
+}
+
+// ---- read_confined_vecs ----
+
+struct RC
+{
+    HashMap<String, usize> lets;
+    HashSet<String> bad;
+    HashSet<String> seen;
+}
+
+fn rc_bare(ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> s = strip(e);
+    match (&s.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 0)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+// The name `e` is, unstripped, when it is a bare one-segment path.
+fn bare_here(ref<Expr, shared> e) : Option<String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 0)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+// A place under a shared borrow: its root, through fields, elements and
+// parentheses, is only read.
+fn rc_shared_place(ref<Expr, shared> e, ref<RC, exclusive> st)
+{
+    match (bare_here(e))
+    {
+        Some(n) :
+        {
+            HashSet::insert(&mut st.seen, n);
+            return;
+        },
+        None    : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EField(f) : rc_shared_place(&Box::get(f).e, st),
+        ExprKind::EParen(b) : rc_shared_place(Box::get(b), st),
+        ExprKind::EIndex(p) :
+        {
+            rc_shared_place(&Box::get(p).a, st);
+            rc_expr(&Box::get(p).b, st);
+        },
+        _                   : rc_expr(e, st),
+    }
+}
+
+// A place under an exclusive borrow: its root is ruled out.
+fn rc_exclusive_place(ref<Expr, shared> e, ref<RC, exclusive> st)
+{
+    match (bare_here(e))
+    {
+        Some(n) :
+        {
+            HashSet::insert(&mut st.bad, n);
+            return;
+        },
+        None    : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EField(f) : rc_exclusive_place(&Box::get(f).e, st),
+        ExprKind::EParen(b) : rc_exclusive_place(Box::get(b), st),
+        ExprKind::EIndex(p) :
+        {
+            rc_exclusive_place(&Box::get(p).a, st);
+            rc_expr(&Box::get(p).b, st);
+        },
+        _                   : rc_expr(e, st),
+    }
+}
+
+fn rc_block(ref<Block, shared> b, ref<RC, exclusive> st)
+{
+    foreach (s in &b.stmts)
+    {
+        match (s)
+        {
+            Stmt::SLet(l)         :
+            {
+                count_let(&mut st.lets, &Box::get(l).name);
+                match (&Box::get(l).init)
+                {
+                    Some(e) : rc_expr(e, st),
+                    None    : { HashSet::insert(&mut st.bad, String::clone(&Box::get(l).name)); },
+                }
+            },
+            Stmt::SDestructure(d) :
+            {
+                foreach (n in &Box::get(d).names)
+                {
+                    HashSet::insert(&mut st.bad, String::clone(n));
+                }
+                rc_expr(&Box::get(d).init, st);
+            },
+            Stmt::SExpr(e)        : rc_expr(Box::get(e), st),
+            Stmt::SBlockLike(e)   : rc_expr(Box::get(e), st),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : rc_expr(Box::get(t), st),
+        None    : {},
+    }
+}
+
+// The bare name `&x` / `&mut x` borrows, when the call's first argument is
+// such a borrow.
+fn rc_first_bare(ref<Vec<Expr>, shared> args) : Option<String>
+{
+    if (Vec::len(args) == 0)
+    {
+        return None;
+    }
+    ref<Expr, shared> a0 = strip(&args[0]);
+    match (&a0.kind)
+    {
+        ExprKind::EBorrow(bb) : rc_bare(&Box::get(bb).e),
+        _                     : None,
+    }
+}
+
+fn rc_is_admitted(ref<Expr, shared> callee) : bool
+{
+    match (pjoined(callee))
+    {
+        Some(n) : String::eq_str(&n, "Vec::push") || String::eq_str(&n, "std::Vec::push") || String::eq_str(
+            &n,
+            "Vec::pop",
+        ) || String::eq_str(&n, "std::Vec::pop") || String::eq_str(&n, "Vec::reserve") || String::eq_str(
+            &n,
+            "std::Vec::reserve",
+        ) || String::eq_str(&n, "Vec::len") || String::eq_str(&n, "std::Vec::len"),
+        None : false,
+    }
+}
+
+fn rc_expr(ref<Expr, shared> e, ref<RC, exclusive> st)
+{
+    match (&e.kind)
+    {
+        ExprKind::EIndex(p)       :
+        {
+            match (rc_bare(&Box::get(p).a))
+            {
+                Some(n) :
+                {
+                    HashSet::insert(&mut st.seen, n);
+                    rc_expr(&Box::get(p).b, st);
+                },
+                None    :
+                {
+                    rc_expr(&Box::get(p).a, st);
+                    rc_expr(&Box::get(p).b, st);
+                },
+            }
+        },
+        ExprKind::EBorrow(bb)     :
+        {
+            if (Box::get(bb).mode == Mode::Shared)
+            {
+                rc_shared_place(&Box::get(bb).e, st);
+            }
+            else
+            {
+                rc_exclusive_place(&Box::get(bb).e, st);
+            }
+        },
+        ExprKind::ECall(c)        :
+        {
+            ref<Vec<Expr>, shared> args = &Box::get(c).args;
+            Option<String> first = if (rc_is_admitted(&Box::get(c).callee)) { rc_first_bare(args) } else { None };
+            match (first)
+            {
+                Some(n) :
+                {
+                    HashSet::insert(&mut st.seen, n);
+                    for (usize k = 1; k < Vec::len(args); k += 1)
+                    {
+                        rc_expr(&args[k], st);
+                    }
+                },
+                None    :
+                {
+                    rc_expr(&Box::get(c).callee, st);
+                    foreach (a in args)
+                    {
+                        rc_expr(a, st);
+                    }
+                },
+            }
+        },
+        ExprKind::EPath(p)        :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                HashSet::insert(&mut st.bad, String::clone(&Box::get(p).segs[0]));
+            }
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                rc_expr(&f.value, st);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                rc_expr(a, st);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : rc_expr(&Box::get(r).value, st),
+        ExprKind::EUnary(u)       : rc_expr(&Box::get(u).e, st),
+        ExprKind::EDeref(a)       : rc_expr(Box::get(a), st),
+        ExprKind::EField(f)       : rc_expr(&Box::get(f).e, st),
+        ExprKind::EPropagate(a)   : rc_expr(Box::get(a), st),
+        ExprKind::EParen(a)       : rc_expr(Box::get(a), st),
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(a) : rc_expr(Box::get(a), st),
+                None    : {},
+            }
+        },
+        ExprKind::EBinary(b)      :
+        {
+            rc_expr(&Box::get(b).a, st);
+            rc_expr(&Box::get(b).b, st);
+        },
+        ExprKind::EAssign(p)      :
+        {
+            rc_expr(&Box::get(p).a, st);
+            rc_expr(&Box::get(p).b, st);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            // A slice of `x` holds a path to its elements; exclusive or not,
+            // it is not one of the admitted forms.
+            rc_exclusive_place(&Box::get(s).base, st);
+            rc_expr(&Box::get(s).lo, st);
+            rc_expr(&Box::get(s).hi, st);
+        },
+        ExprKind::EBlock(b)       : rc_block(b, st),
+        ExprKind::EUnsafe(b)      : rc_block(b, st),
+        ExprKind::EIf(i)          :
+        {
+            rc_expr(&Box::get(i).cond, st);
+            rc_block(&Box::get(i).then_, st);
+            match (&Box::get(i).else_)
+            {
+                Some(x) : rc_expr(x, st),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            rc_expr(&Box::get(w).cond, st);
+            rc_block(&Box::get(w).body, st);
+            match (&Box::get(w).step)
+            {
+                Some(x) : rc_expr(x, st),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            rc_expr(&Box::get(m).scrut, st);
+            foreach (a in &Box::get(m).arms)
+            {
+                match (&a.binder)
+                {
+                    Some(b) : { HashSet::insert(&mut st.bad, String::clone(b)); },
+                    None    : {},
+                }
+                match (&a.lit)
+                {
+                    Some(l) : rc_expr(Box::get(l), st),
+                    None    : {},
+                }
+                rc_expr(Box::get(&a.body), st);
+            }
+        },
+        ExprKind::EClosure(c)     :
+        {
+            foreach (n in &Box::get(c).captures)
+            {
+                HashSet::insert(&mut st.bad, String::clone(n));
+            }
+            foreach (p in &Box::get(c).params)
+            {
+                HashSet::insert(&mut st.bad, String::clone(&p.name));
+            }
+            HashSet<String> names = any_path_names(&Box::get(c).body);
+            add_all(&mut st.bad, &names);
+        },
+        // Literals, `()`, `$`, `break`, `continue`.
+        _                         : {},
+    }
+}
+
+// cobc's `read_confined_vecs`: the locals `x` (declared once, with an
+// initializer; no parameter, binder or capture of the name) that no
+// exclusive path can ever be held to, nor to any of their elements: `x` is
+// named only as `x[i]` (read, or the target of a write -- a write is checked
+// as usual), inside a shared borrow (`&x`, `&x[i]`, `&x[i].f`, however long
+// it is held), or as `&mut x` handed straight to `Vec::push`, `pop`,
+// `reserve` or `len`, whose paths end with their statement. Anything else --
+// `&mut x[i]`, `&mut x` elsewhere (`foreach (p in &mut x)`), moving or
+// assigning `x`, a closure naming it -- rules `x` out. Then a read of an
+// element or of the length meets only shared paths and the root, so it
+// cannot clash (`Fx::read_confined_vec`).
+export fn read_confined_vecs(ref<Block, shared> body, ref<Vec<String>, shared> params) : HashSet<String>
+{
+    RC st = RC { .lets = HashMap::new(), .bad = HashSet::new(), .seen = HashSet::new() };
+    foreach (p in params)
+    {
+        HashSet::insert(&mut st.bad, String::clone(p));
+    }
+    rc_block(body, &mut st);
+    HashSet<String> out = HashSet::new();
+    foreach (x in &st.seen)
+    {
+        bool once = match (HashMap::get(&st.lets, x))
+        {
+            Some(c) : *c == 1,
+            None    : false,
+        };
+        if (once && !HashSet::contains(&st.bad, x))
+        {
+            HashSet::insert(&mut out, String::clone(x));
+        }
+    }
+    out
+}
+
+// ---- direct_ref_params, dual_direct_params ----
+
+// The *direct* reference parameters of `f` (cobc's `direct_ref_params`): a
+// `ref<T, _>` with `T` plain data, the function's only parameter that is or
+// holds a reference, which the body uses only as `r.f…` or `*r`, read or
+// assigned whole (`direct_uses`). Never under `--all-checks` (stage 1).
+export fn direct_ref_params(
+    ref<Gen, exclusive> g,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+) : HashSet<String>
+{
+    if (all_checks(g))
+    {
+        return HashSet::new();
+    }
+    direct_refs_of(g, &f.params, &f.body, subst)
+}
+
+fn is_exclusive_ref(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(m)   : Box::get(m).mode == Mode::Exclusive,
+        Type::TSlice(m) : Box::get(m).mode == Mode::Exclusive,
+        _               : false,
+    }
+}
+
+// The dual-body case (`lower_fn`, `private/direct-params-proposal.md`): two
+// or more reference parameters, at least one exclusive, every one a `ref` or
+// slice to plain data that `direct_refs_of`'s per-parameter test admits.
+// Each is then direct in the `__fast` body, which runs only when the
+// dispatcher has found every incoming path valid and no two overlapping
+// where one is exclusive (`cb_paths_disjoint`). Nothing in such a body can
+// change that: a direct parameter is never handed on, stored or reborrowed,
+// and the body holds no other reference.
+export fn dual_direct_params(
+    ref<Gen, exclusive> g,
+    ref<Vec<ParamDecl>, shared> params,
+    ref<Block, shared> body,
+    ref<HashMap<String, Type>, shared> subst,
+) : Option<Vec<String>>
+{
+    Vec<String> names = Vec::new();
+    Vec<Type> tys = Vec::new();
+    bool any_excl = false;
+    foreach (p in params)
+    {
+        Type t = apply(&p.ty, subst);
+        if (has_refs(g, &t) || holds_fn(g, &t))
+        {
+            any_excl = any_excl || is_exclusive_ref(&t);
+            Vec::push(&mut names, String::clone(&p.name));
+            Vec::push(&mut tys, t);
+        }
+    }
+    if (Vec::len(&names) < 2 || !any_excl)
+    {
+        return None;
+    }
+    foreach (t in &tys)
+    {
+        Option<Type> inner = match (t)
+        {
+            Type::TRef(m)   : Some(clone(&Box::get(m).inner)),
+            Type::TSlice(m) : Some(clone(&Box::get(m).inner)),
+            _               : None,
+        };
+        bool ok = match (&inner)
+        {
+            Some(i) :
+            {
+                plain_data(g, i) && size_align(g, i).size > 0 && match (i)
+                {
+                    Type::TNamed(n) : !String::eq_str(&Box::get(n).name, "std::Vec"),
+                    _               : true,
+                }
+            },
+            None    : false,
+        };
+        if (!ok)
+        {
+            return None;
+        }
+    }
+    HashSet<String> direct = direct_refs_core(g, params, body, subst, false);
+    foreach (n in &names)
+    {
+        if (!HashSet::contains(&direct, n))
+        {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+// ---- pure_direct ----
+
+// `pure_direct`'s memo (cobc's `pure_memo`), kept in `reader_memo` under
+// keys of their own: `pure KEY#POS` (no function's key holds a space).
+fn pure_memo_key(ref<String, shared> key, usize pos) : String
+{
+    sprintf("pure %s#%v", key, pos)
+}
+
+fn mode_code(ref<Type, shared> t) : u8
+{
+    match (t)
+    {
+        Type::TRef(m)   : if (Box::get(m).mode == Mode::Shared) { 1 } else { 2 },
+        Type::TSlice(m) : if (Box::get(m).mode == Mode::Shared) { 1 } else { 2 },
+        _               : 0,
+    }
+}
+
+// A call `segs(…)` whose argument `pos` is a pure direct reference parameter
+// (`pure_direct`), named so that no local can be what it calls (two
+// segments or more: `Type::f`, `m::f`; or one that no binding of the
+// function, `bound`, has). `&x` passed there mints no path on `x`
+// (`lower_user_call`), so it does not pin `x` (`pinned_names`).
+export fn pure_direct_ref_arg(
+    ref<Gen, exclusive> g,
+    ref<Vec<String>, shared> segs,
+    usize pos,
+    ref<HashSet<String>, shared> bound,
+) : bool
+{
+    if (Vec::len(segs) < 2 && (Vec::len(segs) == 0 || HashSet::contains(bound, &segs[0])))
+    {
+        return false;
+    }
+    String key = String::join(&segs[0..$], "::");
+    bool is_ref = match (HashMap::get(&g.prog.table.fns, &key))
+    {
+        Some(f) :
+        {
+            pos < Vec::len(&f.params) && match (&f.params[pos].ty)
+            {
+                Type::TRef(_) : true,
+                _             : false,
+            }
+        },
+        None    : return false,
+    };
+    is_ref && pure_direct(g, &key, pos)
+}
+
+// Whether parameter `pos` of `key` is a pure direct reference (cobc's
+// `pure_direct_in`, past `pure_direct`'s gate). Recursion answers no; cobc's
+// memo is kept as it is: an answer is recorded outside any recursion, or
+// when it is yes.
+export fn pure_direct_in(
+    ref<Gen, exclusive> g,
+    ref<String, shared> key,
+    usize pos,
+    ref<Vec<String>, exclusive> visiting,
+) : bool
+{
+    // D-0192: the key of `std`'s searches is only read (`==`, or
+    // `key_before`'s `<`), never kept, in their bodies and their native
+    // forms alike (a generic body, which the rule below cannot answer for).
+    // Not `binary_search_by`, whose key goes to the caller's own function.
+    if (pos == 1 && (String::eq_str(key, "std::Vec::contains") || String::eq_str(
+        key,
+        "std::Vec::index_of",
+    ) || String::eq_str(key, "std::Vec::binary_search")))
+    {
+        return match (fn_decl(g, key))
+        {
+            Some(f) : in_prelude(String::as_view(key), &f),
+            None    : false,
+        };
+    }
+    String id = pure_memo_key(key, pos);
+    match (HashMap::get(&g.reader_memo, &id))
+    {
+        Some(b) : return *b,
+        None    : {},
+    }
+    if (Vec::contains(visiting, &id))
+    {
+        return false;
+    }
+    FnDecl f = match (fn_decl(g, key))
+    {
+        Some(fd) : fd,
+        None     : return false,
+    };
+    // A generic function qualifies when no parameter's type names a type
+    // parameter: then which parameters are direct is the same in every
+    // instance. A slice parameter, which the caller keeps instead of
+    // sending, also needs every call to be one the compiler sees: the
+    // function never used as a `fn` value.
+    if (pos >= Vec::len(&f.params))
+    {
+        return false;
+    }
+    foreach (p in &f.params)
+    {
+        if (!resolved(&p.ty, &f.type_params))
+        {
+            return false;
+        }
+    }
+    bool kind_ok = match (&f.params[pos].ty)
+    {
+        Type::TRef(_)   : true,
+        Type::TSlice(_) : !used_as_value(g, key),
+        _               : false,
+    };
+    if (!kind_ok)
+    {
+        return false;
+    }
+    String name = String::clone(&f.params[pos].name);
+    HashMap<String, Type> empty = HashMap::new();
+    if (!HashSet::contains(&direct_ref_params(g, &f, &empty), &name))
+    {
+        HashMap::insert(&mut g.reader_memo, id, false);
+        return false;
+    }
+    // A struct reached through `Box`es (`box_rec_uses`): never handed on, so
+    // pure.
+    if (box_rec_uses(&f.body, &name))
+    {
+        HashMap::insert(&mut g.reader_memo, id, true);
+        return true;
+    }
+    Vec::push(visiting, String::clone(&id));
+    u8 my_mode = mode_code(&f.params[pos].ty);
+    CalleeTest t = CalleeTest::PureDirect(PureCtx { .mode = my_mode, .visiting = clone(visiting) });
+    bool ok = direct_uses(g, &f.body, &name, &t);
+    Vec::pop(visiting);
+    if (Vec::len(visiting) == 0 || ok)
+    {
+        HashMap::insert(&mut g.reader_memo, id, ok);
+    }
+    ok
+}
+
+// `pure_direct_in`'s callee test (cobc's closure there): the reference
+// handed on in the same mode only, to a pure direct parameter -- an
+// exclusive reference passed where a shared one is wanted is reborrowed from
+// its token, and a pure parameter's token may be none at all. `c.visiting`
+// is the recursion's list as it stands at the call (cobc's callback sees the
+// same list: the calls it makes push and pop in pairs).
+export fn pure_direct_callee(
+    ref<Gen, exclusive> g,
+    ref<PureCtx, shared> c,
+    ref<Vec<String>, shared> segs,
+    usize at,
+) : bool
+{
+    String k0 = String::join(&segs[0..$], "::");
+    String k = if (HashMap::contains(&g.prog.table.fns, &k0)) { k0 } else { sprintf("std::%s", &k0) };
+    bool same_mode = match (HashMap::get(&g.prog.table.fns, &k))
+    {
+        Some(f) : at < Vec::len(&f.params) && mode_code(&f.params[at].ty) != 0 && mode_code(&f.params[at].ty) == c.mode,
+        None    : false,
+    };
+    if (!same_mode)
+    {
+        return false;
+    }
+    Vec<String> visiting = clone(&c.visiting);
+    pure_direct_in(g, &k, at, &mut visiting)
+}
+
+// `pinned_names`' answer with its candidates (`"? x j a::b"`) taken out: `x`
+// is pinned unless argument `j` of `a::b` is a pure direct reference
+// parameter (`pure_direct_ref_arg`), `bound` being the function's bindings.
+export fn resolve_pinned(
+    ref<Gen, exclusive> g,
+    HashSet<String> raw,
+    ref<HashSet<String>, shared> bound,
+) : HashSet<String>
+{
+    HashSet<String> out = HashSet::new();
+    Vec<String> asks = Vec::new();
+    foreach (n in &raw)
+    {
+        if (StringView::starts_with(String::as_view(n), StringView::of("? ")))
+        {
+            Vec::push(&mut asks, String::clone(n));
+        }
+        else
+        {
+            HashSet::insert(&mut out, String::clone(n));
+        }
+    }
+    foreach (a in &asks)
+    {
+        Vec<StringView> parts = StringView::split(String::as_view(a), " ");
+        usize j = Result::expect(StringView::parse<usize>(parts[2]), "an argument position");
+        Vec<String> segs = Vec::new();
+        foreach (s in StringView::split(parts[3], "::"))
+        {
+            Vec::push(&mut segs, String::from_view(s));
+        }
+        if (!pure_direct_ref_arg(g, &segs, j, bound))
+        {
+            HashSet::insert(&mut out, String::from_view(parts[1]));
+        }
+    }
+    out
+}

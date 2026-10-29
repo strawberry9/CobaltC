@@ -1,0 +1,58 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Request] (D-0174); conf.http-error-closes-connection (CHG-0276)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 66697273743a207468652048545450206d657373616765206973206c6172676572207468616e20746865206c696d69740a7365636f6e643a20636c6f7365640a
+//
+// After an Err the connection closes, whichever part of the request
+// failed: here the request line itself is over the 64 KiB head limit, and
+// a well-formed request follows it on the same connection. The second
+// `HttpConnection::request` is `Ok(None)`; it does not read on into the
+// rest of the stream.
+
+import std;
+
+fn outcome(Result<Option<Request>, HttpError> r) : String
+{
+    match (r)
+    {
+        Ok(Some(_)) : String::from_str("a request"),
+        Ok(None)    : String::from_str("closed"),
+        Err(e)      : String::from_str(HttpError::text(&e)),
+    }
+}
+
+fn serve(HttpServer s) : String
+{
+    HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+    String seen = String::from_str("first: ");
+    String::append(&mut seen, &outcome(HttpConnection::request(&mut c)));
+    String::append(&mut seen, "\nsecond: ");
+    String::append(&mut seen, &outcome(HttpConnection::request(&mut c)));
+    HttpConnection::close(&mut c);
+    seen
+}
+
+fn main() : u8
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    // The client is slow to write under an unoptimised interpreter: the
+    // case is about the Err, not the server's read timeout.
+    s.timeout_ms = 600000;
+    SocketAddr addr = HttpServer::local_addr(&s);
+    auto h = spawn(serve, s);
+    TcpStream c = Result::unwrap(TcpStream::connect(addr));
+    Vec<u8> req = Vec::new();
+    Vec::extend_from(&mut req, StringView::as_bytes("GET /"));
+    for (usize i = 0; i < 150000; i += 1)
+    {
+        Vec::push(&mut req, 97);
+    }
+    Vec::extend_from(&mut req, StringView::as_bytes(" HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    Vec::extend_from(&mut req, StringView::as_bytes("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    _ = TcpStream::write(&mut c, &req[0..$]);
+    _ = TcpStream::shutdown_write(&mut c);
+    printf("%v\n", &join(h));
+    0
+}

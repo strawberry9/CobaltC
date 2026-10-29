@@ -1,0 +1,64 @@
+// Atomic Counter
+//
+// Shows: when what threads share is one integer, `Atomic<T>` changes it
+// with no lock. Each worker counts into its own slot, and each slot is a
+// struct declared `align(64)`, so no two slots share a cache line and the
+// cores never take one from each other. A shared total and a shared
+// maximum use `fetch_add` and `fetch_max`; every operation is indivisible,
+// so nothing is lost however the threads interleave. The workers start
+// together: each sleeps in `AtomicBool::wait` until the main thread opens
+// the gate and notifies them all.
+
+import std;
+
+struct Slot align(64)
+{
+    Atomic<u64> count;
+}
+
+struct Board
+{
+    array<Slot, 4> slots;
+    Atomic<u64> total;
+    Atomic<u64> best;
+    AtomicBool open;
+}
+
+fn worker(ref<Board, shared> b, usize me, u64 times) : u64
+{
+    AtomicBool::wait(&b.open, false);               // asleep until the gate opens
+    foreach (i in 0..times)
+    {
+        _ = Atomic::fetch_add(&b.slots[me].count, 1);
+        _ = Atomic::fetch_add(&b.total, 1);
+        _ = Atomic::fetch_max(&b.best, (widen<u64>(me) * 7919 + i * 104729) % 100003);
+    }
+    times
+}
+
+fn new_slot() : Slot
+{
+    Slot { .count = Atomic::new(0: u64) }
+}
+
+fn main()
+{
+    array<Slot, 4> slots = [new_slot(), new_slot(), new_slot(), new_slot()];
+    Board b = Board { .slots = slots, .total = Atomic::new(0: u64), .best = Atomic::new(0: u64), .open = AtomicBool::new(false) };
+    u64 expected = 0;
+    {
+        auto w0 = spawn(worker, &b, 0, 25000);
+        auto w1 = spawn(worker, &b, 1, 30000);
+        auto w2 = spawn(worker, &b, 2, 35000);
+        auto w3 = spawn(worker, &b, 3, 10000);
+        AtomicBool::store(&b.open, true);
+        AtomicBool::notify_all(&b.open);
+        expected = join(w0) + join(w1) + join(w2) + join(w3);
+    }
+    printf("each slot is %v bytes, on its own cache line\n", sizeof<Slot>());
+    foreach (k in 0..4: usize)
+    {
+        printf("worker %v counted %v\n", k, Atomic::load(&b.slots[k].count));
+    }
+    printf("total %v of %v expected; largest value seen %v\n", Atomic::load(&b.total), expected, Atomic::load(&b.best));
+}

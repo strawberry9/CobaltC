@@ -1,0 +1,659 @@
+// C spellings: mangled names and integer types and literals
+// (impl/cobc/src/lower/cnames.rs, `san` and `fn_cname` of
+// impl/cobc/src/lower.rs).
+
+import std;
+import ast;
+
+// The names C keeps that are CobaltC names (`C_RESERVED`): only a name given
+// to C bare meets them (a field's; a local, a function and a type have a
+// prefix).
+const str C_RESERVED =
+    "alignas alignof asm bool case char complex constexpr default do double false float goto imaginary inline int "
+    "long noreturn nullptr register restrict short signed sizeof static_assert switch thread_local true typedef "
+    "typeof typeof_unqual union unsigned volatile linux unix i386 NULL EOF EXIT_FAILURE EXIT_SUCCESS RAND_MAX "
+    "MB_CUR_MAX INFINITY NAN HUGE_VAL HUGE_VALF HUGE_VALL FP_NAN FP_INFINITE FP_ZERO FP_SUBNORMAL FP_NORMAL "
+    "FP_ILOGB0 FP_ILOGBNAN MATH_ERRNO MATH_ERREXCEPT math_errhandling M_E M_LOG2E M_LOG10E M_LN2 M_LN10 M_PI "
+    "M_PI_2 M_PI_4 M_1_PI M_2_PI M_2_SQRTPI M_SQRT2 M_SQRT1_2 SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX INTPTR_MIN "
+    "INTPTR_MAX UINTPTR_MAX INTMAX_MIN INTMAX_MAX UINTMAX_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX "
+    "WINT_MIN WINT_MAX INT8_MIN INT8_MAX INT16_MIN INT16_MAX INT32_MIN INT32_MAX INT64_MIN INT64_MAX UINT8_MAX "
+    "UINT16_MAX UINT32_MAX UINT64_MAX errno stdin stdout stderr offsetof assert";
+
+// Whether `s` is one of `C_RESERVED`'s words: a scan of the list in place,
+// comparing only words of `s`'s length (no word list is built per call).
+fn reserved(StringView s) : bool
+{
+    slice<u8, shared> w = StringView::as_bytes(StringView::of(C_RESERVED));
+    slice<u8, shared> t = StringView::as_bytes(s);
+    usize n = slice_len(t);
+    usize len = slice_len(w);
+    usize i = 0;
+    while (i < len)
+    {
+        usize j = i;
+        while (j < len && w[j] != b' ')
+        {
+            j += 1;
+        }
+        if (j - i == n)
+        {
+            usize k = 0;
+            while (k < n && w[i + k] == t[k])
+            {
+                k += 1;
+            }
+            if (k == n)
+            {
+                return true;
+            }
+        }
+        i = j + 1;
+    }
+    false
+}
+
+// A name as a C identifier: every byte but an ASCII letter or digit is
+// `_`; CHG-0351: a name C keeps, and that name with `_`s after it, gets one
+// more `_`.
+export fn san(StringView s) : String
+{
+    String out = String::new();
+    foreach (c in StringView::chars(s))
+    {
+        slice<u8, shared> cb = StringView::as_bytes(c);
+        u8 k = cb[0];
+        if (slice_len(cb) == 1 && ((k >= b'0' && k <= b'9') || (k >= b'A' && k <= b'Z') || (k >= b'a' && k <= b'z')))
+        {
+            String::push_ascii(&mut out, k);
+        }
+        else
+        {
+            String::push_ascii(&mut out, b'_');
+        }
+    }
+    usize n = String::len(&out);
+    ref<Vec<u8>, shared> b = String::as_bytes(&out);
+    while (n > 0 && b[n - 1] == b'_')
+    {
+        n -= 1;
+    }
+    if (reserved(String::view(&out, 0, n)))
+    {
+        String::push_ascii(&mut out, b'_');
+    }
+    out
+}
+
+export fn mangle(ref<Type, shared> t) : String
+{
+    match (t)
+    {
+        Type::TInt(i)      : String::from_str(int_ty_name(*i)),
+        Type::TF32         : String::from_str("f32"),
+        Type::TF64         : String::from_str("f64"),
+        Type::TBool        : String::from_str("bool"),
+        Type::TStr         : String::from_str("str"),
+        Type::TVoid        : String::from_str("void"),
+        Type::TNever       : String::from_str("never"),
+        Type::TRef(m)      : sprintf("ref%s_%s", mode_letter(Box::get(m).mode), &mangle(&Box::get(m).inner)),
+        Type::TSlice(m)    : sprintf("slice%s_%s", mode_letter(Box::get(m).mode), &mangle(&Box::get(m).inner)),
+        Type::TRawptr(i)   : sprintf("ptr_%s", &mangle(Box::get(i))),
+        Type::TArray(s)    : sprintf("arr%v_%s", Box::get(s).n, &mangle(&Box::get(s).inner)),
+        Type::TSimd(s)     : sprintf("simd%v_%s", Box::get(s).n, &mangle(&Box::get(s).inner)),
+        Type::TFn(f)       :
+        {
+            Vec<String> ps = Vec::new();
+            foreach (p in &Box::get(f).params)
+            {
+                Vec::push(&mut ps, mangle(p));
+            }
+            sprintf("fn%s_%s", &String::join(&ps[0..$], "_"), &mangle(&Box::get(f).ret))
+        },
+        Type::THandle(i)   : sprintf("handle_%s", &mangle(Box::get(i))),
+        Type::TMutex(i)    : sprintf("mutex_%s", &mangle(Box::get(i))),
+        Type::TGuard(i)    : sprintf("guard_%s", &mangle(Box::get(i))),
+        Type::TNamed(n)    :
+        {
+            if (Vec::len(&Box::get(n).args) == 0)
+            {
+                return san(String::as_view(&Box::get(n).name));
+            }
+            Vec<String> margs = Vec::new();
+            foreach (a in &Box::get(n).args)
+            {
+                Vec::push(&mut margs, mangle(a));
+            }
+            sprintf("%s_L%s_R", &san(String::as_view(&Box::get(n).name)), &String::join(&margs[0..$], "_"))
+        },
+        Type::TClosure(id) : sprintf("closure%v", *id),
+    }
+}
+
+fn mode_letter(Mode m) : str
+{
+    match (m)
+    {
+        Mode::Shared    : "s",
+        Mode::Exclusive : "x",
+    }
+}
+
+// A function's C name: `f_` and its sanitised name, and the mangled type
+// arguments between `_L` and `R`.
+export fn fn_cname(StringView name, ref<Vec<Type>, shared> targs) : String
+{
+    String c = sprintf("f_%s", &san(name));
+    if (Vec::len(targs) > 0)
+    {
+        String::append(&mut c, "_L");
+        foreach (t in targs)
+        {
+            String::append(&mut c, &mangle(t));
+            String::push_ascii(&mut c, b'_');
+        }
+        String::push_ascii(&mut c, b'R');
+    }
+    c
+}
+
+export fn c_int_type(IntTy t) : str
+{
+    match (t)
+    {
+        IntTy::I8    : "int8_t",
+        IntTy::I16   : "int16_t",
+        IntTy::I32   : "int32_t",
+        IntTy::I64   : "int64_t",
+        IntTy::Isize : "int64_t",
+        IntTy::I128  : "cb_i128",
+        IntTy::U8    : "uint8_t",
+        IntTy::U16   : "uint16_t",
+        IntTy::U32   : "uint32_t",
+        IntTy::U64   : "uint64_t",
+        IntTy::Usize : "uint64_t",
+        IntTy::U128  : "cb_u128",
+    }
+}
+
+// An integer constant of type `t` from its bits: one `ULL` literal, or for
+// a 128-bit type (or bits beyond 64) its two halves.
+export fn c_int(IntTy t, u128 bits) : String
+{
+    u64 hi = narrow_wrapping<u64>(bits >> 64);
+    u64 lo = narrow_wrapping<u64>(bits);
+    bool wide = match (t)
+    {
+        IntTy::I128 : true,
+        IntTy::U128 : true,
+        _           : false,
+    };
+    if (hi == 0 && !wide)
+    {
+        return sprintf("((%s)%vULL)", c_int_type(t), lo);
+    }
+    sprintf("((%s)(((cb_u128)%vULL << 64) | (cb_u128)%vULL))", c_int_type(t), hi, lo)
+}
+
+// D-0102: a literal's integer type from its suffix and the type its context
+// expects (`IntTy::of_literal`): `byte` takes an unsigned type the context
+// gives, else `u8`; no suffix takes the context's integer type, else `i32`.
+export fn int_lit_type(ref<Option<String>, shared> sfx, Option<ref<Type, shared>> expected) : IntTy
+{
+    match (sfx)
+    {
+        Some(s) :
+        {
+            if (String::eq_str(s, "byte"))
+            {
+                match (expected)
+                {
+                    Some(t) :
+                    {
+                        match (t)
+                        {
+                            Type::TInt(i) :
+                            {
+                                if (!int_ty_signed(*i))
+                                {
+                                    return *i;
+                                }
+                            },
+                            _             : {},
+                        }
+                    },
+                    None    : {},
+                }
+                return IntTy::U8;
+            }
+            match (int_ty_from(String::as_view(s)))
+            {
+                Some(t) : t,
+                None    : IntTy::I32,
+            }
+        },
+        None    :
+        {
+            match (expected)
+            {
+                Some(t) :
+                {
+                    match (t)
+                    {
+                        Type::TInt(i) : *i,
+                        _             : IntTy::I32,
+                    }
+                },
+                None    : IntTy::I32,
+            }
+        },
+    }
+}
+
+// The bit pattern of `t`'s least value (`bounds(t).0`, as `c_int` takes it).
+export fn int_min_bits(IntTy t) : u128
+{
+    if (!int_ty_signed(t))
+    {
+        return 0;
+    }
+    u32 b = int_ty_bits(t, 64);
+    let_max_shift(b)
+}
+
+fn let_max_shift(u32 b) : u128
+{
+    // Two's complement: every bit from b - 1 up is set.
+    u128 one = 1;
+    u128 low = (one << (b - 1)) - 1;
+    ~low
+}
+
+// D-0118: a bit field's C mask, and the C expression of a `u128` constant.
+export fn c_bits_mask(IntTy backing, u32 w) : String
+{
+    u128 one = 1;
+    u128 zero = 0;
+    u128 m = if (w >= 128) { ~zero } else { (one << w) - 1 };
+    if (backing == IntTy::U128)
+    {
+        return sprintf(
+            "(((cb_u128)%vull << 64) | (cb_u128)%vull)",
+            narrow_wrapping<u64>(m >> 64),
+            narrow_wrapping<u64>(m),
+        );
+    }
+    sprintf("((%s)%vull)", c_int_type(backing), narrow_wrapping<u64>(m))
+}
+
+// The bit pattern of `t`'s greatest value (`bounds(t).1`).
+export fn int_max_bits(IntTy t) : u128
+{
+    u32 b = int_ty_bits(t, 64);
+    u128 one = 1;
+    if (int_ty_signed(t))
+    {
+        return (one << (b - 1)) - 1;
+    }
+    if (b == 128)
+    {
+        u128 zero = 0;
+        return ~zero;
+    }
+    (one << b) - 1
+}
+
+export fn c_uint_of_width(u32 bw) : str
+{
+    if (bw == 8) { "uint8_t" } else if (bw == 16) { "uint16_t" } else if (bw == 32) { "uint32_t" } else if (bw == 64) { "uint64_t" } else { "cb_u128" }
+}
+
+export fn c_sint_of_width(u32 bw) : str
+{
+    if (bw == 8) { "int8_t" } else if (bw == 16) { "int16_t" } else if (bw == 32) { "int32_t" } else if (bw == 64) { "int64_t" } else { "cb_i128" }
+}
+
+export fn c_uint_type(IntTy t) : str
+{
+    c_uint_of_width(int_ty_bits(t, 64))
+}
+
+// Whether `x : s` fits `d` (`[Narrow-Overflow]`'s premise), as a C condition.
+export fn narrow_cond(IntTy s, IntTy d, ref<String, shared> x) : String
+{
+    if (d == IntTy::U128)
+    {
+        if (int_ty_signed(s))
+        {
+            return sprintf("%s >= 0", x);
+        }
+        return String::from_str("1");
+    }
+    if (s == IntTy::U128)
+    {
+        return sprintf("(cb_u128)%s <= (cb_u128)%s", x, &c_int(IntTy::U128, int_max_bits(d)));
+    }
+    sprintf(
+        "(cb_i128)%s >= %s && (cb_i128)%s <= %s",
+        x,
+        &c_int(IntTy::I128, int_min_bits(d)),
+        x,
+        &c_int(IntTy::I128, int_max_bits(d)),
+    )
+}
+
+export fn narrow_check(IntTy s, IntTy d, ref<String, shared> x, ref<String, shared> lc) : String
+{
+    str dt = c_int_type(d);
+    String cond = narrow_cond(s, d, x);
+    sprintf("({ if (!(%s)) cb_fault(\"diag.narrowing-overflow\", %s); (%s)%s; })", &cond, lc, dt, x)
+}
+
+export fn to_int_check(IntTy d, ref<String, shared> x, ref<String, shared> lc) : String
+{
+    str dt = c_int_type(d);
+    String range = if (d == IntTy::U128)
+    {
+        String::from_str("_t >= 0.0 && _t < 340282366920938463463374607431768211456.0")
+    }
+    else if (d == IntTy::I128)
+    {
+        String::from_str("_t >= -170141183460469231731687303715884105728.0 && _t < 170141183460469231731687303715884105728.0")
+    }
+    else
+    {
+        sprintf(
+            "_t >= (double)%s && _t <= (double)%s && (cb_i128)_t >= %s && (cb_i128)_t <= %s",
+            &c_int(d, int_min_bits(d)),
+            &c_int(d, int_max_bits(d)),
+            &c_int(IntTy::I128, int_min_bits(d)),
+            &c_int(IntTy::I128, int_max_bits(d))
+        )
+    };
+    sprintf(
+        "({ double _f = (double)%s; if (!isfinite(_f)) cb_fault(\"diag.narrowing-overflow\", %s); double _t = trunc(_f); if (!(%s)) cb_fault(\"diag.narrowing-overflow\", %s); (%s)_t; })",
+        x,
+        lc,
+        &range,
+        lc,
+        dt,
+    )
+}
+
+// The shortest decimal digits that read back as `f` (CobaltC's `%v` gives
+// them), with the sign and the point's position among them: `f` is
+// 0.DIGITS × 10^point. No leading or trailing zeros; no digits for zero.
+struct Shortest
+{
+    bool neg;
+    Vec<u8> ds;
+    isize point;
+}
+
+fn shortest(f64 f) : Shortest
+{
+    String s = sprintf("%v", f);
+    ref<Vec<u8>, shared> b = String::as_bytes(&s);
+    usize n = Vec::len(b);
+    bool neg = false;
+    usize k = 0;
+    if (n > 0 && b[0] == 45)
+    {
+        neg = true;
+        k = 1;
+    }
+    Vec<u8> all = Vec::new();
+    isize point = 0;
+    bool after = false;
+    isize exp = 0;
+    while (k < n)
+    {
+        u8 c = b[k];
+        if (c == 46)
+        {
+            after = true;
+        }
+        else if (c == 101)
+        {
+            bool eneg = false;
+            k += 1;
+            if (k < n && (b[k] == 45 || b[k] == 43))
+            {
+                eneg = b[k] == 45;
+                k += 1;
+            }
+            while (k < n)
+            {
+                exp = exp * 10 + reinterpret<isize>(widen<usize>(b[k] - 48));
+                k += 1;
+            }
+            if (eneg)
+            {
+                exp = -exp;
+            }
+            break;
+        }
+        else
+        {
+            Vec::push(&mut all, c);
+            if (!after)
+            {
+                point += 1;
+            }
+        }
+        k += 1;
+    }
+    point += exp;
+    usize lead = 0;
+    while (lead < Vec::len(&all) && all[lead] == 48)
+    {
+        lead += 1;
+    }
+    usize end = Vec::len(&all);
+    while (end > lead && all[end - 1] == 48)
+    {
+        end -= 1;
+    }
+    Vec<u8> ds = Vec::new();
+    for (usize j = lead; j < end; j += 1)
+    {
+        Vec::push(&mut ds, all[j]);
+    }
+    Shortest sh = Shortest { .neg = neg, .ds = ds, .point = point - reinterpret<isize>(lead) };
+    tie_round_up(f, &mut sh);
+    sh
+}
+
+// Rust's shortest digits round an exact tie up where `%v`'s round it to
+// even (161305489493093.125 is `...093.13` in Rust, `...093.12` in `%v`). A
+// tie needs the exact value to have one digit more than the shortest form,
+// a final 5: at most 18 digits, which u128 arithmetic gives exactly.
+fn tie_round_up(f64 f, ref<Shortest, exclusive> sh)
+{
+    usize n = Vec::len(&sh.ds);
+    if (n == 0)
+    {
+        return;
+    }
+    u64 bits = reinterpret<u64>(f) & 0x7fffffffffffffff;
+    u64 ef = bits >> 52;
+    if (ef == 0 || ef == 2047)
+    {
+        return;
+    }
+    u64 m = (bits & 0xfffffffffffff) | (1 << 52);
+    i64 e = reinterpret<i64>(ef) - 1075;
+    while ((m & 1) == 0)
+    {
+        m = m >> 1;
+        e += 1;
+    }
+    // The exact value: digits `dx`, times 10^-k.
+    u128 v = widen<u128>(m);
+    u32 k = 0;
+    if (e >= 0)
+    {
+        if (e > 70)
+        {
+            return;
+        }
+        v = v << narrow<u32>(e);
+    }
+    else
+    {
+        if (e < -30)
+        {
+            return;
+        }
+        k = narrow<u32>(-e);
+        for (u32 j = 0; j < k; j += 1)
+        {
+            v = v * 5;
+        }
+    }
+    String dx = sprintf("%v", v);
+    ref<Vec<u8>, shared> xb = String::as_bytes(&dx);
+    usize len = Vec::len(xb);
+    // Trailing zeros are not significant (an integer's).
+    usize sig = len;
+    while (sig > 1 && xb[sig - 1] == 48)
+    {
+        sig -= 1;
+    }
+    if (sig != n + 1 || xb[sig - 1] != 53)
+    {
+        return;
+    }
+    // Round half up to n digits.
+    Vec<u8> nd = Vec::new();
+    for (usize j = 0; j < n; j += 1)
+    {
+        Vec::push(&mut nd, xb[j]);
+    }
+    isize point = reinterpret<isize>(len) - reinterpret<isize>(widen<usize>(k));
+    usize j = n;
+    bool carry = true;
+    while (carry && j > 0)
+    {
+        j -= 1;
+        if (nd[j] == 57)
+        {
+            nd[j] = 48;
+        }
+        else
+        {
+            nd[j] = nd[j] + 1;
+            carry = false;
+        }
+    }
+    if (carry)
+    {
+        Vec::insert(&mut nd, 0, 49);
+        point += 1;
+    }
+    while (Vec::len(&nd) > 0 && nd[Vec::len(&nd) - 1] == 48)
+    {
+        Vec::pop(&mut nd);
+    }
+    sh.ds = nd;
+    sh.point = point;
+}
+
+// The digits `d.ddd` and `e` with the exponent.
+fn sci_text(ref<Vec<u8>, shared> ds, isize e10) : String
+{
+    String text = String::new();
+    String::push_ascii(&mut text, ds[0]);
+    if (Vec::len(ds) > 1)
+    {
+        String::push_ascii(&mut text, 46);
+        for (usize j = 1; j < Vec::len(ds); j += 1)
+        {
+            String::push_ascii(&mut text, ds[j]);
+        }
+    }
+    String::appendf(&mut text, "e%v", e10);
+    text
+}
+
+// A float literal's C text (cobc's `c_float`): the shortest digits that read
+// back as `f`, laid out as Rust's `{:?}` writes them, scientific below 1e-4
+// and from 1e16, and with a `.0` when no point or exponent shows.
+export fn c_float(f64 f, bool single) : String
+{
+    Shortest sh = shortest(f);
+    String out = String::new();
+    if (sh.neg)
+    {
+        String::push_ascii(&mut out, 45);
+    }
+    isize nd = reinterpret<isize>(Vec::len(&sh.ds));
+    isize point = sh.point;
+    if (nd == 0)
+    {
+        String::append(&mut out, "0.0");
+    }
+    else if (point - 1 < -4 || point - 1 >= 16)
+    {
+        String::append(&mut out, String::as_view(&sci_text(&sh.ds, point - 1)));
+    }
+    else if (point <= 0)
+    {
+        String::append(&mut out, "0.");
+        for (isize j = point; j < 0; j += 1)
+        {
+            String::push_ascii(&mut out, 48);
+        }
+        foreach (d in &sh.ds)
+        {
+            String::push_ascii(&mut out, *d);
+        }
+    }
+    else if (point >= nd)
+    {
+        foreach (d in &sh.ds)
+        {
+            String::push_ascii(&mut out, *d);
+        }
+        for (isize j = nd; j < point; j += 1)
+        {
+            String::push_ascii(&mut out, 48);
+        }
+        String::append(&mut out, ".0");
+    }
+    else
+    {
+        usize split = reinterpret<usize>(point);
+        for (usize j = 0; j < Vec::len(&sh.ds); j += 1)
+        {
+            if (j == split)
+            {
+                String::push_ascii(&mut out, 46);
+            }
+            String::push_ascii(&mut out, sh.ds[j]);
+        }
+    }
+    if (single)
+    {
+        return sprintf("(float)%s", &out);
+    }
+    out
+}
+
+// A float as Rust's `{:e}` writes it: the shortest digits, `d.ddde±x`
+// (`0e0` for zero).
+export fn c_float_exp(f64 f) : String
+{
+    Shortest sh = shortest(f);
+    String out = String::new();
+    if (sh.neg)
+    {
+        String::push_ascii(&mut out, 45);
+    }
+    if (Vec::len(&sh.ds) == 0)
+    {
+        String::append(&mut out, "0e0");
+        return out;
+    }
+    String::append(&mut out, String::as_view(&sci_text(&sh.ds, sh.point - 1)));
+    out
+}
