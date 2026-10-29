@@ -824,3 +824,13 @@ by the objects of values and temporaries, not by paths — the objectless track'
 program's by the same objects plus its holders, so the next steps are step 4 (inline fast paths), the frame
 shadows and block objects, the objectless remainder and the per-function lowering of values
 (`stress/d0281/phase3/PERFN.md`), before the port.
+
+**Amended 2026-10-29 (D-0293, Update 148).** Phase 3 step 4 is in: the token-kind tests are inline in the
+runtime header, so a light reference, and an owner's binding whose object has no recorded reference on it, make
+no runtime call for a check, a read or (in a decided body) a borrow (`b` 94 M → 8.6 M instructions). The order of
+what remains is set by the profiles: the decided programs, 97% of the corpus and the self-hosted compiler among
+them, spend most of their runtime instructions on the objects of values and temporaries the objectless analysis
+does not cover (D-0286's remainder: 60% of `cbc`'s), and so does what is left of a tracked program's cost; so
+the objectless remainder (drops the compiler places, D-0286's option C) comes next, then phase 3 steps 6–7
+(frame shadows, block objects: the programs that keep paths only), then the single port of the self-hosted
+compiler and its measurement.

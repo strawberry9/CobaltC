@@ -299,6 +299,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0290 — Frame-held aggregates: a local that keeps references in data holds what it keeps
 - D-0291 — The real programs decided: wrapped handles, `?`, lent slices, and facts that outlive their reference
 - D-0292 — Light references: a decided function's references carry no record, in any program
+- D-0293 — The token-kind tests inline: a decided function's references cost no call in any program
 
 ---
 
@@ -8447,6 +8448,44 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0388: the token-kind tests inline, a decided function's references cost no call in any program (D-0293, 2026-10-29)
+
+- D-0281 phase 3, step 4 (`stress/d0281/phase3/DESIGN.md` §5). After D-0292 a light reference, and the owner's
+  own binding, still called the runtime at every borrow check, read and borrow to learn that nothing was to be
+  checked: the micro program `b` spent 93% of its instructions in `cb_borrow_unminted`, `cb_borrow_check`, `view`
+  and `check_access_with` over an empty holder list. Now `cbrt.h` tests the token first (`cb_vouched`: a light
+  reference, or an owner's binding whose object's mark is zero) and calls only for a path token, a marked owner,
+  or under an oracle: `cb_borrow_check`, `cb_borrow_unminted`, `cb_borrow_range_unminted` and `cb_read` in every
+  body; `cb_borrow`, `cb_borrow_unstamped` (the token with `CB_ROOT` cleared) and `cb_write` (through a light
+  reference: a resource target is `diag.overwrite-of-live-resource`, as D-0292 §4) in a decided body, which
+  `cobc` opens with `enum { cb_lf = 1 };` (written by `resolve_scopes` at the `G` marker: an emitted statement
+  naming `cb_lf` counted as a use of the frame and made every light frame real, which cost `d` 9% until found).
+  Each inline form is a `static inline` behind a variadic macro of the entry's name.
+- The marks: `cb_marks[heap][slot]`, one byte per object, exported by `cbrt`, set by `mint_in`, cleared by
+  `retire_token` when the object's list empties and at the object's end, carried by its migration; the arrays
+  grow at `objs.reserve` (`ensure_mark`) and are never freed, since a thread sharing the heap may still read the
+  old one. The C reads a mark with no lock (DESIGN.md §2.9's argument: a mark on an owner a thread accesses rises
+  only through that thread's own holder, or under a guard or a lent reference). `COBALTC_RECORD=full|check` set
+  `cb_inline_off`: no inline test then decides, and both oracles keep their meaning.
+- Measured (`stress/d0281/phase3/BENCH.md`, `runs/step4`, instructions, GCC `-O2`, against Update 147): `b`
+  94.2 M → 8.6 M (0.09; Clang 18.6 M), `d0` 2.14 G → 2.00 G (0.93), `d` 11.03 G → 10.57 G (0.96), `h` 20.71 G →
+  20.30 G (0.98); the decided programs (`cbc`, `cbparse`, `cobfmt`, the showcases) and the controls within 1%:
+  their entries were constants already, and `cbc` pays 0.9% for the marks kept at every object's creation and at
+  the 290k recorded roots its destructor calls still mint. What remains in a tracked program's profile is the objects of values and temporaries (`d`:
+  `HeapReclaimed::get` 23%, the element objects of its reads; `h`: the slot map of its stores), and in the
+  decided `cbc` the same objects alone (60% of its instructions; 24,261 objects made in its C, 2,357 of them
+  objectless locals), so the objectless remainder (D-0286's option C: drops the compiler places) comes before
+  phase 3 steps 6–7; D-0281 §24 amended.
+- Gates: `cargo test -p cbrt`; the 167 dynamic conformance cases three ways (`gate3.sh` over the list: `coby`,
+  light under check, full) under GCC and Clang, the 78 that keep paths all agree; the three-way differential over
+  the 996 programs that keep paths; `spec/IMPLEMENTATION-NOTES.md` regenerated; the Windows runtime rebuilt.
+- For the next step's design, `COBC_DEBUG_W` (the objectless analysis's trace) now names the construct a rejected
+  mention sits in and, for a resource binding that keeps its object, why (`bad`, `type`, `indexed`, `fields`,
+  `compared`): over the self-hosted compiler's decided lowering 2,362 resource bindings keep objects, 1,578 for
+  their type (the recursive `ast::Type`, `ast::Expr`, `state::V`, which `objectless_type` answers no to), 248 for
+  being assigned to, 139 for being matched on.
+- Release suites `stress/suites/runs/u148`: passed.
 
 ## CHG-0387: light references, a decided function's references carry no record in any program (D-0292, 2026-10-29)
 

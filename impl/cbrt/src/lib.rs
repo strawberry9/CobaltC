@@ -530,6 +530,62 @@ fn ph3_count(c: &AtomicU64) {
     }
 }
 
+// D-0293 (phase 3 step 4): the marks `cbrt.h` tests inline. Per heap, one
+// byte per object slot, nonzero while the object has paths on it
+// (`Obj.toks`): a light token whose object is unmarked needs no check a
+// call could make, so the generated C makes none (`cb_vouched`). Kept by
+// `mint_in` and `retire_token` under the object's heap lock; read by the C
+// with no lock, which the phase-3 argument allows (DESIGN.md §2.9: a mark
+// on an owner a thread accesses rises only through that thread's own
+// holder, or under a guard or a lent reference). An array that grows is
+// never freed, since a reader on another thread sharing the heap may still
+// be testing a byte of the old one; the waste is at most one byte per
+// object slot ever reserved. `cb_inline_off` turns the inline tests off
+// (`COBALTC_RECORD=full|check`): every entry is then the runtime's, and the
+// oracles keep their meaning.
+#[no_mangle]
+pub static mut cb_marks: [*mut u8; 256] = [std::ptr::null_mut(); 256];
+#[no_mangle]
+pub static mut cb_inline_off: u8 = 0;
+static mut MARK_LEN: [usize; 256] = [0; 256];
+
+#[inline(always)]
+fn mark_at(id: u64) -> (usize, usize) {
+    (((id >> HEAP_SHIFT) & 0xff) as usize, ((id & 0xffff_ffff) as usize).wrapping_sub(1))
+}
+
+// After `objs.reserve`: the heap's marks cover the new id (the heap's lock
+// is held, as `reserve_in` asks).
+fn ensure_mark(id: u64) {
+    let (h, i) = mark_at(id);
+    unsafe {
+        let n = *std::ptr::addr_of!(MARK_LEN[h]);
+        if i < n {
+            return;
+        }
+        let cap = (n * 2).max(i + 1).max(1024);
+        let mut v = vec![0u8; cap].into_boxed_slice();
+        let slot = std::ptr::addr_of_mut!(cb_marks[h]) as *mut std::sync::atomic::AtomicPtr<u8>;
+        if n > 0 {
+            std::ptr::copy_nonoverlapping((*slot).load(Ordering::Relaxed) as *const u8, v.as_mut_ptr(), n);
+        }
+        let p = Box::leak(v).as_mut_ptr();
+        (*slot).store(p, Ordering::Release);
+        *std::ptr::addr_of_mut!(MARK_LEN[h]) = cap;
+    }
+}
+
+#[inline]
+fn set_mark(id: u64, on: bool) {
+    let (h, i) = mark_at(id);
+    unsafe {
+        let slot = std::ptr::addr_of!(cb_marks[h]) as *const std::sync::atomic::AtomicPtr<u8>;
+        let p = (*slot).load(Ordering::Relaxed);
+        debug_assert!(!p.is_null() && i < *std::ptr::addr_of!(MARK_LEN[h]), "cbrt: a mark outside the heap's array");
+        (*(p.add(i) as *const std::sync::atomic::AtomicU8)).store(on as u8, Ordering::Relaxed);
+    }
+}
+
 struct Arena<T> {
     slots: Vec<(u32, Option<T>)>,
     free: Vec<u32>,
@@ -3290,6 +3346,8 @@ pub unsafe extern "C" fn cb_init(files: *const *const c_char, nfiles: usize, typ
     let record = std::env::var_os("COBALTC_RECORD");
     RECORD_FULL.store(record.as_deref().map_or(false, |v| v == "full"), Ordering::Relaxed);
     RECORD_CHECK.store(record.as_deref().map_or(false, |v| v == "check"), Ordering::Relaxed);
+    // D-0293: under either oracle every entry is the runtime's.
+    *std::ptr::addr_of_mut!(cb_inline_off) = record.is_some() as u8;
     PH3_ON.store(std::env::var_os("COBALTC_RT_STATS").is_some(), Ordering::Relaxed);
     netio::set_cancel_probe(cancel_probe);
     netio::wake_init();
@@ -4822,6 +4880,9 @@ fn retire_token(r: &mut Rt, t: u64) {
             if p.exclusive && !p.is_root {
                 o.xtoks.remove(t);
             }
+            if o.toks.is_empty() {
+                set_mark(p.of, false);
+            }
             // Its root ended: the object keeps no name for a dead path,
             // so a later `[Reclaim]` of its cells mints a new root rather
             // than handing back this one (`cb_reclaim`).
@@ -4997,6 +5058,7 @@ fn stamp_tok(r: &mut Rt, tok: u64, scope: Option<usize>) {
 fn new_obj(addr: usize, ty: u32, init: bool) -> u64 {
     let r = rt();
     let id = r.objs.reserve();
+    ensure_mark(id);
     let is_resource = r.typ_opt(ty).map_or(false, |t| t.is_resource);
     r.objs.insert(id, Obj { addr, ty, alive: true, init, is_resource, reclaimed: false, root: None, frame: None, scope: None, tid: 0, ephemeral: false, toks: TokList::default(), xtoks: TokList::default() });
     let scope = top_scope(r);
@@ -5041,6 +5103,7 @@ fn mint_in(r: &mut Rt, of: u64, proj: Vec<Proj>, exclusive: bool, is_root: bool,
         if exclusive && !is_root {
             o.xtoks.push(tok);
         }
+        set_mark(of, true);
     }
     if stamp {
         let scope = top_scope(r);
@@ -5632,6 +5695,7 @@ fn drop_fn_handle(handle: usize) {
 // `self` path; it exists only for the duration of the call.
 fn new_anonymous(r: &mut Rt, addr: usize, ty: u32) -> u64 {
     let id = r.objs.reserve();
+    ensure_mark(id);
     r.objs.insert(id, Obj { addr, ty, alive: true, init: true, is_resource: true, reclaimed: false, root: None, frame: None, scope: None, tid: 0, ephemeral: false, toks: TokList::default(), xtoks: TokList::default() });
     id
 }
@@ -5673,6 +5737,7 @@ fn end_identity_in(r: &mut Rt, obj: u64, forget: bool) {
     if forget && !ephemeral && r.typ(ty).has_refs {
         forget_slots(r, addr, size);
     }
+    set_mark(obj, false);
     let o = r.objs.remove(&obj).unwrap();
     if o.reclaimed {
         r.reclaimed.remove_if(addr, obj, ephemeral);
@@ -5732,6 +5797,7 @@ pub extern "C" fn cb_reclaim(addr: *mut u8, ty: u32) -> u64 {
 // an ephemeral object, which has none) and its id.
 fn establish_reclaimed(r: &mut Rt, a: usize, ty: u32, ephemeral: bool) -> (u64, u64) {
     let id = r.objs.reserve();
+    ensure_mark(id);
     let is_resource = r.typ_opt(ty).map_or(false, |t| t.is_resource);
     r.objs.insert(id, Obj { addr: a, ty, alive: true, init: true, is_resource, reclaimed: true, root: None, frame: None, scope: None, tid: 0, ephemeral, toks: TokList::default(), xtoks: TokList::default() });
     if ephemeral {
@@ -6430,6 +6496,7 @@ pub unsafe extern "C" fn cb_fn_copy(handle: *mut u8, file: u32, line: u32) -> *m
     }
     let _ = obj;
     let id = r.objs.reserve();
+    ensure_mark(id);
     r.objs.insert(id, Obj { addr: data as usize, ty, alive: true, init: true, is_resource: false, reclaimed: false, root: None, frame: None, scope: None, tid: 0, ephemeral: false, toks: TokList::default(), xtoks: TokList::default() });
     let root = make_root(r, id);
     r.objs.get_mut(&id).unwrap().root = Some(root);
@@ -7712,9 +7779,13 @@ fn migrate(r: &mut Rt, obj: u64) -> u64 {
     if STATS_ON.load(Ordering::Relaxed) {
         N_MIGRATED.fetch_add(1, Ordering::Relaxed);
     }
+    set_mark(obj, false);
     let o = r.objs.remove(&obj).unwrap();
+    let marked = !o.toks.is_empty();
     let id = r.objs.reserve();
+    ensure_mark(id);
     r.objs.insert(id, o);
+    set_mark(id, marked);
     id
 }
 

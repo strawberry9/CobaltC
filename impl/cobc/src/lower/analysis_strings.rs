@@ -48,6 +48,10 @@ impl<'a> Gen<'a> {
             // expression (`unsafe { … x }` ending the body): its own last
             // expression is the function's result too.
             tail_next: bool,
+            // `COBC_DEBUG_W`: the expression walked, and the one it sits in.
+            parent: String,
+            outer: String,
+            dbg: bool,
         }
         // `std`'s `String` builders, which change the `String` they are lent
         // and keep no reference to it (each is native or a few `Vec` calls
@@ -77,8 +81,8 @@ impl<'a> Gen<'a> {
             fn mark_bad(&mut self, n: &str) {
                 if let Some(id) = self.id(n) {
                     if id != 0 {
-                        if std::env::var("COBC_DEBUG_W").is_ok() && !self.bad.contains(&id) {
-                            eprintln!("W bad {}", n);
+                        if self.dbg && !self.bad.contains(&id) {
+                            eprintln!("W bad {} in {} id {}", n, self.outer, id);
                         }
                         self.bad.insert(id);
                     }
@@ -232,6 +236,21 @@ impl<'a> Gen<'a> {
                 self.depth -= 1;
             }
             fn expr(&mut self, e: &Expr) {
+                let outer = if self.dbg {
+                    let d = format!("{:?}", e.kind);
+                    let k = d.find(|c: char| c == '(' || c == ' ' || c == '{').unwrap_or(d.len());
+                    let o = std::mem::replace(&mut self.parent, d[..k].to_string());
+                    self.outer = o.clone();
+                    Some(o)
+                } else {
+                    None
+                };
+                self.expr_in(e);
+                if let Some(o) = outer {
+                    self.parent = o;
+                }
+            }
+            fn expr_in(&mut self, e: &Expr) {
                 match &e.kind {
                     ExprKind::Call(c, args) => {
                         let mut handled = vec![false; args.len()];
@@ -445,7 +464,7 @@ impl<'a> Gen<'a> {
         }
         let bound: HashSet<String> = bound_names(body).into_iter().chain(params.iter().cloned()).collect();
         let top: HashMap<String, usize> = params.iter().map(|p| (p.clone(), cands.iter().find(|(n, _)| n == p).map_or(0, |c| c.1))).collect();
-        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), names: HashMap::new(), depth: 0, fields: HashMap::new(), tail_next: false };
+        let mut w = W { g: self, bound, scopes: vec![top], bad: HashSet::new(), seen: HashSet::new(), moved: HashSet::new(), compared: HashSet::new(), indexed: HashSet::new(), names: HashMap::new(), depth: 0, fields: HashMap::new(), tail_next: false, parent: String::new(), outer: String::new(), dbg: std::env::var_os("COBC_DEBUG_W").is_some() };
         w.block(body);
         *fields = std::mem::take(&mut w.fields);
         // A candidate moved away is recorded twice (`id` and `!id`): its

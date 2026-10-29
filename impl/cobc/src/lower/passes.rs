@@ -714,11 +714,17 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
                     's' | 't' => "cb_stmt_pop();",
                     _ => continue,
                 };
+                let ind = &line[..line.len() - line.trim_start().len()];
                 if used.contains(&id) {
-                    let ind = &line[..line.len() - line.trim_start().len()];
                     res.push_str(ind);
                     res.push_str(call);
                     res.push('\n');
+                }
+                // D-0293: a decided body's borrows from vouched tokens are
+                // light inline (`cbrt.h`'s `cb_lf`), frame or no frame.
+                if k == 'G' {
+                    res.push_str(ind);
+                    res.push_str("enum { cb_lf = 1 };\n");
                 }
             }
             None => {

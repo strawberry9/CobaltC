@@ -86,7 +86,8 @@ one, and a reborrow of one are left to the run while the lend lasts.""")
 b += p("""A program that is not decided no longer pays for every reference (D-0292). A function the
 compiler decided forms its references with no record at all, in any program: `&x`, `&s.f`, `&*p` cost a
 check against the references the run does record on that value, which is nothing when there are none,
-and after that nothing. The record is kept only where it is needed: a reference stored into data
+and after that nothing — and since D-0293 the nothing is no call either: the generated C tests the
+reference's kind, and an owner's binding a one-byte mark, before it would call the runtime. The record is kept only where it is needed: a reference stored into data
 becomes a holder as it is stored, a reference arriving in a function that left a conflict to the run
 is recorded as it arrives, and element references, slices, views, lock guards and what a thread is
 lent are recorded everywhere. So a program that keeps paths for one function pays for that function,

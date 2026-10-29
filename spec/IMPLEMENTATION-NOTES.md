@@ -399,6 +399,16 @@ names a rule or is marked internal.
 | `cb_fnv_more` (inline) | text and hashing helpers | D-0110: FNV-1a continued from h over n more bytes (a composite key) | — |
 | `cb_bytes_cmp` (inline) | text and hashing helpers | D-0108: text in byte order; negative, zero or positive | — |
 | `cb_bytes_eq` (inline) | text and hashing helpers | — | — |
+| `cb_marks` (variable) | text and hashing helpers | internal: per heap, one byte per object slot, nonzero while the object has paths on it (D-0293) | — |
+| `cb_inline_off` (variable) | text and hashing helpers | internal: 1 under COBALTC_RECORD=full\|check: the inline tests make no decision (D-0293) | — |
+| `cb_vouched` (inline) | text and hashing helpers | internal: a token no check needs to see: a light reference, or an owner's binding whose object is unmarked (D-0293) | — |
+| `cb_borrow_check_i` (inline) | text and hashing helpers | internal: cb_borrow_check for a token that is not vouched (D-0293) | — |
+| `cb_borrow_unminted_i` (inline) | text and hashing helpers | internal: cb_borrow_unminted for a token that is not vouched (D-0293) | — |
+| `cb_borrow_range_unminted_i` (inline) | text and hashing helpers | internal: cb_borrow_range_unminted for a token that is not vouched (D-0293) | — |
+| `cb_read_i` (inline) | text and hashing helpers | internal: cb_read for a token that is not vouched (D-0293) | — |
+| `cb_borrow_i` (inline) | text and hashing helpers | internal: cb_borrow, light inline in a decided body from a vouched token (D-0293) | — |
+| `cb_borrow_unstamped_i` (inline) | text and hashing helpers | internal: cb_borrow_unstamped, light inline in a decided body from a vouched token (D-0293) | — |
+| `cb_write_i` (inline) | text and hashing helpers | internal: cb_write through a light reference in a decided body: the place holds its value, a resource target is overwritten live (D-0293) | — |
 | `cb_write_pathless` (inline) | text and hashing helpers | D-0281 step 4c: a whole tier-S program lowered with no paths (cobc defines CB_PATHLESS when the program is eligible). Every reference carries token 0: the path entries are constants or no-ops, so the C compiler deletes the calls and what is computed only for them. Objects, frames, scopes and destruction are unchanged, and so are bounds, overflow, positions and the value tests. A reference in flight or an element's reference sent as data still takes its place in the queue of what is in flight, as token 0. | — |
 
 <!-- runtime-contract:end -->

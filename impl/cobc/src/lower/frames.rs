@@ -499,10 +499,15 @@ impl<'g, 'a> Fx<'g, 'a> {
             },
             _ => false,
         });
-        self.objectless_names.contains(&id)
+        let ok = self.objectless_names.contains(&id)
             && fields_plain
             && (!self.objectless_names.contains(&(id | 2)) || plain_vec)
-            && (is_string || (self.g.objectless_type(ty) && !self.objectless_names.contains(&(id | 1))))
+            && (is_string || (self.g.objectless_type(ty) && !self.objectless_names.contains(&(id | 1))));
+        if !ok && std::env::var_os("COBC_DEBUG_W").is_some() && self.g.is_resource(ty) {
+            let why = if !self.objectless_names.contains(&id) { "bad" } else if !fields_plain { "fields" } else if self.objectless_names.contains(&(id | 2)) && !plain_vec { "indexed" } else if !is_string && !self.g.objectless_type(ty) { "type" } else { "compared" };
+            eprintln!("OB reject id {} {} {}", id, why, super::cnames::mangle(ty));
+        }
+        ok
     }
 
     // `let s = String::from_str(x);` (or `String::clone(r)`) for an

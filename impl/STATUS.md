@@ -81,7 +81,9 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   formation against the owner's recorded references, and recorded where they are stored into data or arrive in
   a function the static pass left a conflict in; `-v` says "lowered with holders", `COBALTC_RECORD=full` keeps
   the full record (the differential oracle) and `COBALTC_RECORD=check` aborts where a light reference reaches
-  what should have recorded it. `--all-checks` keeps every
+  what should have recorded it. The token's kind is tested inline (D-0293): a light reference, and an owner's
+  binding whose object has no recorded reference on it, make no runtime call for a check, a read or (in a
+  decided function) a borrow. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

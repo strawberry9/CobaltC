@@ -424,6 +424,69 @@ static inline uint8_t cb_bytes_eq(const void *a, uint64_t an, const void *b, uin
     return an == bn && (an == 0 || memcmp(a, b, an) == 0);
 }
 
+/* D-0293 (D-0281 phase 3 step 4): the token-kind tests inline. A token is
+   `0` (no record), `CB_LIGHT | CB_ROOT | obj` (the owner's own binding),
+   `CB_LIGHT | obj` (a light reference) or a path id (D-0292). A light
+   reference needs no check an entry could make, and the owner's binding
+   none while its object has no path on it (`cb_marks`: per heap, one byte
+   per object, kept by the runtime), so the entries below test the token
+   first and call the runtime only for a path, a marked owner, or under an
+   oracle (`cb_inline_off`: COBALTC_RECORD=full|check). A decided body
+   (cobc: `enum { cb_lf = 1 };` at its start) may also form a light borrow
+   inline; a recording body, and the std natives that share any frame, keep
+   the runtime's borrow, which records in a recording frame. */
+#define CB_LIGHT (1ULL << 53)
+#define CB_ROOT  (1ULL << 54)
+extern uint8_t *cb_marks[256];   /* internal: per heap, one byte per object slot, nonzero while the object has paths on it (D-0293) */
+extern uint8_t cb_inline_off;    /* internal: 1 under COBALTC_RECORD=full|check: the inline tests make no decision (D-0293) */
+enum { cb_lf = 0 };   /* a decided body shadows it with 1: its borrows from vouched tokens are light (D-0293) */
+static inline uint8_t cb_vouched(uint64_t t)   /* internal: a token no check needs to see: a light reference, or an owner's binding whose object is unmarked (D-0293) */
+{
+    return !cb_inline_off && (t & CB_LIGHT) != 0 && ((t & CB_ROOT) == 0 || cb_marks[(t >> 55) & 0xffu][(uint32_t)t - 1u] == 0);
+}
+#ifndef CB_PATHLESS
+static inline void cb_borrow_check_i(uint64_t b, const cb_proj *p, size_t n, uint32_t m, uint32_t f, uint32_t l)   /* internal: cb_borrow_check for a token that is not vouched (D-0293) */
+{
+    if (!cb_vouched(b)) cb_borrow_check(b, p, n, m, f, l);
+}
+static inline void cb_borrow_unminted_i(uint64_t b, const cb_proj *p, size_t n, uint32_t m, uint32_t f, uint32_t l)   /* internal: cb_borrow_unminted for a token that is not vouched (D-0293) */
+{
+    if (!cb_vouched(b)) cb_borrow_unminted(b, p, n, m, f, l);
+}
+static inline void cb_borrow_range_unminted_i(uint64_t b, const void *c, uint32_t ct, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t m, uint32_t f, uint32_t l)   /* internal: cb_borrow_range_unminted for a token that is not vouched (D-0293) */
+{
+    if (!cb_vouched(b)) cb_borrow_range_unminted(b, c, ct, p, n, lo, hi, m, f, l);
+}
+static inline void cb_read_i(uint64_t b, const cb_proj *p, size_t n, uint32_t f, uint32_t l)   /* internal: cb_read for a token that is not vouched (D-0293) */
+{
+    if (!cb_vouched(b)) cb_read(b, p, n, f, l);
+}
+static inline uint64_t cb_borrow_i(int lf, uint64_t b, const cb_proj *p, size_t n, uint32_t m, uint32_t f, uint32_t l)   /* internal: cb_borrow, light inline in a decided body from a vouched token (D-0293) */
+{
+    return lf && cb_vouched(b) ? (b & ~CB_ROOT) : cb_borrow(b, p, n, m, f, l);
+}
+static inline uint64_t cb_borrow_unstamped_i(int lf, uint64_t b, const cb_proj *p, size_t n, uint32_t m, uint32_t f, uint32_t l)   /* internal: cb_borrow_unstamped, light inline in a decided body from a vouched token (D-0293) */
+{
+    return lf && cb_vouched(b) ? (b & ~CB_ROOT) : cb_borrow_unstamped(b, p, n, m, f, l);
+}
+static inline void cb_write_i(int lf, uint64_t b, const cb_proj *p, size_t n, uint32_t tr, uint32_t f, uint32_t l)   /* internal: cb_write through a light reference in a decided body: the place holds its value, a resource target is overwritten live (D-0293) */
+{
+    if (lf && !cb_inline_off && (b & (CB_LIGHT | CB_ROOT)) == CB_LIGHT)
+    {
+        if (tr) cb_fault("diag.overwrite-of-live-resource", f, l);
+        return;
+    }
+    cb_write(b, p, n, tr, f, l);
+}
+#define cb_borrow_check(...)          cb_borrow_check_i(__VA_ARGS__)
+#define cb_borrow_unminted(...)       cb_borrow_unminted_i(__VA_ARGS__)
+#define cb_borrow_range_unminted(...) cb_borrow_range_unminted_i(__VA_ARGS__)
+#define cb_read(...)                  cb_read_i(__VA_ARGS__)
+#define cb_borrow(...)                cb_borrow_i(cb_lf, __VA_ARGS__)
+#define cb_borrow_unstamped(...)      cb_borrow_unstamped_i(cb_lf, __VA_ARGS__)
+#define cb_write(...)                 cb_write_i(cb_lf, __VA_ARGS__)
+#endif
+
 #ifdef CB_PATHLESS
 /* D-0281 step 4c: a whole tier-S program lowered with no paths (cobc defines
    CB_PATHLESS when the program is eligible). Every reference carries token 0:
