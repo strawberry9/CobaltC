@@ -612,6 +612,11 @@ struct Body<'a> {
     // it for that one expression, reset by every nested check).
     arg_temp_ok: bool,
     cur_temp_ok: bool,
+    // D-0291: the argument being checked goes to a reference or slice
+    // parameter, whose reach the call-site rule follows (`arg_ref_param`;
+    // `cur_arg_ref_param` for that one expression, as `cur_temp_ok`).
+    arg_ref_param: bool,
+    cur_arg_ref_param: bool,
     // The module lexically containing the function being checked
     // (`rule.module.visibility`'s M for its field clause).
     module: String,
@@ -656,6 +661,12 @@ struct Body<'a> {
     // D-0289: the `spawn` calls (their callee's position) whose handle a
     // binding of the frame takes; whether a `join`/`drop` call is checked.
     bound_spawns: HashSet<(usize, usize)>,
+    // D-0291: spawns a `let`'s value is or wraps (`Some(spawn(…))`, a
+    // `match`'s arms): the facts each was lent, found where the spawn is
+    // checked; `None` when one names a binding of a scope the `let` does
+    // not see. `spawn_let_depth`: the scope depth at each open `let`.
+    tail_spawns: HashMap<(usize, usize), Option<Vec<(DerivKey, Tri)>>>,
+    spawn_let_depth: Vec<usize>,
     joining: bool,
     // D-0289: a handle moved where its facts follow it (a `let` of a
     // handle taken out of a `Vec` of them, a `foreach`'s drain), and the
@@ -841,10 +852,14 @@ impl<'a> Ck<'a> {
                 borrow_referents: HashMap::default(),
                 arg_temp_ok: false,
                 cur_temp_ok: false,
+                arg_ref_param: false,
+                cur_arg_ref_param: false,
                 infer_poisoned: false,
                 privileged: false,
                 closure_moves: HashMap::default(),
                 bound_spawns: HashSet::default(),
+                tail_spawns: HashMap::default(),
+                spawn_let_depth: Vec::new(),
                 joining: false,
                 handing: false,
                 taken_handles: HashSet::default(),
@@ -1322,11 +1337,26 @@ mod tier_report {
         });
     }
 
+    // D-0291: a `std` body whose rule decides it. `std::slice_parts`
+    // pushes reborrows of its slice into its result, each checked against
+    // those already there; `[Slice-Parts]` makes them disjoint, so no
+    // check of the body can fault, and its result reaches what its slice
+    // does (its signature).
+    fn trusted(func: &str) -> bool {
+        func == "std::slice_parts" || func.starts_with("std::slice_parts<")
+    }
+
+    // Whether the body being checked is one its rule decides: its point
+    // checks are not made, as none can fault.
+    pub fn in_trusted() -> bool {
+        CUR.with(|c| c.borrow().as_ref().map_or(false, |r| trusted(&r.func)))
+    }
+
     // A conflict this body leaves to the run's tracking, `why` (the first
     // is kept).
     pub fn left(why: String) {
         with(|r| {
-            if r.left.is_none() {
+            if r.left.is_none() && !trusted(&r.func) {
                 r.left = Some(why);
             }
         });
@@ -1778,14 +1808,21 @@ fn holds_ref(items: &Items, ty: &Type) -> bool {
 // `fn_refs`: some closure of the program keeps a reference in its
 // environment.
 pub fn keeps_refs_in_data(items: &Items, ty: &Type, fn_refs: bool) -> bool {
-    fn keeps(items: &Items, t: &Type, fn_refs: bool, seen: &mut HashSet<Type>) -> bool {
+    keeps_refs_in_data_by(items, ty, &|_| fn_refs)
+}
+
+// `keeps_refs_in_data`, with `fn_refs` deciding for each `fn` or closure
+// type whether a value of it may keep references (D-0291: whether a
+// closure of that signature does).
+pub fn keeps_refs_in_data_by(items: &Items, ty: &Type, fn_refs: &dyn Fn(&Type) -> bool) -> bool {
+    fn keeps(items: &Items, t: &Type, fn_refs: &dyn Fn(&Type) -> bool, seen: &mut HashSet<Type>) -> bool {
         match t {
             Type::Ref(..) | Type::Slice(..) | Type::Guard(..) => true,
             // D-0289: a handle in data lends nothing (a spawn that lends
             // has a binding of the frame hold its handle, or is the run's),
             // so it keeps only what its result does.
             Type::Handle(inner) => keeps(items, inner, fn_refs, seen),
-            Type::Closure(_) | Type::Fn(..) => fn_refs,
+            Type::Closure(_) | Type::Fn(..) => fn_refs(t),
             Type::Array(inner, _) | Type::Rawptr(inner) | Type::Mutex(inner) => keeps(items, inner, fn_refs, seen),
             Type::Named(name, args) => {
                 if is_borrow_ty(t) {
@@ -2347,6 +2384,7 @@ impl<'a> Body<'a> {
         self.block_stack.pop();
         for e in sc.into_iter().rev() {
             self.closure_arity.remove(&e.name);
+            self.hand_over_referent(&e.name);
             self.flow.remove(&e.name);
             self.decl_block.remove(&e.name);
             self.ref_origin.remove(&e.name);
@@ -2358,6 +2396,41 @@ impl<'a> Body<'a> {
             }
             if let Some(o) = e.ref_origin {
                 self.ref_origin.insert(e.name.clone(), o);
+            }
+        }
+    }
+
+    // D-0291: a reference or slice binding leaving its scope while
+    // something else holds a fact through its referent `*r` (a thread's
+    // handle, a closure, a copy): that fact now holds what `r` reached.
+    fn hand_over_referent(&mut self, r: &str) {
+        if !matches!(self.lookup_local(r), Some(Type::Ref(..) | Type::Slice(..))) {
+            return;
+        }
+        let rr = referent_root(r);
+        let own: Vec<(DerivKey, Tri)> = self.flow.deriv.get(r).map(|m| m.iter().filter(|(_, v)| **v != Tri::F).map(|(k, v)| (k.clone(), *v)).collect()).unwrap_or_default();
+        if own.is_empty() {
+            return;
+        }
+        for (h, facts) in self.flow.deriv.iter_mut() {
+            if h == r {
+                continue;
+            }
+            let through: Vec<(DerivKey, Tri)> = facts.iter().filter(|(k, v)| k.root == rr && **v != Tri::F).map(|(k, v)| (k.clone(), *v)).collect();
+            for (k, t) in through {
+                facts.remove(&k);
+                for (ok, ot) in &own {
+                    let mut nk = ok.clone();
+                    nk.path.extend(k.path.iter().cloned());
+                    if k.mode == Mode::Shared {
+                        nk.mode = Mode::Shared;
+                    }
+                    let nt = if t == Tri::T && *ot == Tri::T { Tri::T } else { Tri::U };
+                    let e = facts.entry(nk).or_insert(nt);
+                    if *e != nt {
+                        *e = if *e == Tri::T || nt == Tri::T { Tri::T } else { Tri::U };
+                    }
+                }
             }
         }
     }
@@ -2971,6 +3044,46 @@ impl<'a> Body<'a> {
         self.flow_clash(&x, &path, Mode::Shared, "diag.aliasing-conflict")
     }
 
+    // D-0291: a reborrow of a slice binding's elements (`&mut s[a .. b]`,
+    // `&s[i]`) reaches `*s` as a copy does (`tier_referent_reach`), in the
+    // borrow's mode.
+    fn tier_slice_reborrow(&self, base: &Expr, mode: &Mode) {
+        let mut b: &Expr = base;
+        loop {
+            match &strip_parens_tc(b).kind {
+                ExprKind::Field(x, _) | ExprKind::Index(x, _) => b = x,
+                _ => break,
+            }
+        }
+        if let ExprKind::Path(segs, _) = &strip_parens_tc(b).kind {
+            if segs.len() == 1 && matches!(self.lookup_local(&segs[0]), Some(Type::Slice(..))) {
+                self.tier_referent_reach(&segs[0], Some(mode.clone()));
+            }
+        }
+    }
+
+    // D-0291: a reference or slice binding `r` read whole (copied, stored)
+    // while another live holder holds what it refers to (`*r`, a thread
+    // lent it, a closure captured it): the copy reaches `*r` under no fact,
+    // so what it does there is the run's. A copy goes in `r`'s mode; one
+    // passed to a reference or slice parameter is the call-site rule's. A
+    // hidden binding (`$c`, a `foreach`'s) is read by the desugaring, not
+    // copied: what is borrowed from it is checked where it is borrowed.
+    fn tier_referent_reach(&self, r: &str, mode: Option<Mode>) {
+        if !self.report || self.flow.unreachable || !tier_report::on() || !self.flow.is_tracked(r) || r.starts_with('$') {
+            return;
+        }
+        let m = match self.lookup_local(r) {
+            Some(Type::Ref(_, m)) | Some(Type::Slice(_, m)) => mode.unwrap_or(m),
+            _ => return,
+        };
+        let root = referent_root(r);
+        let held = self.flow.deriv.iter().any(|(h, facts)| h != r && facts.iter().any(|(k, v)| *v != Tri::F && k.root == root && !permitted(m.clone(), k.mode.clone())) && self.holder_live_after(h));
+        if held {
+            tier_report::left(format!("line {}: `{}` is read while a thread or a closure holds what it refers to", self.current_line, r));
+        }
+    }
+
     // D-0290: an access through a reference read out of a holder or out
     // of a reference's referent (`*s.inner`, `*v[i]`): the reference may
     // be any of those stored there, so a live holder of another binding
@@ -2986,6 +3099,42 @@ impl<'a> Body<'a> {
                 ExprKind::Field(x, _) | ExprKind::Index(x, _) => b = x,
                 _ => break,
             }
+        }
+        // D-0291: an element of a slice binding `s` that a thread or a
+        // closure holds (`*s`, lent or captured), or a reborrow of it
+        // (`&mut s[a .. b]`, rooted at `s`): no place names it, the run's.
+        if let ExprKind::Path(segs, _) = &strip_parens_tc(b).kind {
+            if segs.len() == 1 && self.flow.is_tracked(&segs[0]) && matches!(self.lookup_local(&segs[0]), Some(Type::Slice(..))) {
+                let root = referent_root(&segs[0]);
+                // The element `s[i]` against a reborrow's range of `s`.
+                let mut elem = PElem::Index(None);
+                let mut x: &Expr = e;
+                loop {
+                    match &strip_parens_tc(x).kind {
+                        ExprKind::Index(y, idx) if std::ptr::eq(strip_parens_tc(y), strip_parens_tc(b)) => {
+                            elem = PElem::Index(literal_value(idx).and_then(|v| if v >= 0 { Some(v as u128) } else { None }));
+                            break;
+                        }
+                        ExprKind::Field(y, _) | ExprKind::Index(y, _) => x = y,
+                        _ => break,
+                    }
+                }
+                let held = self.flow.deriv.iter().any(|(h, facts)| {
+                    h != &segs[0]
+                        && self.holder_live_after(h)
+                        && facts.iter().any(|(k, v)| *v != Tri::F && (k.root == root || (k.root == segs[0] && overlap3(&k.path, std::slice::from_ref(&elem)) != Ov::No)) && !permitted(mode.clone(), k.mode.clone()))
+                });
+                if held {
+                    let line = self.current_line;
+                    tier_report::with(|r| {
+                        r.checks += 1;
+                        r.undecided += 1;
+                        r.events.push(format!("U\t{}\t{}\t{:?}\t{}\t{}", line, root, mode, segs[0], line));
+                    });
+                    tier_report::left(format!("line {}: an element of `{}`, which a thread or a closure holds", line, segs[0]));
+                }
+            }
+            return;
         }
         let ExprKind::Deref(inner) = &strip_parens_tc(b).kind else { return };
         if matches!(&strip_parens_tc(inner).kind, ExprKind::Path(..)) {
@@ -3667,7 +3816,7 @@ impl<'a> Body<'a> {
         // passed whole, D-0247; a value holding references) is not seen.
         for a in &args[1..] {
             let visible = self.deriv_facts_of(a).is_some();
-            let lent_ref = matches!(&strip_parens_tc(a).kind, ExprKind::Path(segs, _) if segs.len() == 1 && self.flow.is_tracked(&segs[0]) && matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..))));
+            let lent_ref = matches!(&strip_parens_tc(a).kind, ExprKind::Path(segs, _) if segs.len() == 1 && self.flow.is_tracked(&segs[0]) && matches!(self.lookup_local(&segs[0]), Some(Type::Ref(..) | Type::Slice(..))));
             if self.arg_may_be_reference(a) && !visible && !lent_ref {
                 tier_report::left(format!("line {}: a thread is lent a reference no fact describes", callee.line));
                 break;
@@ -3714,22 +3863,14 @@ impl<'a> Body<'a> {
     // whole is lent to the thread, which holds a path borrowed from it
     // until `join`: a borrow of `*r` in the mode the parameter takes.
     fn spawn_lent_refs(&self, args: &[Expr]) -> Vec<DerivKey> {
-        let params: Option<Vec<Type>> = args.first().and_then(|f| match &strip_parens_tc(f).kind {
-            ExprKind::Path(..) => self.resolve_fn_path(f).map(|fd| fd.params.iter().map(|p| p.ty.clone()).collect()),
-            _ => None,
-        });
         args.iter()
             .skip(1)
-            .enumerate()
-            .filter_map(|(i, a)| match &strip_parens_tc(a).kind {
+            .filter_map(|a| match &strip_parens_tc(a).kind {
                 ExprKind::Path(segs, _) if segs.len() == 1 && self.flow.is_tracked(&segs[0]) => match self.lookup_local(&segs[0]) {
-                    Some(Type::Ref(_, m)) => {
-                        let mode = match params.as_ref().and_then(|ps| ps.get(i)) {
-                            Some(Type::Ref(_, Mode::Shared)) => Mode::Shared,
-                            _ => m,
-                        };
-                        Some(DerivKey { root: referent_root(&segs[0]), path: Vec::new(), mode })
-                    }
+                    // D-0291: a slice binding lent whole, as a reference;
+                    // an exclusive one is lent exclusively whatever the
+                    // parameter takes (`[Thread-Lend]` lends before binding).
+                    Some(Type::Ref(_, m)) | Some(Type::Slice(_, m)) => Some(DerivKey { root: referent_root(&segs[0]), path: Vec::new(), mode: m }),
                     _ => None,
                 },
                 _ => None,
@@ -3744,6 +3885,9 @@ impl<'a> Body<'a> {
     // that argument's mode. `Option::unwrap(e)` and the like hold what
     // `e` holds.
     fn contained_ref_facts(&self, e: &Expr) -> Vec<DerivKey> {
+        if let ExprKind::Propagate(inner) = &strip_parens_tc(e).kind {
+            return self.contained_ref_facts(inner);
+        }
         let ExprKind::Call(callee, args) = &strip_parens_tc(e).kind else { return Vec::new() };
         let Some(f) = self.resolve_fn_path(callee) else { return Vec::new() };
         let std_fn = |key: &str| self.items.fns.get(key).map_or(false, |g| std::sync::Arc::ptr_eq(g, &f));
@@ -3998,6 +4142,9 @@ impl<'a> Body<'a> {
                 match self.lookup_local(r) {
                     Some(Type::Ref(_, m)) | Some(Type::Slice(_, m)) => Some(vec![(DerivKey { root: referent_root(r), path: Vec::new(), mode: m }, Tri::T)]),
                     Some(t) if holds_ref(self.items, &t) => Some(vec![(DerivKey { root: referent_root(r), path: Vec::new(), mode: Mode::Shared }, Tri::T)]),
+                    // D-0291: a parameter given by value that keeps
+                    // references in data holds what its caller put there.
+                    Some(t) if self.params.contains(r) && self.data_type(&t) => Some(vec![(DerivKey { root: referent_root(r), path: Vec::new(), mode: Mode::Shared }, Tri::T)]),
                     // An owner of this frame (`&v[0].f` reaches `v`).
                     Some(_) if self.flow.is_tracked(r) => Some(vec![(DerivKey { root: r.clone(), path: Vec::new(), mode: Mode::Shared }, Tri::T)]),
                     _ => Some(Vec::new()),
@@ -4012,6 +4159,8 @@ impl<'a> Body<'a> {
                 None => tier_d(),
             },
             ExprKind::Field(base, _) | ExprKind::Deref(base) => self.inherited_facts_in(base, depth + 1, binder),
+            // D-0291: `e?` gives `e`'s payload, which holds what `e` holds.
+            ExprKind::Propagate(inner) => self.inherited_facts_in(inner, depth + 1, binder),
             ExprKind::Borrow(m, inner) | ExprKind::SliceOf(m, inner, _, _) => {
                 // The projection down to the reference it goes through:
                 // its fields, cut at the first index (an element is
@@ -4835,6 +4984,17 @@ impl<'a> Body<'a> {
                 if let Some(ExprKind::Call(c, _)) = init.as_ref().filter(|e| is_spawn_call(e)).map(|e| &strip_parens_tc(e).kind) {
                     self.bound_spawns.insert((c.line, c.col));
                 }
+                // D-0291: a spawn whose handle the value wraps, on every path
+                // or some: the binding holds it, as a handle binding does.
+                let mut tails: Vec<(usize, usize)> = Vec::new();
+                let tails_all = match init.as_deref() {
+                    Some(e) if !is_spawn_call(e) => tail_spawn_sites(e, &mut tails),
+                    _ => false,
+                };
+                for site in &tails {
+                    self.bound_spawns.insert(*site);
+                    self.tail_spawns.insert(*site, None);
+                }
                 // `foreach (x in &f())` (D-0042): the hidden `$c` binding
                 // would borrow a temporary. Name the form that iterates one.
                 if name.starts_with("$c") {
@@ -4856,13 +5016,21 @@ impl<'a> Body<'a> {
                 // D-0290: a holder moved into a new binding: its facts follow.
                 let held = match init.as_deref().map(|e| &strip_parens_tc(e).kind) {
                     Some(ExprKind::Path(segs, _)) if segs.len() == 1 && self.is_holder(&segs[0]) => Some(self.holder_facts(&segs[0])),
+                    // D-0291: a consuming `foreach`'s drain of its hidden
+                    // holder (`auto $d = $each_drain($e, n)`) holds it.
+                    Some(ExprKind::Call(c, a)) if matches!(&c.kind, ExprKind::Path(segs, _) if segs.len() == 1 && segs[0] == "$each_drain") && !a.is_empty() => match &strip_parens_tc(&a[0]).kind {
+                        ExprKind::Path(segs, _) if segs.len() == 1 && self.is_holder(&segs[0]) => Some(self.holder_facts(&segs[0])),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 let saved_holding = std::mem::replace(&mut self.holding, held.is_some());
+                self.spawn_let_depth.push(self.scopes.len());
                 let ity = match init {
                     Some(e) => self.check_store_operand(e, expected.as_ref()),
                     None => Ok(None),
                 };
+                self.spawn_let_depth.pop();
                 self.handing = saved_handing;
                 self.holding = saved_holding;
                 let ity = ity?;
@@ -4974,6 +5142,22 @@ impl<'a> Body<'a> {
                     self.set_deriv_tri(name, facts);
                 } else if let Some(e) = init.as_ref().filter(|e| is_spawn_call(e)) {
                     let facts = self.spawn_facts_tri_of(e);
+                    self.set_deriv_tri(name, facts);
+                } else if !tails.is_empty() {
+                    let mut facts: Vec<(DerivKey, Tri)> = Vec::new();
+                    for site in &tails {
+                        match self.tail_spawns.remove(site).flatten() {
+                            Some(f) => facts.extend(f),
+                            None => tier_report::left(format!("line {}: a thread is lent references and its handle is not held by this frame", site.0)),
+                        }
+                    }
+                    // A thread on some paths only: what it was lent is held
+                    // on those paths.
+                    if !(tails_all && tails.len() == 1) {
+                        for f in facts.iter_mut() {
+                            f.1 = Tri::U;
+                        }
+                    }
                     self.set_deriv_tri(name, facts);
                 } else if let Some(e) = init.as_ref().filter(|e| is_closure(e)) {
                     let facts = self.closure_facts_of(e);
@@ -5105,6 +5289,7 @@ impl<'a> Body<'a> {
         self.current_line = e.line;
         self.current_col = e.col;
         self.cur_temp_ok = std::mem::take(&mut self.arg_temp_ok);
+        self.cur_arg_ref_param = std::mem::take(&mut self.arg_ref_param);
         // D-0218: a field, element or `*r` read as a value (not a place
         // position, not the operand of `*`) through a shared reference.
         let exempt = std::mem::take(&mut self.read_exempt) || self.place_pos;
@@ -5245,6 +5430,9 @@ impl<'a> Body<'a> {
                     t = self.generic_item_value(segs, targs, expected)?;
                 }
                 if !in_place {
+                    if segs.len() == 1 && !std::mem::take(&mut self.cur_arg_ref_param) {
+                        self.tier_referent_reach(&segs[0], None);
+                    }
                     self.flow_read(e)?;
                 }
                 Ok(t)
@@ -5253,6 +5441,7 @@ impl<'a> Body<'a> {
             ExprKind::Binary(op, a, b) => self.check_binary(*op, a, b, e, expected),
             ExprKind::Borrow(m, inner) => {
                 self.tier_elem_access(inner, m.clone())?;
+                self.tier_slice_reborrow(inner, m);
                 // D-0289: through an exclusive reference to what holds a
                 // lending thread's handle the handle can be moved out of
                 // this analysis' sight (swapped into longer-lived data):
@@ -5453,6 +5642,7 @@ impl<'a> Body<'a> {
                     OperandKind::Place => {}
                 }
                 self.place_pos = true;
+                self.tier_slice_reborrow(base, m);
                 let bt = self.check_expr(base, None)?;
                 if *m == Mode::Exclusive
                     && (self.crosses_shared(base) || matches!(&bt, Some(Type::Ref(_, Mode::Shared)) | Some(Type::Slice(_, Mode::Shared))))
@@ -6854,12 +7044,15 @@ impl<'a> Body<'a> {
             if through.contains(h) || (self.lookup_local(h).map_or(false, |t| self.tier_d_type(&t)) && !self.is_holder(h)) {
                 continue;
             }
-            if !self.compound_held.contains(h) && !tier_report::live_after(h, self.current_line, self.current_col) {
-                continue;
-            }
+            // Liveness (`holder_live_after` follows who reaches `h`) is
+            // asked only of a holder with a fact at this root.
+            let mut live: Option<bool> = None;
             for (k, v) in facts {
                 if *v == Tri::F || k.root != root || permitted(mode.clone(), k.mode.clone()) {
                     continue;
+                }
+                if !self.compound_held.contains(h) && !*live.get_or_insert_with(|| self.holder_live_after(h)) {
+                    break;
                 }
                 match overlap3(&k.path, path) {
                     Ov::No => {}
@@ -7234,14 +7427,24 @@ impl<'a> Body<'a> {
             // D-0290: what the references kept where an argument reaches
             // reach (a holder's facts, `**q` through a parameter `q`): the
             // callee reaches them through it, in no stronger mode.
+            // Only references the parameter's referent type can hold are
+            // reached through it: none, or shared ones only.
+            let tparams: HashSet<String> = f.type_params.iter().cloned().collect();
+            let reach = match &p.ty {
+                Type::Ref(t, _) | Type::Slice(t, _) if !mentions_any(t, &tparams) => Some((may_hold_ref(self.items, t, 0), may_hold_excl_ref(self.items, t))),
+                _ => None,
+            };
             let mut deep: Vec<(DerivKey, Tri)> = Vec::new();
             for k in &whole {
                 if self.is_holder(&k.root) {
                     through.insert(k.root.clone());
                 }
+                if reach.map_or(false, |(any, _)| !any) {
+                    continue;
+                }
                 if let Some(v) = self.reach_of_root(&k.root) {
                     for (hk, t) in v {
-                        let m = if mode == Mode::Shared { Mode::Shared } else { hk.mode.clone() };
+                        let m = if mode == Mode::Shared || reach.map_or(false, |(_, excl)| !excl) { Mode::Shared } else { hk.mode.clone() };
                         deep.push((DerivKey { mode: m, ..hk }, t));
                     }
                 }
@@ -7391,6 +7594,9 @@ impl<'a> Body<'a> {
                 }
             }
         }
+        if tier_report::in_trusted() {
+            return Ok(());
+        }
         for pc in pcs {
             crate::tier::record_point_check(self.items, site, pc);
         }
@@ -7451,6 +7657,13 @@ impl<'a> Body<'a> {
         }
         if matches!(&callee.kind, ExprKind::Path(segs, _) if segs.len() == 1 && segs[0] == "spawn" && !self.is_local(&segs[0])) {
             self.tier_spawn_rule(callee, args);
+        }
+        if self.tail_spawns.contains_key(&(callee.line, callee.col)) {
+            let facts = self.spawn_facts_tri_of(&Expr { kind: ExprKind::Call(Box::new(callee.clone()), args.to_vec()), line: callee.line, col: callee.col });
+            let depth = self.spawn_let_depth.last().copied().unwrap_or(0);
+            let inner: HashSet<&str> = self.scopes.iter().skip(depth).flatten().map(|e| e.name.as_str()).collect();
+            let seen = facts.iter().all(|(k, _)| !k.root.starts_with('<') && !inner.contains(k.root.trim_start_matches('*')));
+            self.tail_spawns.insert((callee.line, callee.col), seen.then_some(facts));
         }
         let saved_joining = std::mem::replace(&mut self.joining, joining);
         let handing = handing || self.handing;
@@ -8896,8 +9109,10 @@ impl<'a> Body<'a> {
                 }
             }
             self.arg_temp_ok = !matches!(f.ret, Type::Ref(..));
+            self.arg_ref_param = matches!(f.params.get(i).map(|p| &p.ty), Some(Type::Ref(..) | Type::Slice(..)));
             let r = self.check_store_operand(a, hint.as_ref());
             self.arg_temp_ok = false;
+            self.arg_ref_param = false;
             self.infer_poisoned = saved;
             by_index[i] = r?;
             checked[i] = true;
@@ -9498,7 +9713,13 @@ impl<'a> Body<'a> {
             if let (Some(bn), Some(pt)) = (&arm.binder, binder_ty[arm_ix[ai]].clone()) {
                 if let (Some(x), None, None) = (&consume_x, &by_ref, &cross) {
                     if is_resource_ty(self.items, &pt) {
-                        self.flow_consume(x, "diag.destroy-while-aliased")?;
+                        // D-0291: a handle taken out into the binder, which
+                        // holds what its thread was lent.
+                        let handing = self.handing || hand.is_some();
+                        let saved_handing = std::mem::replace(&mut self.handing, handing);
+                        let r = self.flow_consume(x, "diag.destroy-while-aliased");
+                        self.handing = saved_handing;
+                        r?;
                     }
                 }
                 let bt = match (&by_ref, &cross) {
@@ -10868,6 +11089,33 @@ fn holds_guard(t: &Type) -> bool {
         Type::Array(x, _) => holds_guard(x),
         Type::Named(_, args) => args.iter().any(holds_guard),
         _ => false,
+    }
+}
+
+// D-0291: the spawns whose handle `e`'s value is, or wraps in `Some`,
+// through a `match`'s arms, an `if`'s branches and a block's tail; and
+// whether every path that gives a value gives one of them (an arm that
+// leaves by `return`, `break` or `continue` gives none).
+fn tail_spawn_sites(e: &Expr, out: &mut Vec<(usize, usize)>) -> bool {
+    fn block(b: &Block, out: &mut Vec<(usize, usize)>) -> bool {
+        match &b.tail {
+            Some(t) => tail_spawn_sites(t, out),
+            None => matches!(b.stmts.last(), Some(Stmt::Expr(e)) | Some(Stmt::BlockLike(e)) if leaves(e)),
+        }
+    }
+    fn leaves(e: &Expr) -> bool {
+        matches!(&strip_parens_tc(e).kind, ExprKind::Return(_) | ExprKind::Break | ExprKind::Continue)
+    }
+    match &strip_parens_tc(e).kind {
+        ExprKind::Call(c, _) if is_spawn_call(e) => {
+            out.push((c.line, c.col));
+            true
+        }
+        ExprKind::Call(c, a) if a.len() == 1 && matches!(&c.kind, ExprKind::Path(segs, _) if segs.last().map_or(false, |s| s == "Some")) => tail_spawn_sites(&a[0], out),
+        ExprKind::Match(_, arms) => arms.iter().fold(true, |all, arm| tail_spawn_sites(&arm.body, out) & all),
+        ExprKind::If(_, t, Some(f)) => block(t, out) & tail_spawn_sites(f, out),
+        ExprKind::Block(b) => block(b, out),
+        _ => leaves(e),
     }
 }
 

@@ -805,3 +805,12 @@ boundary is a check at formation, and per-function lowering follows.
 
 **What remains, in order:** phase 3's tier-D runtime with per-function lowering (Update 146); the single port of
 the self-hosted compiler and its measurement (Update 147).
+
+**Amended 2026-10-29 (D-0291, Update 146).** Before phase 3, the programs that mattered most were decided
+(`cbc`, `cbparse`, `parallel_chunks`, the `PriorityQueue` programs) and five soundness holes of D-0288–D-0290's
+rules were closed; the soundness sweep (every decided program run under `coby`) is part of each Update's gate.
+Per-function lowering is not a separate lowering: a tracked caller may pass a stale reference, which only an
+access through it faults, so a pathless callee would read freed memory where the tracked one faults; phase 3's
+light tokens do what it was for (D-0291, `stress/d0281/phase3/PERFN.md`). So what remains is phase 3's tier-D
+runtime (Update 147, perhaps more than one), then the single port of the self-hosted compiler and its
+measurement (the Update after).

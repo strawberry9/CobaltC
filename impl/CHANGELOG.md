@@ -294,6 +294,10 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0285 — A decided program is lowered knowing it is decided
 - D-0286 — In a decided program, values pass between functions with no object
 - D-0287 — A `foreach` over a text splitter finds the parts as it takes them
+- D-0288 — A closure holds what its captures reach, and a program with closures may be decided
+- D-0289 — Scoped lending: a program that spawns threads may be decided
+- D-0290 — Frame-held aggregates: a local that keeps references in data holds what it keeps
+- D-0291 — The real programs decided: wrapped handles, `?`, lent slices, and facts that outlive their reference
 
 ---
 
@@ -8442,3 +8446,55 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0386: the real programs decided, and five holes closed (D-0291, 2026-10-29)
+
+- The programs that mattered most were not decided after D-0290: the self-hosted compiler `cbc`
+  (`direct::fn_decl`), the parser `cbparse`, the showcase `parallel_chunks`, and the four `PriorityQueue`
+  programs. Each was kept by a gap in what the static pass follows, closed in `typecheck.rs`: a callee's reach
+  through an argument is bounded by the parameter's referent type; a handle wrapped in the value a `let` gives
+  (`Some(spawn(…))`, an `if` or `match` giving one on some arms) is held by the binding (`tail_spawns`); `e?`
+  holds what `e` holds; a consuming `foreach`'s drain holds its holder; a by-value parameter that keeps
+  references holds `*v`; a slice binding lent whole to a thread is lent as a reference binding is, and
+  `slice_parts`' body is decided by its rule (`[Slice-Parts]`: neither tool makes its point checks). In `cobc`,
+  a `fn` value in data keeps references only when a capturing closure of its signature exists in the program
+  (`pathless_blocker`: `sigs`, `fn_refs`), so `PriorityQueue`'s comparator no longer makes its users tier D.
+- Found by the soundness sweep (every program the static pass decides, of the corpus and both conformance suites,
+  run under `coby`; three decided programs faulted `diag.aliasing-conflict` where the binary ran with no check)
+  and by variants written around the finds (`stress/d0281/why/sound146/`), five holes, each closed: a handle kept
+  past the block of the reference it was lent held a fact about nothing once the reference ended, so the write
+  after the loop was decided (Update 144; now the fact is handed over to what the reference held,
+  `hand_over_referent`); an exclusive reference lent to a shared parameter was lent shared, so the spawner's read
+  was decided (Update 144; `[Thread-Lend]` lends in the binding's own mode, `spawn_lent_refs`); an element of a
+  slice binding was checked against no thread's or closure's hold of the slice and no reborrow of it
+  (`holder_deref_access`, `tier_slice_reborrow`); a copy of a lent reference or slice (`auto w = s`, `Some(s)`)
+  reached its referent under no fact (`tier_referent_reach`); and a slice's borrow was taken to end at its last
+  mention while a closure that captured it still wrote through it (`tier_access` on `holder_live_after`, the
+  spec's Liveness rule). Where the conflict is sure, both tools now refuse the program before the run (`sv/v9`,
+  the closure cases `sv/c1`, `sv/c5`, `rv/r8`); where only the values decide, the run checks it, and the binary
+  faults as `coby` does.
+- Over the 13,397 programs of the soundness sweep (the corpus `stress/d0281/why`, both conformance suites, the
+  book's and the guide's examples): 10,648 decided (Update 145: 10,635), 996 keep paths, 1,753 refuted before the
+  run; no program without a decision note. Fourteen programs decided that kept paths (the four `PriorityQueue`
+  programs, `foreach_consumes_vec_of_references_ok`, `propagate_slice_index_ok`, `hashmap_get_mut_match_ok`, the
+  four `postgres` cases, `hand-l01`, two fuzz programs); `hand-x03`, decided before and faulting under `coby`,
+  keeps paths; two that kept paths are refuted before the run. Against this Update's first sweep, the three
+  decided programs whose run faulted (`conf.slice-written-while-lent-reborrow`, `hand-x03`, `hand-x06`) keep
+  paths, and one program kept by the copy rule on a `foreach`'s hidden binding (`round6/inventory`) is decided
+  again. Every decided program whose `coby` run faults (`diag.stale-binding`, `diag.overwrite-of-live-resource`)
+  faults the same way compiled, under gcc.
+- Conformance: `conf.ref-lent-in-loop-handle-kept-written`, `conf.exclusive-ref-lent-to-shared-param`,
+  `conf.wrapped-handle-lent`, `conf.wrapped-handle-maybe-lent`, `conf.slice-lent-copy-written`,
+  `conf.lent-parts-written-after-loop`, `conf.slice-parts-lent-to-threads` (decided),
+  `conf.closure-captured-slice-source-read`, `conf.slice-reborrow-parent-element-written`,
+  `conf.propagated-ref-holds-borrow`. `conf.vec-predicate-value-keeps-element`'s `fn` value lives in its own
+  block (its first read of `kept` is refuted before the run otherwise, since a closure holds what it captures
+  while it exists), and the case faults `diag.stale-binding` at the read after the growing push.
+- Per-function lowering is not a separate lowering (D-0291, `stress/d0281/phase3/PERFN.md`): a tracked caller may
+  pass a stale reference, and only an access through it faults, so a pathless callee that drops the token would
+  read freed memory where the tracked one faults; phase 3's light tokens do what it was for.
+- Cost of the static pass: `cobc` on the self-hosted compiler (`impl/selfhost/cbc/main.cb`, no C compiled) takes
+  56 s against Update 145's 35 s: the static pass 24 s against 20 s, and the lowering 32 s against 15 s because
+  `cbc` is decided now, and a decided program is lowered a second time knowing it (D-0285: 15 s, then 17 s;
+  `COBALTC_DECIDED=0` gives 39.5 s in all). Peak memory 567 MB against 367 MB (467 MB with one lowering).
+- Release suites `stress/suites/runs/u146`: passed.

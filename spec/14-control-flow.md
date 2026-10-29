@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.39.0
+Version: 1.40.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -563,8 +563,9 @@ evaluation order within the statement):
 | block exit | for every `r` declared in the block: `deriv(r, ·, ·) := F`, forgetting them (below); for every `x` declared in it: `valid(x) := F` |
 | a binding `x` ended after `s_j` by `[Ref-Binding-Last-Use]` (D-0219, D-0221) | as block exit, for `x` alone: `deriv(x, ·, ·) := F`, forgetting them (below), `deriv(·, *x.·, ·) := F`, `valid(x) := F` |
 | `spawn(…, &_m x …)`, its handle not bound whole by a `let` or an assignment (D-0289) | `escaped(x) := T` |
-| `auto h = spawn(f, a1, …, an);` or `h = spawn(…)` (D-0071) | `deriv(h, x.π, m) := T` for each `ai` that is a visible borrow, slice or elided call forming `deriv(·, x.π, m)` by the lines above; `deriv(h, *r, m) := T` for each `ai` that is a tracked binding `r` of reference type, `m` the mode `f`'s parameter takes (D-0213: the thread is lent `r`, `spec/19` `[Thread-Lend]`) — a `ref`, not a slice: a slice binding passed whole is lent as any value is, and forms no fact (D-0247); when `f` is a closure literal or a closure binding, the facts the closure row gives it (D-0289); other `deriv(h, ·, ·) := F` |
-| `spawn(…, r …)` with `r` a tracked binding of reference type (D-0213) | the lend is a borrow of `*r` in the parameter's mode: `¬clash` against `deriv` facts, as `&_m *r` would be |
+| `auto h = spawn(f, a1, …, an);` or `h = spawn(…)` (D-0071) | `deriv(h, x.π, m) := T` for each `ai` that is a visible borrow, slice or elided call forming `deriv(·, x.π, m)` by the lines above; `deriv(h, *r, m) := T` for each `ai` that is a tracked binding `r` of type `ref<τ, m>` or `slice<τ, m>`, in `r`'s own mode whatever `f`'s parameter takes (D-0213: the thread is lent `r`, `spec/19` `[Thread-Lend]`, which lends before the parameters are bound; a slice binding as a reference, D-0291); when `f` is a closure literal or a closure binding, the facts the closure row gives it (D-0289); other `deriv(h, ·, ·) := F` |
+| `spawn(…, r …)` with `r` a tracked binding of reference or slice type (D-0213, D-0291) | the lend is a borrow of `*r` in `r`'s mode: `¬clash` against `deriv` facts, as `&_m *r` would be |
+| `τ h = e;` / `auto h = e;` with `e` a `spawn` wrapped in the value it gives: `Some(spawn(…))`, or an `if`, a `match` or a block whose branches give one or none (D-0291) | `deriv(h, ·, ·)` the facts the spawn row gives each such spawn, each `?` unless there is one spawn and every branch that gives a value gives it; the facts are taken where the spawn is, and a spawn whose facts name a binding of a scope `h`'s declaration does not see is lent where no binding holds its handle (below); a `match (h)` arm's binder that takes the handle out holds them, as a handle taken out of a `Vec` of handles does |
 | `join(h)` | `deriv(h, ·, ·) := F` (the thread has finished) |
 | `auto o = e;` / `o = e;` / a `match (e)` arm's binder `o`, where `e` is a call `f(a1, …, an)` (or `Option::unwrap`/`expect`, `Result::unwrap`/`expect` of one) whose result holds a reference without being one (`Option<ref<V, m>>`, D-0088) | `deriv(o, x.π, m) := T` for the first reference-typed parameter's argument, when it is a visible borrow or slice forming `deriv(·, x.π, m)`; other `deriv(o, ·, ·) := F` |
 | `auto c = [x1, …, xn](…) { … };` or `c = [x1, …](…) { … }` — a closure without `move` (CHG-0100) | `deriv(c, xi, m) := T` for each captured local `xi` not of reference type, `m` = `exclusive` when the body writes `xi` (spec/15 §6's capture mode) and `shared` otherwise; `deriv(c, r, m) := T` and `escaped(r) := T` for each captured local `r` of reference type (D-0243: the closure holds a borrow of `r` itself, `m` as for any capture; the fact since D-0288); and as for `move` below; other `deriv(c, ·, ·) := F` |
@@ -594,6 +595,16 @@ was a borrow its spawn already marked, by `spawn(…, &_m x …)` or by the
 lent binding's own facts), and the consumption or `drop` of `x` itself
 — do not forget in this sense the facts rooted in `x`; the facts `x`
 itself held, as a holder, are forgotten when it is consumed (D-0244).
+
+**Handing over** (D-0291). When a reference or slice binding `r` that
+holds facts ends, a fact `deriv(h, *r.π, m)` another binding `h` holds —
+a thread's handle `r` was lent to, a closure that captured `r`, a copy —
+becomes `deriv(h, x.π'.π, m ⊓ m')` for each fact `deriv(r, x.π', m')` `r`
+held (`shared` if either is), `?` unless both were `T`: the thread or the
+closure still holds the reference `r` held, and the fact now says where.
+Without it a handle kept past `r`'s block (in a `Vec` of handles) held a
+fact about nothing, and a later write to what `r` reached was *proven*
+clash-free (`conf.ref-lent-in-loop-handle-kept-written`).
 
 **Discharge.** A guarded side-condition `⟦ φ ⟧` at a program point,
 where `φ` is one of the following, is resolved from the state there:
@@ -722,8 +733,9 @@ inherits the facts of `e`:
 | `*b`, and `b.f` for a frame-held `b` | the facts of `b` |
 | `&_m p` or a slice of `p` | the fact §6 forms for it (`p`'s place, literal indices and ranges included) where it forms one; otherwise the facts of `p`'s root, extended by `p`'s fields up to its first index, in mode `m`; when `p`'s root is the result of a call that is not a reference, holds none and is not a constant: the temporary of that statement |
 | `String::view(s, lo, hi)`, `StringView::sub(s, lo, hi)` | the facts of `s`, each extended by the range `[lo, hi)` |
+| `e?` (`[Propagate]`) | the facts of `e`: the `Option`'s or `Result`'s (D-0291) |
 | a call `f(a1, …, an)` whose result is or holds a reference | the facts of the first argument whose parameter is or holds a reference (D-0011, D-0088), in the parameter's mode; none when no parameter is, and none (static data) when that argument is static data; when the result keeps references in data, each `?` (it may hold none), and when several arguments are or hold references, the facts of all of them, each `?`; when the result holds a reference only through a type argument, or when that argument reaches storage that keeps references (a `Vec<ref<T>>`, a struct with a reference field: the result may be one of them), what that storage keeps (below), and tier D when that is not known; a call given no reference holds what its values hold (`Vec::new()`: nothing) |
-| a hidden `foreach` binding | the facts of the collection it walks; over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap; under `[Foreach-Parts]`, the facts of the text |
+| a hidden `foreach` binding | the facts of the collection it walks (a consuming `foreach`'s drain of a holder: the holder's, D-0291); over a `HashMap`, a key binder's are its keys' and a value binder's its values', which do not overlap; under `[Foreach-Parts]`, the facts of the text |
 | `if`, a block, `match` | the facts of the results of the branches that complete (a `match` arm's binder stands for the scrutinee); facts from two or more branches are `?` |
 | an element of a container, or a reference read out of a field of an aggregate that holds references | what that aggregate keeps (below), each `?`; tier D, no facts, when that is not known |
 | a literal (`S { .f = e, … }`, `[e, …]`) | the facts of its parts that are or hold references, together |
@@ -760,8 +772,11 @@ What an aggregate keeps, read out of it (an element, a field, a result
 of `Vec::pop` or `Vec::get`, a `foreach` binder over it): for a holder of
 the frame, its facts, each `?`; through a reference parameter `q`, `**q`,
 a root of its own, disjoint from the frame's places and from what the
-other parameters reach, as `*q` is (`?` when it may be exclusive); through
-another reference of the frame, what the roots its facts name keep.
+other parameters reach, as `*q` is (`?` when it may be exclusive); in a
+parameter `v` passed by value, `*v`, what its caller put there (D-0291:
+`Vec::drain`'s `Drain { .v = v }` reaches only what the parameters do);
+through another reference of the frame, what the roots its facts name
+keep.
 
 The run checks, and the program is not decided, when a holder holding
 facts is moved where its facts do not follow (an argument, a field, a
@@ -780,6 +795,18 @@ aggregate keeps, or rooted at the aggregate itself (`auto r =
 &*s.inner`, `give(&s)` returning `s.inner`): the reference read may be any
 of those kept.
 
+**Slices and copies** (D-0291). An element of a slice binding `s` (`s[i]`,
+`s[i].f`) is no place §6 names. Reading or writing it, and reborrowing
+`s` (`&_m s[a .. b]`, `&_m s[i]`, in the borrow's mode), is the run's when,
+in a mode that does not permit it, a live binding other than `s` holds a
+fact rooted at `*s` (a thread `s` was lent to, a closure that captured
+it) or, for an element, a reborrow of `s` that meets it. A reference or
+slice binding `r` read whole — copied (`auto w = r`), wrapped (`Some(r)`),
+stored in a literal — while a live binding other than `r` holds a fact
+rooted at `*r` that does not permit `r`'s mode is the run's too: the copy
+reaches `*r` under no fact. A copy passed to a reference or slice
+parameter is the call-site rule's.
+
 **A block's end.** When a block ends, a frame-held reference declared
 outside it that holds a fact `T` rooted at a binding the block declares,
 and that is live after the block, is refuted:
@@ -792,7 +819,9 @@ the program is not decided.
 the binding of that name in scope at `P` is mentioned (read, borrowed,
 passed, captured or assigned) after `P` in the source, or anywhere in a loop that encloses `P` and that its declaration
 precedes; also while another live binding holds a fact rooted at `*h`,
-or at `h` itself (`auto hr = &h`: what `h` holds lives while `hr` does).
+or at `h` itself (`auto hr = &h`: what `h` holds lives while `hr` does),
+for every access the frame makes, an element's among them (D-0291: a
+closure that captured a slice holds the slice's borrow while it lives).
 A mention resolves to the binding in scope where it is written, so a
 later binding of the same name does not keep `h` live. A holder that is not live has
 ended (`[Ref-Binding-Last-Use]`, D-0111) and conflicts with nothing.
@@ -836,7 +865,10 @@ shared reference is interior mutability), and otherwise `W(ai)`. Both
 include, unextended, what the references kept where a key of `W(ai)` is
 rooted reach (a holder's facts, `**q` through a parameter `q`), in no
 stronger mode than `m`, the holder they come from counting as one the
-argument is formed through (D-0290). Two
+argument is formed through (D-0290) — for a parameter `ref<τ, m>` or
+`slice<τ, m>` with `τ` no type parameter, only what a `τ` can keep: none
+when `τ` keeps no reference, shared when it keeps no exclusive one
+(D-0291). Two
 keys *certainly overlap* when their roots are equal, their paths agree
 step by step (fields equal; literal indices equal; a literal index
 inside a literal range; literal ranges that intersect) and the longer
@@ -931,7 +963,12 @@ guard in data (tier D, D-0281; one a frame holds is its facts, D-0288,
 D-0289; an aggregate of references is checked where it is, D-0290), or
 when it forms a reference
 to a reclaimed object in its own code (`[Reclaim]`: the run checks it
-against the record of raw storage).
+against the record of raw storage). A `fn` value kept in data keeps
+references only when a closure the program makes of its signature does
+(D-0291: a named function captures nothing). The body of
+`std::slice_parts` is decided by `[Slice-Parts]`: it pushes reborrows of
+its slice into its result, which that rule makes disjoint, so none of its
+point checks can fault, and none is made (D-0291).
 
 **The cost contract** (D-0281 §14, D-0290). What a reference costs at run
 time is promised as properties, not instruction counts; an
@@ -1007,6 +1044,7 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.40.0 — `CHG-0386` (D-0291): §6 the spawn rows: a slice binding is lent as a reference, in its own mode whatever the parameter takes (D-0247's "forms no fact" withdrawn for `spawn`); a spawn wrapped in the value a binding takes (`Some(spawn(…))`, a branch); "Handing over" after "Forgetting"; inherited facts of `e?`, of a consuming `foreach`'s drain, of a by-value parameter (`*v`); "Slices and copies"; liveness through a holder for element accesses; the call-site rule's reach bounded by the parameter's referent type; decided programs: a `fn` value in data, `std::slice_parts`' body.
 - 1.39.0 — `CHG-0385` (D-0290): §6 "The cost contract" (D-0281 §14, the tier-D lines provisional; cost cases); §6 holders: a local that keeps references in data is a holder of the frame; "Frame-held aggregates"; inherited facts of calls whose result keeps references in data, of reads out of an aggregate (`**q` through a parameter), of literals and of a view's bytes; `r = e` where `r` held nothing; what is the run's (a holder moved out, a result holding more than the parameters reach, a store through a reference); decided programs no longer exclude every type that keeps references in data; an access through a reference read out of an aggregate; liveness while a binding reaches a holder; a struct argument's kept paths at a point check; scoped lending of an exclusive reference through a shared one.
 - 1.38.0 — `CHG-0384` (D-0289): §6 scoped lending: a guard given to a thread as an argument is the run's; a `Vec` of handles the frame holds holds what its threads were lent, and a handle taken out of it holds that too; a holder whose end waits or releases holds its facts to its scope's end.
 - 1.37.0 — `CHG-0383` (D-0289): §6 decided programs: scoped lending, a thread's handle and a lock's guard held by a frame are its facts; the spawn rows (a bound spawn's handle holds its closure's facts and escapes nothing); the paragraph no longer lists closures (D-0288) or spawns.

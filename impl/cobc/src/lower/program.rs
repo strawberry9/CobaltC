@@ -294,12 +294,21 @@ impl<'a> Gen<'a> {
         // keeps references in its environment: a `fn` value kept in data
         // may then be one. In a frame the static pass holds what such a
         // closure reaches as a borrow (D-0288), so only data keeps paths.
-        let fn_refs = self.closures.values().any(|c| (!c.is_move && !c.fields.is_empty()) || c.fields.iter().any(|(_, t)| coby::typecheck::keeps_refs_in_data(self.items, t, true) || matches!(t, Type::Ref(..) | Type::Slice(..)) || matches!(t, Type::Named(n, _) if n == "std::StringView")));
+        // D-0291: a `fn` value may be such a closure only when one of its
+        // signature does (modes aside: a named function keeps nothing).
+        let sigs: Vec<(Vec<Type>, Type)> = self.closures.values().filter(|c| (!c.is_move && !c.fields.is_empty()) || c.fields.iter().any(|(_, t)| coby::typecheck::keeps_refs_in_data(self.items, t, true) || matches!(t, Type::Ref(..) | Type::Slice(..)) || matches!(t, Type::Named(n, _) if n == "std::StringView"))).map(|c| (c.params.iter().map(modeless).collect(), modeless(&c.ret))).collect();
+        let fn_refs = |t: &Type| match t {
+            Type::Fn(ps, r) => {
+                let (ps, r): (Vec<Type>, Type) = (ps.iter().map(modeless).collect(), modeless(r));
+                sigs.iter().any(|(cp, cr)| *cp == ps && *cr == r)
+            }
+            _ => !sigs.is_empty(),
+        };
         // D-0290: a type whose values the static pass follows as holders
         // (no `fn` value, guard, lock or handle in it) is checked where it
         // is used: a function that keeps one where the facts do not see it
         // is in `tracking_needed` above.
-        let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data(self.items, t, fn_refs) && !coby::typecheck::frame_holdable(self.items, t)).map(|t| t.to_string()).collect();
+        let mut tys: Vec<String> = self.type_ids.keys().filter(|t| coby::typecheck::keeps_refs_in_data_by(self.items, t, &fn_refs) && !coby::typecheck::frame_holdable(self.items, t)).map(|t| t.to_string()).collect();
         tys.sort();
         if let Some(t) = tys.first() {
             return Some(format!("the type `{}` keeps references in data (tier D)", t));
@@ -474,5 +483,18 @@ impl Gen<'_> {
     // D-0274 stage `stage` is switched off (`bootstrap_level`).
     pub(crate) fn boot(&self, stage: u8) -> bool {
         self.bootstrap >= stage
+    }
+}
+
+// D-0291: `t` with every reference and slice made shared, so that two
+// signatures compare as one when only their modes differ.
+fn modeless(t: &Type) -> Type {
+    match t {
+        Type::Ref(i, _) => Type::Ref(Box::new(modeless(i)), Mode::Shared),
+        Type::Slice(i, _) => Type::Slice(Box::new(modeless(i)), Mode::Shared),
+        Type::Array(i, n) => Type::Array(Box::new(modeless(i)), *n),
+        Type::Named(n, a) => Type::Named(n.clone(), a.iter().map(modeless).collect()),
+        Type::Fn(ps, r) => Type::Fn(ps.iter().map(modeless).collect(), Box::new(modeless(r))),
+        other => other.clone(),
     }
 }

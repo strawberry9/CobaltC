@@ -76,6 +76,13 @@ a struct of views built and read in one function, is checked the same way (D-029
 was stored into it, and a view read out of it holds that, so writing the text while the `Vec` still
 lives is refused, or left to the run when the `Vec` may hold nothing. A `Vec` holds what it keeps
 until its scope ends; a struct that owns nothing, until its last use.""")
+b += p("""The same holds for a handle wrapped in the value a binding takes (`Option<handle<T>> h = if (go) {
+Some(spawn(…)) } else { None }`), for a reference `call(…)?` gives, and for a slice lent whole to a
+thread, such as the parts `slice_parts` gives (D-0291): each holds what it was formed from, and the
+compiler checks the frame's accesses against it. When a reference or slice binding ends while a
+thread or a closure still holds it, what they hold passes to what the binding referred to, so a
+write to it after the loop that lent it is still checked. A copy of a lent slice, an element of
+one, and a reborrow of one are left to the run while the lend lasts.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
 the run, then lists the lines whose generated C still calls the runtime's tracking, with the

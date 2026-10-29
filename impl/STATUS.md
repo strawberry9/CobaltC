@@ -74,7 +74,9 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   where it can. A consuming `foreach` over a text splitter's call (`StringView::lines(v)`, `String::split(&s,
   ",")`, …) walks the text, holding a view of it, and makes no `Vec` (D-0287, in both tools), so it leaves a
   program decided. A local `Vec<StringView>`, `Vec<ref<T>>` or struct of references that stays in its frame
-  is checked before the run as a reference is (D-0290), and leaves it decided too. `--all-checks` keeps every
+  is checked before the run as a reference is (D-0290), and leaves it decided too; so do a handle wrapped in
+  an `Option`, a reference `call(…)?` gives, and a slice lent whole to a thread (D-0291), which lets the
+  self-hosted compiler and the showcase `parallel_chunks` be decided. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.
