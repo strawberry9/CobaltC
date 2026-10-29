@@ -489,7 +489,46 @@ const HEAP_SHIFT: u32 = 55;
 // Under Kani (the harnesses at the end of this file) a handful: the places
 // are filled in a loop the model checker unrolls.
 const MAX_HEAPS: usize = if cfg!(kani) { 8 } else { 256 };
-const GEN_MASK: u32 = 0x007f_ffff;
+// D-0292 (phase 3): two of the generation's bits name a token's kind.
+// Bit 53 (`LIGHT`) marks a light token: `LIGHT | ROOT | obj` is an owner's
+// own binding with no root path (its validity is the object's current
+// root), `LIGHT | obj` a light reference into `obj` (step 3). The object
+// part is the `objs` id with its heap bits, so `heap_of` works unchanged,
+// and no arena ever resolves a light token (`HeapArena::get`).
+const GEN_MASK: u32 = 0x001f_ffff;
+const LIGHT: u64 = 1 << 53;
+const ROOT: u64 = 1 << 54;
+const TOK_FLAGS: u64 = LIGHT | ROOT;
+
+// D-0292: `COBALTC_RECORD=full` makes every root a recorded path, as before
+// phase 3: the oracle the differential gate compares light tokens with.
+static RECORD_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// D-0292: `COBALTC_RECORD=check`: light tokens as usual, and the program
+// aborted where a light reference reaches an entry of a recording frame
+// (a reference `cobc` should have recorded on arrival) or a place the
+// runtime cannot reconstruct: the runtime form of "a hole in the lowering".
+static RECORD_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// D-0292: `COBALTC_RT_STATS` counters of the phase-3 runtime: roots handed
+// out light and recorded, paths minted (holders and borrows), checks that
+// met a marked owner (step 3), projections reconstructed from an address
+// (step 3), owners found from a token-0 reference (step 3).
+static PH3_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static N_ROOT_LIGHT: AtomicU64 = AtomicU64::new(0);
+static N_ROOT_REC: AtomicU64 = AtomicU64::new(0);
+static N_PATHS: AtomicU64 = AtomicU64::new(0);
+static N_SLOW: AtomicU64 = AtomicU64::new(0);
+static N_PROJ_ADDR: AtomicU64 = AtomicU64::new(0);
+static N_TOK0_OWNER: AtomicU64 = AtomicU64::new(0);
+static N_LIGHT: AtomicU64 = AtomicU64::new(0);
+static N_HOLDERS: AtomicU64 = AtomicU64::new(0);
+static N_ARRIVALS: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn ph3_count(c: &AtomicU64) {
+    if PH3_ON.load(Ordering::Relaxed) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 struct Arena<T> {
     slots: Vec<(u32, Option<T>)>,
@@ -701,7 +740,9 @@ impl<T> HeapArena<T> {
     #[inline]
     fn get(&self, k: &u64) -> Option<&T> {
         // No id (0) names no entry, in no heap: nothing to lock or touch.
-        if *k == 0 {
+        // Nor does a light token (D-0292): it names an object, never a path,
+        // and the object by its own id.
+        if *k == 0 || *k & LIGHT != 0 {
             return None;
         }
         debug_assert!(holds_heap(Self::heap_of(*k)), "cbrt: heap {} used without its lock", Self::heap_of(*k));
@@ -710,7 +751,7 @@ impl<T> HeapArena<T> {
     #[inline]
     fn get_mut(&mut self, k: &u64) -> Option<&mut T> {
         // No id (0) names no entry, in no heap: nothing to lock or touch.
-        if *k == 0 {
+        if *k == 0 || *k & LIGHT != 0 {
             return None;
         }
         debug_assert!(holds_heap(Self::heap_of(*k)), "cbrt: heap {} used without its lock", Self::heap_of(*k));
@@ -723,7 +764,7 @@ impl<T> HeapArena<T> {
     #[inline]
     fn remove(&mut self, k: &u64) -> Option<T> {
         // No id (0) names no entry, in no heap: nothing to lock or touch.
-        if *k == 0 {
+        if *k == 0 || *k & LIGHT != 0 {
             return None;
         }
         debug_assert!(holds_heap(Self::heap_of(*k)), "cbrt: heap {} used without its lock", Self::heap_of(*k));
@@ -1681,6 +1722,10 @@ struct TState {
     // Each frame's owning construct's location (`cb_frame_push_at`), and
     // the one whose frame is ending now, for a destruction fault.
     frame_locs: Vec<(u32, u32)>,
+    // D-0292: per frame, whether the references formed in it are recorded
+    // (a function the static pass left work in, `cb_frame_push_rec`) or
+    // light (`cb_frame_push_fn`); a block's frame is its function's.
+    rec: Vec<bool>,
     dloc: (u32, u32),
     // A Box teardown loop is running (`box_drop`), and the referent a Box
     // in tail position left to it: (its root, its object, its cells).
@@ -2057,7 +2102,7 @@ thread_local! {
 
 // Until the first spawn only the main thread exists, so its state and
 // its runtime-call depth are plain statics and no thread-local is read.
-static mut MAIN_TS: TState = TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() };
+static mut MAIN_TS: TState = TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), rec: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() };
 // How many destructor callbacks the main thread is inside: the only way
 // a spawn (the switch to locking) can happen while an outer runtime
 // call is still active, one entry per level (`go_multi`).
@@ -3242,6 +3287,10 @@ impl Rt {
 
 #[no_mangle]
 pub unsafe extern "C" fn cb_init(files: *const *const c_char, nfiles: usize, types: *const CbType, ntypes: usize, ids: *const u32) {
+    let record = std::env::var_os("COBALTC_RECORD");
+    RECORD_FULL.store(record.as_deref().map_or(false, |v| v == "full"), Ordering::Relaxed);
+    RECORD_CHECK.store(record.as_deref().map_or(false, |v| v == "check"), Ordering::Relaxed);
+    PH3_ON.store(std::env::var_os("COBALTC_RT_STATS").is_some(), Ordering::Relaxed);
     netio::set_cancel_probe(cancel_probe);
     netio::wake_init();
     sched_init();
@@ -3548,6 +3597,7 @@ fn contained_fault(id: std::borrow::Cow<'_, str>, file: u32, line: u32, me: u64)
     t.pend.clear();
     t.inflight.clear();
     t.frame_locs.clear();
+    t.rec.clear();
     let fid = {
         let mut b = book();
         b.failures.push(Failure { raw: id.into_owned(), file, line, text });
@@ -3662,7 +3712,7 @@ pub unsafe extern "C" fn cb_lib_enter(init: unsafe extern "C" fn()) {
         set_heap(rt(), h);
         h
     };
-    let own = Box::into_raw(Box::new(TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() }));
+    let own = Box::into_raw(Box::new(TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), rec: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() }));
     TSP.with(|c| c.set(own));
     set_at(NOLOC, 0);
     set_stack_floor();
@@ -3749,6 +3799,7 @@ fn lib_contained_fault(id: &str, file: u32, line: u32, me: u64, jb: usize) -> ! 
     t.pend.clear();
     t.inflight.clear();
     t.frame_locs.clear();
+    t.rec.clear();
     t.cunwind = false;
     LIB_FAULT.with(|f| *f.borrow_mut() = Some(diagnostics::for_stderr(&text)));
     LIB_JMP.with(|c| c.set(0));
@@ -3781,6 +3832,18 @@ pub extern "C" fn cb_terminate_ok(status: u8) -> ! {
         let paths = r.paths.values().count();
         eprintln!("cbrt: live at exit: {} objects, {} paths", objects, paths);
         eprintln!("cbrt: entries while threads ran: {} local, {} exclusive; {} objects migrated", N_LOCAL.load(Ordering::Relaxed), N_EXCL.load(Ordering::Relaxed), N_MIGRATED.load(Ordering::Relaxed));
+        eprintln!(
+            "cbrt: roots: {} light, {} recorded; light references: {}; paths minted: {} ({} holders at stores, {} recorded on arrival); marked-owner checks: {}; projections from addresses: {}; owners from token 0: {}",
+            N_ROOT_LIGHT.load(Ordering::Relaxed),
+            N_ROOT_REC.load(Ordering::Relaxed),
+            N_LIGHT.load(Ordering::Relaxed),
+            N_PATHS.load(Ordering::Relaxed),
+            N_HOLDERS.load(Ordering::Relaxed),
+            N_ARRIVALS.load(Ordering::Relaxed),
+            N_SLOW.load(Ordering::Relaxed),
+            N_PROJ_ADDR.load(Ordering::Relaxed),
+            N_TOK0_OWNER.load(Ordering::Relaxed)
+        );
     }
     std::process::exit(status as i32);
 }
@@ -4510,12 +4573,60 @@ pub unsafe extern "C" fn cb_parse_bool(p: *const u8, n: u64, out: *mut u8) -> i6
 
 #[no_mangle]
 pub extern "C" fn cb_frame_push() {
+    // A block's frame: it records what its function's does (D-0292).
+    let rec = ts_raw().rec.last().copied().unwrap_or(false);
+    frame_push_with(rec);
+}
+
+// D-0292: a function's frame. `cb_frame_push_rec`: the static pass left a
+// conflict of this body to the run (`Items::tracking_needed`, a point
+// check), so every reference it forms is recorded, and every reference
+// that arrives in it is recorded (`cb_rec_ref`). `cb_frame_push_fn`: a
+// decided body, whose references are light.
+#[no_mangle]
+pub extern "C" fn cb_frame_push_fn() {
+    frame_push_with(false);
+}
+
+#[no_mangle]
+pub extern "C" fn cb_frame_push_rec() {
+    frame_push_with(true);
+}
+
+fn frame_push_with(rec: bool) {
     // D-0202: this thread's own stack and its heap's pool: no lock.
     let _h = own_heap();
     let r = rt();
     let v = take_vec(&mut r.pool);
-    ts().stack.push(Entry::Frame(v));
-    ts().frame_locs.push((NOLOC, 0));
+    let t = ts();
+    t.stack.push(Entry::Frame(v));
+    t.frame_locs.push((NOLOC, 0));
+    t.rec.push(rec);
+}
+
+// D-0292: whether the running frame records every reference it forms
+// (`COBALTC_RECORD=full`: every frame does, as before phase 3).
+#[inline(always)]
+fn frame_rec() -> bool {
+    RECORD_FULL.load(Ordering::Relaxed) || ts_raw().rec.last().copied().unwrap_or(false)
+}
+
+// A light reference into an object (`LIGHT | obj`): no record of its own.
+#[inline(always)]
+fn light_ref(tok: u64) -> bool {
+    tok & LIGHT != 0 && tok & ROOT == 0
+}
+
+// `COBALTC_RECORD=check`: a light reference where a recorded one was due.
+#[cold]
+#[inline(never)]
+fn check_light(what: &str, tok: u64, file: u32, line: u32) {
+    if RECORD_CHECK.load(Ordering::Relaxed) {
+        let r = rt_ro();
+        let at = r.files.get(file as usize).map(|f| format!("{}:{}", f, line)).unwrap_or_else(|| format!("?:{}", line));
+        eprintln!("cbrt check: a light reference ({:#x}) reached {} in a recording frame at {}", tok, what, at);
+        std::process::abort();
+    }
 }
 
 #[no_mangle]
@@ -4532,6 +4643,7 @@ pub extern "C" fn cb_frame_pop() {
     if matches!(ts().stack.last(), Some(Entry::Frame(v)) if v.is_empty()) {
         let _h = own_heap();
         ts().frame_locs.pop();
+        ts().rec.pop();
         if let Some(Entry::Frame(v)) = ts().stack.pop() {
             give_vec(&mut rt().pool, v);
         }
@@ -4539,6 +4651,7 @@ pub extern "C" fn cb_frame_pop() {
     }
     let _e = enter_frame_end();
     let loc = ts().frame_locs.pop().unwrap_or((NOLOC, 0));
+    ts().rec.pop();
     match ts().stack.pop() {
         Some(Entry::Frame(owned)) => {
             let saved = std::mem::replace(&mut ts().dloc, loc);
@@ -4557,8 +4670,9 @@ pub extern "C" fn cb_frame_pop() {
 // holder (`drop_occ`).
 #[no_mangle]
 pub extern "C" fn cb_frame_hold(tok: u64) {
-    // No path (a pathless reference, CHG-0237): nothing to hold.
-    if tok == 0 {
+    // No path (a pathless reference, CHG-0237; a light token, D-0292):
+    // nothing to hold.
+    if tok == 0 || tok & LIGHT != 0 {
         return;
     }
     // D-0204: the path's record and this thread's own frame: local (a
@@ -4579,9 +4693,9 @@ pub extern "C" fn cb_frame_hold(tok: u64) {
 
 #[no_mangle]
 pub extern "C" fn cb_frame_unhold(tok: u64) {
-    // No path (a pathless reference; a static's or a constant's, D-0258):
-    // nothing was held.
-    if tok == 0 {
+    // No path (a pathless reference; a static's or a constant's, D-0258; a
+    // light token, D-0292): nothing was held.
+    if tok == 0 || tok & LIGHT != 0 {
         return;
     }
     let _e = enter_planned(|p, r| p.drop_occ(r, tok));
@@ -4728,6 +4842,7 @@ fn retire_token(r: &mut Rt, t: u64) {
             if let Some(o) = r.objs.get(&p.of) {
                 let unobserved = match o.root {
                     None => o.toks.is_empty(),
+                    Some(root) if root & LIGHT != 0 => o.toks.is_empty(),
                     Some(root) => rest == Some(root),
                 };
                 if o.ephemeral && unobserved {
@@ -4914,6 +5029,7 @@ fn mint_locked(r: &mut Rt, of: u64, proj: Vec<Proj>, exclusive: bool, is_root: b
 // that leaves for the caller at once (`cb_elem_borrow`) is not stamped:
 // `cb_recv_ref` stamps it into the caller's scope.
 fn mint_in(r: &mut Rt, of: u64, proj: Vec<Proj>, exclusive: bool, is_root: bool, ancestors: Vec<u64>, lock_of: Option<Vec<Proj>>, stamp: bool) -> u64 {
+    ph3_count(if is_root { &N_ROOT_REC } else { &N_PATHS });
     // D-0202: a path lives in its object's heap.
     let tok = r.paths.reserve_in(HeapArena::<Obj>::heap_of(of));
     r.paths.insert(tok, PathRec { of, proj, exclusive, valid: true, is_root, ancestors, occ: 0, scope: None, lock_of, thread: AtomicU64::new(me()) });
@@ -4933,6 +5049,18 @@ fn mint_in(r: &mut Rt, of: u64, proj: Vec<Proj>, exclusive: bool, is_root: bool,
     tok
 }
 
+// D-0292: an object's root token: light (`LIGHT | ROOT | obj`, no path
+// record; valid while it is the object's `root`) unless `COBALTC_RECORD=full`
+// asks for the recorded root path of before phase 3.
+fn make_root(r: &mut Rt, obj: u64) -> u64 {
+    if RECORD_FULL.load(Ordering::Relaxed) {
+        return mint(r, obj, Vec::new(), true, true, Vec::new());
+    }
+    debug_assert!(obj & TOK_FLAGS == 0, "cbrt: an object id reaches the token flag bits");
+    ph3_count(&N_ROOT_LIGHT);
+    obj | LIGHT | ROOT
+}
+
 #[no_mangle]
 pub extern "C" fn cb_bind(obj: u64) -> u64 {
     // D-0202: the object's records and its root path (in its heap), and
@@ -4944,7 +5072,7 @@ pub extern "C" fn cb_bind(obj: u64) -> u64 {
     if let Entry::Frame(v) = &mut ts().stack[frame] {
         v.push(obj);
     }
-    let tok = mint(r, obj, Vec::new(), true, true, Vec::new());
+    let tok = make_root(r, obj);
     let o = r.objs.get_mut(&obj).unwrap();
     o.frame = Some(frame);
     o.tid = me();
@@ -4973,18 +5101,23 @@ pub extern "C" fn cb_rebind(root: u64, addr: *mut u8, ty: u32, frame: u64, _file
     // it is the same); only a new object's binding enters exclusively.
     // (An X25519 ladder rebinds in its inner loop: every TLS handshake
     // stopped every other thread thousands of times.)
+    // D-0292: a light root is the object's current root (`view`), which a
+    // later binding of the same object (moved into a callee's parameter,
+    // another local, a thread's block) hands out again with the same bits:
+    // the binding still owns its object only while the object is at the
+    // binding's own address.
     if multi() {
         let _h = enter_on(heap_of(root));
         let r = rt();
-        if let Some(p) = r.paths.get(&root) {
-            if p.valid && holds_heap(heap_of(p.of)) && r.objs.get(&p.of).map_or(false, |o| o.alive) {
+        if let Some(v) = view(r, root) {
+            if holds_heap(heap_of(v.of)) && r.objs.get(&v.of).map_or(false, |o| o.alive && (v.rec.is_some() || o.addr == addr as usize)) {
                 return root;
             }
         }
     }
     let _e = enter();
     let r = rt();
-    let live = r.paths.get(&root).map_or(false, |p| p.valid && r.objs.get(&p.of).map_or(false, |o| o.alive));
+    let live = view(r, root).map_or(false, |v| r.objs.get(&v.of).map_or(false, |o| o.alive && (v.rec.is_some() || o.addr == addr as usize)));
     if live {
         return root;
     }
@@ -4995,7 +5128,7 @@ pub extern "C" fn cb_rebind(root: u64, addr: *mut u8, ty: u32, frame: u64, _file
     if let Entry::Frame(v) = &mut ts().stack[frame] {
         v.push(obj);
     }
-    let tok = mint(r, obj, Vec::new(), true, true, Vec::new());
+    let tok = make_root(r, obj);
     let o = r.objs.get_mut(&obj).unwrap();
     o.frame = Some(frame);
     o.tid = me();
@@ -5063,9 +5196,9 @@ fn path_target(r: &Rt, tok: u64, file: u32, line: u32) -> (u64, Vec<Proj>, Vec<u
 }
 
 fn path_target_locked(r: &Rt, tok: u64, file: u32, line: u32) -> (u64, Vec<Proj>, Vec<u64>, Option<Vec<Proj>>) {
-    let rec = match r.paths.get(&tok) {
-        Some(p) if p.valid => p,
-        _ => fault("diag.stale-binding", file, line),
+    let rec = match view(r, tok) {
+        Some(v) => v,
+        None => fault("diag.stale-binding", file, line),
     };
     if !r.objs.get(&rec.of).map_or(false, |o| o.alive) {
         fault("diag.stale-binding", file, line);
@@ -5077,7 +5210,58 @@ fn path_target_locked(r: &Rt, tok: u64, file: u32, line: u32) -> (u64, Vec<Proj>
         v.extend(rec.ancestors.iter().cloned());
         v
     };
-    (rec.of, rec.proj.clone(), excludes, rec.lock_of.clone())
+    (rec.of, rec.proj.to_vec(), excludes, rec.lock_of.map(|l| l.to_vec()))
+}
+
+// D-0292: what a token names, read the same way whatever its kind: a
+// light root (`LIGHT | ROOT | obj`) is the object's own path with no
+// projection, exclusive, with no ancestors and no lock origin, valid while
+// it is the object's current root; a path id is its valid record. `None`:
+// stale. `rec` is the record when there is one (`affine` needs its thread).
+struct PathView<'a> {
+    of: u64,
+    proj: &'a [Proj],
+    exclusive: bool,
+    is_root: bool,
+    ancestors: &'a [u64],
+    lock_of: Option<&'a [Proj]>,
+    rec: Option<&'a PathRec>,
+}
+
+#[inline]
+fn view(r: &Rt, tok: u64) -> Option<PathView<'_>> {
+    if tok & LIGHT != 0 {
+        let obj = tok & !TOK_FLAGS;
+        let o = r.objs.get(&obj)?;
+        if tok & ROOT != 0 {
+            if o.root != Some(tok) {
+                return None;
+            }
+            return Some(PathView { of: obj, proj: &[], exclusive: true, is_root: true, ancestors: &[], lock_of: None, rec: None });
+        }
+        // A light reference (D-0292): its place is not recorded. Where a
+        // check needs one all the same (a recording frame it reached
+        // unrecorded), the whole object stands for it: more clashes than
+        // the place has, never fewer.
+        if !o.alive {
+            return None;
+        }
+        return Some(PathView { of: obj, proj: &[], exclusive: true, is_root: false, ancestors: &[], lock_of: None, rec: None });
+    }
+    let p = r.paths.get(&tok)?;
+    if !p.valid {
+        return None;
+    }
+    Some(PathView { of: p.of, proj: &p.proj, exclusive: p.exclusive, is_root: p.is_root, ancestors: &p.ancestors, lock_of: p.lock_of.as_deref(), rec: Some(p) })
+}
+
+// The object a token names, valid or not (`None`: no record at all).
+fn tok_obj(r: &Rt, tok: u64) -> Option<u64> {
+    if tok & LIGHT != 0 {
+        let obj = tok & !TOK_FLAGS;
+        return r.objs.get(&obj).map(|_| obj);
+    }
+    r.paths.get(&tok).map(|p| p.of)
 }
 
 // A path to a temporary for an access that needs one (calling a closure
@@ -5167,9 +5351,30 @@ pub extern "C" fn cb_destroy(root: u64, file: u32, line: u32) {
 // own root is another valid path on the object, so it is never
 // solitary while owned; an unowned temporary is destroyed.
 #[no_mangle]
-pub extern "C" fn cb_destroy_via(tok: u64, file: u32, line: u32) {
+pub extern "C" fn cb_destroy_via(tok: u64, addr: *const u8, ty: u32, file: u32, line: u32) {
     let _e = enter();
     let r = rt();
+    // D-0292: through a light reference: the referent's place, from its
+    // address and type.
+    if light_ref(tok) {
+        let obj = tok & !TOK_FLAGS;
+        if !r.objs.get(&obj).map_or(false, |o| o.alive) {
+            fault("diag.stale-binding", file, line);
+        }
+        let proj = proj_of_addr(obj, addr as usize, ty);
+        let whole = proj.is_empty();
+        give_proj(&mut rt().proj_pool, proj);
+        if !whole {
+            fault("diag.move-out-of-field", file, line);
+        }
+        let r = rt();
+        if r.objs[&obj].root.is_some() || !solitary(r, obj, &[]) {
+            fault("diag.destroy-while-aliased", file, line);
+        }
+        set_at(file, line);
+        destroy_obj(obj, Some(tok));
+        return;
+    }
     let (obj, proj, mut excludes) = path_target(r, tok, file, line);
     if !proj.is_empty() {
         fault("diag.move-out-of-field", file, line);
@@ -5188,7 +5393,7 @@ pub extern "C" fn cb_destroy_via(tok: u64, file: u32, line: u32) {
 pub extern "C" fn cb_end_binding(root: u64) {
     let _e = enter();
     let r = rt();
-    let Some(obj) = r.paths.get(&root).map(|p| p.of) else { return };
+    let Some(obj) = tok_obj(r, root) else { return };
     destroy_obj(obj, Some(root));
 }
 
@@ -5513,7 +5718,7 @@ pub extern "C" fn cb_reclaim(addr: *mut u8, ty: u32) -> u64 {
         let root = match r.objs[&obj].root {
             Some(root) => root,
             None => {
-                let root = mint(r, obj, Vec::new(), true, true, Vec::new());
+                let root = make_root(r, obj);
                 r.objs.get_mut(&obj).unwrap().root = Some(root);
                 root
             }
@@ -5536,7 +5741,7 @@ fn establish_reclaimed(r: &mut Rt, a: usize, ty: u32, ephemeral: bool) -> (u64, 
         return (0, id);
     }
     r.reclaimed.insert(a, id, r.typ(ty).size);
-    let tok = mint(r, id, Vec::new(), true, true, Vec::new());
+    let tok = make_root(r, id);
     r.objs.get_mut(&id).unwrap().root = Some(tok);
     (tok, id)
 }
@@ -5566,7 +5771,8 @@ fn establish_reclaimed(r: &mut Rt, a: usize, ty: u32, ephemeral: bool) -> (u64, 
 // reference (`cb_borrow` gives 0).
 #[no_mangle]
 pub unsafe extern "C" fn cb_borrow_unminted(base: u64, p: *const CbProj, n: usize, mode: u32, file: u32, line: u32) {
-    if base == 0 {
+    // D-0292: through a light reference nothing is checked (`light_borrow`).
+    if base == 0 || (light_ref(base) && !frame_rec()) {
         return;
     }
     let _e = enter_on(heap_of(base));
@@ -5576,7 +5782,7 @@ pub unsafe extern "C" fn cb_borrow_unminted(base: u64, p: *const CbProj, n: usiz
 
 #[no_mangle]
 pub unsafe extern "C" fn cb_borrow_check(base: u64, p: *const CbProj, n: usize, mode: u32, file: u32, line: u32) {
-    if base == 0 {
+    if base == 0 || (light_ref(base) && !frame_rec()) {
         return;
     }
     let _e = enter_on(heap_of(base));
@@ -6193,7 +6399,7 @@ pub unsafe extern "C" fn cb_fn_box(obj: u64, code: *mut u8, ty: u32) -> *mut u8 
     let root = match r.objs[&obj].root {
         Some(t) => t,
         None => {
-            let t = mint(r, obj, Vec::new(), true, true, Vec::new());
+            let t = make_root(r, obj);
             r.objs.get_mut(&obj).unwrap().root = Some(t);
             t
         }
@@ -6225,7 +6431,7 @@ pub unsafe extern "C" fn cb_fn_copy(handle: *mut u8, file: u32, line: u32) -> *m
     let _ = obj;
     let id = r.objs.reserve();
     r.objs.insert(id, Obj { addr: data as usize, ty, alive: true, init: true, is_resource: false, reclaimed: false, root: None, frame: None, scope: None, tid: 0, ephemeral: false, toks: TokList::default(), xtoks: TokList::default() });
-    let root = mint(r, id, Vec::new(), true, true, Vec::new());
+    let root = make_root(r, id);
     r.objs.get_mut(&id).unwrap().root = Some(root);
     cb_copy_datum(data, b.data, ty);
     // The `fn` values among the captures are copied in turn: each copy owns
@@ -6269,6 +6475,14 @@ pub unsafe extern "C" fn cb_borrow(base: u64, p: *const CbProj, n: usize, mode: 
     if base == 0 {
         return 0;
     }
+    // D-0292: in a decided function's frame a borrow from the owner's own
+    // binding, or from a light reference, is light.
+    if base & LIGHT != 0 && !frame_rec() {
+        return light_borrow(base, p, n, mode, file, line);
+    }
+    if light_ref(base) {
+        check_light("cb_borrow", base, file, line);
+    }
     // D-0202: local when the base's object, and every path it was formed
     // through (whose ancestors the new path's list closes over), are in
     // this thread's heap.
@@ -6288,18 +6502,21 @@ pub unsafe extern "C" fn cb_borrow(base: u64, p: *const CbProj, n: usize, mode: 
 // its elements `lo .. hi` (the range made absolute). Checked as an access
 // to that range.
 #[no_mangle]
-pub unsafe extern "C" fn cb_borrow_range(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32) -> u64 {
-    borrow_range_in(base, p, n, lo, hi, mode, file, line, true)
+// D-0292: `cont`/`cty`, the place and type of the container `base ++ p`
+// reaches: a light base carries no projection, and the slice's path (a
+// holder: slices live in data) is reconstructed from them (`proj_of_addr`).
+pub unsafe extern "C" fn cb_borrow_range(base: u64, cont: *const u8, cty: u32, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32) -> u64 {
+    borrow_range_in(base, cont, cty, p, n, lo, hi, mode, file, line, true)
 }
 
 // `cb_borrow_range`'s checks with no path minted: a slice formed for a
 // parameter that never reads its path (`cobc`'s pure direct slices).
 #[no_mangle]
-pub unsafe extern "C" fn cb_borrow_range_unminted(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32) {
-    borrow_range_in(base, p, n, lo, hi, mode, file, line, false);
+pub unsafe extern "C" fn cb_borrow_range_unminted(base: u64, cont: *const u8, cty: u32, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32) {
+    borrow_range_in(base, cont, cty, p, n, lo, hi, mode, file, line, false);
 }
 
-unsafe fn borrow_range_in(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32, minted: bool) -> u64 {
+unsafe fn borrow_range_in(base: u64, cont: *const u8, cty: u32, p: *const CbProj, n: usize, lo: u64, hi: u64, mode: u32, file: u32, line: u32, minted: bool) -> u64 {
     // No path (0): a range of a reference whose checks were proved (an
     // objectless `String` lent to a `std` builder, D-0196) has none either.
     if base == 0 {
@@ -6316,17 +6533,31 @@ unsafe fn borrow_range_in(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u6
     };
     let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
     let r = rt();
-    let rec = match r.paths.get(&base) {
-        Some(p) if p.valid => p,
-        _ => fault("diag.stale-binding", file, line),
+    let rec = match view(r, base) {
+        Some(v) => v,
+        None => fault("diag.stale-binding", file, line),
     };
     // The new path's projection and ancestors come from the runtime's
     // pools, and the check compares through a stack buffer (`Norm`,
     // `ranged_overlap_with`), as `borrow_in`'s do: every slice and view a
     // program forms passes through here.
-    let mut path = r.proj_pool.pop().unwrap_or_default();
-    path.extend_from_slice(&rec.proj);
-    path.extend(extra.iter().map(|q| conv(*q)));
+    // D-0292: through a light reference the container's projection is read
+    // from its place; a light root's is the explicit one.
+    let light = light_ref(base);
+    let mut path = if light {
+        let of = rec.of;
+        if cont.is_null() {
+            check_light("cb_borrow_range", base, file, line);
+            rt().proj_pool.pop().unwrap_or_default()
+        } else {
+            proj_of_addr(of, cont as usize, cty)
+        }
+    } else {
+        let mut path = rt().proj_pool.pop().unwrap_or_default();
+        path.extend_from_slice(rec.proj);
+        path.extend(extra.iter().map(|q| conv(*q)));
+        path
+    };
     let range = match path.last().copied() {
         Some(Proj::Range(pl, _)) => {
             path.pop();
@@ -6338,7 +6569,7 @@ unsafe fn borrow_range_in(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u6
     // The access check over the range: `base` itself (and its ancestors)
     // excluded, as for any borrow through it.
     let r = rt();
-    let brec = &r.paths[&base];
+    let brec = view(r, base).unwrap();
     let rec_of = brec.of;
     let rec_root = brec.is_root;
     let exclusive = mode == 1;
@@ -6371,12 +6602,13 @@ unsafe fn borrow_range_in(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u6
         }
     }
     if !minted {
-        give_proj(&mut r.proj_pool, path);
+        give_proj(&mut rt().proj_pool, path);
         return 0;
     }
-    let mut anc2 = if rec_root { Vec::new() } else { take_vec(&mut r.pool) };
-    let brec = &r.paths[&base];
-    if !rec_root {
+    let mut anc2 = if rec_root || light { Vec::new() } else { take_vec(&mut rt().pool) };
+    let r = rt();
+    let brec = view(r, base).unwrap();
+    if !rec_root && !light {
         anc2.push(base);
         anc2.extend(brec.ancestors.iter().copied());
         for e in std::iter::once(&base).chain(brec.ancestors.iter()) {
@@ -6389,12 +6621,41 @@ unsafe fn borrow_range_in(base: u64, p: *const CbProj, n: usize, lo: u64, hi: u6
             }
         }
     }
-    let lock_of = brec.lock_of.clone();
-    mint_locked(r, rec_of, path, exclusive, false, anc2, lock_of)
+    let lock_of = brec.lock_of.map(|l| l.to_vec());
+    mint_locked(rt(), rec_of, path, exclusive, false, anc2, lock_of)
 }
 
 fn borrow(r: &mut Rt, base: u64, extra: &[CbProj], exclusive: bool, file: u32, line: u32) -> u64 {
     borrow_in(r, base, extra, exclusive, file, line, true)
+}
+
+// D-0292: `[Borrow]` in a frame that forms light references. From the
+// owner's own binding (a light root): valid, and, where holders exist on
+// the object, the new place (the explicit projection) checked against
+// them -- `rule.control.frame-references` decided it against every other
+// reference that has facts. From a light reference: its object alive, and
+// nothing else: a holder that overlapped this reference would have met it
+// at its own formation, or at this one's base's (DESIGN.md §2.1). The
+// result is `LIGHT | obj`: no record, no stamp, nothing to retire.
+unsafe fn light_borrow(base: u64, p: *const CbProj, n: usize, mode: u32, file: u32, line: u32) -> u64 {
+    let obj = base & !TOK_FLAGS;
+    let _e = enter_on(heap_of(base));
+    let r = rt_ro();
+    if base & ROOT != 0 {
+        let marked = match r.objs.get(&obj) {
+            Some(o) if o.root == Some(base) => !o.toks.is_empty(),
+            _ => fault("diag.stale-binding", file, line),
+        };
+        if marked {
+            ph3_count(&N_SLOW);
+            let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
+            check_access(r, base, extra, mode == 1, file, line);
+        }
+    } else if !r.objs.get(&obj).map_or(false, |o| o.alive) {
+        fault("diag.stale-binding", file, line);
+    }
+    ph3_count(&N_LIGHT);
+    obj | LIGHT
 }
 
 // `stamp` false: the path is recorded in no statement scope; its taker
@@ -6404,13 +6665,19 @@ fn borrow_in(r: &mut Rt, base: u64, extra: &[CbProj], exclusive: bool, file: u32
     let of = check_access(r, base, extra, exclusive, file, line);
     // The two lists from the runtime's pools (`give_proj`, `give_vec`).
     let mut proj = r.proj_pool.pop().unwrap_or_default();
-    let mut anc = if r.paths[&base].is_root { Vec::new() } else { take_vec(&mut r.pool) };
-    let rec = &r.paths[&base];
-    proj.extend_from_slice(&rec.proj);
-    proj.extend(extra.iter().map(|q| conv(*q)));
+    let is_root = view(r, base).map_or(true, |v| v.is_root);
+    let light = light_ref(base);
+    let mut anc = if is_root || light { Vec::new() } else { take_vec(&mut r.pool) };
+    let rec = view(r, base).unwrap();
+    // D-0292: a light base reached a recording frame unrecorded: its place
+    // is unknown, so the new path is the whole object (never fewer clashes).
+    if !light {
+        proj.extend_from_slice(rec.proj);
+        proj.extend(extra.iter().map(|q| conv(*q)));
+    }
     // `ancestors`: the chain this borrow was formed through, closed
     // over those tokens' own ancestors (record_token_ancestors).
-    if !rec.is_root {
+    if !rec.is_root && !light {
         anc.push(base);
         anc.extend(rec.ancestors.iter().copied());
         for e in std::iter::once(&base).chain(rec.ancestors.iter()) {
@@ -6423,8 +6690,8 @@ fn borrow_in(r: &mut Rt, base: u64, extra: &[CbProj], exclusive: bool, file: u32
             }
         }
     }
-    let lock_of = rec.lock_of.clone();
-    mint_in(r, of, proj, exclusive, false, anc, lock_of, stamp)
+    let lock_of = rec.lock_of.map(|l| l.to_vec());
+    mint_in(rt(), of, proj, exclusive, false, anc, lock_of, stamp)
 }
 
 // A call through a closure's box (`cobc`'s `cb_call_…` thunks): the
@@ -6434,6 +6701,11 @@ fn borrow_in(r: &mut Rt, base: u64, extra: &[CbProj], exclusive: bool, file: u32
 // is unobservable, and the thunk records nothing in the caller's scopes.
 #[no_mangle]
 pub extern "C" fn cb_call_self(root: u64) -> u64 {
+    // D-0292: light in a decided function's frame (`cb_call_done` of a
+    // light token ends nothing).
+    if root & LIGHT != 0 && !frame_rec() {
+        return unsafe { light_borrow(root, std::ptr::null(), 0, 1, NOLOC, 0) };
+    }
     let _e = enter();
     borrow_in(rt(), root, &[], true, NOLOC, 0, false)
 }
@@ -6447,6 +6719,9 @@ pub unsafe extern "C" fn cb_borrow_unstamped(base: u64, p: *const CbProj, n: usi
     // objectless local lent to a `std` builder, D-0196) lends none on.
     if base == 0 {
         return 0;
+    }
+    if base & LIGHT != 0 && !frame_rec() {
+        return light_borrow(base, p, n, mode, file, line);
     }
     let _e = enter();
     let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
@@ -6518,6 +6793,11 @@ pub unsafe extern "C" fn cb_point_check(args: *const u64, nargs: usize, tok: u64
     if tok == 0 {
         return;
     }
+    // D-0292: a point check is made in a recording frame, whose references
+    // are all recorded; a light one here is a lowering hole (whole-object).
+    if light_ref(tok) {
+        check_light("cb_point_check", tok, file, line);
+    }
     let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
     let held = if nargs == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs) };
     let clash = {
@@ -6534,13 +6814,15 @@ pub unsafe extern "C" fn cb_point_check(args: *const u64, nargs: usize, tok: u64
 // faulted on.
 fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point: Option<&[u64]>, file: u32, line: u32) -> (u64, bool) {
     let held = point.unwrap_or(&[]);
-    let rec = match r.paths.get(&tok) {
-        Some(p) if p.valid => p,
-        _ => fault("diag.stale-binding", file, line),
+    let rec = match view(r, tok) {
+        Some(v) => v,
+        None => fault("diag.stale-binding", file, line),
     };
     // D-0213: an exclusive path is its own thread's.
     if rec.exclusive && !rec.is_root && cb_live_threads.load(Ordering::Relaxed) != 1 {
-        affine(rec, file, line);
+        if let Some(p) = rec.rec {
+            affine(p, file, line);
+        }
     }
     // A shared access can clash only with an exclusive path.
     let toks = match r.objs.get(&rec.of) {
@@ -6548,7 +6830,7 @@ fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point:
         _ => fault("diag.stale-binding", file, line),
     };
     let n = rec.proj.len() + extra.len();
-    let ranged = has_range(&rec.proj);
+    let ranged = has_range(rec.proj);
     // The accessing path normalized, once per access, when some path
     // involved has a range (`mine` is built on first need).
     let mut mine: Option<Norm> = None;
@@ -6557,7 +6839,7 @@ fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point:
         if !p.valid || p.is_root || (p.occ == 0 && !held.contains(&t)) {
             continue;
         }
-        if point.is_some() && (empty_range(&rec.proj) || empty_range(&p.proj)) {
+        if point.is_some() && (empty_range(rec.proj) || empty_range(&p.proj)) {
             continue;
         }
         // `excluded`: the accessing path itself and its ancestors (a
@@ -6570,13 +6852,13 @@ fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point:
             continue;
         }
         if ranged || has_range(&p.proj) {
-            let m = mine.get_or_insert_with(|| Norm::of((0..n).map(|i| proj_at(&rec.proj, extra, i))));
+            let m = mine.get_or_insert_with(|| Norm::of((0..n).map(|i| proj_at(rec.proj, extra, i))));
             if !ranged_overlap_with(m.get(), &p.proj) {
                 continue;
             }
         } else {
             let m = n.min(p.proj.len());
-            if (0..m).any(|i| proj_at(&rec.proj, extra, i) != p.proj[i]) {
+            if (0..m).any(|i| proj_at(rec.proj, extra, i) != p.proj[i]) {
                 continue;
             }
         }
@@ -6611,7 +6893,8 @@ fn check_access_with(r: &Rt, tok: u64, extra: &[CbProj], exclusive: bool, point:
 // (D-0209): such an object passes only while this thread is alone.
 #[no_mangle]
 pub unsafe extern "C" fn cb_frozen_ok(tok: u64, lo: *const u8, n: usize) -> u8 {
-    if tok == 0 {
+    // D-0292: a light reference is vouched for as token 0 is.
+    if tok == 0 || (light_ref(tok) && !frame_rec()) {
         return 1;
     }
     if n > 0 && cb_live_in(lo as *mut u8, n as u64) != 0 {
@@ -6619,8 +6902,8 @@ pub unsafe extern "C" fn cb_frozen_ok(tok: u64, lo: *const u8, n: usize) -> u8 {
     }
     let _e = enter_on(heap_of(tok));
     let r = rt_ro();
-    let rec = match r.paths.get(&tok) {
-        Some(p) if p.valid && p.lock_of.is_none() => p,
+    let rec = match view(r, tok) {
+        Some(v) if v.lock_of.is_none() => v,
         _ => return 0,
     };
     let o = match r.objs.get(&rec.of) {
@@ -6644,7 +6927,7 @@ pub unsafe extern "C" fn cb_frozen_ok(tok: u64, lo: *const u8, n: usize) -> u8 {
         if !q.valid || q.is_root {
             continue;
         }
-        let overlap = if has_range(&rec.proj) || has_range(&q.proj) {
+        let overlap = if has_range(rec.proj) || has_range(&q.proj) {
             let mine = mine.get_or_insert_with(|| Norm::of(rec.proj.iter().copied()));
             ranged_overlap_with(mine.get(), &q.proj)
         } else {
@@ -6663,13 +6946,21 @@ pub unsafe extern "C" fn cb_read(base: u64, p: *const CbProj, n: usize, file: u3
     if base == 0 {
         return;
     }
+    // D-0292: nothing through a light reference: its conflicts were decided
+    // at its formation (in a recording frame, the whole object stands in).
+    if light_ref(base) {
+        if !frame_rec() {
+            return;
+        }
+        check_light("cb_read", base, file, line);
+    }
     let _e = enter_on(heap_of(base));
     let r = rt_ro();
     let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
     // Staleness first, then initialization, then `clash` — the order
     // `path_target` and the checks after it always had.
-    let of = match r.paths.get(&base) {
-        Some(rec) if rec.valid && r.objs.get(&rec.of).map_or(false, |o| o.alive) => rec.of,
+    let of = match view(r, base) {
+        Some(rec) if r.objs.get(&rec.of).map_or(false, |o| o.alive) => rec.of,
         _ => fault("diag.stale-binding", file, line),
     };
     if !r.objs[&of].init {
@@ -6722,7 +7013,7 @@ pub unsafe extern "C" fn cb_owns(addr: *const u8, ty: u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn cb_write_quiet(base: u64, p: *const CbProj, n: usize, addr: *mut u8, ty: u32, file: u32, line: u32) {
     let _e = enter();
-    let init = if base == 0 {
+    let init = if base == 0 || (light_ref(base) && !frame_rec()) {
         true
     } else {
         let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
@@ -6745,6 +7036,17 @@ pub unsafe extern "C" fn cb_write(base: u64, p: *const CbProj, n: usize, target_
     if base == 0 {
         return;
     }
+    // D-0292: a light reference: the place holds its value, so a resource
+    // target that owns something is overwritten live (`cb_write_pathless`).
+    if light_ref(base) {
+        if !frame_rec() {
+            if target_resource != 0 {
+                fault("diag.overwrite-of-live-resource", file, line);
+            }
+            return;
+        }
+        check_light("cb_write", base, file, line);
+    }
     let extra = if n == 0 { &[][..] } else { std::slice::from_raw_parts(p, n) };
     // D-0192: the check, and the target already initialized (nearly every
     // write), change nothing: under the shared hold. Otherwise the whole
@@ -6763,8 +7065,147 @@ pub unsafe extern "C" fn cb_write(base: u64, p: *const CbProj, n: usize, target_
 
 // ---- reference data ----
 
+// D-0292: `[Write]` of a reference value whose place `cobc` knows: a
+// light reference stored into data becomes a holder -- a path on its
+// object with the projection of its place (`proj_of_addr`), held by the
+// slot alone (occurrence 1, no statement scope). A recorded reference is
+// stored as `cb_store_ref` stores it. `mode`: `CB_EXCLUSIVE` for an
+// exclusive reference.
+#[no_mangle]
+pub extern "C" fn cb_hold_ref(slot: *mut u8, tok: u64, addr: *const u8, ty: u32, mode: u32, file: u32, line: u32) {
+    if tok & LIGHT == 0 {
+        cb_store_ref(slot, tok);
+        return;
+    }
+    let obj = tok & !TOK_FLAGS;
+    let _e = enter_planned(|p, r| p.store(r, slot as usize, tok));
+    let r = rt();
+    if !r.objs.get(&obj).map_or(false, |o| o.alive) {
+        fault("diag.stale-binding", file, line);
+    }
+    let proj = proj_of_addr(obj, addr as usize, ty);
+    let holder = mint_in(rt(), obj, proj, mode & 1 == 1, false, Vec::new(), None, false);
+    ph3_count(&N_HOLDERS);
+    let r = rt();
+    r.paths.get_mut(&holder).unwrap().occ = 1;
+    if let Some(old) = r.slots.insert(slot as usize, holder) {
+        drop_occ(r, old);
+    }
+}
+
+// D-0292: a reference arriving in a recording frame (a parameter, a
+// call's result): recorded, so that the frame's checks see it. A light
+// reference gets a path with the projection of its place; `kind` 1 holds
+// it in the frame (a parameter, for the call), 0 stamps it into the
+// statement (a result, held by whatever binds it). A recorded reference,
+// or none, is returned as it is.
+#[no_mangle]
+pub extern "C" fn cb_rec_ref(tok: u64, addr: *const u8, ty: u32, mode: u32, kind: u32, file: u32, line: u32) -> u64 {
+    if tok & LIGHT == 0 {
+        return tok;
+    }
+    let obj = tok & !TOK_FLAGS;
+    let _e = enter_on(heap_of(tok));
+    let r = rt();
+    if !r.objs.get(&obj).map_or(false, |o| o.alive) {
+        fault("diag.stale-binding", file, line);
+    }
+    let proj = proj_of_addr(obj, addr as usize, ty);
+    let t = mint_in(rt(), obj, proj, mode & 1 == 1, false, Vec::new(), None, kind == 0);
+    ph3_count(&N_ARRIVALS);
+    if kind != 0 {
+        let r = rt();
+        r.paths.get_mut(&t).unwrap().occ += 1;
+        let ts = ts();
+        if let Some(Entry::Frame(owned)) = ts.stack.iter_mut().rev().find(|e| matches!(e, Entry::Frame(_))) {
+            owned.push(t | HOLD);
+        }
+    }
+    t
+}
+
+// D-0292: the projection of the place of type `ty` at `addr` inside the
+// object `obj`, read from the owner's type: fields by offset, elements by
+// size, an enum's payload by the tag in memory -- what `borrow_in` would
+// have recorded had the reference been formed through recorded paths. A
+// place the walk does not reach (the type never matches) gives the
+// deepest place found, which is at least as wide; under
+// `COBALTC_RECORD=check` it is reported.
+fn proj_of_addr(obj: u64, addr: usize, ty: u32) -> Vec<Proj> {
+    ph3_count(&N_PROJ_ADDR);
+    let mut proj = rt().proj_pool.pop().unwrap_or_default();
+    let r = rt_ro();
+    let (mut cur, mut cty) = match r.objs.get(&obj) {
+        Some(o) => (o.addr, o.ty),
+        None => return proj,
+    };
+    let want_zero = r.typ_opt(ty).map_or(false, |t| t.size == 0);
+    loop {
+        if cty == ty && cur == addr {
+            return proj;
+        }
+        let info = r.typ(cty);
+        let step = match info.kind {
+            K_STRUCT => info
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, &(off, fty))| {
+                    let size = r.typ(fty).size as usize;
+                    let lo = cur + off as usize;
+                    if want_zero {
+                        size == 0 && addr == lo
+                    } else {
+                        size > 0 && addr >= lo && addr < lo + size
+                    }
+                })
+                .map(|(i, &(off, fty))| (Proj::Field(i as u64), cur + off as usize, fty)),
+            K_ARRAY => {
+                let es = r.typ(info.elem).size as usize;
+                if es == 0 || addr < cur {
+                    None
+                } else {
+                    let i = (addr - cur) / es;
+                    if (i as u64) < info.count {
+                        Some((Proj::Index(i as u64), cur + i * es, info.elem))
+                    } else {
+                        None
+                    }
+                }
+            }
+            K_ENUM => {
+                let tag = unsafe { *(cur as *const u32) } as usize;
+                match info.variants.get(tag) {
+                    Some(&pty) if pty != NOTYPE && addr >= cur + info.payload_off as usize => Some((Proj::Payload, cur + info.payload_off as usize, pty)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match step {
+            Some((p, a, t)) => {
+                proj.push(p);
+                cur = a;
+                cty = t;
+            }
+            None => break,
+        }
+    }
+    if RECORD_CHECK.load(Ordering::Relaxed) && !(cur == addr && cty == ty) {
+        eprintln!("cbrt check: no place of type {} at {:#x} in object {} ({} at {:#x}): the deepest place found is used", r.typ_opt(ty).map(|t| t.name.as_str()).unwrap_or("?"), addr, obj, r.typ(r.objs[&obj].ty).name, r.objs[&obj].addr);
+        std::process::abort();
+    }
+    proj
+}
+
 #[no_mangle]
 pub extern "C" fn cb_store_ref(slot: *mut u8, tok: u64) {
+    // D-0292: a light reference is stored with its place (`cb_hold_ref`);
+    // one that reaches here has lost it, and would hold nothing.
+    if tok & LIGHT != 0 {
+        eprintln!("cbrt: internal: a light reference ({:#x}) stored without its place", tok);
+        std::process::abort();
+    }
     let _e = enter_planned(|p, r| p.store(r, slot as usize, tok));
     let r = rt();
     // Token 0 (a proven reference, `cb_read`'s note): the slot stays empty,
@@ -6796,6 +7237,13 @@ pub extern "C" fn cb_valid(tok: u64, file: u32, line: u32) {
         return;
     }
     let _e = enter();
+    // D-0292: a light reference: its object is still there.
+    if light_ref(tok) {
+        if !rt_ro().objs.get(&(tok & !TOK_FLAGS)).map_or(false, |o| o.alive) {
+            fault("diag.stale-binding", file, line);
+        }
+        return;
+    }
     path_target(rt(), tok, file, line);
 }
 
@@ -7282,6 +7730,9 @@ pub extern "C" fn cb_send_ref(tok: u64) {
         // The flight holds it until `cb_recv_ref` (`cb_send_datum`'s rule).
         r.paths.get_mut(&tok).unwrap().occ += 1;
         ts().inflight.push_back(Inflight::Ref(tok));
+    } else if tok & LIGHT != 0 {
+        // D-0292: a light token travels as it is; nothing holds it.
+        ts().inflight.push_back(Inflight::Ref(tok));
     } else {
         ts().inflight.push_back(Inflight::Ref(0));
     }
@@ -7482,8 +7933,15 @@ pub unsafe extern "C" fn cb_paths_disjoint(n: usize, toks: *const u64, excl: *co
     let r = rt_ro();
     let excl = std::slice::from_raw_parts(excl, n);
     let mut recs = Vec::with_capacity(n);
+    // D-0292: a light reference is vouched for (as token 0 would be): it
+    // takes part in no pair.
+    let vouched = |t: u64| light_ref(t) && !frame_rec();
     for &t in toks {
-        let rec = match r.paths.get(&t) {
+        if vouched(t) {
+            recs.push(None);
+            continue;
+        }
+        let rec = match view(r, t) {
             // Not over a reclaimed object (an element, a box's cells) when
             // there are pairs to compare: a clash between it and a range of
             // its container is found by other means than the two paths'
@@ -7494,17 +7952,18 @@ pub unsafe extern "C" fn cb_paths_disjoint(n: usize, toks: *const u64, excl: *co
             // A single reclaimed path only while this thread is alone
             // (D-0209, `spec/08` §4 H5): another thread's `grow` could
             // release the object without clashing with it.
-            Some(p) if p.valid && p.lock_of.is_none() && r.objs.get(&p.of).map_or(false, |o| o.alive && o.init && (!o.reclaimed || (n == 1 && cb_live_threads.load(Ordering::Acquire) == 1))) => p,
+            Some(p) if p.lock_of.is_none() && r.objs.get(&p.of).map_or(false, |o| o.alive && o.init && (!o.reclaimed || (n == 1 && cb_live_threads.load(Ordering::Acquire) == 1))) => p,
             _ => return 0,
         };
-        recs.push(rec);
+        recs.push(Some(rec));
     }
     for i in 0..n {
         for j in i + 1..n {
-            if !(excl[i] != 0 || excl[j] != 0) || recs[i].of != recs[j].of {
+            let (Some(ri), Some(rj)) = (&recs[i], &recs[j]) else { continue };
+            if !(excl[i] != 0 || excl[j] != 0) || ri.of != rj.of {
                 continue;
             }
-            let (a, b) = (&recs[i].proj, &recs[j].proj);
+            let (a, b) = (ri.proj, rj.proj);
             let overlap = if has_range(a) || has_range(b) {
                 let na = Norm::of(a.iter().copied());
                 ranged_overlap_with(na.get(), b)
@@ -7537,6 +7996,9 @@ pub unsafe extern "C" fn cb_paths_arrive(n: usize, toks: *const u64, excl: *cons
     let _e = if ts.iter().all(|&t| heap_of(t) == c) { enter_on(c) } else { Held::excl() };
     let r = rt_ro();
     for (i, &t) in ts.iter().enumerate() {
+        if light_ref(t) && !frame_rec() {
+            continue;
+        }
         if access_clashes(r, t, ex[i] != 0) {
             return 0;
         }
@@ -7548,12 +8010,12 @@ pub unsafe extern "C" fn cb_paths_arrive(n: usize, toks: *const u64, excl: *cons
 // `check_access` computes it, without faulting (D-0219: the dispatcher's
 // arrival test, `spec/08` §4 `[Standing-Local]` H3).
 fn access_clashes(r: &Rt, tok: u64, exclusive: bool) -> bool {
-    let Some(rec) = r.paths.get(&tok) else { return true };
+    let Some(rec) = view(r, tok) else { return true };
     let toks = match r.objs.get(&rec.of) {
         Some(o) if o.alive => if exclusive { &o.toks } else { &o.xtoks },
         _ => return true,
     };
-    let ranged = has_range(&rec.proj);
+    let ranged = has_range(rec.proj);
     let mut mine: Option<Norm> = None;
     for &t in toks {
         let p = &r.paths[&t];
@@ -7606,12 +8068,12 @@ pub unsafe extern "C" fn cb_direct_ok(n: usize, toks: *const u64) -> u8 {
     let others = cb_live_threads.load(Ordering::Relaxed) != 1;
     let me = me();
     for &t in toks {
-        if t == 0 {
+        if t == 0 || (light_ref(t) && !frame_rec()) {
             continue;
         }
-        match r.paths.get(&t) {
-            Some(p) if p.valid && p.lock_of.is_none() && r.objs.get(&p.of).map_or(false, |o| o.alive && o.init && (!others || !o.reclaimed)) => {
-                if others && p.exclusive && !p.is_root && p.thread.load(Ordering::Acquire) != me {
+        match view(r, t) {
+            Some(p) if p.lock_of.is_none() && r.objs.get(&p.of).map_or(false, |o| o.alive && o.init && (!others || !o.reclaimed)) => {
+                if others && p.exclusive && !p.is_root && p.rec.map_or(false, |q| q.thread.load(Ordering::Acquire) != me) {
                     return 0;
                 }
                 if access_clashes(r, t, p.exclusive) {
@@ -7931,7 +8393,7 @@ fn run_job(job: Job) {
         HEAP.with(|c| c.set(h));
         set_heap(rt(), h);
     }
-    let own = Box::into_raw(Box::new(TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() }));
+    let own = Box::into_raw(Box::new(TState { stack: Vec::new(), scopes: Vec::new(), inflight: VecDeque::new(), frame_locs: Vec::new(), rec: Vec::new(), dloc: (NOLOC, 0), box_draining: false, box_next: None, pend: Vec::new(), cunwind: false, jmp: 0, failed: None, notes: Vec::new() }));
     set_at(job.at.0, job.at.1);
     TSP.with(|c| c.set(own));
     let body: unsafe extern "C" fn(*mut u8) = unsafe { std::mem::transmute(job.body) };
@@ -8365,9 +8827,29 @@ pub extern "C" fn cb_spin_hint() {
 // `[Lock]`: `tok` is the shared reference to the mutex at `m`. Returns
 // the lock path's token, which the guard holds.
 #[no_mangle]
-pub extern "C" fn cb_lock(tok: u64, m: *mut u8, file: u32, line: u32) -> u64 {
+pub extern "C" fn cb_lock(tok: u64, m: *mut u8, ty: u32, file: u32, line: u32) -> u64 {
     let key = m as usize;
     let me = me();
+    // D-0292: through a light reference: the mutex's place from its address
+    // and type; the guard's path lists no ancestor.
+    if light_ref(tok) {
+        let obj = tok & !TOK_FLAGS;
+        {
+            let _e = enter_on(heap_of(tok));
+            if book().locks.get(&key) == Some(&me) {
+                fault("diag.mutex-reentrant-lock", file, line);
+            }
+            if !rt_ro().objs.get(&obj).map_or(false, |o| o.alive) {
+                fault("diag.stale-binding", file, line);
+            }
+        }
+        claim_mutex(key, me, file, line);
+        let _e = enter_on(heap_of(tok));
+        let proj = proj_of_addr(obj, m as usize, ty);
+        let mut gproj = proj.clone();
+        gproj.push(Proj::Field(0));
+        return mint_locked(rt(), obj, gproj, true, false, Vec::new(), Some(proj));
+    }
     // D-0202: the checks and the guard's path under a local hold on the
     // heaps of the reference to the mutex and the paths it was formed
     // through; the wait under none (only the book's lock). Nothing between

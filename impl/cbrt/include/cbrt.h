@@ -203,6 +203,8 @@ static inline void cb_index_check(uint64_t i, uint64_t n, uint32_t file, uint32_
 
 /* frames and statement scopes (spec/14 §1, §1a) */
 void cb_frame_push(void);   /* [Block-Enter], [Call]: pushes a frame (state.frame-stack); its pop ends what it owns */
+void cb_frame_push_fn(void);   /* D-0292: [Call]: a decided body's own frame, whose references are light */
+void cb_frame_push_rec(void);   /* D-0292: [Call]: the frame of a body the static pass left a conflict in (or with a point check): every reference formed or arriving in it is recorded */
 void cb_frame_pop(void);   /* [Block-Exit]: ends the frame's owned objects last bound first, [Destroy] for a resource (its destructor, [Run-Destructor], [Destroy-Composite]), [Object-End] for the rest; drops the frame's holds */
 void cb_frame_push_at(uint32_t file, uint32_t line);   /* [Block-Enter] with the block's location, for a destruction fault */
 void cb_stmt_push(void);   /* [Stmt-Enter]: a statement scope for this statement's temporaries and unheld paths */
@@ -220,13 +222,13 @@ void     cb_absorb(uint64_t obj);                   /* [Relocate-In]: now part o
 void     cb_absorb_refs(uint64_t obj);              /* the same for plain data holding references, moved in first: its slots stay — [Relocate-In] for plain data holding references, moved in first: its slots' holds stay */
 void     cb_result(uint64_t obj);                   /* a statement's result: re-stamped outward — [Stmt-Exit]'s re-stamp: the statement's result object belongs to the parent scope */
 void     cb_destroy(uint64_t root, uint32_t file, uint32_t line);   /* drop(x) — [Destroy] through the binding's root path: temporally valid, solitary, authority held; [Run-Destructor], [Destroy-Composite], [Object-End] */
-void     cb_destroy_via(uint64_t tok, uint32_t file, uint32_t line); /* drop(*r): through a reference — [Destroy] through a reference (drop(*r)): the same premises on the referent */
+void     cb_destroy_via(uint64_t tok, const void *addr, uint32_t ty, uint32_t file, uint32_t line); /* drop(*r): through a reference — [Destroy] through a reference (drop(*r)): the same premises on the referent */
 void     cb_consume(uint64_t obj, uint32_t file, uint32_t line);    /* destroy a temporary now — [Destroy] of a temporary now, as [Stmt-Exit] would at the statement's end */
 void     cb_end_moved_out(uint64_t obj);            /* end a temporary whose contents relocated out — [Relocate-Out]'s source after a destructuring: the container ends ([Object-End]) without destroying the parts that moved */
 
 /* access paths (state.access-paths; spec/08, spec/10, spec/16) */
 uint64_t cb_borrow(uint64_t base, const cb_proj *p, size_t n, uint32_t mode, uint32_t file, uint32_t line);   /* [Borrow] from `base` through the projections `p` ([Field-Access], [Index-Checked] steps): temporally valid, mode no stronger than the source, ¬clash, [Thread-Affine]; mints the path, held by this statement until stored */
-uint64_t cb_borrow_range(uint64_t base, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t mode, uint32_t file, uint32_t line);   /* a slice's range (D-0070) — [Slice-Form]: [Borrow] whose last step is the range lo..hi (D-0070) */
+uint64_t cb_borrow_range(uint64_t base, const void *cont, uint32_t cty, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t mode, uint32_t file, uint32_t line);   /* a slice's range (D-0070) — [Slice-Form]: [Borrow] whose last step is the range lo..hi (D-0070) */
 void     cb_read(uint64_t base, const cb_proj *p, size_t n, uint32_t file, uint32_t line);   /* [Read]'s premises on the place: temporally valid, ¬clash(shared), [Thread-Affine]; the C reads the value itself */
 void     cb_write(uint64_t base, const cb_proj *p, size_t n, uint32_t target_resource, uint32_t file, uint32_t line);   /* [Write]'s premises: temporally valid, mode exclusive, ¬clash(exclusive), ¬live-resource-at when `target_resource`; the C stores the value itself */
 void     cb_point_check(const uint64_t *args, size_t nargs, uint64_t base, const cb_proj *p, size_t n, uint32_t exclusive, const uint8_t *msg, uint64_t msg_len, uint32_t file, uint32_t line);   /* D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call, the call's argument paths `args` counted as held */
@@ -235,6 +237,8 @@ uint32_t cb_owns(const void *addr, uint32_t ty);   /* D-0049: the value there ow
 
 /* reference data (plan D5) */
 void     cb_store_ref(void *slot, uint64_t tok);   /* [Write] of a reference value: the slot's holder gains the path (held-by), keyed by the slot's address */
+void     cb_hold_ref(void *slot, uint64_t tok, const void *addr, uint32_t ty, uint32_t mode, uint32_t file, uint32_t line);   /* D-0292: [Write] of a reference value with its place: a light reference becomes a holder (a path on its object, held by the slot) — [Write] of a reference value whose place cobc knows (D-0292): a light reference stored into data becomes a holder, a recorded one is stored as cb_store_ref stores it */
+uint64_t cb_rec_ref(uint64_t tok, const void *addr, uint32_t ty, uint32_t mode, uint32_t kind, uint32_t file, uint32_t line);   /* D-0292: a reference arriving in a recording frame, recorded (kind 1: held by the frame, a parameter; 0: stamped into the statement, a result) — [Borrow]'s record for a light reference arriving in a body whose references the run records (D-0292): a path with the projection of its place; a recorded one is returned as it is */
 uint64_t cb_load_ref(const void *slot);   /* [Read] of a reference value: the token the slot holds */
 void     cb_valid(uint64_t tok, uint32_t file, uint32_t line);   /* [Swap-Places]: temporally valid, no conflict check */
 void     cb_copy_datum(void *dst, const void *src, uint32_t ty);   /* [Read] then [Write] of a value holding references: the bytes and each slot's hold are copied */
@@ -317,7 +321,7 @@ static inline void cb_elem_access_if(uint8_t live, void *addr, uint32_t ty, uint
 {
     if (__builtin_expect(live != 0, 0)) cb_elem_access_slow(addr, ty, mode, write, file, line);
 }
-void     cb_borrow_range_unminted(uint64_t base, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t mode, uint32_t file, uint32_t line); /* `&e[lo..hi]` for a pure direct slice: the checks alone — [Slice-Form]'s premises without minting a path: a direct parameter's slice (D-0209) */
+void     cb_borrow_range_unminted(uint64_t base, const void *cont, uint32_t cty, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t mode, uint32_t file, uint32_t line); /* `&e[lo..hi]` for a pure direct slice: the checks alone — [Slice-Form]'s premises without minting a path: a direct parameter's slice (D-0209) */
 void     cb_borrow_unminted(uint64_t base, const cb_proj *p, size_t n, uint32_t mode, uint32_t file, uint32_t line); /* `&p` to a pure direct parameter: the check alone — [Borrow]'s premises without minting: `&p` to a pure direct parameter (D-0191) */
 void     cb_borrow_check(uint64_t base, const cb_proj *p, size_t n, uint32_t mode, uint32_t file, uint32_t line); /* `&v` straight into Vec::index_*: checks only */  /* Vec::index_*: [Reclaim] + [Borrow] + send (spec/21 §0) — [Borrow]'s premises without minting: `&v` straight into Vec::index_* */
 void     cb_vec_drop_plain(void *addr, uint64_t len, uint64_t size);   /* Vec::drop element loop, plain T (spec/21 §0) — [Object-End] of every element object over the buffer, as Vec::drop's loop does for plain elements; [Deallocate] follows */
@@ -371,7 +375,7 @@ uint64_t cb_join_status(uint64_t tid, uint8_t mode);   /* [Try-Join] (mode 0, wa
 void     cb_cancel(uint64_t tid);   /* [Cancel] (D-0204) */
 int64_t  cb_task_op(uint64_t op, uint64_t id, void *out, uint64_t cap);   /* [Failure-Text] and the supervision operations' queries */
 uint64_t cb_join(uint64_t tid, void *dst);                         /* [Join]: the result's object, or 0 */
-uint64_t cb_lock(uint64_t tok, void *m, uint32_t file, uint32_t line);   /* [Lock]: the lock path's token */
+uint64_t cb_lock(uint64_t tok, void *m, uint32_t ty, uint32_t file, uint32_t line);   /* [Lock]: the lock path's token */
 uint64_t cb_lock_pathless(void *m, uint32_t file, uint32_t line);   /* D-0289: [Lock] with no lock path (CB_PATHLESS) */
 void     cb_lock_bare(void *m, uint32_t file, uint32_t line);   /* D-0200: lock without a guard — [Lock] without a guard object (D-0200, std's own bodies): sync(o) := locked-by; unlocked by cb_unlock_bare */
 void     cb_unlock_bare(void *m);   /* [Guard-Drop] without a guard object */
@@ -451,6 +455,8 @@ static inline void cb_write_pathless(uint64_t base, const cb_proj *p, size_t n, 
 #define cb_read(b, ...)                  ((void)(b))
 #define cb_valid(t, ...)                 ((void)(t))
 #define cb_store_ref(s, t)               ((void)(s), (void)(t))
+#define cb_hold_ref(s, ...)              ((void)(s))
+#define cb_rec_ref(t, ...)               ((void)(t), (uint64_t)0)
 #define cb_load_ref(s)                   ((void)(s), (uint64_t)0)
 #define cb_frame_hold(t)                 ((void)(t))
 #define cb_frame_unhold(t)               ((void)(t))
@@ -469,7 +475,7 @@ static inline void cb_write_pathless(uint64_t base, const cb_proj *p, size_t n, 
    nothing, so one made here would never be retired (CHG-0383). */
 #define cb_call_self(r)                  ((void)(r), (uint64_t)0)
 /* D-0289: a lock makes no path; the guard holds the mutex's address. */
-#define cb_lock(t, m, f, l)              ((void)(t), cb_lock_pathless((m), (f), (l)))
+#define cb_lock(t, m, ty, f, l)          ((void)(t), (void)(ty), cb_lock_pathless((m), (f), (l)))
 #ifdef CB_DECIDED
 /* D-0285: lowered knowing the program is decided (cobc's second lowering):
    a value holding references is plain data, sent and received as its bytes

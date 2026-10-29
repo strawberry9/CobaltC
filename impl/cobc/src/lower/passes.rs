@@ -592,7 +592,7 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
         "cb_fnbox",
         // Pure inline helpers (`cbrt.h`), and a query that records nothing.
         "cb_bytes_lt", "cb_bytes_cmp", "cb_find_bytes", "cb_char_boundary", "cb_popcount64", "cb_popcount128", "cb_clz", "cb_clz128", "cb_ctz", "cb_ctz128", "cb_rotl", "cb_rotl128", "cb_rotr", "cb_rotr128", "cb_rotl8", "cb_rotl16", "cb_rotl32", "cb_rotl64", "cb_rotr8", "cb_rotr16", "cb_rotr32", "cb_rotr64", "cb_fnv_more", "cb_live_at",
-        "cb_read", "cb_write", "cb_write_quiet", "cb_borrow_unminted", "cb_borrow_range_unminted", "cb_borrow_unstamped", "cb_call_done", "cb_load_ref", "cb_store_ref", "cb_copy_datum", "cb_move_to", "cb_send", "cb_send_ref", "cb_send_datum", "cb_borrow_check", "cb_elem_access", "cb_elem_access_if", "cb_live_in",
+        "cb_read", "cb_write", "cb_write_quiet", "cb_borrow_unminted", "cb_borrow_range_unminted", "cb_borrow_unstamped", "cb_call_done", "cb_load_ref", "cb_store_ref", "cb_hold_ref", "cb_copy_datum", "cb_move_to", "cb_send", "cb_send_ref", "cb_send_datum", "cb_borrow_check", "cb_elem_access", "cb_elem_access_if", "cb_live_in",
         // A question about the value at an address (`owns`), recording nothing.
         "cb_owns",
         // D-0269: a frame's table of objectless locals and its registration
@@ -620,7 +620,7 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
     // the statement, as `cb_absorb` does.
     // `cb_recv_datum` and `cb_recv_datum_tok` stamp what they receive into
     // the statement, as `cb_recv_ref` does.
-    const SCOPE: &[&str] = &["cb_new", "cb_new_uninit", "cb_recv", "cb_recv_ref", "cb_recv_datum", "cb_recv_datum_tok", "cb_forget_obj", "cb_take", "cb_borrow", "cb_borrow_range", "cb_absorb", "cb_absorb_refs", "cb_elem_borrow", "cb_raw_move_in"];
+    const SCOPE: &[&str] = &["cb_new", "cb_new_uninit", "cb_recv", "cb_recv_ref", "cb_rec_ref", "cb_recv_datum", "cb_recv_datum_tok", "cb_forget_obj", "cb_take", "cb_borrow", "cb_borrow_range", "cb_absorb", "cb_absorb_refs", "cb_elem_borrow", "cb_raw_move_in"];
     let effects = |line: &str, out: &mut Vec<Eff>| {
         let b = line.as_bytes();
         let is_id = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -673,7 +673,12 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
     let mut effs = Vec::new();
     for line in out.lines() {
         match marker(line) {
-            Some(('F', id)) => open.push((true, id)),
+            Some(('F' | 'G', id)) => open.push((true, id)),
+            // D-0292: a recording body's frame is always emitted.
+            Some(('R', id)) => {
+                open.push((true, id));
+                used.insert(id);
+            }
             Some(('S', id)) => open.push((false, id)),
             Some(('f' | 's' | 'e', id)) => {
                 let top = open.pop();
@@ -702,6 +707,8 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
                 let at = marker_loc(line).map(|l| format!("cb_{}_push_at({});", if k == 'F' { "frame" } else { "stmt" }, l));
                 let call = match k {
                     'F' => at.as_deref().unwrap_or("cb_frame_push();"),
+                    'G' => "cb_frame_push_fn();",
+                    'R' => "cb_frame_push_rec();",
                     'S' => at.as_deref().unwrap_or("cb_stmt_push();"),
                     'f' | 'g' => "cb_frame_pop();",
                     's' | 't' => "cb_stmt_pop();",

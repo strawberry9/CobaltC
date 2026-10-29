@@ -150,7 +150,8 @@ impl<'a> Gen<'a> {
             // `[Index-Vec]` checks, through `v` itself: a live shared path
             // to the vector (or a slice holding i) meets it; a slice of
             // other elements does not.
-            writeln!(b, "    cb_borrow_range_unminted(p_v.tok, NULL, 0, p_i, p_i + 1, CB_EXCLUSIVE, CB_NOLOC, 0);").unwrap();
+            let vtid = self.type_id(&Type::Named("std::Vec".to_string(), vec![elem.clone()]))?;
+            writeln!(b, "    cb_borrow_range_unminted(p_v.tok, p_v.p, {}u, NULL, 0, p_i, p_i + 1, CB_EXCLUSIVE, CB_NOLOC, 0);", vtid).unwrap();
         }
         writeln!(b, "    {} *e = v->ptr + (int64_t)p_i;", elem_c).unwrap();
         writeln!(b, "    return (cb_ref){{ (void *)e, cb_elem_borrow(e, {}u, {}) }};", ty, mode).unwrap();
@@ -656,6 +657,7 @@ impl<'a> Gen<'a> {
         }
         let grow = self.request_fn("std::Vec::grow", vec![elem.clone()])?;
         let vt = Type::Named("std::Vec".to_string(), vec![elem.clone()]);
+        let vtid = self.type_id(&vt)?;
         let rtid = self.type_id(&Type::Ref(Box::new(vt), Mode::Exclusive))?;
         let stid = self.type_id(&Type::Slice(Box::new(elem.clone()), Mode::Shared))?;
         let fb = self.std_fallback()?;
@@ -668,7 +670,7 @@ impl<'a> Gen<'a> {
         writeln!(b, "    cb_frame_push();").unwrap();
         writeln!(b, "    void *l_a = p_a.p;").unwrap();
         writeln!(b, "    uint64_t oa = cb_new(&l_a, {}u, CB_NOLOC, 0);", rtid).unwrap();
-        writeln!(b, "    cb_store_ref(&l_a, p_a.tok);").unwrap();
+        writeln!(b, "    cb_hold_ref(&l_a, p_a.tok, p_a.p, {}u, CB_EXCLUSIVE, CB_NOLOC, 0);", vtid).unwrap();
         writeln!(b, "    (void)cb_bind(oa);").unwrap();
         writeln!(b, "    cb_recv_datum(&p_s, {}u);", stid).unwrap();
         writeln!(b, "    uint64_t os = cb_new(&p_s, {}u, CB_NOLOC, 0);", stid).unwrap();
@@ -683,7 +685,7 @@ impl<'a> Gen<'a> {
         // `len + n` cannot overflow: `n` elements are in memory already.
         writeln!(b, "    while (v->cap - v->len < n) {{ {}(((cb_ref){{ p_a.p, at }})); }}", grow).unwrap();
         writeln!(b, "    cb_write(at, (cb_proj[]){{ {{ CB_FIELD, 1u }} }}, 1, 0u, CB_NOLOC, 0);").unwrap();
-        writeln!(b, "    if (n > 1) cb_borrow_range_unminted(st, NULL, 0, 1u, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    if (n > 1) cb_borrow_range_unminted(st, NULL, 0u, NULL, 0, 1u, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
         writeln!(b, "    memcpy(v->ptr + v->len, p_s.data, n * sizeof(*v->ptr));").unwrap();
         writeln!(b, "    v->len += n;").unwrap();
         writeln!(b, "    cb_frame_pop();").unwrap();

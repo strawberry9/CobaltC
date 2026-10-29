@@ -1,7 +1,7 @@
 # CobaltC Control Flow
 
 Status: normative artifact
-Version: 1.40.0
+Version: 1.41.0
 Conforms to: `spec/02-schema.md` (Kind: Rule, `rule.control.*`)
 Governed by: `CobaltC_Master_Instructions.md` §12, §23
 Realizes: D-0008 (scope-end destruction), D-0018, D-0019
@@ -987,7 +987,15 @@ follow, lent where no binding holds the handle, in a function that leaves a
 conflict to the run) has, in this edition, the record of references
 `spec/08` describes: forming one into an owner, copying an aggregate that
 keeps k of them (O(k)), reading through one, ending one and destroying or
-moving an owner each record or consult it, and may allocate. The tier-D
+moving an owner each record or consult it, and may allocate. In such a
+program a reference formed in a function the static pass decided is
+*light* (D-0292): formed with a check against the owner's recorded
+references, which costs nothing when there are none, and recorded
+nowhere — no access through it, and not its end, touches the record;
+it is recorded where it is stored into data (a holder, made with the
+place it refers to), and where it arrives in a function that leaves a
+conflict to the run. An element reference, a slice, a view, a lock's
+guard and what a thread is lent are recorded in every function. The tier-D
 promises of D-0281 §14 (O(1) with no allocation and no address-keyed
 lookup, counts kept in the owner) are *provisional*, D-0281 phase 3: a
 stored reference is 8 bytes (`[Repr-Ref]`), so moving an aggregate that
@@ -1044,6 +1052,7 @@ rule.agg.index, rule.resauth.transfer
 
 ## Change Log
 
+- 1.41.0 — `CHG-0387` (D-0292): §6 "The cost contract": in a program the run checks, a reference formed in a function the static pass decided is light (no record; recorded where it is stored into data or arrives in a function that leaves a conflict to the run); element references, slices, views, guards and lends stay recorded.
 - 1.40.0 — `CHG-0386` (D-0291): §6 the spawn rows: a slice binding is lent as a reference, in its own mode whatever the parameter takes (D-0247's "forms no fact" withdrawn for `spawn`); a spawn wrapped in the value a binding takes (`Some(spawn(…))`, a branch); "Handing over" after "Forgetting"; inherited facts of `e?`, of a consuming `foreach`'s drain, of a by-value parameter (`*v`); "Slices and copies"; liveness through a holder for element accesses; the call-site rule's reach bounded by the parameter's referent type; decided programs: a `fn` value in data, `std::slice_parts`' body.
 - 1.39.0 — `CHG-0385` (D-0290): §6 "The cost contract" (D-0281 §14, the tier-D lines provisional; cost cases); §6 holders: a local that keeps references in data is a holder of the frame; "Frame-held aggregates"; inherited facts of calls whose result keeps references in data, of reads out of an aggregate (`**q` through a parameter), of literals and of a view's bytes; `r = e` where `r` held nothing; what is the run's (a holder moved out, a result holding more than the parameters reach, a store through a reference); decided programs no longer exclude every type that keeps references in data; an access through a reference read out of an aggregate; liveness while a binding reaches a holder; a struct argument's kept paths at a point check; scoped lending of an exclusive reference through a shared one.
 - 1.38.0 — `CHG-0384` (D-0289): §6 scoped lending: a guard given to a thread as an argument is the run's; a `Vec` of handles the frame holds holds what its threads were lent, and a handle taken out of it holds that too; a holder whose end waits or releases holds its facts to its scope's end.

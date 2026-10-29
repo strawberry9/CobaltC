@@ -125,7 +125,7 @@ impl<'a> Gen<'a> {
                 writeln!(b, "    cb_borrow_check(p_s.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, CB_EXCLUSIVE, CB_NOLOC, 0);").unwrap();
                 if sent {
                     // Every byte's `[Read]` through the view's path.
-                    writeln!(b, "    if (vt != 0) cb_borrow_range_unminted(vt, NULL, 0, 0u, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
+                    writeln!(b, "    if (vt != 0) cb_borrow_range_unminted(vt, NULL, 0u, NULL, 0, 0u, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
                 }
                 "(const void *)p_v.bytes.data".to_string()
             }
@@ -176,7 +176,7 @@ impl<'a> Gen<'a> {
         writeln!(b, "    uint64_t vt = cb_recv_datum_tok();").unwrap();
         writeln!(b, "    if (p_lo > p_hi || p_hi > p_v.bytes.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);").unwrap();
         writeln!(b, "    if (!{b}(p_v.bytes, p_lo) || !{b}(p_v.bytes, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);", b = boundary).unwrap();
-        writeln!(b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0u, NULL, 0, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);").unwrap();
         writeln!(b, "    {} r;", svc).unwrap();
         writeln!(b, "    r.bytes.src = p_v.bytes.src;").unwrap();
         writeln!(b, "    r.bytes.data = p_v.bytes.data + p_lo;").unwrap();
@@ -270,7 +270,7 @@ impl<'a> Gen<'a> {
         );
         let cut = |lo: &str, hi: &str| -> String {
             format!(
-                "    if (!{b}(p_v.bytes, {lo}) || !{b}(p_v.bytes, {hi})) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n    {{ uint64_t tk = cb_borrow_range(vt, NULL, 0, {lo}, {hi}, CB_SHARED, CB_NOLOC, 0);\n    {p} }}\n",
+                "    if (!{b}(p_v.bytes, {lo}) || !{b}(p_v.bytes, {hi})) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n    {{ uint64_t tk = cb_borrow_range(vt, NULL, 0u, NULL, 0, {lo}, {hi}, CB_SHARED, CB_NOLOC, 0);\n    {p} }}\n",
                 b = boundary,
                 lo = lo,
                 hi = hi,
@@ -346,7 +346,7 @@ impl<'a> Gen<'a> {
             writeln!(b, "        while (i < n && !(d[i] == ' ' || (d[i] >= 9 && d[i] <= 13))) i++;").unwrap();
         }
         writeln!(b, "        if (i > start) {{").unwrap();
-        writeln!(b, "            uint64_t tk = cb_borrow_range(vt, NULL, 0, start, i, CB_SHARED, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "            uint64_t tk = cb_borrow_range(vt, NULL, 0u, NULL, 0, start, i, CB_SHARED, CB_NOLOC, 0);").unwrap();
         writeln!(b, "            if (out.len == out.cap) {{ {}(((cb_ref){{ (void *)&out, root }})); }}", grow).unwrap();
         writeln!(b, "            {} *el = out.ptr + out.len; el->bytes.src = p_v.bytes.src; el->bytes.data = p_v.bytes.data + start; el->bytes.len = i - start; cb_store_ref(&el->bytes.src, tk); out.len += 1;", svc).unwrap();
         writeln!(b, "        }}").unwrap();
@@ -415,7 +415,7 @@ impl<'a> Gen<'a> {
         if name != "std::StringView::trim_start" {
             writeln!(b, "    while (n > i && (d[n - 1] == ' ' || (d[n - 1] >= 9 && d[n - 1] <= 13))) n--;").unwrap();
         }
-        writeln!(b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0, i, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
+        writeln!(b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0u, NULL, 0, i, n, CB_SHARED, CB_NOLOC, 0);").unwrap();
         writeln!(b, "    {} r;", svc).unwrap();
         writeln!(b, "    r.bytes.src = p_v.bytes.src;").unwrap();
         writeln!(b, "    r.bytes.data = p_v.bytes.data + i;").unwrap();
@@ -622,7 +622,8 @@ impl<'a> Gen<'a> {
         writeln!(b, "    uint64_t n = s->bytes.len;").unwrap();
         writeln!(b, "    if (p_lo > p_hi || p_hi > n) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);").unwrap();
         writeln!(b, "    if (!cb_char_boundary(s->bytes.ptr, n, p_lo) || !cb_char_boundary(s->bytes.ptr, n, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);").unwrap();
-        writeln!(b, "    uint64_t tk = cb_borrow_range(p_s.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);").unwrap();
+        let btid = self.type_id(&Type::Named("std::Vec".to_string(), vec![Type::Int(IntTy::U8)]))?;
+        writeln!(b, "    uint64_t tk = cb_borrow_range(p_s.tok, (void *)&s->bytes, {}u, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);", btid).unwrap();
         writeln!(b, "    {} r;", svc).unwrap();
         writeln!(b, "    r.bytes.src = (void *)&s->bytes;").unwrap();
         writeln!(b, "    r.bytes.data = s->bytes.ptr + p_lo;").unwrap();

@@ -116,9 +116,11 @@ impl<'g, 'a> Fx<'g, 'a> {
         let mut body = String::new();
         let mut call_args = Vec::new();
         for (i, (pty, t)) in ps.iter().zip(argv.iter()).enumerate() {
-            if matches!(pty, Type::Ref(..)) {
+            if let Type::Ref(inner, m) = pty {
+                let itid = self.tid(inner)?;
+                let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
                 self.emit(&format!("{}->a{} = {}.p;", e, i, t.c));
-                self.emit(&format!("cb_store_ref(&{}->a{}, {}.tok);", e, i, t.c));
+                self.emit(&format!("cb_hold_ref(&{}->a{}, {}.tok, {}.p, {}u, {}, CB_NOLOC, 0);", e, i, t.c, t.c, itid, md));
                 writeln!(body, "    cb_ref r{} = {{ e->a{}, cb_load_ref(&e->a{}) }};", i, i, i).unwrap();
                 call_args.push(format!("r{}", i));
                 continue;
@@ -164,7 +166,11 @@ impl<'g, 'a> Fx<'g, 'a> {
             writeln!(body, "    cb_ref rr = {};", call).unwrap();
             writeln!(body, "    cb_recv_ref();").unwrap();
             writeln!(body, "    e->res = rr.p;").unwrap();
-            writeln!(body, "    cb_store_ref(&e->res, rr.tok);").unwrap();
+            let (itid, md) = match &ret {
+                Type::Ref(inner, m) => (self.tid(inner)?, if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" }),
+                _ => unreachable!(),
+            };
+            writeln!(body, "    cb_hold_ref(&e->res, rr.tok, rr.p, {}u, {}, CB_NOLOC, 0);", itid, md).unwrap();
             writeln!(body, "    cb_env_forget((uint8_t *)e + sizeof(void *), sizeof(*e) - sizeof(void *));").unwrap();
             "0".to_string()
         } else {
@@ -963,7 +969,11 @@ impl<'g, 'a> Fx<'g, 'a> {
                 }
                 match (&p.base, p.is_binding, p.projs.is_empty()) {
                     (Some(root), true, true) => self.emit(&format!("cb_destroy({}, {});", root, loc)),
-                    (Some(tok), false, true) => self.emit(&format!("cb_destroy_via({}, {});", tok, loc)),
+                    (Some(tok), false, true) => {
+                        // D-0292: the referent's place, for a light reference.
+                        let tid = self.tid(&p.ty)?;
+                        self.emit(&format!("cb_destroy_via({}, (void *)&({}), {}u, {});", tok, p.c, tid, loc));
+                    }
                     (Some(_), _, false) => {
                         // `[Destroy-Projection]`: a field, element, or payload.
                         self.emit(&format!("cb_fault(\"diag.move-out-of-field\", {});", loc));
@@ -1028,6 +1038,13 @@ impl<'g, 'a> Fx<'g, 'a> {
                     self.emit(&format!("cb_ref {} = {{ {}, cb_load_ref(&{}) }};", rr, t, t));
                     self.emit(&format!("cb_send_ref({}.tok);", rr));
                     self.emit("cb_recv_ref();");
+                    if self.tracked {
+                        if let Type::Ref(inner, m) = &rty {
+                            let itid = self.tid(inner)?;
+                            let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+                            self.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 0u, CB_NOLOC, 0);", rr, rr, rr, itid, md));
+                        }
+                    }
                     self.emit(&format!("cb_env_forget((uint8_t *)&{}, sizeof({}));", t, t));
                     return Ok(V { c: rr, ty: rty, obj: None });
                 }
@@ -1059,7 +1076,9 @@ impl<'g, 'a> Fx<'g, 'a> {
                 };
                 let mt = self.into_temp(mv, line)?;
                 let gt = self.g.fresh("tok");
-                self.emit(&format!("uint64_t {} = cb_lock({}.tok, {}.p, {});", gt, mt.c, mt.c, loc));
+                // D-0292: the mutex's type, for its place behind a light reference.
+                let mtid = self.tid(&Type::Mutex(Box::new(inner.clone())))?;
+                self.emit(&format!("uint64_t {} = cb_lock({}.tok, {}.p, {}u, {});", gt, mt.c, mt.c, mtid, loc));
                 // D-0204: an interior that may hold an exclusive reference
                 // (a channel of them) lends its locker another's data.
                 if coby::typecheck::may_hold_excl_ref(&self.g.items, &inner) {

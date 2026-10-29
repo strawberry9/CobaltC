@@ -546,10 +546,17 @@ impl<'g, 'a> Fx<'g, 'a> {
             self.emit(&format!("{};", call));
             return Ok(if matches!(ret, Type::Never) { never() } else { unit() });
         }
-        if matches!(ret, Type::Ref(..)) {
+        if let Type::Ref(inner, m) = &ret {
             let r = self.g.fresh("r");
             self.emit(&format!("cb_ref {} = {};", r, call));
             self.emit("cb_recv_ref();");
+            // D-0292: recorded on arrival in a recording frame.
+            if self.tracked {
+                let tid = self.tid(inner)?;
+                let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+                let loc = self.loc(line);
+                self.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 0u, {});", r, r, r, tid, md, loc));
+            }
             return Ok(V { c: r, ty: ret, obj: None });
         }
         let t = self.g.fresh("t");

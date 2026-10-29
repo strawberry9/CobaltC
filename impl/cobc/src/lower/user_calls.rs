@@ -92,6 +92,9 @@ impl<'g, 'a> Fx<'g, 'a> {
                         self.emit(&format!("void *{} = (void *)(({} *){})->ptr;", a, bc, bind.c));
                         self.emit(&format!("cb_ref {} = (cb_ref){{ {}, cb_elem_borrow({}, {}u, {}) }};", r, a, a, tid, md));
                         self.emit("cb_recv_ref();");
+                        if self.tracked {
+                            self.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 0u, CB_NOLOC, 0);", r, r, r, tid, md));
+                        }
                         return Ok(V { c: r, ty: Type::Ref(Box::new(elem.clone()), mode), obj: None });
                     }
                 }

@@ -683,9 +683,17 @@ impl<'a> Gen<'a> {
             eprintln!("ANALYSES {} direct [{}]", name, dr.join(" "));
         }
         let all_checks = self.all_checks;
-        let mut fx = Fx { g: self, pc_site: None, subst, scopes: vec![HashMap::new()], out: String::new(), ret: ret.clone(), cleanup: Vec::new(), loops: Vec::new(), loop_broken: Vec::new(), ind: 1, self_ref: None, assigned: assigned_names(&f.body), rebind_frames: HashMap::new(), holder_roots: HashMap::new(), no_overflow: HashSet::new(), proven_next: false, pinned, confined_names, confined_fields: if all_checks { HashSet::new() } else { confined_fields(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, read_confined: if all_checks { HashSet::new() } else { read_confined_vecs(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, objectless_names, objectless_fields, cur_let: None, raw_ret: false, raw_tail: None, raw_sinks: HashSet::new(), raw_substring: None, raw_return_path: false, raw_call: None, objectless_c: HashSet::new(), moved_flag: HashMap::new(), bare_trims: HashSet::new(), elem_ref_ids, quiet_ids, quiet_roots: HashSet::new(), drop_lines: Vec::new(), confined: HashSet::new(), confined_params: HashMap::new(), probes: HashMap::new(), kept: Vec::new(), dollar: Vec::new(), place_write: false,
+        // D-0292: a body whose references the run records: a library's or
+        // an `--all-checks` program's every body, one the static pass left a
+        // conflict in (`Items::tracking_needed`), or one with a point check
+        // (D-0283). Every other body forms light references.
+        let tracked = {
+            let key = coby::tier::body_key(name, targs);
+            self.lib || self.all_checks || self.items.tracking_needed.lock().unwrap().contains_key(&key) || self.items.point_check_fns.lock().unwrap().contains(&key)
+        };
+        let mut fx = Fx { g: self, pc_site: None, tracked, subst, scopes: vec![HashMap::new()], out: String::new(), ret: ret.clone(), cleanup: Vec::new(), loops: Vec::new(), loop_broken: Vec::new(), ind: 1, self_ref: None, assigned: assigned_names(&f.body), rebind_frames: HashMap::new(), holder_roots: HashMap::new(), no_overflow: HashSet::new(), proven_next: false, pinned, confined_names, confined_fields: if all_checks { HashSet::new() } else { confined_fields(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, read_confined: if all_checks { HashSet::new() } else { read_confined_vecs(&f.body, &f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>()) }, objectless_names, objectless_fields, cur_let: None, raw_ret: false, raw_tail: None, raw_sinks: HashSet::new(), raw_substring: None, raw_return_path: false, raw_call: None, objectless_c: HashSet::new(), moved_flag: HashMap::new(), bare_trims: HashSet::new(), elem_ref_ids, quiet_ids, quiet_roots: HashSet::new(), drop_lines: Vec::new(), confined: HashSet::new(), confined_params: HashMap::new(), probes: HashMap::new(), kept: Vec::new(), dollar: Vec::new(), place_write: false,
             fused_scrut: None, map_acc: None, map_acc_used: false, compound_elem: false, datum_tok: None, datum_tok_out: None, map_get_acc: None, map_get_acc_out: None, elem_mode: None, temp_root: false, frame_line: None, vec_index_exprs: HashMap::new(), index_sugar: HashSet::new(), propagate_scrutinee: false, elem_alias: HashMap::new(), alias_kept: Vec::new(), stmt_match: false, branch_scope: false, objectless: false, inert_c: HashSet::new(), obj_temps: HashSet::new(), inert_result: None, inert_now: None, notes: 0, root_frame: 0, direct_params: HashSet::new(), entry_tested: false, direct_refs: HashSet::new(), direct_live: HashMap::new(), fast_half: false, elem_reader: false, frozen_on: false, pred_body: false, field_confined: HashMap::new(), pure_slices: HashSet::new(), pure_views: HashSet::new(), unstored: HashMap::new(), unstored_params: HashSet::new(), held_locals: HashSet::new(), held_c: HashSet::new(), unminted_binders: HashMap::new() };
-        fx.push_frame();
+        fx.push_frame_fn(tracked);
         fx.root_frame = fx.g.nscope;
         fx.fast_half = direct.is_some();
         fx.entry_tested = std::mem::replace(&mut fx.g.pending_tested, false);
@@ -729,6 +737,13 @@ impl<'a> Gen<'a> {
                 let Type::Named(_, a) = &**inner else { return internal("confined parameter of a non-Vec type") };
                 let vec_c = fx.g.ctype(inner)?;
                 let pc = format!("p_{}", san(&p.name));
+                // D-0292: its uses go through the parameter's own token:
+                // recorded on arrival in a recording frame.
+                if fx.tracked {
+                    let itid = fx.tid(inner)?;
+                    let md = if matches!(pty, Type::Ref(_, Mode::Exclusive)) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+                    fx.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 1u, CB_NOLOC, 0);", pc, pc, pc, itid, md));
+                }
                 fx.confined_params.insert(p.name.clone(), (format!("(*({} *){}.p)", vec_c, pc), format!("{}.tok", pc), a[0].clone()));
             } else {
                 fx.bind_param(p)?;

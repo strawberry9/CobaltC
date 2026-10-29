@@ -271,7 +271,8 @@ impl<'g, 'a> Fx<'g, 'a> {
                     let vc = self.g.ctype(&vty)?;
                     let tid = self.tid(&vty)?;
                     let (rt, t, o) = (self.g.fresh("tok"), self.g.fresh("t"), self.g.fresh("o"));
-                    self.emit(&format!("uint64_t {} = cb_borrow_range({}, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", rt, tok, p.c, loc));
+                    let btid = self.tid(&Type::Named("std::Vec".to_string(), vec![Type::Int(IntTy::U8)]))?;
+                    self.emit(&format!("uint64_t {} = cb_borrow_range({}, (void *)&(({}).bytes), {}u, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", rt, tok, p.c, btid, p.c, loc));
                     self.emit(&format!("{} {};", vc, t));
                     self.emit(&format!("{}.bytes.src = (void *)&(({}).bytes);", t, p.c));
                     self.emit(&format!("cb_store_ref(&{}.bytes.src, {});", t, rt));
@@ -447,7 +448,8 @@ impl<'g, 'a> Fx<'g, 'a> {
         let sc = format!("(*({} *){}.p)", string_c, r.c);
         let (tok, rt, t, o) = (self.g.fresh("tok"), self.g.fresh("tok"), self.g.fresh("t"), self.g.fresh("o"));
         self.emit(&format!("uint64_t {} = cb_borrow({}.tok, NULL, 0, CB_SHARED, {});", tok, r.c, loc));
-        self.emit(&format!("uint64_t {} = cb_borrow_range({}, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", rt, tok, sc, loc));
+        let btid = self.tid(&Type::Named("std::Vec".to_string(), vec![Type::Int(IntTy::U8)]))?;
+        self.emit(&format!("uint64_t {} = cb_borrow_range({}, (void *)&(({}).bytes), {}u, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", rt, tok, sc, btid, sc, loc));
         self.emit(&format!("{} {};", vc, t));
         self.emit(&format!("{}.bytes.src = (void *)&(({}).bytes);", t, sc));
         self.emit(&format!("cb_store_ref(&{}.bytes.src, {});", t, rt));
@@ -503,7 +505,8 @@ impl<'g, 'a> Fx<'g, 'a> {
         let sc = format!("(*({} *){}.p)", string_c, r.c);
         let t = self.g.fresh("t");
         self.emit(&format!("cb_borrow_unminted({}.tok, NULL, 0, CB_SHARED, {});", r.c, loc));
-        self.emit(&format!("cb_borrow_range_unminted({}.tok, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", r.c, sc, loc));
+        let btid = self.tid(&Type::Named("std::Vec".to_string(), vec![Type::Int(IntTy::U8)]))?;
+        self.emit(&format!("cb_borrow_range_unminted({}.tok, (void *)&(({}).bytes), {}u, (cb_proj[]){{ {{ CB_FIELD, 0u }} }}, 1, 0u, ({}).bytes.len, CB_SHARED, {});", r.c, sc, btid, sc, loc));
         self.emit(&format!("{} {};", vc, t));
         self.emit(&format!("{}.bytes.src = (void *)&(({}).bytes);", t, sc));
         self.emit(&format!("{}.bytes.data = ({}).bytes.ptr;", t, sc));

@@ -1348,6 +1348,11 @@ mod tier_report {
 
     // Whether the body being checked is one its rule decides: its point
     // checks are not made, as none can fault.
+    // The body being checked (`begin`'s key), if one is.
+    pub fn func() -> Option<String> {
+        CUR.with(|c| c.borrow().as_ref().map(|r| r.func.clone()))
+    }
+
     pub fn in_trusted() -> bool {
         CUR.with(|c| c.borrow().as_ref().map_or(false, |r| trusted(&r.func)))
     }
@@ -7596,6 +7601,11 @@ impl<'a> Body<'a> {
         }
         if tier_report::in_trusted() {
             return Ok(());
+        }
+        if !pcs.is_empty() {
+            if let Some(key) = tier_report::func() {
+                self.items.point_check_fns.lock().unwrap().insert(key);
+            }
         }
         for pc in pcs {
             crate::tier::record_point_check(self.items, site, pc);

@@ -244,10 +244,12 @@ impl<'g, 'a> Fx<'g, 'a> {
         let at = self.into_temp(a?, line)?;
         let bt = self.into_temp(b.unwrap()?, line)?;
         self.emit(&format!("if ((uint64_t){} > (uint64_t){} || (uint64_t){} > {}) cb_fault(\"diag.index-out-of-bounds\", {});", at.c, bt.c, bt.c, lenv, loc));
+        // D-0292: the container's place and type, for a light base.
+        let ptid = self.tid(&pb.ty)?;
         if !minted {
             match (&parent, &pb.base) {
-                (Some(t0), _) => self.emit(&format!("cb_borrow_range_unminted({}, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", t0, at.c, bt.c, m, loc)),
-                (None, Some(base)) => self.emit(&format!("cb_borrow_range_unminted({}, {}, (uint64_t){}, (uint64_t){}, {}, {});", base, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
+                (Some(t0), _) => self.emit(&format!("cb_borrow_range_unminted({}, NULL, 0u, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", t0, at.c, bt.c, m, loc)),
+                (None, Some(base)) => self.emit(&format!("cb_borrow_range_unminted({}, (void *)&({}), {}u, {}, (uint64_t){}, (uint64_t){}, {}, {});", base, pb.c, ptid, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
                 (None, None) => return internal("slice of an unchecked place"),
             }
             let sty = Type::Slice(Box::new(elem), mode.clone());
@@ -263,8 +265,8 @@ impl<'g, 'a> Fx<'g, 'a> {
         // when the source is itself a slice), not the whole source.
         let tok = self.g.fresh("tok");
         match (&parent, &pb.base) {
-            (Some(t0), _) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", tok, t0, at.c, bt.c, m, loc)),
-            (None, Some(base)) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, {}, (uint64_t){}, (uint64_t){}, {}, {});", tok, base, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
+            (Some(t0), _) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, NULL, 0u, NULL, 0, (uint64_t){}, (uint64_t){}, {}, {});", tok, t0, at.c, bt.c, m, loc)),
+            (None, Some(base)) => self.emit(&format!("uint64_t {} = cb_borrow_range({}, (void *)&({}), {}u, {}, (uint64_t){}, (uint64_t){}, {}, {});", tok, base, pb.c, ptid, Self::projs_args(&pb.projs), at.c, bt.c, m, loc)),
             (None, None) => return internal("slice of an unchecked place"),
         }
         let sty = Type::Slice(Box::new(elem), mode.clone());

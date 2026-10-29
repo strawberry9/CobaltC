@@ -298,6 +298,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0289 — Scoped lending: a program that spawns threads may be decided
 - D-0290 — Frame-held aggregates: a local that keeps references in data holds what it keeps
 - D-0291 — The real programs decided: wrapped handles, `?`, lent slices, and facts that outlive their reference
+- D-0292 — Light references: a decided function's references carry no record, in any program
 
 ---
 
@@ -8446,6 +8447,55 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0387: light references, a decided function's references carry no record in any program (D-0292, 2026-10-29)
+
+- D-0281 phase 3, steps 0–3 (`stress/d0281/phase3/DESIGN.md` §5). A program that is not decided kept the whole
+  record of `spec/08` for every reference in every function; now a reference formed in a function the static
+  pass decided is *light*: checked once at its formation against the owner's recorded references (nothing when
+  there are none) and recorded nowhere, so no access through it and not its end touches the runtime. Tokens:
+  `LIGHT | ROOT | obj` for an owner's binding (no root path is minted), `LIGHT | obj` for a light reference, a
+  path id for a recorded one, 0 as before (`cbrt` `GEN_MASK` 21 bits, bits 53–54 the kind; `view` reads any
+  token; `make_root`; `light_borrow`).
+- The frame decides what is recorded: a body the static pass left a conflict in (`Items::tracking_needed`), one
+  with a point check (`Items::point_check_fns`, new in the front end), and every body of a library or an
+  `--all-checks` program pushes a recording frame (`cb_frame_push_rec`; `cobc`'s `Fx::tracked`, the function
+  frame marker `R`/`G`), in which every reference formed is recorded as before and every reference arriving — a
+  parameter, whether its uses go through its own token or its binding's slot, a `move` closure's `self`, a
+  confined vector, a call's reference result — is recorded on arrival with its place (`cb_rec_ref`). Every other
+  body pushes a light frame (`cb_frame_push_fn`); a block's frame is its function's.
+- A reference stored into data becomes a holder where it is stored: `cb_hold_ref(slot, tok, addr, ty, mode)` at
+  `cobc`'s stores of reference values mints a path with the projection of the place, read from the owner's type
+  (`proj_of_addr`: fields by offset, elements by size, an enum's payload by its tag), held by the slot alone;
+  `cb_borrow_range` takes the container's place for a slice formed through a light reference, `cb_destroy_via`
+  the referent's, `cb_lock` the mutex's type. Element references, slices, views, lock guards and what a thread is
+  lent stay recorded in every frame (phase 3 steps 6–7 are what would make them light). A slot never holds a
+  light token (`cb_store_ref` of one aborts).
+- `COBALTC_RECORD=full` records every root and reference as before, in the same binary, the oracle of the
+  three-way gate `stress/d0281/phase3/gate3.sh` (`coby`, light, full over the 996 programs that keep paths:
+  all agree but thread programs whose model headers admit both outcomes, which re-runs show in both modes);
+  `COBALTC_RECORD=check` aborts where a light reference reaches an entry of a recording frame unrecorded (it
+  found `move` closures' `self`, read through its own token, before the arrival rule covered it).
+  `COBALTC_RT_STATS` prints the roots handed out light and recorded, light references, paths minted, holders at
+  stores, arrivals recorded, marked-owner checks and projections reconstructed. The 167 dynamic conformance cases
+  pass under GCC and Clang in check mode; `-v` says "kept paths: …; lowered with holders (D-0292)".
+- Measured (`stress/d0281/phase3/BENCH.md`, instructions, GCC `-O2`): the micro programs `h` (a reference stored
+  in a `Vec` a million times, tracked) 23.6 G → 20.7 G (−12%), `d` (200k views read in 20 passes) −3%, `b` (200k
+  string appends in a tracked program) +6%: the loop's frame push and pop now keep the recording flag, and the
+  object machinery, not the paths, is what such a program pays for. The decided programs lose only their root
+  paths (`cb_bind` is no macro): the self-hosted `cbc` compiling `anagrams.cb` 7.20 G → 6.80 G (−6%), `cbparse`
+  and `cobfmt` −3%, the showcases `password_store` and `static_site` −6%, the controls `csvstat`, `extsort`,
+  `wordpar` within 1%. `perf record` of `cbc` (decided): `end_identity_in` 8.7%, `detach` 5.7%, `cb_stmt_pop`
+  5.6%, `new_obj` 5.3%, `mint_in` 4.4%, `cb_frame_push` 4.1% — the objects of values and temporaries, the
+  objectless track's remainder, not paths.
+- Two conformance rows (`spec/conformance.md` 3.283.0): `conf.light-ref-recorded-on-arrival` (a decided `main`'s
+  references into three fields of one struct arrive in a tracked function and are recorded with their places, so
+  the disjoint fields do not clash) and `conf.light-ref-recorded-on-arrival-written` (the element the values
+  decide clashes). `spec/14` 1.41.0 §6 "The cost contract" says what is light and what stays recorded;
+  `spec/IMPLEMENTATION-NOTES.md`'s runtime contract regenerated; D-0281 §24 amended: next are step 4 (inline
+  fast paths), the frame shadows and block objects, the per-function objectless lowering (`PERFN.md`), then the
+  single port of the self-hosted compiler.
+- Release suites `stress/suites/runs/u147`: passed.
 
 ## CHG-0386: the real programs decided, and five holes closed (D-0291, 2026-10-29)
 

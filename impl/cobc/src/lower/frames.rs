@@ -111,6 +111,17 @@ impl<'g, 'a> Fx<'g, 'a> {
         self.push_frame_at(None);
     }
 
+    // D-0292: a function's own frame. `R`: the body's references are
+    // recorded (`Fx::tracked`), emitted as `cb_frame_push_rec` whether or
+    // not anything binds into it; `G`: a decided body, light, emitted as
+    // `cb_frame_push_fn` where the frame is used.
+    pub(super) fn push_frame_fn(&mut self, tracked: bool) {
+        self.g.nscope += 1;
+        let id = self.g.nscope;
+        self.scope_marker(if tracked { 'R' } else { 'G' }, id);
+        self.cleanup.push(Cleanup::Frame(id));
+    }
+
     // A frame whose end reports `line` for a destruction fault (the
     // block expression's, or its `if`'s): the marker carries the
     // location to `resolve_scopes`, which emits `cb_frame_push_at`.
@@ -259,9 +270,13 @@ impl<'g, 'a> Fx<'g, 'a> {
         if matches!(ty, Type::Void | Type::Never) {
             return Ok(());
         }
-        if matches!(ty, Type::Ref(..)) {
+        if let Type::Ref(inner, m) = ty {
+            // D-0292: the reference's place goes with it: a light one
+            // becomes a holder here.
+            let tid = self.tid(inner)?;
+            let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
             self.emit(&format!("{} = ({}).p;", dst, v.c));
-            self.emit(&format!("cb_store_ref(&{}, ({}).tok);", dst, v.c));
+            self.emit(&format!("cb_hold_ref(&{}, ({}).tok, ({}).p, {}u, {}, CB_NOLOC, 0);", dst, v.c, v.c, tid, md));
             return Ok(());
         }
         self.emit(&format!("{} = {};", dst, v.c));
@@ -892,6 +907,15 @@ impl<'g, 'a> Fx<'g, 'a> {
             // itself is never written, borrowed or captured.
             let l = format!("l_{}", pc);
             self.emit(&format!("void *{} = {}.p;", l, pc));
+            // D-0292: in a recording frame the parameter's reference is
+            // recorded on arrival, held by the frame for the call.
+            if self.tracked {
+                if let Type::Ref(inner, m) = &ty {
+                    let tid = self.tid(inner)?;
+                    let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+                    self.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 1u, CB_NOLOC, 0);", pc, pc, pc, tid, md));
+                }
+            }
             self.unstored.insert(l.clone(), format!("{}.tok", pc));
             self.scopes.last_mut().unwrap().insert(p.name.clone(), Binding { c: l, ty, root: String::new(), kind: BindKind::Local });
             return Ok(());
@@ -902,11 +926,20 @@ impl<'g, 'a> Fx<'g, 'a> {
         }
         let tid = self.tid(&ty)?;
         let o = self.g.fresh("o");
-        let cname = if matches!(ty, Type::Ref(..)) {
+        let cname = if let Type::Ref(inner, m) = &ty {
             let l = format!("l_{}", pc);
+            let itid = self.tid(inner)?;
+            let md = if *m == Mode::Exclusive { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+            // D-0292: in a recording frame the reference is recorded on
+            // arrival, held by the frame: the binding's slot and every use
+            // of the parameter's own token (a `move` closure's captures are
+            // read through `self`'s) see the record.
+            if self.tracked {
+                self.emit(&format!("{}.tok = cb_rec_ref({}.tok, {}.p, {}u, {}, 1u, CB_NOLOC, 0);", pc, pc, pc, itid, md));
+            }
             self.emit(&format!("void *{} = {}.p;", l, pc));
             self.emit(&format!("uint64_t {} = cb_new(&{}, {}u, {});", o, l, tid, NOLOC));
-            self.emit(&format!("cb_store_ref(&{}, {}.tok);", l, pc));
+            self.emit(&format!("cb_hold_ref(&{}, {}.tok, {}.p, {}u, {}, CB_NOLOC, 0);", l, pc, pc, itid, md));
             l
         } else if self.is_res(&ty) && self.g.decided {
             // D-0286: it arrives with no object. Objectless where the

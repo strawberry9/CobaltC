@@ -83,6 +83,14 @@ compiler checks the frame's accesses against it. When a reference or slice bindi
 thread or a closure still holds it, what they hold passes to what the binding referred to, so a
 write to it after the loop that lent it is still checked. A copy of a lent slice, an element of
 one, and a reborrow of one are left to the run while the lend lasts.""")
+b += p("""A program that is not decided no longer pays for every reference (D-0292). A function the
+compiler decided forms its references with no record at all, in any program: `&x`, `&s.f`, `&*p` cost a
+check against the references the run does record on that value, which is nothing when there are none,
+and after that nothing. The record is kept only where it is needed: a reference stored into data
+becomes a holder as it is stored, a reference arriving in a function that left a conflict to the run
+is recorded as it arrives, and element references, slices, views, lock guards and what a thread is
+lent are recorded everywhere. So a program that keeps paths for one function pays for that function,
+not for all of them.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
 the run, then lists the lines whose generated C still calls the runtime's tracking, with the

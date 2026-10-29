@@ -284,6 +284,8 @@ names a rule or is marked internal.
 | `cb_roundf` (inline) | bit operations | — | — |
 | `cb_index_check` (inline) | bit operations | — | — |
 | `cb_frame_push` | frames and statement scopes | [Block-Enter], [Call]: pushes a frame (state.frame-stack); its pop ends what it owns | `[Block-Enter]`, `[Call]` |
+| `cb_frame_push_fn` | frames and statement scopes | D-0292: [Call]: a decided body's own frame, whose references are light | `[Call]` |
+| `cb_frame_push_rec` | frames and statement scopes | D-0292: [Call]: the frame of a body the static pass left a conflict in (or with a point check): every reference formed or arriving in it is recorded | `[Call]` |
 | `cb_frame_pop` | frames and statement scopes | [Block-Exit]: ends the frame's owned objects last bound first, [Destroy] for a resource (its destructor, [Run-Destructor], [Destroy-Composite]), [Object-End] for the rest; drops the frame's holds | `[Block-Exit]`, `[Destroy]`, `[Run-Destructor]`, `[Destroy-Composite]`, `[Object-End]` |
 | `cb_frame_push_at` | frames and statement scopes | [Block-Enter] with the block's location, for a destruction fault | `[Block-Enter]` |
 | `cb_stmt_push` | frames and statement scopes | [Stmt-Enter]: a statement scope for this statement's temporaries and unheld paths | `[Stmt-Enter]` |
@@ -306,9 +308,12 @@ names a rule or is marked internal.
 | `cb_borrow_range` | access paths | a slice's range (D-0070) — [Slice-Form]: [Borrow] whose last step is the range lo..hi (D-0070) | `[Slice-Form]`, `[Borrow]` |
 | `cb_read` | access paths | [Read]'s premises on the place: temporally valid, ¬clash(shared), [Thread-Affine]; the C reads the value itself | `[Read]`, `[Thread-Affine]` |
 | `cb_write` | access paths | [Write]'s premises: temporally valid, mode exclusive, ¬clash(exclusive), ¬live-resource-at when `target_resource`; the C stores the value itself | `[Write]` |
+| `cb_point_check` | access paths | D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call, the call's argument paths `args` counted as held | — |
 | `cb_write_quiet` | access paths | D-0194: a quiet place's old value destroyed by the write — [Write-Quiet-Replace] (D-0194): the old quiet value at `addr` is destroyed ([Destroy]) and the place written | `[Write-Quiet-Replace]`, `[Destroy]` |
 | `cb_owns` | access paths | D-0049: the value there owns a resource now — `owns(τ, v)` of [Write]'s live-resource-at (D-0049): whether the value at `addr` owns a resource now | `[Write]` |
 | `cb_store_ref` | reference data | [Write] of a reference value: the slot's holder gains the path (held-by), keyed by the slot's address | `[Write]` |
+| `cb_hold_ref` | reference data | D-0292: [Write] of a reference value with its place: a light reference becomes a holder (a path on its object, held by the slot) — [Write] of a reference value whose place cobc knows (D-0292): a light reference stored into data becomes a holder, a recorded one is stored as cb_store_ref stores it | `[Write]` |
+| `cb_rec_ref` | reference data | D-0292: a reference arriving in a recording frame, recorded (kind 1: held by the frame, a parameter; 0: stamped into the statement, a result) — [Borrow]'s record for a light reference arriving in a body whose references the run records (D-0292): a path with the projection of its place; a recorded one is returned as it is | `[Borrow]` |
 | `cb_load_ref` | reference data | [Read] of a reference value: the token the slot holds | `[Read]` |
 | `cb_valid` | reference data | [Swap-Places]: temporally valid, no conflict check | `[Swap-Places]` |
 | `cb_copy_datum` | reference data | [Read] then [Write] of a value holding references: the bytes and each slot's hold are copied | `[Read]`, `[Write]` |
@@ -385,6 +390,7 @@ names a rule or is marked internal.
 | `cb_task_op` | threads and mutexes | [Failure-Text] and the supervision operations' queries | `[Failure-Text]` |
 | `cb_join` | threads and mutexes | [Join]: the result's object, or 0 | `[Join]` |
 | `cb_lock` | threads and mutexes | [Lock]: the lock path's token | `[Lock]` |
+| `cb_lock_pathless` | threads and mutexes | D-0289: [Lock] with no lock path (CB_PATHLESS) | `[Lock]` |
 | `cb_lock_bare` | threads and mutexes | D-0200: lock without a guard — [Lock] without a guard object (D-0200, std's own bodies): sync(o) := locked-by; unlocked by cb_unlock_bare | `[Lock]` |
 | `cb_unlock_bare` | threads and mutexes | [Guard-Drop] without a guard object | `[Guard-Drop]` |
 | `cb_unlock_signal` | threads and mutexes | D-0200: event_op(3, id) then cb_unlock_bare(m) — [Atomic-Notify]-like event signal (event_op(3, id)) then [Guard-Drop] without a guard, as one step | `[Atomic-Notify]`, `[Guard-Drop]` |
@@ -393,6 +399,7 @@ names a rule or is marked internal.
 | `cb_fnv_more` (inline) | text and hashing helpers | D-0110: FNV-1a continued from h over n more bytes (a composite key) | — |
 | `cb_bytes_cmp` (inline) | text and hashing helpers | D-0108: text in byte order; negative, zero or positive | — |
 | `cb_bytes_eq` (inline) | text and hashing helpers | — | — |
+| `cb_write_pathless` (inline) | text and hashing helpers | D-0281 step 4c: a whole tier-S program lowered with no paths (cobc defines CB_PATHLESS when the program is eligible). Every reference carries token 0: the path entries are constants or no-ops, so the C compiler deletes the calls and what is computed only for them. Objects, frames, scopes and destruction are unchanged, and so are bounds, overflow, positions and the value tests. A reference in flight or an element's reference sent as data still takes its place in the queue of what is in flight, as token 0. | — |
 
 <!-- runtime-contract:end -->
 

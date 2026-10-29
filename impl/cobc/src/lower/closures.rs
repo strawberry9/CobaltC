@@ -163,6 +163,7 @@ impl<'g, 'a> Fx<'g, 'a> {
             map_acc: None,
             map_acc_used: false,
             pc_site: None,
+            tracked: self.tracked,
             compound_elem: false,
             datum_tok: None,
             datum_tok_out: None,
@@ -191,7 +192,8 @@ impl<'g, 'a> Fx<'g, 'a> {
                 inert_c: HashSet::new(),
                 obj_temps: HashSet::new(), inert_result: None, inert_now: None, notes: 0, root_frame: 0,
             };
-            fx.push_frame();
+            let tracked = fx.tracked;
+            fx.push_frame_fn(tracked);
             fx.root_frame = fx.g.nscope;
             // A closure that captures nothing never reaches `self`: it is
             // bound as a bare address (`bind_param`'s direct form), and its

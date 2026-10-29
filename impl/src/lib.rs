@@ -105,6 +105,7 @@ pub fn new_items() -> interp::Items {
         point_checks: std::sync::Mutex::new(HashMap::default()),
         any_point_checks: std::sync::atomic::AtomicBool::new(false),
         tracking_needed: std::sync::Mutex::new(HashMap::default()),
+        point_check_fns: std::sync::Mutex::new(std::collections::HashSet::new()),
     }
 }
 

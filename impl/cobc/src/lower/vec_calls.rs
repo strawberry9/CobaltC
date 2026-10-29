@@ -854,7 +854,8 @@ impl<'g, 'a> Fx<'g, 'a> {
         // exclusively through `v`, so a live shared path to the container
         // clashes.
         if name == "std::Vec::index_exclusive" {
-            self.emit(&format!("cb_borrow_range_unminted({}.tok, NULL, 0, {}, {} + 1, CB_EXCLUSIVE, CB_NOLOC, 0);", r.c, i.c, i.c));
+            let vtid = self.tid(&Type::Named("std::Vec".to_string(), vec![elem.clone()]))?;
+            self.emit(&format!("cb_borrow_range_unminted({}.tok, {}.p, {}u, NULL, 0, {}, {} + 1, CB_EXCLUSIVE, CB_NOLOC, 0);", r.c, r.c, vtid, i.c, i.c));
         }
         self.emit(&format!("{} *{} = {}->ptr + (int64_t){};", elem_c, e, v, i.c));
         let loc = self.loc(line);

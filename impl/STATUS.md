@@ -76,7 +76,12 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   program decided. A local `Vec<StringView>`, `Vec<ref<T>>` or struct of references that stays in its frame
   is checked before the run as a reference is (D-0290), and leaves it decided too; so do a handle wrapped in
   an `Option`, a reference `call(…)?` gives, and a slice lent whole to a thread (D-0291), which lets the
-  self-hosted compiler and the showcase `parallel_chunks` be decided. `--all-checks` keeps every
+  self-hosted compiler and the showcase `parallel_chunks` be decided. In a program that keeps paths, a
+  function the static pass decided forms *light* references (D-0292): recorded nowhere, checked once at their
+  formation against the owner's recorded references, and recorded where they are stored into data or arrive in
+  a function the static pass left a conflict in; `-v` says "lowered with holders", `COBALTC_RECORD=full` keeps
+  the full record (the differential oracle) and `COBALTC_RECORD=check` aborts where a light reference reaches
+  what should have recorded it. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

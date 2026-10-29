@@ -618,7 +618,7 @@ fn real_main() -> ExitCode {
     match &gen.pathless {
         Ok(()) if gen.decided => note("lowered pathless and decided (D-0284, D-0285)"),
         Ok(()) => note("lowered pathless (D-0284)"),
-        Err(why) => note(&format!("kept paths: {}", why)),
+        Err(why) => note(&format!("kept paths: {}; lowered with holders (D-0292)", why)),
     }
     if report_tracking {
         match &gen.pathless {

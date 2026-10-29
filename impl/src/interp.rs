@@ -156,6 +156,10 @@ pub struct Items {
     // each with the first reason; `cobc` lowers a program pathless only
     // when none of its functions is here.
     pub tracking_needed: Mutex<HashMap<String, String>>,
+    // D-0292: the bodies (`tier::body_key`) with a point check (D-0283) at
+    // one of their calls: `cobc` lowers them as recording frames, since a
+    // point check sees only recorded references.
+    pub point_check_fns: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Items {

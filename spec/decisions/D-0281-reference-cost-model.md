@@ -814,3 +814,13 @@ access through it faults, so a pathless callee would read freed memory where the
 light tokens do what it was for (D-0291, `stress/d0281/phase3/PERFN.md`). So what remains is phase 3's tier-D
 runtime (Update 147, perhaps more than one), then the single port of the self-hosted compiler and its
 measurement (the Update after).
+
+**Amended 2026-10-29 (D-0292, Update 147).** Phase 3's first steps are in: a decided function's references are
+light in any program (recorded nowhere; holders made where a reference is stored into data; recorded on arrival
+in a function the static pass left a conflict in), with `COBALTC_RECORD=full` as the oracle and a three-way gate
+(`stress/d0281/phase3/gate3.sh`). Element references, slices, views, guards and lends stay recorded until steps
+6–7 (frame shadows, block objects). The profile of the self-hosted compiler (decided since D-0291) is dominated
+by the objects of values and temporaries, not by paths — the objectless track's remainder — and a tracked
+program's by the same objects plus its holders, so the next steps are step 4 (inline fast paths), the frame
+shadows and block objects, the objectless remainder and the per-function lowering of values
+(`stress/d0281/phase3/PERFN.md`), before the port.

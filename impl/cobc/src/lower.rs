@@ -351,6 +351,10 @@ struct Fx<'g, 'a> {
     // D-0283: the site (the callee's line and column) of the call
     // `lower_call` is lowering, for its point checks; taken as it starts.
     pc_site: Option<(usize, usize)>,
+    // D-0292: the body's frame records every reference formed in it (the
+    // static pass left it a conflict, or a point check): `cb_frame_push_rec`,
+    // and references arriving in it are recorded (`cb_rec_ref`).
+    tracked: bool,
     // A `match`'s fused scrutinee, lowered as its place (`lower_match`).
     fused_scrut: Option<V>,
     // `*HashMap::entry(…) op= e` (`lower_block_body`'s compound pair):
