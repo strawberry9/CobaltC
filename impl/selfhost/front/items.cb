@@ -1,0 +1,645 @@
+// The item table the type checker reads, as impl/src/lib.rs's
+// `build_items` fills `interp::Items`' declaration tables (every key as
+// `modres::qualify` makes it); the functions of `std`, whose bodies are
+// parsed when the checker first reaches them (`load_body`, CHG-0355); and
+// the expressions' ids, which the checker's facts are keyed by.
+
+import std;
+import ast;
+import parser;
+import modres;
+import consts;
+import views;
+import prelude;
+
+export struct ExternCode
+{
+    export String code;
+    export usize line;
+}
+
+// Where a function of `std` is in `PRELUDE_BODIES`, and how to parse it.
+struct BodyRec
+{
+    String home;
+    usize line;
+    usize col;
+    usize fresh;
+    usize local_consts;
+    usize offset;
+    usize length;
+}
+
+export struct Items
+{
+    export HashMap<String, FnDecl> fns;
+    export HashMap<String, ExternDecl> externs;
+    export HashMap<String, StaticDecl> statics;
+    export HashMap<String, StructDecl> structs;
+    export HashMap<String, EnumDecl> enums;
+    // A variant's name to its enum (the last declared).
+    export HashMap<String, String> enum_of_variant;
+    export Vec<ExternCode> extern_code;
+    // The functions of `std` whose bodies are not parsed yet.
+    HashMap<String, BodyRec> pending;
+    usize next_id;
+    // Whether a struct's or an enum's values hold a reference or slice
+    // (`holds_ref`), computed once (`ref_infos`).
+    export HashMap<String, RefInfo> ref_info;
+    // The same for whether they are resources (`is_resource_ty`).
+    export HashMap<String, RefInfo> res_info;
+    // A variant's name to whether it has a payload, where every enum with
+    // a variant of that name agrees (`None` where they disagree).
+    export HashMap<String, Option<bool>> variant_payload;
+    // `m::V` (`module_variant_enum`): a module path and a variant name,
+    // joined by `\u{1}`, to the one enum directly in that module with the
+    // variant (`None` where there are several).
+    export HashMap<String, Option<String>> module_variant;
+}
+
+// What `holds_ref` finds for a struct or an enum `N<P1, …>`: its values
+// hold a reference or slice by themselves (`own`), or when the arguments
+// at `params` do. `exact` is false where an arity disagrees, and then
+// `holds_ref` looks at the fields themselves.
+export struct RefInfo
+{
+    export bool own;
+    export Vec<usize> params;
+    export bool exact;
+    export usize arity;
+}
+
+// What the front end keeps for the functions of `std` parsed later: the
+// resolver, the folded constants' literals, the literal views' signatures.
+export struct Front
+{
+    export Resolver resolver;
+    export HashMap<String, Expr> lits;
+    export Sigs sigs;
+    export StdBase std_base;
+}
+
+fn simple_name(ref<FnDecl, shared> f) : String
+{
+    match (&f.assoc_type)
+    {
+        Some(t) : sprintf("%s::%s", t, &f.name),
+        None    : String::clone(&f.name),
+    }
+}
+
+fn enter_items(Vec<Item> list, ref<Vec<String>, exclusive> path, ref<Items, exclusive> out)
+{
+    Vec::reverse(&mut list);
+    while (true)
+    {
+        Item it = match (Vec::pop(&mut list))
+        {
+            Some(it) : it,
+            None     : break,
+        };
+        match (it)
+        {
+            Item::IFn(b)         :
+            {
+                FnDecl f = Box::into_inner(b);
+                HashMap::insert(&mut out.fns, qualify(path, String::as_view(&simple_name(&f))), f);
+            },
+            Item::IExtern(b)     :
+            {
+                ExternDecl e = Box::into_inner(b);
+                HashMap::insert(&mut out.externs, qualify(path, String::as_view(&e.name)), e);
+            },
+            Item::IStatic(b)     :
+            {
+                StaticDecl s = Box::into_inner(b);
+                HashMap::insert(&mut out.statics, qualify(path, String::as_view(&s.name)), s);
+            },
+            Item::IStruct(b)     :
+            {
+                StructDecl s = Box::into_inner(b);
+                HashMap::insert(&mut out.structs, qualify(path, String::as_view(&s.name)), s);
+            },
+            Item::IEnum(b)       :
+            {
+                EnumDecl e = Box::into_inner(b);
+                String qk = qualify(path, String::as_view(&e.name));
+                for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+                {
+                    HashMap::insert(&mut out.enum_of_variant, String::clone(&e.variants[i].name), String::clone(&qk));
+                }
+                HashMap::insert(&mut out.enums, qk, e);
+            },
+            Item::IModule(b)     :
+            {
+                ModuleItem { name, items, .. } = Box::into_inner(b);
+                Vec::push(path, name);
+                enter_items(items, path, out);
+                Vec::pop(path);
+            },
+            Item::IImport(_)     : {},
+            Item::IExternCode(b) :
+            {
+                ExternCodeItem { code, line, .. } = Box::into_inner(b);
+                Vec::push(&mut out.extern_code, ExternCode { .code = code, .line = line });
+            },
+        }
+    }
+}
+
+fn field(ref<Vec<StringView>, shared> parts, usize k) : usize
+{
+    Result::expect(StringView::parse<usize>(parts[k]), "a number in PRELUDE_BODY_INDEX")
+}
+
+// The table of `program`'s items (consumed), and the functions of `std`
+// whose bodies `PRELUDE_BODIES` holds.
+export fn build_items(Program program) : Items
+{
+    Items out = Items {
+        .fns = HashMap::new(),
+        .externs = HashMap::new(),
+        .statics = HashMap::new(),
+        .structs = HashMap::new(),
+        .enums = HashMap::new(),
+        .enum_of_variant = HashMap::new(),
+        .extern_code = Vec::new(),
+        .pending = HashMap::new(),
+        .next_id = 1,
+        .ref_info = HashMap::new(),
+        .res_info = HashMap::new(),
+        .variant_payload = HashMap::new(),
+        .module_variant = HashMap::new(),
+    };
+    Program { items, .. } = program;
+    Vec<String> path = Vec::new();
+    enter_items(items, &mut path, &mut out);
+    out.ref_info = ref_infos(&out, 0);
+    out.res_info = ref_infos(&out, 1);
+    out.variant_payload = variant_payloads(&out);
+    out.module_variant = module_variants(&out);
+    Vec<StringView> records = StringView::lines(PRELUDE_BODY_INDEX);
+    for (usize i = 0; i < Vec::len(&records); i += 1)
+    {
+        Vec<StringView> parts = StringView::split(records[i], " ");
+        if (Vec::len(&parts) != 8)
+        {
+            continue;
+        }
+        HashMap::insert(&mut out.pending, String::from_view(parts[0]), BodyRec {
+            .home = String::from_view(parts[1]),
+            .line = field(&parts, 2),
+            .col = field(&parts, 3),
+            .fresh = field(&parts, 4),
+            .local_consts = field(&parts, 5),
+            .offset = field(&parts, 6),
+            .length = field(&parts, 7),
+        });
+    }
+    out
+}
+
+// `ty`'s part in a `RefInfo` of a declaration with type parameters `tps`:
+// of `kind` 0, references and slices; of `kind` 1, resources.
+fn ref_info_add(
+    ref<RefInfo, exclusive> acc,
+    ref<Type, shared> ty,
+    ref<Vec<String>, shared> tps,
+    ref<HashMap<String, RefInfo>, shared> table,
+    u8 kind,
+)
+{
+    match (ty)
+    {
+        Type::TRef(_)    : acc.own = acc.own || kind == 0,
+        Type::TSlice(_)  : acc.own = acc.own || kind == 0,
+        Type::THandle(_) : acc.own = acc.own || kind == 1,
+        Type::TMutex(_)  : acc.own = acc.own || kind == 1,
+        Type::TGuard(_)  : acc.own = acc.own || kind == 1,
+        Type::TArray(b)  : ref_info_add(acc, &Box::get(b).inner, tps, table, kind),
+        Type::TNamed(b)  :
+        {
+            ref<NamedTy, shared> n = Box::get(b);
+            if (Vec::len(&n.args) == 0)
+            {
+                for (usize i = 0; i < Vec::len(tps); i += 1)
+                {
+                    if (String::eq(&tps[i], &n.name))
+                    {
+                        if (!Vec::contains(&acc.params, &i))
+                        {
+                            Vec::push(&mut acc.params, i);
+                        }
+                        return;
+                    }
+                }
+            }
+            match (HashMap::get(table, &n.name))
+            {
+                Some(r) :
+                {
+                    if (!r.exact || Vec::len(&n.args) != r.arity)
+                    {
+                        acc.exact = false;
+                        return;
+                    }
+                    if (r.own)
+                    {
+                        acc.own = true;
+                    }
+                    for (usize k = 0; k < Vec::len(&r.params); k += 1)
+                    {
+                        ref_info_add(acc, &n.args[r.params[k]], tps, table, kind);
+                    }
+                },
+                None    : {},
+            }
+        },
+        _                : {},
+    }
+}
+
+// Every struct's and enum's `RefInfo`, the least fixpoint (a struct
+// first where an enum has its name, as `any_part` looks).
+fn ref_infos(ref<Items, shared> it, u8 kind) : HashMap<String, RefInfo>
+{
+    HashMap<String, RefInfo> table = HashMap::new();
+    for (usize i = 0; i < HashMap::len(&it.structs); i += 1)
+    {
+        ref<StructDecl, shared> d = HashMap::value_at(&it.structs, i);
+        HashMap::insert(&mut table, String::clone(HashMap::key_at(&it.structs, i)), RefInfo {
+            .own = false,
+            .params = Vec::new(),
+            .exact = true,
+            .arity = Vec::len(&d.type_params),
+        });
+    }
+    for (usize i = 0; i < HashMap::len(&it.enums); i += 1)
+    {
+        ref<EnumDecl, shared> d = HashMap::value_at(&it.enums, i);
+        if (!HashMap::contains(&table, HashMap::key_at(&it.enums, i)))
+        {
+            HashMap::insert(&mut table, String::clone(HashMap::key_at(&it.enums, i)), RefInfo {
+                .own = false,
+                .params = Vec::new(),
+                .exact = true,
+                .arity = Vec::len(&d.type_params),
+            });
+        }
+    }
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (usize i = 0; i < HashMap::len(&table); i += 1)
+        {
+            String name = String::clone(HashMap::key_at(&table, i));
+            RefInfo next = RefInfo { .own = false, .params = Vec::new(), .exact = true, .arity = 0 };
+            match (HashMap::get(&it.structs, &name))
+            {
+                Some(d) :
+                {
+                    next.arity = Vec::len(&d.type_params);
+                    next.own = kind == 1 && d.resource_;
+                    for (usize k = 0; k < Vec::len(&d.fields); k += 1)
+                    {
+                        ref_info_add(&mut next, &d.fields[k].ty, &d.type_params, &table, kind);
+                    }
+                },
+                None : match (HashMap::get(&it.enums, &name))
+                {
+                    Some(d) :
+                    {
+                        next.arity = Vec::len(&d.type_params);
+                        next.own = kind == 1 && d.resource_;
+                        for (usize k = 0; k < Vec::len(&d.variants); k += 1)
+                        {
+                            match (&d.variants[k].payload)
+                            {
+                                Some(p) : ref_info_add(&mut next, p, &d.type_params, &table, kind),
+                                None    : {},
+                            }
+                        }
+                    },
+                    None    : {},
+                },
+            }
+            Vec::sort(&mut next.params);
+            ref<RefInfo, shared> now = HashMap::value_at(&table, i);
+            bool same = now.own == next.own && now.exact == next.exact && Vec::len(&now.params) == Vec::len(&next.params);
+            if (!same)
+            {
+                HashMap::insert(&mut table, name, next);
+                changed = true;
+            }
+        }
+    }
+    table
+}
+
+// Every module path and variant name to the enum directly in that module
+// with that variant.
+fn module_variants(ref<Items, shared> it) : HashMap<String, Option<String>>
+{
+    HashMap<String, Option<String>> out = HashMap::new();
+    for (usize i = 0; i < HashMap::len(&it.enums); i += 1)
+    {
+        ref<String, shared> key = HashMap::key_at(&it.enums, i);
+        StringView kv = String::as_view(key);
+        // The last `::`.
+        slice<u8, shared> bytes = StringView::as_bytes(kv);
+        usize at = 0;
+        bool cut = false;
+        for (usize j = StringView::len(kv); j >= 2; j -= 1)
+        {
+            if (bytes[j - 1] == b':' && bytes[j - 2] == b':')
+            {
+                at = j - 2;
+                cut = true;
+                break;
+            }
+        }
+        if (!cut)
+        {
+            continue;
+        }
+        ref<EnumDecl, shared> e = HashMap::value_at(&it.enums, i);
+        HashSet<String> seen = HashSet::new();
+        for (usize k = 0; k < Vec::len(&e.variants); k += 1)
+        {
+            ref<String, shared> v = &e.variants[k].name;
+            if (HashSet::contains(&seen, v))
+            {
+                continue;
+            }
+            HashSet::insert(&mut seen, String::clone(v));
+            String mk = String::from_view(StringView::sub(kv, 0, at));
+            String::append(&mut mk, "\u{1}");
+            String::append(&mut mk, String::as_view(v));
+            bool there = HashMap::contains(&out, &mk);
+            if (there)
+            {
+                HashMap::insert(&mut out, mk, None);
+            }
+            else
+            {
+                HashMap::insert(&mut out, mk, Some(String::clone(key)));
+            }
+        }
+    }
+    out
+}
+
+// Every variant name's payload, where the enums agree (`variant_arity`).
+fn variant_payloads(ref<Items, shared> it) : HashMap<String, Option<bool>>
+{
+    HashMap<String, Option<bool>> out = HashMap::new();
+    for (usize i = 0; i < HashMap::len(&it.enums); i += 1)
+    {
+        ref<EnumDecl, shared> e = HashMap::value_at(&it.enums, i);
+        HashSet<String> seen = HashSet::new();
+        for (usize k = 0; k < Vec::len(&e.variants); k += 1)
+        {
+            ref<VariantDecl, shared> v = &e.variants[k];
+            if (HashSet::contains(&seen, &v.name))
+            {
+                continue;
+            }
+            HashSet::insert(&mut seen, String::clone(&v.name));
+            bool p = Option::is_some(&v.payload);
+            Option<Option<bool>> before = match (HashMap::get(&out, &v.name))
+            {
+                Some(b) : Some(*b),
+                None    : None,
+            };
+            match (before)
+            {
+                None          :
+                {
+                    HashMap::insert(&mut out, String::clone(&v.name), Some(p));
+                },
+                Some(Some(q)) :
+                {
+                    if (q != p)
+                    {
+                        HashMap::insert(&mut out, String::clone(&v.name), None);
+                    }
+                },
+                Some(None)    : {},
+            }
+        }
+    }
+    out
+}
+
+// Whether `key` is a function of `std` whose body is not parsed yet.
+export fn is_pending(ref<Items, shared> it, ref<String, shared> key) : bool
+{
+    HashMap::contains(&it.pending, key)
+}
+
+// The body of the function of `std` `key`, parsed alone and taken through
+// what the front end did to the rest (`modres`, `consts`, `views`), its
+// expressions numbered, in place of the declaration's empty one.
+export fn load_body(ref<Items, exclusive> it, ref<Front, shared> front, ref<String, shared> key) : Result<void, String>
+{
+    BodyRec rec = match (HashMap::swap_remove(&mut it.pending, key))
+    {
+        Some(r) : r,
+        None    : return Ok(()),
+    };
+    StringView text = StringView::sub(PRELUDE_BODIES, rec.offset, rec.offset + rec.length);
+    Item item = parse_std_fn(&front.std_base, text, rec.line, rec.col, rec.fresh, rec.local_consts)?;
+    Vec<Item> one = Vec::new();
+    Vec::push(&mut one, item);
+    resolve_more(&front.resolver, &mut one, String::as_view(&rec.home))?;
+    consts::rewrite_more(&mut one, &front.lits);
+    views::rewrite_more(&mut one, &front.sigs);
+    match (Vec::pop(&mut one))
+    {
+        Some(Item::IFn(b)) :
+        {
+            FnDecl f = Box::into_inner(b);
+            // A test of `std` (D-0230) parsed alone: its name is its key's.
+            if (String::starts_with(&f.name, "__unittest_"))
+            {
+                match (String::find(key, "__unittest_"))
+                {
+                    Some(i) : f.name = String::from_view(StringView::sub(String::as_view(key), i, String::len(key))),
+                    None    : {},
+                }
+            }
+            number_block(&mut f.body, &mut it.next_id);
+            HashMap::insert(&mut it.fns, String::clone(key), f);
+        },
+        _                  : {},
+    }
+    Ok(())
+}
+
+// ---- the expressions' ids ----
+
+// Every expression of the program's functions and statics gets its id, in
+// the order of the functions' keys and then the tree's, pre-order.
+export fn number(ref<Items, exclusive> it)
+{
+    Vec<String> keys = Vec::new();
+    for (usize i = 0; i < HashMap::len(&it.fns); i += 1)
+    {
+        Vec::push(&mut keys, String::clone(HashMap::key_at(&it.fns, i)));
+    }
+    Vec::sort(&mut keys);
+    for (usize i = 0; i < Vec::len(&keys); i += 1)
+    {
+        ref<FnDecl, exclusive> f = Option::expect(HashMap::get_mut(&mut it.fns, &keys[i]), "a function");
+        number_block(&mut f.body, &mut it.next_id);
+    }
+    Vec<String> statics = Vec::new();
+    for (usize i = 0; i < HashMap::len(&it.statics); i += 1)
+    {
+        Vec::push(&mut statics, String::clone(HashMap::key_at(&it.statics, i)));
+    }
+    Vec::sort(&mut statics);
+    for (usize i = 0; i < Vec::len(&statics); i += 1)
+    {
+        ref<StaticDecl, exclusive> s = Option::expect(HashMap::get_mut(&mut it.statics, &statics[i]), "a static");
+        number_expr(&mut s.init, &mut it.next_id);
+    }
+}
+
+fn number_block(ref<Block, exclusive> b, ref<usize, exclusive> next)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        match (&mut b.stmts[i])
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&mut Box::get_mut(l).init)
+                {
+                    Some(e) : number_expr(e, next),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : number_expr(&mut Box::get_mut(d).init, next),
+            Stmt::SExpr(e)        : number_expr(Box::get_mut(e), next),
+            Stmt::SBlockLike(e)   : number_expr(Box::get_mut(e), next),
+        }
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : number_expr(Box::get_mut(t), next),
+        None    : {},
+    }
+}
+
+export fn number_expr(ref<Expr, exclusive> e, ref<usize, exclusive> next)
+{
+    e.id = *next;
+    *next += 1;
+    match (&mut e.kind)
+    {
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, exclusive> s = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                number_expr(&mut s.fields[i].value, next);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                number_expr(&mut es[i], next);
+            }
+        },
+        ExprKind::EArrayRepeat(b) : number_expr(&mut Box::get_mut(b).value, next),
+        ExprKind::EUnary(b)       : number_expr(&mut Box::get_mut(b).e, next),
+        ExprKind::EBorrow(b)      : number_expr(&mut Box::get_mut(b).e, next),
+        ExprKind::EDeref(x)       : number_expr(Box::get_mut(x), next),
+        ExprKind::EField(b)       : number_expr(&mut Box::get_mut(b).e, next),
+        ExprKind::EPropagate(x)   : number_expr(Box::get_mut(x), next),
+        ExprKind::EParen(x)       : number_expr(Box::get_mut(x), next),
+        ExprKind::EBinary(b)      :
+        {
+            number_expr(&mut Box::get_mut(b).a, next);
+            number_expr(&mut Box::get_mut(b).b, next);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            number_expr(&mut Box::get_mut(b).a, next);
+            number_expr(&mut Box::get_mut(b).b, next);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            number_expr(&mut Box::get_mut(b).a, next);
+            number_expr(&mut Box::get_mut(b).b, next);
+        },
+        ExprKind::ESliceOf(b)     :
+        {
+            ref<SliceExpr, exclusive> x = Box::get_mut(b);
+            number_expr(&mut x.base, next);
+            number_expr(&mut x.lo, next);
+            number_expr(&mut x.hi, next);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, exclusive> c = Box::get_mut(b);
+            number_expr(&mut c.callee, next);
+            for (usize i = 0; i < Vec::len(&c.args); i += 1)
+            {
+                number_expr(&mut c.args[i], next);
+            }
+        },
+        ExprKind::EBlock(b)       : number_block(b, next),
+        ExprKind::EUnsafe(b)      : number_block(b, next),
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            number_expr(&mut x.cond, next);
+            number_block(&mut x.then_, next);
+            match (&mut x.else_)
+            {
+                Some(el) : number_expr(el, next),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, exclusive> x = Box::get_mut(b);
+            number_expr(&mut x.cond, next);
+            number_block(&mut x.body, next);
+            match (&mut x.step)
+            {
+                Some(s) : number_expr(s, next),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            number_expr(&mut x.scrut, next);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                ref<Arm, exclusive> a = &mut x.arms[i];
+                match (&mut a.lit)
+                {
+                    Some(l) : number_expr(Box::get_mut(l), next),
+                    None    : {},
+                }
+                number_expr(Box::get_mut(&mut a.body), next);
+            }
+        },
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) : number_expr(Box::get_mut(x), next),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(b)     : number_block(&mut Box::get_mut(b).body, next),
+        _                         : {},
+    }
+}

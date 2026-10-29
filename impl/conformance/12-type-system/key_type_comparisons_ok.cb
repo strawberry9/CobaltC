@@ -1,0 +1,122 @@
+// CONFORMANCE-CASE
+// spec: 12-type-system
+// facility: rule.type.bound (D-0271: a key type satisfies `eq` and `ordered`); rule.arith.cmp [Cmp-Key]; rule.stdlib.sort [Sort]; conf.cmp-struct-key, conf.cmp-enum-key, conf.bound-ordered-struct-key, conf.vec-contains-struct-key, conf.eq-string-field-struct, conf.sort-order-is-lt
+// kind: positive
+// expect: ok
+//
+// A struct or enum of key types (D-0110) is ordered as `Vec::sort` orders
+// it: field by field in declaration order, a text field by its bytes, a
+// nested key type by its own order; an enum by variant order, then by
+// payload. The same types satisfy `eq` and `ordered` at a generic call.
+// A key type holding a `String` is compared where it stands: nothing is
+// moved, and the `String` is usable afterwards.
+
+import std;
+
+struct Pos
+{
+    i32 x;
+    i32 y;
+}
+
+struct Name
+{
+    String first;
+    u8 n;
+}
+
+struct Cell
+{
+    Pos at;
+    bool live;
+}
+
+enum Lvl
+{
+    Low,
+    Mid,
+    High,
+}
+
+enum Shape
+{
+    Dot,
+    Square(u32),
+    Label(String),
+}
+
+fn biggest<T: ordered>(ref<Vec<T>, shared> v) : ref<T, shared>
+{
+    usize best = 0;
+    for (usize i = 1; i < Vec::len(v); i += 1)
+    {
+        if (v[best] < v[i])
+        {
+            best = i;
+        }
+    }
+    &v[best]
+}
+
+fn same<T: eq>(ref<T, shared> a, ref<T, shared> b) : bool
+{
+    *a == *b
+}
+
+fn main()
+{
+    // conf.cmp-struct-key: field by field in declaration order.
+    Pos p = Pos { .x = 1, .y = 2 };
+    Pos q = Pos { .x = 1, .y = 3 };
+    Pos r = Pos { .x = 0, .y = 9 };
+    assert(p < q && !(q < p) && r < p && p <= p && p > r && !(p >= q));
+    // A nested key type by its own order, then the next field.
+    Cell c1 = Cell { .at = r, .live = true };
+    Cell c2 = Cell { .at = p, .live = false };
+    Cell c3 = Cell { .at = p, .live = true };
+    assert(c1 < c2 && c2 < c3 && !(c3 < c2));
+
+    // conf.cmp-enum-key: variant order, then payload.
+    Lvl lo = Lvl::Low;
+    Lvl hi = Lvl::High;
+    assert(lo < hi && !(hi < lo) && lo < Lvl::Mid && Lvl::Mid < hi && hi == Lvl::High);
+    Shape s1 = Shape::Square(4);
+    Shape s2 = Shape::Label(String::from_str("x"));
+    Shape s3 = Shape::Label(String::from_str("y"));
+    assert(Shape::Dot < s1 && s1 < s2 && s2 < s3 && !(s3 < s2));
+    assert(s2 == Shape::Label(String::from_str("x")) && s2 != s3);
+    Option<String> some = Some(String::from_str("k"));
+    Option<String> none = None;
+    assert(some != none && some == Some(String::from_str("k")) && some < none);
+
+    // conf.bound-ordered-struct-key, conf.vec-contains-struct-key: `eq`
+    // and `ordered` at a struct, in `std`'s generics and the program's.
+    Vec<Pos> v = Vec::new();
+    Vec::push(&mut v, p);
+    Vec::push(&mut v, r);
+    Vec::push(&mut v, q);
+    assert(Vec::contains(&v, &q) && !Vec::contains(&v, &Pos { .x = 7, .y = 7 }));
+    assert(Option::unwrap(Vec::index_of(&v, &r)) == 1);
+    assert(*biggest(&v) == q && same(&p, &p) && !same(&p, &q));
+    assert(max(p, r) == p && min(p, r) == r);
+
+    // conf.eq-string-field-struct: by the text's bytes, where it stands.
+    Name a = Name { .first = String::from_str("ann"), .n = 1 };
+    Name b = Name { .first = String::from_str("bob"), .n = 0 };
+    Name d = Name { .first = String::from_str("ann"), .n = 1 };
+    assert(a == d && a != b && a < b && !(b < a) && !(a < d));
+    assert(String::len(&a.first) == 3 && String::len(&d.first) == 3);
+    Vec<Name> names = Vec::new();
+    Vec::push(&mut names, b);
+    Vec::push(&mut names, a);
+    assert(Vec::contains(&names, &d));
+    assert(String::eq_str(&biggest(&names).first, "bob"));
+
+    // conf.sort-order-is-lt: `Vec::sort` puts `a` before `b` exactly when
+    // `a < b`.
+    Vec::sort(&mut v);
+    assert(v[0] == r && v[1] == p && v[2] == q);
+    assert(v[0] < v[1] && v[1] < v[2]);
+    Vec::sort(&mut names);
+    assert(names[0] < names[1] && String::eq_str(&names[0].first, "ann"));
+}

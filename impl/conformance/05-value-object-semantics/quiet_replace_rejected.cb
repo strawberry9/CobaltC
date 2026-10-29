@@ -1,0 +1,78 @@
+// CONFORMANCE-CASE
+// spec: 05-value-object-semantics
+// facility: spec/05 [Write-Quiet-Replace]; conf.quiet-replace
+// kind: negative
+// expect: diag.overwrite-of-live-resource (dynamic)
+// expect-stdout-hex: 74776f2d74687265650a622033206e320a7a20790a72320a616761696e20330a3239392d35203239392d350a7365740a5b64726f7020325d5b64726f7020315d
+//
+// x = v over a live value of a quiet type destroys the old value: a
+// String local (also x = f(&x)), struct fields of String, Vec and
+// Option<String>, Vec elements, a struct element and its field, a
+// moved-out binding reassigned, and 300 replacements in a loop; an Option
+// of a resource with a destructor is not quiet, and writing over its Some
+// faults after destroying the value being written (D-0194)
+
+import std;
+
+resource struct Noisy
+{
+    i64 id;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[drop %v]", self.id);
+}
+
+struct Rec
+{
+    String name;
+    Vec<u64> nums;
+    Option<String> note;
+}
+
+fn main()
+{
+    String s = String::from_str("one");
+    s = String::from_str("two");
+    s = sprintf("%s-three", &s);
+    printf("%s\n", &s);
+    Rec r = Rec { .name = String::from_str("a"), .nums = Vec::new(), .note = None };
+    r.name = String::from_str("b");
+    r.note = Some(String::from_str("n1"));
+    r.note = Some(String::from_str("n2"));
+    r.nums = Vec::from_fn(3, [](usize i) : u64 { narrow<u64>(i) });
+    printf("%s %v ", &r.name, Vec::len(&r.nums));
+    match (&r.note)
+    {
+        Some(n) : printf("%s\n", n),
+        None    : printf("-\n"),
+    }
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, String::from_str("x"));
+    Vec::push(&mut v, String::from_str("y"));
+    v[0] = String::from_str("z");
+    printf("%s %s\n", &v[0], &v[1]);
+    Vec<Rec> rs = Vec::new();
+    Vec::push(&mut rs, Rec { .name = String::from_str("r0"), .nums = Vec::new(), .note = None });
+    rs[0] = Rec { .name = String::from_str("r1"), .nums = Vec::new(), .note = Some(String::from_str("q")) };
+    rs[0].name = String::from_str("r2");
+    printf("%s\n", &rs[0].name);
+    String moved = String::from_str("m");
+    Vec::push(&mut v, moved);
+    moved = String::from_str("again");
+    printf("%s %v\n", &moved, Vec::len(&v));
+    String acc = String::new();
+    for (u64 i = 0; i < 300; i += 1)
+    {
+        acc = sprintf("%v-%v", i, String::len(&acc) % 7);
+        r.name = String::clone(&acc);
+        v[1] = String::clone(&acc);
+    }
+    printf("%s %s\n", &acc, &v[1]);
+    Option<Noisy> on = None;
+    on = Some(Noisy { .id = 1 });
+    printf("set\n");
+    on = Some(Noisy { .id = 2 });
+    printf("unreached\n");
+}

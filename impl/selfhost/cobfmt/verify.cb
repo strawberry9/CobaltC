@@ -1,0 +1,121 @@
+// The safety check (`private/cobfmt-proposal.md` §6), as
+// impl/cobfmt/src/verify.rs gives it: the formatted text is the same
+// program — the same tokens, spelled the same, in the same order; the
+// same comments with the same text. Whether it still parses is asked of
+// `cobc --check-syntax` (main.cb), and then whether the line endings are
+// those of the original.
+
+import std;
+import lexer;
+import format;
+
+// `s` without the byte-order marks it begins with.
+export fn strip_bom(StringView s) : StringView
+{
+    StringView r = s;
+    while (StringView::starts_with(r, "\u{feff}"))
+    {
+        r = StringView::sub(r, 3, StringView::len(r));
+    }
+    r
+}
+
+// The tokens' texts; in `--width` mode a comma right before a closing
+// bracket is left out, since breaking a list adds one (D-0098).
+fn token_texts(StringView src, ref<Lexed, shared> lx, bool width_mode) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = Vec::len(&lx.toks);
+    for (usize k = 0; k < n; k += 1)
+    {
+        Tok t = lx.toks[k].tok;
+        if (t == Tok::Eof)
+        {
+            continue;
+        }
+        if (width_mode && t == Tok::Comma && k + 1 < n)
+        {
+            Tok nx = lx.toks[k + 1].tok;
+            if (nx == Tok::RParen || nx == Tok::RBracket || nx == Tok::RBrace)
+            {
+                continue;
+            }
+        }
+        Vec::push(&mut out, text(src, lx.toks[k]));
+    }
+    out
+}
+
+fn comment_texts(StringView src, ref<Lexed, shared> lx) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    foreach (t in &lx.trivia)
+    {
+        StringView v = StringView::sub(src, t.pos, t.pos + t.len);
+        if (t.kind == TRIVIA_LINE)
+        {
+            Vec::push(&mut out, String::from_view(trim_end(v)));
+        }
+        else if (t.kind == TRIVIA_BLOCK)
+        {
+            Vec::push(&mut out, StringView::replace(v, "\r\n", "\n"));
+        }
+    }
+    out
+}
+
+// The same tokens and the same comments; the reason when not.
+export fn same_tokens(StringView before_in, StringView after_in, bool width_mode) : Result<void, String>
+{
+    String before_text = String::from_view(strip_bom(before_in));
+    String after_text = String::from_view(strip_bom(after_in));
+    StringView before = String::as_view(&before_text);
+    StringView after = String::as_view(&after_text);
+    Lexed a = match (lex(&before_text))
+    {
+        Ok(x)  : x,
+        Err(_) : return Err(String::from_str("the original does not lex")),
+    };
+    Lexed b = match (lex(&after_text))
+    {
+        Ok(x)  : x,
+        Err(_) : return Err(String::from_str("the result does not lex")),
+    };
+    Vec<StringView> ta = token_texts(before, &a, width_mode);
+    Vec<StringView> tb = token_texts(after, &b, width_mode);
+    usize na = Vec::len(&ta);
+    usize nb = Vec::len(&tb);
+    usize at = 0;
+    while (at < na && at < nb && StringView::eq(ta[at], tb[at]))
+    {
+        at += 1;
+    }
+    if (at < na || at < nb)
+    {
+        StringView x = if (at < na) { ta[at] } else { StringView::of("end") };
+        StringView y = if (at < nb) { tb[at] } else { StringView::of("end") };
+        return Err(sprintf("the tokens differ at token %v (`%v` became `%v`)", at, x, y));
+    }
+    Vec<String> ca = comment_texts(before, &a);
+    Vec<String> cb = comment_texts(after, &b);
+    bool same = Vec::len(&ca) == Vec::len(&cb);
+    for (usize i = 0; same && i < Vec::len(&ca); i += 1)
+    {
+        same = ca[i] == cb[i];
+    }
+    if (!same)
+    {
+        return Err(String::from_str("the comments differ"));
+    }
+    Ok(())
+}
+
+// Whether the first line ends with `\r\n`.
+export fn is_crlf(StringView s) : bool
+{
+    match (StringView::find(s, "\n"))
+    {
+        Some(i) : i > 0 && StringView::as_bytes(s)[i - 1] == b'\r',
+        None    : false,
+    }
+}

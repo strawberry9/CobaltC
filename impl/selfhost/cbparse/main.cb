@@ -1,0 +1,149 @@
+// cbparse — coby's parser written in CobaltC (impl/selfhost/front),
+// standing alone: `--check-syntax` answers as `cobc --check-syntax` does,
+// `--dump-ast` prints the program's own part of the parse as
+// `coby --dump-ast` does, and `--dump-resolved` that part once its names
+// are resolved as `coby --dump-resolved` does, so the two front ends are
+// compared output for output (impl/selfhost/compare_parser.sh).
+//
+//   cbparse --check-syntax [--origin PATH] (FILE | -)
+//   cbparse --dump-ast [--origin PATH] (FILE | -)
+//   cbparse --dump-resolved [--origin PATH] (FILE | -)
+//   cbparse --dump-folded [--origin PATH] (FILE | -)
+//   cbparse --dump-checked [--origin PATH] (FILE | -)
+
+import std;
+
+module lexer "../front/lexer.cb";
+module ast "../front/ast.cb";
+module prelude "../front/prelude.cb";
+module parser "../front/parser.cb";
+module dump "../front/dump.cb";
+module loader "../front/loader.cb";
+module derive "../front/derive.cb";
+module modres "../front/modres.cb";
+module consts "../front/consts.cb";
+module views "../front/views.cb";
+module items "../front/items.cb";
+module each "../front/each.cb";
+module fmtcheck "../front/fmtcheck.cb";
+module typecheck "../front/typecheck.cb";
+module consteval "../front/consteval.cb";
+module check "../front/check.cb";
+
+import check;
+
+fn usage() : u8
+{
+    eprintf("usage: cbparse --check-syntax [--origin PATH] (FILE | -)\n");
+    eprintf("       cbparse --dump-ast [--origin PATH] (FILE | -)\n");
+    eprintf("       cbparse --dump-resolved [--origin PATH] (FILE | -)\n");
+    eprintf("       cbparse --dump-folded [--origin PATH] (FILE | -)\n");
+    eprintf("       cbparse --dump-checked [--origin PATH] (FILE | -)\n");
+    2
+}
+
+fn main() : u8
+{
+    Vec<String> args = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(a)  : Vec::push(&mut args, a),
+            Err(_) : return usage(),
+        }
+    }
+    if (Vec::len(&args) < 2)
+    {
+        return usage();
+    }
+    bool checked = args[0] == "--dump-checked";
+    bool folded = args[0] == "--dump-folded";
+    bool resolved = folded || args[0] == "--dump-resolved";
+    bool dump = resolved || checked || args[0] == "--dump-ast";
+    if (!dump && args[0] != "--check-syntax")
+    {
+        return usage();
+    }
+    String origin = String::new();
+    usize at = 1;
+    if (args[1] == "--origin")
+    {
+        if (Vec::len(&args) != 4)
+        {
+            return usage();
+        }
+        origin = String::clone(&args[2]);
+        at = 3;
+    }
+    if (Vec::len(&args) != at + 1)
+    {
+        return usage();
+    }
+    StringView file = String::as_view(&args[at]);
+    String src = if (StringView::eq_str(file, "-"))
+    {
+        match (read_all())
+        {
+            Ok(s)  : s,
+            Err(_) :
+            {
+                eprintf("cbparse: standard input is not readable UTF-8 text\n");
+                return 2;
+            },
+        }
+    }
+    else
+    {
+        match (read_file(file))
+        {
+            Ok(s)  : s,
+            Err(e) :
+            {
+                eprintf("cbparse: %v: cannot read: %s\n", file, FileError::text(&e));
+                return 2;
+            },
+        }
+    };
+    if (String::len(&origin) == 0 && !StringView::eq_str(file, "-"))
+    {
+        origin = String::from_view(file);
+    }
+    if (dump)
+    {
+        Result<String, String> text = if (checked)
+        {
+            checked_text(String::as_view(&src), String::as_view(&origin))
+        }
+        else if (resolved)
+        {
+            dump_resolved_text(String::as_view(&src), String::as_view(&origin), folded)
+        }
+        else
+        {
+            dump_text(String::as_view(&src), String::as_view(&origin))
+        };
+        match (text)
+        {
+            Ok(t)  :
+            {
+                printf("%s", &t);
+                return 0;
+            },
+            Err(e) :
+            {
+                eprintf("%s\n", &e);
+                return 1;
+            },
+        }
+    }
+    match (syntax(String::as_view(&src), String::as_view(&origin)))
+    {
+        None    : 0,
+        Some(e) :
+        {
+            eprintf("%s\n", &e);
+            1
+        },
+    }
+}
