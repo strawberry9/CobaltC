@@ -86,7 +86,10 @@ under `cobc/src/lower/`) and compiles that with `cc`, or the compiler `--cc` nam
   decided function) a borrow. In a decided program the lowering places no object where no check could read it
   (D-0294): recursive types are objectless, an objectless local may be assigned, matched, sliced and moved like
   any other, results built in place leave with no object, every reference parameter is unstored, and a record
-  nothing reads is removed from the C; the self-hosted compiler runs in half the instructions. `--all-checks` keeps every
+  nothing reads is removed from the C; the self-hosted compiler runs in half the instructions. In a program
+  that keeps paths, a decided function's element references are light too when the element's object persists,
+  and a reference's flight leaves the statement's scope pending (D-0295); phase 3 of D-0281 is closed, its
+  tier-D promises restated in `spec/14` §6. `--all-checks` keeps every
   check, for differential testing. `--report-tracking` says which functions kept which tracking.
 - **Threads.** `--explore N` and `--schedule-seed S`, as for `coby`, with the runtime choosing the
   schedule at each synchronization point.

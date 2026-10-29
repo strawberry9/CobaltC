@@ -842,3 +842,15 @@ parameter unstored, one body per function, a text pass removing a record nothing
 compiler runs in half the instructions (6.86 G → 3.51 G). What it still pays is the statement scopes and frames of
 the objects that remain (arm binders over rejected payloads, 165 locals, argument temporaries): a next round of
 the same kind, after phase 3 steps 6–7 (the programs that keep paths) and the single port.
+
+**Amended 2026-10-29 (D-0295, Update 150).** Phase 3 is closed. Its last delivery is the element references: in
+a function the static pass decided, in any program, a borrow of an element whose object persists is light, and a
+reference's flight no longer makes the statement's scope (`d` 10.6 G → 4.9 G instructions). Steps 6–7 (frame
+shadows, block objects and side tables) are not built: the programs that keep paths are 2.9% of the corpus, their
+decided functions now pay nothing per reference, and what they still pay is per store into data and per frame of
+the objects their values keep — constants the steps would lower, not orders, at the price of a header per held
+block, a page radix and a cross-object rule in `std`'s raw-pointer code; the step stays available for a real
+program whose profile asks for it. §14's tier-D lines are restated in `spec/14` §6 as what this edition promises
+(an O(k) move; an address-keyed lookup for raw storage; O(h) per write to or end of an owner with h holders), the
+provisional marks withdrawn; granularity stays per element (§16). What remains of D-0281 is the single port of the
+self-hosted toolchain (D-0278's amendment) and its measurement.

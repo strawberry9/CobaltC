@@ -301,6 +301,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0292 — Light references: a decided function's references carry no record, in any program
 - D-0293 — The token-kind tests inline: a decided function's references cost no call in any program
 - D-0294 — The objectless remainder: a decided program's values keep no object where no check could read it
+- D-0295 — Light element references: a decided function's element references carry no record in any program; phase 3 closed
 
 ---
 
@@ -8449,6 +8450,37 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0390: light element references, a decided function's element references carry no record in any program; phase 3 closed (D-0295, 2026-10-29)
+
+- D-0281 §24 (the amendment of Update 149): phase 3 steps 6–7, the programs that keep paths. D-0292 had left
+  element references recorded in every function, so a decided function of a tracked program reading a `Vec`'s
+  elements paid the whole record per read (the element's object by address, a path minted, stamped, sent, received
+  and retired: `d`, 4 M reads of a table of views, 2,600 instructions each), and every call whose result passed
+  through the runtime's in-flight queue made the statement's pending scope real only to pop it empty. Now
+  (`cbrt`): in a frame that forms light references, a borrow of an element whose object persists (not ephemeral:
+  one established already, or one made now for an element holding references or a `fn` value) is `LIGHT | obj`
+  after the check against the element object's holders — minted, stamped, sent and retired nowhere
+  (`elem_borrow`'s `light`; `cb_elem_borrow`, `cb_elem_borrow_here`); a plain element with no object keeps the
+  recorded borrow, as do `cb_elem_access_slow` and the native `HashMap::get`'s datum. The in-flight queue is read
+  through `ts_raw()`: a reference's flight leaves the statement's scope pending (D-0196's one-test pop).
+- Phase 3 steps 6–7 (frame shadows, block objects and side tables) are not built (D-0295 item 3): the programs
+  that keep paths are 2.9% of the corpus, their decided functions now pay nothing per reference, and what they
+  still pay is per store into data (`h`: 18 k instructions per store, clear and read of a struct holding a
+  reference) and per frame and scope of the objects their values keep — constants, not orders. `spec/14` §6
+  restates the tier-D lines as this edition's promises (an O(k) move, an address-keyed lookup for raw storage,
+  O(h) per write to or end of an owner with h holders), D-0281 §14's provisional marks withdrawn; granularity
+  stays per element. Phase 3 is closed; D-0281's remaining item is the single port (D-0278).
+- Measured (`stress/d0281/phase3/BENCH.md`, `runs/elem` against `runs/base149` — Update 149's committed toolchain
+  rebuilt, since its `objl` column predated that Update's last compiler fix; instructions, GCC `-O2`): `d` 10.57 G
+  → 4.94 G (0.47); `h` 0.90 and `cbc` 0.98 from the pending scopes alone; `d0`, `b`, the other decided programs and
+  the controls within 1%. `d`'s profile after: `HeapReclaimed::get` 12%, the read loop's block frame push and
+  pop 21%, `cb_stmt_pop` 7%.
+- Gates: `gate3.sh` over the 82 dynamic-tracking conformance cases, GCC and Clang (78 SAME, 4 decided, 0 DIFF);
+  `gate3.sh` over the 996 programs that keep paths (`kept146.list`) with the repeated runs for the thread races
+  and `cobmodel compare` over the modelled DIFFs; the bench; `cargo +1.77.2 check --workspace --tests`; the Windows
+  runtime rebuilt.
+- Release suites `stress/suites/runs/u150`: passed.
 
 ## CHG-0389: the objectless remainder, a decided program's values keep no object where no check could read it (D-0294, 2026-10-29)
 

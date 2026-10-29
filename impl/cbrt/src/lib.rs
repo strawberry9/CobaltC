@@ -2189,7 +2189,11 @@ fn ts_raw() -> &'static mut TState {
 }
 
 // This thread's state, its pending statement scopes made first (D-0196):
-// whatever the caller does sees the stack as if each had been pushed.
+// whatever the caller does sees the stack as if each had been pushed. The
+// in-flight queue is not the stack: its users take `ts_raw()`, so that a
+// call passing a reference through it leaves the statement's scope pending
+// (made, and then popped, it cost a decided function's element reads a
+// fifth of their instructions, D-0295).
 #[inline]
 fn ts() -> &'static mut TState {
     let t = ts_raw();
@@ -5578,9 +5582,9 @@ fn drop_in_place_tail(addr: usize, ty: u32, owner: u64, tail: bool) {
         // before the frame's objects are destroyed, and a destructor's own
         // calls send and receive through the same queue. It gets an empty
         // queue, and the caller's is put back when it returns.
-        let saved = std::mem::take(&mut ts().inflight);
+        let saved = std::mem::take(&mut ts_raw().inflight);
         unsafe { drop(CbRef { p: addr as *mut u8, tok }) };
-        let leftover = std::mem::replace(&mut ts().inflight, saved);
+        let leftover = std::mem::replace(&mut ts_raw().inflight, saved);
         debug_assert!(leftover.is_empty(), "cbrt: a destructor left values in flight");
         if counted {
             unsafe { CALLBACK_DEPTH -= 1 };
@@ -5865,11 +5869,11 @@ pub unsafe extern "C" fn cb_borrow_check(base: u64, p: *const CbProj, n: usize, 
 #[no_mangle]
 pub extern "C" fn cb_elem_borrow(addr: *mut u8, ty: u32, mode: u32) -> u64 {
     let _e = enter_elem(addr as usize, ty);
-    let tok = elem_borrow(addr, ty, mode, false);
+    let tok = elem_borrow(addr, ty, mode, false, true);
     if let Some(p) = rt().paths.get_mut(&tok) {
         p.occ += 1;
     }
-    ts().inflight.push_back(Inflight::Ref(tok));
+    ts_raw().inflight.push_back(Inflight::Ref(tok));
     tok
 }
 
@@ -5880,7 +5884,7 @@ pub extern "C" fn cb_elem_borrow(addr: *mut u8, ty: u32, mode: u32) -> u64 {
 #[no_mangle]
 pub extern "C" fn cb_elem_borrow_here(addr: *mut u8, ty: u32, mode: u32) -> u64 {
     let _e = enter_elem(addr as usize, ty);
-    elem_borrow(addr, ty, mode, true)
+    elem_borrow(addr, ty, mode, true, true)
 }
 
 // D-0202: entering for the object over an element's cells at `a`: a local
@@ -5931,7 +5935,7 @@ pub unsafe extern "C" fn cb_elem_access_slow(addr: *mut u8, ty: u32, mode: u32, 
     if !(file == NOLOC && line == 0) {
         set_at(file, line);
     }
-    let tok = elem_borrow(addr, ty, mode, false);
+    let tok = elem_borrow(addr, ty, mode, false, false);
     if write != 0 {
         cb_write(tok, std::ptr::null(), 0, 0, file, line);
     } else {
@@ -5953,13 +5957,29 @@ fn live_reclaimed(r: &Rt, a: usize) -> Option<u64> {
     })
 }
 
-fn elem_borrow(addr: *mut u8, ty: u32, mode: u32, stamp: bool) -> u64 {
+// `light`: the borrow may be a light reference (D-0295) where the frame
+// forms light references and the element's object persists -- one that
+// is not ephemeral, or one established now for an element that holds
+// references or a function value. The checks are the recorded borrow's
+// (`check_root_access` against the element's holders); the result,
+// `LIGHT | obj`, is recorded nowhere, stamped nowhere and retires
+// nothing, as `light_borrow`'s. An ephemeral object is left out: it ends
+// when its last recorded path does (`retire_token`), which a light
+// reference to it would not see. The callers that go on to check or send
+// the path itself (`cb_elem_access_slow`, `cb_elem_borrow_datum`) pass
+// false.
+fn elem_borrow(addr: *mut u8, ty: u32, mode: u32, stamp: bool, light: bool) -> u64 {
     let r = rt();
     let a = addr as usize;
     let exclusive = mode == 1;
     let existing = live_reclaimed(r, a);
+    let light = light && !frame_rec();
+    let persists;
     let obj = match existing {
-        Some(obj) => obj,
+        Some(obj) => {
+            persists = light && r.objs.get(&obj).map_or(false, |o| !o.ephemeral);
+            obj
+        }
         None => {
             // Ephemeral unless the element holds references (the object
             // holds them, `[Rawptr-Write]`) or is a function value. A
@@ -5970,6 +5990,7 @@ fn elem_borrow(addr: *mut u8, ty: u32, mode: u32, stamp: bool) -> u64 {
             // `[Reclaim]` establishes one no program can tell from it.
             let t = &r.typ(ty);
             let plain = !t.has_refs && t.kind != K_FN;
+            persists = light && !plain;
             establish_reclaimed(r, a, ty, plain).1
         }
     };
@@ -5977,6 +5998,10 @@ fn elem_borrow(addr: *mut u8, ty: u32, mode: u32, stamp: bool) -> u64 {
     // projection, `check_access` is `check_root_access`, and the new
     // path's projection, ancestors and lock origin are all empty.
     check_root_access(r, obj, exclusive, NOLOC, 0);
+    if persists {
+        ph3_count(&N_LIGHT);
+        return obj | LIGHT;
+    }
     mint_in(r, obj, Vec::new(), exclusive, false, Vec::new(), None, stamp)
 }
 
@@ -7730,7 +7755,7 @@ pub extern "C" fn cb_send(obj: u64) {
     let _h = enter_on(heap_of(obj));
     let r = rt();
     detach(r, obj);
-    ts().inflight.push_back(Inflight::Obj(obj));
+    ts_raw().inflight.push_back(Inflight::Obj(obj));
 }
 
 #[no_mangle]
@@ -7740,13 +7765,13 @@ pub extern "C" fn cb_recv(addr: *mut u8) -> u64 {
     let _e = if !multi() {
         Held(SOLO)
     } else {
-        let front = match ts().inflight.front() {
+        let front = match ts_raw().inflight.front() {
             Some(Inflight::Obj(o)) => *o,
             _ => 0,
         };
         enter_planned(|p, r| p.move_obj(r, front, addr as usize))
     };
-    let obj = match ts().inflight.pop_front() {
+    let obj = match ts_raw().inflight.pop_front() {
         Some(Inflight::Obj(o)) => o,
         _ => panic!("cbrt: receive of an object that was not sent"),
     };
@@ -7800,12 +7825,12 @@ pub extern "C" fn cb_send_ref(tok: u64) {
         detach_tok(r, tok);
         // The flight holds it until `cb_recv_ref` (`cb_send_datum`'s rule).
         r.paths.get_mut(&tok).unwrap().occ += 1;
-        ts().inflight.push_back(Inflight::Ref(tok));
+        ts_raw().inflight.push_back(Inflight::Ref(tok));
     } else if tok & LIGHT != 0 {
         // D-0292: a light token travels as it is; nothing holds it.
-        ts().inflight.push_back(Inflight::Ref(tok));
+        ts_raw().inflight.push_back(Inflight::Ref(tok));
     } else {
-        ts().inflight.push_back(Inflight::Ref(0));
+        ts_raw().inflight.push_back(Inflight::Ref(0));
     }
 }
 
@@ -7814,14 +7839,14 @@ pub extern "C" fn cb_recv_ref() {
     let _e = if !multi() {
         Held(SOLO)
     } else {
-        let front = match ts().inflight.front() {
+        let front = match ts_raw().inflight.front() {
             Some(Inflight::Ref(t)) => *t,
             _ => 0,
         };
         enter_on(heap_of(front))
     };
     let r = rt();
-    let tok = match ts().inflight.pop_front() {
+    let tok = match ts_raw().inflight.pop_front() {
         Some(Inflight::Ref(t)) => t,
         _ => panic!("cbrt: receive of a reference that was not sent"),
     };
@@ -7895,7 +7920,7 @@ pub extern "C" fn cb_send_datum(src: *const u8, ty: u32) {
     }
     give_vec(&mut r.pool, offs);
     unname_sent(r, src as usize);
-    ts().inflight.push_back(Inflight::Datum(toks));
+    ts_raw().inflight.push_back(Inflight::Datum(toks));
 }
 
 // CHG-0372. The temporary the sender made for the datum it sends, if any:
@@ -7930,14 +7955,14 @@ fn unname_sent(r: &mut Rt, a: usize) {
 #[no_mangle]
 pub extern "C" fn cb_elem_borrow_datum(addr: *mut u8, ty: u32, mode: u32) -> u64 {
     let _e = enter_elem(addr as usize, ty);
-    let tok = elem_borrow(addr, ty, mode, false);
+    let tok = elem_borrow(addr, ty, mode, false, false);
     let r = rt();
     if let Some(p) = r.paths.get_mut(&tok) {
         p.occ += 1;
     }
     let mut toks = take_vec(&mut r.pool);
     toks.push(tok);
-    ts().inflight.push_back(Inflight::Datum(toks));
+    ts_raw().inflight.push_back(Inflight::Datum(toks));
     tok
 }
 
@@ -7962,7 +7987,7 @@ pub extern "C" fn cb_send_tok_datum(tok: u64) {
     }
     let mut toks = take_vec(&mut r.pool);
     toks.push(tok);
-    ts().inflight.push_back(Inflight::Datum(toks));
+    ts_raw().inflight.push_back(Inflight::Datum(toks));
 }
 
 // The token of the `k`-th of the `n` data in flight to this thread (0:
@@ -7974,7 +7999,7 @@ pub extern "C" fn cb_send_tok_datum(tok: u64) {
 #[no_mangle]
 pub extern "C" fn cb_peek_datum_tok(k: usize, n: usize) -> u64 {
     let _e = enter();
-    let q = &ts().inflight;
+    let q = &ts_raw().inflight;
     if q.len() != n || k >= n {
         panic!("cbrt: dual-body dispatch found {} data in flight, expected {}", q.len(), n);
     }
@@ -8161,7 +8186,7 @@ pub unsafe extern "C" fn cb_direct_ok(n: usize, toks: *const u64) -> u8 {
 #[no_mangle]
 pub extern "C" fn cb_send_datum_none() {
     let _e = enter();
-    ts().inflight.push_back(Inflight::Datum(Vec::new()));
+    ts_raw().inflight.push_back(Inflight::Datum(Vec::new()));
 }
 
 // Reference data with at most one reference (`Option<ref<T>>`) received
@@ -8180,7 +8205,7 @@ pub extern "C" fn cb_recv_datum_tok() -> u64 {
     };
     let _e = enter_on(heap_of(front));
     let r = rt();
-    let toks = match ts().inflight.pop_front() {
+    let toks = match ts_raw().inflight.pop_front() {
         Some(Inflight::Datum(t)) => t,
         _ => panic!("cbrt: receive of reference data that was not sent"),
     };
@@ -8206,7 +8231,7 @@ pub extern "C" fn cb_recv_datum_tok() -> u64 {
 #[no_mangle]
 pub extern "C" fn cb_recv_datum(dst: *mut u8, ty: u32) {
     let _e = enter_planned(|p, r| {
-        if let Some(Inflight::Datum(toks)) = ts().inflight.front() {
+        if let Some(Inflight::Datum(toks)) = ts_raw().inflight.front() {
             for &t in toks.iter() {
                 if t != 0 {
                     p.drop_occ(r, t);
@@ -8217,7 +8242,7 @@ pub extern "C" fn cb_recv_datum(dst: *mut u8, ty: u32) {
         p.forget(r, dst as usize, dst as usize + size);
     });
     let r = rt();
-    let toks = match ts().inflight.pop_front() {
+    let toks = match ts_raw().inflight.pop_front() {
         Some(Inflight::Datum(t)) => t,
         _ => panic!("cbrt: receive of reference data that was not sent"),
     };

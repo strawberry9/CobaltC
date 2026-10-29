@@ -93,8 +93,8 @@ check against the references the run does record on that value, which is nothing
 and after that nothing — and since D-0293 the nothing is no call either: the generated C tests the
 reference's kind, and an owner's binding a one-byte mark, before it would call the runtime. The record is kept only where it is needed: a reference stored into data
 becomes a holder as it is stored, a reference arriving in a function that left a conflict to the run
-is recorded as it arrives, and element references, slices, views, lock guards and what a thread is
-lent are recorded everywhere. So a program that keeps paths for one function pays for that function,
+is recorded as it arrives, an element reference is light too once the element's object persists
+(D-0295), and slices, views, lock guards and what a thread is lent are recorded everywhere. So a program that keeps paths for one function pays for that function,
 not for all of them.""")
 b += p("""To see where your own program still pays for tracking, run `cobc --report-tracking prog.cb`. It
 compiles nothing: for a decided program it says so; otherwise it names the first conflict left to
