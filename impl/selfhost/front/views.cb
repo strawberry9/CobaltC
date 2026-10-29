@@ -1,0 +1,569 @@
+// D-0134 `[Str-Literal-View]` and D-0149 `[Str-Literal-String]` (spec/21
+// §2a), as impl/src/views.rs's `process` does them: a `str` literal where
+// a declared type expects a `StringView` is `StringView::of(L)`, and one
+// where it expects a `String` is `String::from_str(L)`. The positions: a
+// called function's parameter, a declaration's type, a struct literal's
+// field, and, for `String`, what a function returns. Runs after name
+// resolution, so each call's function is found by its key. (The checker's
+// own rewrites, `views.rs`'s `rewrite_literals_as_string`, come with the
+// type checker.)
+
+import std;
+import ast;
+import modres;
+
+enum Want
+{
+    No,
+    View,
+    Owned,
+}
+
+struct FieldWant
+{
+    String name;
+    Want want;
+}
+
+export struct Sigs
+{
+    // A function's key to what each of its parameters asks.
+    HashMap<String, Vec<Want>> fns;
+    // A struct's key to what each of its text fields asks.
+    HashMap<String, Vec<FieldWant>> structs;
+}
+
+fn want_of(ref<Type, shared> t) : Want
+{
+    match (t)
+    {
+        Type::TNamed(b) :
+        {
+            ref<NamedTy, shared> n = Box::get(b);
+            if (Vec::len(&n.args) > 0)
+            {
+                return Want::No;
+            }
+            if (String::eq_str(&n.name, "std::StringView"))
+            {
+                return Want::View;
+            }
+            if (String::eq_str(&n.name, "std::String"))
+            {
+                return Want::Owned;
+            }
+            Want::No
+        },
+        _               : Want::No,
+    }
+}
+
+fn joined(ref<Vec<String>, shared> v) : String
+{
+    String::join(&v[0..$], "::")
+}
+
+// What each function's parameters and each struct's fields ask of a
+// literal, kept for the functions of `std` parsed later (`rewrite_more`).
+export fn process(ref<Program, exclusive> program) : Sigs
+{
+    Sigs sigs = Sigs { .fns = HashMap::new(), .structs = HashMap::new() };
+    Vec<String> path = Vec::new();
+    collect(&program.items, &mut path, &mut sigs);
+    rewrite_items(&mut program.items, &sigs);
+    sigs
+}
+
+// The literals of `items` viewed, as `process` viewed the rest.
+export fn rewrite_more(ref<Vec<Item>, exclusive> items, ref<Sigs, shared> sigs)
+{
+    rewrite_items(items, sigs);
+}
+
+fn collect(ref<Vec<Item>, shared> items, ref<Vec<String>, exclusive> path, ref<Sigs, exclusive> out)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                Vec<Want> wants = Vec::new();
+                bool any = false;
+                for (usize k = 0; k < Vec::len(&f.params); k += 1)
+                {
+                    Want w = want_of(&f.params[k].ty);
+                    if (w != Want::No)
+                    {
+                        any = true;
+                    }
+                    Vec::push(&mut wants, w);
+                }
+                if (any)
+                {
+                    String simple = match (&f.assoc_type)
+                    {
+                        Some(a) : sprintf("%s::%s", a, &f.name),
+                        None    : String::clone(&f.name),
+                    };
+                    HashMap::insert(&mut out.fns, qualify(path, String::as_view(&simple)), wants);
+                }
+            },
+            Item::IStruct(b) :
+            {
+                ref<StructDecl, shared> s = Box::get(b);
+                Vec<FieldWant> fs = Vec::new();
+                for (usize k = 0; k < Vec::len(&s.fields); k += 1)
+                {
+                    Want w = want_of(&s.fields[k].ty);
+                    if (w != Want::No)
+                    {
+                        Vec::push(&mut fs, FieldWant { .name = String::clone(&s.fields[k].name), .want = w });
+                    }
+                }
+                if (Vec::len(&fs) > 0)
+                {
+                    HashMap::insert(&mut out.structs, qualify(path, String::as_view(&s.name)), fs);
+                }
+            },
+            Item::IModule(b) :
+            {
+                ref<ModuleItem, shared> m = Box::get(b);
+                Vec::push(path, String::clone(&m.name));
+                collect(&m.items, path, out);
+                Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+fn rewrite_items(ref<Vec<Item>, exclusive> items, ref<Sigs, shared> sigs)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, exclusive> f = Box::get_mut(b);
+                block(&mut f.body, sigs);
+                // D-0149: the function's result type is the expected type of
+                // what it returns.
+                if (!f.is_const && want_of(&f.ret) == Want::Owned)
+                {
+                    returns_in_block(&mut f.body);
+                    match (&mut f.body.tail)
+                    {
+                        Some(t) : wrap(Box::get_mut(t), Want::Owned),
+                        None    : {},
+                    }
+                }
+            },
+            Item::IModule(b) : rewrite_items(&mut Box::get_mut(b).items, sigs),
+            _                : {},
+        }
+    }
+}
+
+// `L` as `std::StringView::of(L)` or `std::String::from_str(L)`, when `e`
+// is a literal, or (D-0155) what a block, an `if` branch or a `match` arm
+// in that position gives.
+fn wrap(ref<Expr, exclusive> e, Want want)
+{
+    if (want == Want::No)
+    {
+        return;
+    }
+    match (&mut e.kind)
+    {
+        ExprKind::EParen(inner) : return wrap(Box::get_mut(inner), want),
+        ExprKind::EBlock(b)     :
+        {
+            match (&mut b.tail)
+            {
+                Some(t) : wrap(Box::get_mut(t), want),
+                None    : {},
+            }
+            return;
+        },
+        ExprKind::EUnsafe(b)    :
+        {
+            match (&mut b.tail)
+            {
+                Some(t) : wrap(Box::get_mut(t), want),
+                None    : {},
+            }
+            return;
+        },
+        ExprKind::EIf(b)        :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            match (&mut x.then_.tail)
+            {
+                Some(t) : wrap(Box::get_mut(t), want),
+                None    : {},
+            }
+            match (&mut x.else_)
+            {
+                Some(el) : wrap(el, want),
+                None     : {},
+            }
+            return;
+        },
+        ExprKind::EMatch(b)     :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                wrap(Box::get_mut(&mut x.arms[i].body), want);
+            }
+            return;
+        },
+        ExprKind::EStr(_)       : {},
+        _                       : return,
+    }
+    usize line = e.line;
+    usize col = e.col;
+    ExprKind lit = replace(&mut e.kind, ExprKind::EUnit);
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::from_str("std"));
+    if (want == Want::View)
+    {
+        Vec::push(&mut segs, String::from_str("StringView"));
+        Vec::push(&mut segs, String::from_str("of"));
+    }
+    else
+    {
+        Vec::push(&mut segs, String::from_str("String"));
+        Vec::push(&mut segs, String::from_str("from_str"));
+    }
+    Expr callee = mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), line, col);
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, mk(lit, line, col));
+    e.kind = ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = args }));
+}
+
+// D-0149: every `return L;` of the function's own body (a closure's
+// `return` is the closure's and is left alone).
+fn returns_in_block(ref<Block, exclusive> b)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        match (&mut b.stmts[i])
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&mut Box::get_mut(l).init)
+                {
+                    Some(e) : returns_in_expr(e),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : returns_in_expr(&mut Box::get_mut(d).init),
+            Stmt::SExpr(e)        : returns_in_expr(Box::get_mut(e)),
+            Stmt::SBlockLike(e)   : returns_in_expr(Box::get_mut(e)),
+        }
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : returns_in_expr(Box::get_mut(t)),
+        None    : {},
+    }
+}
+
+fn returns_in_expr(ref<Expr, exclusive> e)
+{
+    match (&mut e.kind)
+    {
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) :
+                {
+                    returns_in_expr(Box::get_mut(x));
+                    wrap(Box::get_mut(x), Want::Owned);
+                },
+                None    : {},
+            }
+        },
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, exclusive> s = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                returns_in_expr(&mut s.fields[i].value);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                returns_in_expr(&mut es[i]);
+            }
+        },
+        ExprKind::EArrayRepeat(b) : returns_in_expr(&mut Box::get_mut(b).value),
+        ExprKind::EUnary(b)       : returns_in_expr(&mut Box::get_mut(b).e),
+        ExprKind::EBorrow(b)      : returns_in_expr(&mut Box::get_mut(b).e),
+        ExprKind::EDeref(x)       : returns_in_expr(Box::get_mut(x)),
+        ExprKind::EField(b)       : returns_in_expr(&mut Box::get_mut(b).e),
+        ExprKind::EPropagate(x)   : returns_in_expr(Box::get_mut(x)),
+        ExprKind::EParen(x)       : returns_in_expr(Box::get_mut(x)),
+        ExprKind::EBinary(b)      :
+        {
+            returns_in_expr(&mut Box::get_mut(b).a);
+            returns_in_expr(&mut Box::get_mut(b).b);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            returns_in_expr(&mut Box::get_mut(b).a);
+            returns_in_expr(&mut Box::get_mut(b).b);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            returns_in_expr(&mut Box::get_mut(b).a);
+            returns_in_expr(&mut Box::get_mut(b).b);
+        },
+        ExprKind::ESliceOf(b)     :
+        {
+            ref<SliceExpr, exclusive> x = Box::get_mut(b);
+            returns_in_expr(&mut x.base);
+            returns_in_expr(&mut x.lo);
+            returns_in_expr(&mut x.hi);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, exclusive> c = Box::get_mut(b);
+            returns_in_expr(&mut c.callee);
+            for (usize i = 0; i < Vec::len(&c.args); i += 1)
+            {
+                returns_in_expr(&mut c.args[i]);
+            }
+        },
+        ExprKind::EBlock(b)       : returns_in_block(b),
+        ExprKind::EUnsafe(b)      : returns_in_block(b),
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            returns_in_expr(&mut x.cond);
+            returns_in_block(&mut x.then_);
+            match (&mut x.else_)
+            {
+                Some(el) : returns_in_expr(el),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, exclusive> x = Box::get_mut(b);
+            returns_in_expr(&mut x.cond);
+            returns_in_block(&mut x.body);
+            match (&mut x.step)
+            {
+                Some(s) : returns_in_expr(s),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            returns_in_expr(&mut x.scrut);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                returns_in_expr(Box::get_mut(&mut x.arms[i].body));
+            }
+        },
+        _                         : {},
+    }
+}
+
+fn block(ref<Block, exclusive> b, ref<Sigs, shared> sigs)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        match (&mut b.stmts[i])
+        {
+            Stmt::SLet(bl)        :
+            {
+                ref<LetStmt, exclusive> l = Box::get_mut(bl);
+                match (&mut l.init)
+                {
+                    Some(e) :
+                    {
+                        expr(e, sigs);
+                        match (&l.ty)
+                        {
+                            Some(t) : wrap(e, want_of(t)),
+                            None    : {},
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : expr(&mut Box::get_mut(d).init, sigs),
+            Stmt::SExpr(e)        : expr(Box::get_mut(e), sigs),
+            Stmt::SBlockLike(e)   : expr(Box::get_mut(e), sigs),
+        }
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : expr(Box::get_mut(t), sigs),
+        None    : {},
+    }
+}
+
+fn field_want(ref<Vec<FieldWant>, shared> ws, ref<String, shared> name) : Want
+{
+    for (usize i = 0; i < Vec::len(ws); i += 1)
+    {
+        if (String::eq(&ws[i].name, name))
+        {
+            return ws[i].want;
+        }
+    }
+    Want::No
+}
+
+fn expr(ref<Expr, exclusive> e, ref<Sigs, shared> sigs)
+{
+    match (&mut e.kind)
+    {
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, exclusive> s = Box::get_mut(b);
+            String key = joined(&s.segs);
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                ref<FieldInit, exclusive> f = &mut s.fields[i];
+                expr(&mut f.value, sigs);
+                match (HashMap::get(&sigs.structs, &key))
+                {
+                    Some(ws) : wrap(&mut f.value, field_want(ws, &f.name)),
+                    None     : {},
+                }
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                expr(&mut es[i], sigs);
+            }
+        },
+        ExprKind::EArrayRepeat(b) : expr(&mut Box::get_mut(b).value, sigs),
+        ExprKind::EUnary(b)       : expr(&mut Box::get_mut(b).e, sigs),
+        ExprKind::EBorrow(b)      : expr(&mut Box::get_mut(b).e, sigs),
+        ExprKind::EDeref(x)       : expr(Box::get_mut(x), sigs),
+        ExprKind::EField(b)       : expr(&mut Box::get_mut(b).e, sigs),
+        ExprKind::EPropagate(x)   : expr(Box::get_mut(x), sigs),
+        ExprKind::EParen(x)       : expr(Box::get_mut(x), sigs),
+        ExprKind::EBinary(b)      :
+        {
+            expr(&mut Box::get_mut(b).a, sigs);
+            expr(&mut Box::get_mut(b).b, sigs);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            expr(&mut Box::get_mut(b).a, sigs);
+            expr(&mut Box::get_mut(b).b, sigs);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            expr(&mut Box::get_mut(b).a, sigs);
+            expr(&mut Box::get_mut(b).b, sigs);
+        },
+        ExprKind::ESliceOf(b)     :
+        {
+            ref<SliceExpr, exclusive> x = Box::get_mut(b);
+            expr(&mut x.base, sigs);
+            expr(&mut x.lo, sigs);
+            expr(&mut x.hi, sigs);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, exclusive> c = Box::get_mut(b);
+            expr(&mut c.callee, sigs);
+            for (usize i = 0; i < Vec::len(&c.args); i += 1)
+            {
+                expr(&mut c.args[i], sigs);
+            }
+            String key = match (&c.callee.kind)
+            {
+                ExprKind::EPath(p) : joined(&Box::get(p).segs),
+                _                  : String::new(),
+            };
+            match (HashMap::get(&sigs.fns, &key))
+            {
+                Some(ws) :
+                {
+                    if (Vec::len(ws) == Vec::len(&c.args))
+                    {
+                        for (usize i = 0; i < Vec::len(ws); i += 1)
+                        {
+                            wrap(&mut c.args[i], ws[i]);
+                        }
+                    }
+                },
+                None     : {},
+            }
+        },
+        ExprKind::EBlock(b)       : block(b, sigs),
+        ExprKind::EUnsafe(b)      : block(b, sigs),
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            expr(&mut x.cond, sigs);
+            block(&mut x.then_, sigs);
+            match (&mut x.else_)
+            {
+                Some(el) : expr(el, sigs),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, exclusive> x = Box::get_mut(b);
+            expr(&mut x.cond, sigs);
+            block(&mut x.body, sigs);
+            match (&mut x.step)
+            {
+                Some(s) : expr(s, sigs),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            expr(&mut x.scrut, sigs);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                ref<Arm, exclusive> a = &mut x.arms[i];
+                match (&mut a.lit)
+                {
+                    Some(l) : expr(Box::get_mut(l), sigs),
+                    None    : {},
+                }
+                expr(Box::get_mut(&mut a.body), sigs);
+            }
+        },
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) : expr(Box::get_mut(x), sigs),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(b)     : block(&mut Box::get_mut(b).body, sigs),
+        _                         : {},
+    }
+}
+
+// D-0162: a text literal the type checker typed as `String` through a
+// generic parameter becomes `String::from_str(L)` (with D-0155's tails).
+export fn wrap_owned(ref<Expr, exclusive> e)
+{
+    wrap(e, Want::Owned);
+}

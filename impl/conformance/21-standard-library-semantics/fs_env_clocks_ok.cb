@@ -1,0 +1,126 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.fs [Make-Dir] [List-Dir] [Path-Kind] [Rename] [Remove-File] [Remove-Dir]; rule.stdlib.env [Env-Var] [Current-Dir] [Clocks]; D-0061; conf.fs-env-clocks
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6d616b655f6469723a2074727565207468656e2066616c73650a3320656e74726965733a20612e747874202866696c65206f6620352062797465732920622e747874202866696c65206f6620352062797465732920696e6e657220286469726563746f7279290a72656e616d65643a206f6c64206e6f7468696e672c206e65772066696c65206f6620352062797465730a72656d6f76655f646972206f6620612066756c6c206469726563746f72793a20496f0a72656d6f76655f66696c652074776963653a204e6f74466f756e640a61667465723a206e6f7468696e670a6d616b655f64697220756e6465722061206d697373696e67206469726563746f72793a204e6f74466f756e640a50415448207365743a20747275650a756e7365743a204e6f6e650a637764206e6f6e2d656d7074793a20747275650a636c6f636b20666f72776172643a20747275652c2077616c6c20636c6f636b20616674657220323032333a20747275650a
+// args: $TMP
+//
+// Argument 0 is a fresh, empty directory. A directory is made (twice:
+// `Ok(true)` then `Ok(false)`), filled, listed in byte order with each
+// entry's kind, a file renamed, a full directory refused, files and the
+// directories removed; `NotFound` for a missing file and a missing
+// parent. `PATH` is set and an unlikely name is not; the working
+// directory is known; the monotonic clock does not go backwards and the
+// wall clock is past 2023.
+
+import std;
+
+fn kind(ref<String, shared> p) : String
+{
+    match (path_kind(&p[0..$]))
+    {
+        Ok(File(n))   : sprintf("file of %v bytes", n),
+        Ok(Dir)       : "directory",
+        Ok(Other)     : "other",
+        Err(NotFound) : "nothing",
+        Err(_)        : "error",
+    }
+}
+
+fn main() : u8
+{
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String sub = sprintf("%s/data", &dir);
+    printf(
+        "make_dir: %v then %v\n",
+        Result::unwrap_or(make_dir(&sub[0..$]), false),
+        Result::unwrap_or(make_dir(&sub[0..$]), true),
+    );
+    String a = sprintf("%s/b.txt", &sub);
+    String b = sprintf("%s/a.txt", &sub);
+    String c = sprintf("%s/c.log", &sub);
+    String hello = "hello";
+    Result::unwrap_or(write_file(&a[0..$], &hello[0..$]), ());
+    Result::unwrap_or(write_file(&b[0..$], &hello[0..$]), ());
+    String nested = sprintf("%s/inner", &sub);
+    Result::unwrap_or(make_dir(&nested[0..$]), false);
+    match (list_dir(&sub[0..$]))
+    {
+        Ok(names) :
+        {
+            printf("%v entries:", Vec::len(&names));
+            foreach (n in &names)
+            {
+                String p = sprintf("%s/%s", &sub, n);
+                String k = kind(&p);
+                printf(" %s (%s)", n, &k);
+            }
+            printf("\n");
+        },
+        Err(_)    : return 1,
+    }
+    match (rename(&a[0..$], &c[0..$]))
+    {
+        Ok(_)  :
+        {
+            String ka = kind(&a);
+            String kc = kind(&c);
+            printf("renamed: old %s, new %s\n", &ka, &kc);
+        },
+        Err(_) : return 2,
+    }
+    match (remove_dir(&sub[0..$]))
+    {
+        Ok(_)   : printf("removed a full directory?\n"),
+        Err(Io) : printf("remove_dir of a full directory: Io\n"),
+        Err(_)  : printf("other\n"),
+    }
+    Result::unwrap_or(remove_file(&b[0..$]), ());
+    Result::unwrap_or(remove_file(&c[0..$]), ());
+    match (remove_file(&c[0..$]))
+    {
+        Ok(_)         : printf("?\n"),
+        Err(NotFound) : printf("remove_file twice: NotFound\n"),
+        Err(_)        : printf("other\n"),
+    }
+    Result::unwrap_or(remove_dir(&nested[0..$]), ());
+    Result::unwrap_or(remove_dir(&sub[0..$]), ());
+    String ks = kind(&sub);
+    printf("after: %s\n", &ks);
+    match (make_dir(&a[0..$]))
+    {
+        Ok(_)         : printf("?\n"),
+        Err(NotFound) : printf("make_dir under a missing directory: NotFound\n"),
+        Err(_)        : printf("other\n"),
+    }
+    String home = "PATH";
+    String unset = "COBALTC_SURELY_UNSET";
+    match (env_var(&home[0..$]))
+    {
+        Ok(Some(v)) : printf("PATH set: %v\n", String::len(&v) > 0),
+        Ok(None)    : printf("env: unset\n"),
+        Err(_)      : printf("env: not UTF-8\n"),
+    }
+    match (env_var(&unset[0..$]))
+    {
+        Ok(None) : printf("unset: None\n"),
+        _        : printf("?\n"),
+    }
+    match (current_dir())
+    {
+        Ok(d)  : printf("cwd non-empty: %v\n", String::len(&d) > 0),
+        Err(_) : printf("cwd error\n"),
+    }
+    u64 t0 = monotonic_ns();
+    u64 s = 0;
+    u64 i = 0;
+    while (i < 100000)
+    {
+        s = wrapping_add(s, i);
+        i += 1;
+    }
+    u64 t1 = monotonic_ns();
+    printf("clock forward: %v, wall clock after 2023: %v\n", t1 >= t0, unix_seconds() > 1_700_000_000);
+    0
+}

@@ -1,0 +1,72 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.layout [Layout-Struct]; rule.trust.extern-call [Extern-Call]; D-0250; D-0251; conf.struct-c-layout
+// kind: positive
+// expect: ok
+// cobc-only: links the program's own C code
+// expect-stdout-hex: 3634203130303030303030303039383020333030303232390a
+//
+// A struct is laid out as C lays out the same members in the same order,
+// and `align(N)` is C's `aligned(N)`: C code reports the sizes, alignments
+// and an offset of each struct, which match `sizeof`/`alignof`, and reads
+// every field of a CobaltC value through a pointer by C's own offsets.
+
+import std;
+
+extern "./extern_code/layout.c";
+
+unsafe extern fn c_layout(u32 which) : u64;
+unsafe extern fn c_outer_sum(rawptr<Outer> o) : i64;
+unsafe extern fn c_lines_sum(rawptr<Lines> l) : i64;
+
+struct Rec
+{
+    u8 a;
+    u64 b;
+    u16 c;
+    i32 d;
+    u8 e;
+    f64 f;
+    bool flag;
+}
+
+struct Outer
+{
+    u8 x;
+    Rec r;
+    array<u16, 3> y;
+}
+
+struct Slot align(64)
+{
+    u32 n;
+}
+
+struct Lines
+{
+    u8 tag;
+    array<Slot, 2> s;
+    u8 last;
+}
+
+fn layout<T>() : u64
+{
+    widen<u64>(sizeof<T>()) * 10000 + widen<u64>(alignof<T>()) * 100
+}
+
+fn main()
+{
+    // Offsets C reports: Rec.f at 32, Outer.y at 56, Lines.last at 192.
+    assert(unsafe { c_layout(0) } == layout<Rec>() + 32);
+    assert(unsafe { c_layout(1) } == layout<Outer>() + 56);
+    assert(unsafe { c_layout(2) } == layout<Slot>());
+    assert(unsafe { c_layout(3) } == layout<Lines>() + 192);
+    Rec r = Rec { .a = 1, .b = 1000000000000, .c = 300, .d = -40, .e = 5, .f = 6.5, .flag = true };
+    Outer o = Outer { .x = 7, .r = r, .y = [100, 200, 400] };
+    i64 sum = unsafe { c_outer_sum(rawptr_of(&o)) };
+    assert(sum == 1000000000980);
+    Lines l = Lines { .tag = 3, .s = [Slot { .n = 11 }, Slot { .n = 22 }], .last = 9 };
+    i64 ls = unsafe { c_lines_sum(rawptr_of(&l)) };
+    assert(ls == 3000229);
+    printf("%v %v %v\n", sizeof<Outer>(), sum, ls);
+}

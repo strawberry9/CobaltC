@@ -1,0 +1,148 @@
+// cbc: the code generator written in CobaltC (D-0274), the self-hosting
+// compiler's back end over the front end of impl/selfhost/front. It writes
+// the C that `cobc --bootstrap-form` writes for the program, byte for byte:
+//
+//   cbc --emit-c [--c-name NAME] FILE
+//
+// prints the C on standard output; NAME is the C file's name, which its
+// `#line` directives name (cobc's `-o OUT` names `OUT.c`). A program the
+// static pass rejects gets the diagnostic `coby` gives, and status 1.
+//
+// With any other command line cbc is cobc (impl/cobc/src/main.rs): the same
+// options, messages, exit statuses, files and commands (`driver.cb`).
+
+import std;
+
+module lexer "../front/lexer.cb";
+module ast "../front/ast.cb";
+module prelude "../front/prelude.cb";
+module parser "../front/parser.cb";
+module dump "../front/dump.cb";
+module loader "../front/loader.cb";
+module derive "../front/derive.cb";
+module modres "../front/modres.cb";
+module consts "../front/consts.cb";
+module views "../front/views.cb";
+module items "../front/items.cb";
+module each "../front/each.cb";
+module fmtcheck "../front/fmtcheck.cb";
+module typecheck "../front/typecheck.cb";
+module consteval "../front/consteval.cb";
+module check "../front/check.cb";
+module header "../back/header.cb";
+module passes "../back/passes.cb";
+module cnames "../back/cnames.cb";
+module uses "../back/uses.cb";
+module typeops "../back/typeops.cb";
+module state "../back/state.cb";
+module layout "../back/layout.cb";
+module direct "../back/direct.cb";
+module vec_scan "../back/vec_scan.cb";
+module strings4 "../back/strings4.cb";
+module std_values "../back/std_values.cb";
+module refs4 "../back/refs4.cb";
+module analyses "../back/analyses.cb";
+module stage1a "../back/stage1a.cb";
+module bodies "../back/bodies.cb";
+module natives "../back/natives.cb";
+module fresh3 "../back/fresh3.cb";
+module literals "../back/literals.cb";
+module vec3 "../back/vec3.cb";
+module native_vec "../back/native_vec.cb";
+module native_misc "../back/native_misc.cb";
+module native_text "../back/native_text.cb";
+module native_map "../back/native_map.cb";
+module native_io "../back/native_io.cb";
+module gen "../back/gen.cb";
+module libheader "../back/libheader.cb";
+module build_info "./build_info.cb";
+module driverbase "./driverbase.cb";
+module host "./host.cb";
+module target "./target.cb";
+module diags "./diags.cb";
+module link "./link.cb";
+module cc "./cc.cb";
+module report "./report.cb";
+module frontend "./frontend.cb";
+module driver "./driver.cb";
+
+import check;
+import state;
+import gen;
+import driver;
+
+fn usage() : u8
+{
+    eprintf("usage: cobc --emit-c [--c-name NAME] FILE\n");
+    2
+}
+
+fn main() : u8
+{
+    // Anything but `--emit-c` first is cobc's command line (`driver.cb`).
+    bool emit = false;
+    if (arg_count() > 0)
+    {
+        match (arg(0))
+        {
+            Ok(a)  : emit = a == "--emit-c",
+            Err(_) : {},
+        }
+    }
+    if (!emit)
+    {
+        return driver_main();
+    }
+    Vec<String> args = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(a)  : Vec::push(&mut args, a),
+            Err(_) : return usage(),
+        }
+    }
+    if (Vec::len(&args) < 2 || args[0] != "--emit-c")
+    {
+        return usage();
+    }
+    String c_name = String::from_str("a.c");
+    usize at = 1;
+    if (args[1] == "--c-name")
+    {
+        if (Vec::len(&args) != 4)
+        {
+            return usage();
+        }
+        c_name = String::clone(&args[2]);
+        at = 3;
+    }
+    if (Vec::len(&args) != at + 1)
+    {
+        return usage();
+    }
+    StringView file = String::as_view(&args[at]);
+    String src = match (read_file(file))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("cbc: %v: cannot read: %s\n", file, FileError::text(&e));
+            return 2;
+        },
+    };
+    match (check_text(String::as_view(&src), file))
+    {
+        Ok(prog) :
+        {
+            Gen g = new_gen(prog);
+            printf("%s", &generate(&mut g, String::as_view(&c_name)));
+            0
+        },
+        Err(e)   :
+        {
+            eprintf("%s\n", &e);
+            1
+        },
+    }
+}

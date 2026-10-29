@@ -1,0 +1,954 @@
+// cobc's lower/native_text.rs, written in CobaltC (D-0274 stage 5): native
+// C bodies for std's String and StringView operations.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+import native_vec;
+import gen;
+
+fn ty1(Type t) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, t);
+    v
+}
+
+fn string_ty() : Type
+{
+    named(StringView::of("std::String"), Vec::new())
+}
+
+fn view_ty() : Type
+{
+    named(StringView::of("std::StringView"), Vec::new())
+}
+
+// Rust's `str::replacen(from, to, 1)`.
+fn replace_first(StringView s, StringView from, StringView to) : String
+{
+    match (StringView::find(s, from))
+    {
+        Some(i) :
+        {
+            String out = String::from_view(StringView::sub(s, 0, i));
+            String::appendf(&mut out, "%v", to);
+            String::appendf(&mut out, "%v", StringView::sub(s, i + StringView::len(from), StringView::len(s)));
+            out
+        },
+        None    : String::from_view(s),
+    }
+}
+
+// `String::append_string(s, t)`: the body's checked read of `t.bytes.len`;
+// then, when there is a byte, the first iteration's checked read of
+// `t.bytes.ptr` and its push's borrow check of `s.bytes`. The later
+// iterations' checks are the same checks through the same paths with
+// nothing between that could change them (`s` and `t` cannot share a
+// `String`: the call holds both), so the loop runs unchecked, handing
+// `grow` a path formed for it when it needs one (as the inline push does,
+// `lower_push_place_once`).
+// `String::from_str(s)` and `String::clone(&t)` (`spec/21` §2): a new
+// `String` holding a copy of the bytes. The bodies build `Vec::new()`,
+// `Vec::reserve` it to exactly `n`, and push each byte, which never grows.
+// Natively: the checked reads `append_string` makes of `t` (for `clone`; a
+// `str` is a value), one `allocate` of `n` bytes with its failure, the
+// copy, and the result object, established and sent as the body's `return`
+// does. No other state the bodies touch is observable.
+export fn native_string_copy(ref<Gen, exclusive> g, bool clone_) : String
+{
+    Type st = string_ty();
+    String sc = ctype(g, &st);
+    u32 ty = type_id(g, &st);
+    _ = ctype(g, &named(StringView::of("std::Vec"), ty1(Type::TInt(IntTy::U8))));
+    String b = String::new();
+    if (clone_)
+    {
+        String::append(
+            &mut b,
+            "    cb_read(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    %s *t = (%s *)p_s.p;\n", &sc, &sc);
+        String::append(&mut b, "    uint64_t n = t->bytes.len;\n");
+        String::append(&mut b, "    const uint8_t *src = t->bytes.ptr;\n");
+    }
+    else
+    {
+        String::append(&mut b, "    uint64_t n = p_s.n;\n");
+        String::append(&mut b, "    const uint8_t *src = (const uint8_t *)p_s.p;\n");
+    }
+    String::appendf(&mut b, "    %s r;\n", &sc);
+    String::append(&mut b, "    r.bytes.ptr = (uint8_t *)1;\n");
+    String::append(&mut b, "    r.bytes.len = 0;\n");
+    String::append(&mut b, "    r.bytes.cap = 0;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        uint8_t *p = cb_allocate(n, 1u);\n");
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    if (clone_)
+    {
+        String::append(
+            &mut b,
+            "        cb_read(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 0u } }, 2, CB_NOLOC, 0);\n",
+        );
+    }
+    String::append(&mut b, "        memcpy(p, src, n);\n");
+    String::append(&mut b, "        r.bytes.ptr = p;\n");
+    String::append(&mut b, "        r.bytes.cap = n;\n");
+    String::append(&mut b, "        r.bytes.len = n;\n");
+    String::append(&mut b, "    }\n");
+    String::appendf(&mut b, "    uint64_t o = cb_new(&r, %vu, CB_NOLOC, 0);\n", ty);
+    String::append(&mut b, "    cb_send(o);\n");
+    String::append(&mut b, "    return r;\n");
+    b
+}
+
+export fn native_append_string(ref<Gen, exclusive> g) : String
+{
+    // The body: `Vec::reserve(&mut s.bytes, n)` -- the borrow formed for
+    // the call (its exclusive check, made even when `n` is 0), then
+    // `need = len + n` (its overflow fault) and, when it does not fit, a
+    // buffer of `max(2 * cap, need)` -- then `t`'s bytes pushed one at a
+    // time. Nothing runs between those checks and the pushes, so the bytes
+    // are copied at once. `reserve`'s growth rule is kept exactly.
+    str ovf = "cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0)";
+    String sc = ctype(g, &string_ty());
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_read(p_t.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *t = (%s *)p_t.p;\n", &sc, &sc);
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String::append(&mut b, "    uint64_t n = t->bytes.len;\n");
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    uint64_t need;\n");
+    String::appendf(&mut b, "    if (__builtin_add_overflow(s->bytes.len, n, &need)) %s;\n", ovf);
+    String::append(&mut b, "    if (n == 0) return;\n");
+    String::append(
+        &mut b,
+        "    cb_read(p_t.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 0u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    if (need > s->bytes.cap) {\n");
+    String::append(&mut b, "        uint64_t nc = need;\n");
+    String::appendf(
+        &mut b,
+        "        if (s->bytes.cap > need - s->bytes.cap && __builtin_mul_overflow(s->bytes.cap, (uint64_t)2, &nc)) %s;\n",
+        ovf,
+    );
+    String::append(&mut b, "        uint8_t *p = cb_allocate(nc, 1u);\n");
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "        cb_copy_raw(p, (uint8_t *)s->bytes.ptr, s->bytes.len);\n");
+    String::append(&mut b, "        if (s->bytes.cap > 0) cb_deallocate((uint8_t *)s->bytes.ptr, s->bytes.cap, 1u);\n");
+    String::append(&mut b, "        s->bytes.ptr = p;\n");
+    String::append(&mut b, "        s->bytes.cap = nc;\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    memcpy(s->bytes.ptr + s->bytes.len, t->bytes.ptr, n);\n");
+    String::append(&mut b, "    s->bytes.len += n;\n");
+    b
+}
+
+// `String::append_str`, `append_view` and `append_text<T>` (`spec/21` §2d)
+// natively: each body pushes its bytes one at a time, each push through a
+// borrow of `s.bytes` formed and checked anew, each byte of a view read
+// through its checked path, and `append_text` formats into 64 allocated
+// bytes first. Nothing else runs in between, so the first byte's checks are
+// every byte's: they are made once (when there is a byte), `s.bytes` grows
+// as the pushes would grow it (`Vec::grow` until the bytes fit), and the
+// bytes are copied. `append_text` formats into a buffer on the stack; a
+// view not sent to it (`pure_view`) is the caller's to hold, and one sent
+// is received as its body's binding would be.
+export fn native_append_bytes(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<Vec<Type>, shared> targs,
+) : Option<String>
+{
+    String sc = ctype(g, &string_ty());
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ty1(Type::TInt(IntTy::U8)));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String src = String::new();
+    if (String::eq_str(name, "std::String::append_str"))
+    {
+        String::append(&mut b, "    uint64_t n = p_t.n;\n");
+        String::append(&mut b, "    if (n == 0) return;\n");
+        String::append(
+            &mut b,
+            "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+        src = String::from_str("(const void *)p_t.p");
+    }
+    else if (String::eq_str(name, "std::String::append_view"))
+    {
+        bool sent = !pure_view(g, &String::from_str("std::String::append_view"), 1);
+        if (sent)
+        {
+            String::append(&mut b, "    uint64_t vt = cb_recv_datum_tok();\n");
+        }
+        String::append(&mut b, "    uint64_t n = p_v.bytes.len;\n");
+        String::append(&mut b, "    if (n == 0) return;\n");
+        String::append(
+            &mut b,
+            "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+        if (sent)
+        {
+            // Every byte's `[Read]` through the view's path.
+            String::append(
+                &mut b,
+                "    if (vt != 0) cb_borrow_range_unminted(vt, NULL, 0, 0u, n, CB_SHARED, CB_NOLOC, 0);\n",
+            );
+        }
+        src = String::from_str("(const void *)p_v.bytes.data");
+    }
+    else
+    {
+        assert(Vec::len(targs) == 1, "cobc: append_text's type argument");
+        String call = match (&targs[0])
+        {
+            Type::TInt(it) :
+            {
+                bool sg = int_signed(*it);
+                str wide = if (sg) { "(cb_u128)(cb_i128)(p_x)" } else { "(cb_u128)(p_x)" };
+                sprintf(
+                    "cb_text_int((uint64_t)(%s >> 64), (uint64_t)(%s), %vu, (void *)buf)",
+                    wide,
+                    wide,
+                    if (sg) { 1 } else { 0 },
+                )
+            },
+            Type::TF64     : String::from_str("cb_text_f64(p_x, (void *)buf)"),
+            Type::TF32     : String::from_str("cb_text_f32(p_x, (void *)buf)"),
+            Type::TBool    : String::from_str("cb_text_bool(p_x, (void *)buf)"),
+            _              : return None,
+        };
+        String::append(&mut b, "    uint8_t buf[64];\n");
+        String::appendf(&mut b, "    uint64_t n = %s;\n", &call);
+        String::append(&mut b, "    if (n == 0) return;\n");
+        String::append(
+            &mut b,
+            "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+        src = String::from_str("(const void *)buf");
+    }
+    String::appendf(
+        &mut b,
+        "    while (s->bytes.cap - s->bytes.len < n) { uint64_t gt = cb_borrow_unstamped(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0); %s(((cb_ref){ (void *)&s->bytes, gt })); cb_call_done(gt); }\n",
+        &grow,
+    );
+    String::appendf(&mut b, "    memcpy(s->bytes.ptr + s->bytes.len, %s, n);\n", &src);
+    String::append(&mut b, "    s->bytes.len += n;\n");
+    Some(b)
+}
+
+// `StringView::sub(v, lo, hi)` natively: the body receives `v`, makes its
+// bounds and character-boundary checks (`StringView::boundary`), borrows
+// `[lo, hi)` of `v`'s path and returns the view built over it as reference
+// data. Here `v`'s path is received as `split` receives it, the same checks
+// are made in the same order, the range borrowed from that path, and the
+// new path sent as the result's one reference (`cb_send_tok_datum`).
+export fn native_view_sub(ref<Gen, exclusive> g) : Option<String>
+{
+    // `boundary` is called with the view's bytes and nothing sent: the form
+    // a pure direct slice parameter takes (D-0191). When it is not one
+    // (`--all-checks`), the body is lowered as written.
+    if (pure_view(
+        g,
+        &String::from_str("std::StringView::sub"),
+        0,
+    ) || !pure_direct(g, &String::from_str("std::StringView::boundary"), 0))
+    {
+        return None;
+    }
+    String svc = ctype(g, &view_ty());
+    String boundary = request_fn(g, StringView::of("std::StringView::boundary"), Vec::new());
+    String b = String::new();
+    String::append(&mut b, "    uint64_t vt = cb_recv_datum_tok();\n");
+    String::append(
+        &mut b,
+        "    if (p_lo > p_hi || p_hi > p_v.bytes.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n",
+    );
+    String::appendf(
+        &mut b,
+        "    if (!%s(p_v.bytes, p_lo) || !%s(p_v.bytes, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n",
+        &boundary,
+        &boundary,
+    );
+    String::append(&mut b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s r;\n", &svc);
+    String::append(&mut b, "    r.bytes.src = p_v.bytes.src;\n");
+    String::append(&mut b, "    r.bytes.data = p_v.bytes.data + p_lo;\n");
+    String::append(&mut b, "    r.bytes.len = p_hi - p_lo;\n");
+    String::append(&mut b, "    cb_send_tok_datum(tk);\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `String::from_view(v)` natively: the body is `String { .bytes =
+// Vec::from_slice(v.bytes) }` -- `v` received and bound, its bytes copied,
+// the `String` built and returned. Here `v`'s path is received as `sub`
+// receives it, the bytes copied, and the result a binding moved out and
+// sent, as `from_slice`'s is.
+export fn native_string_from_view(ref<Gen, exclusive> g) : Option<String>
+{
+    if (pure_view(g, &String::from_str("std::String::from_view"), 0))
+    {
+        return None;
+    }
+    Type st = string_ty();
+    String sc = ctype(g, &st);
+    u32 stid = type_id(g, &st);
+    String b = String::new();
+    String::append(&mut b, "    (void)cb_recv_datum_tok();\n");
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", &sc);
+    String::append(&mut b, "    out.bytes.ptr = (uint8_t *)1;\n");
+    String::append(&mut b, "    out.bytes.len = 0;\n");
+    String::append(&mut b, "    out.bytes.cap = 0;\n");
+    String::append(&mut b, "    uint64_t n = p_v.bytes.len;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        uint8_t *p = cb_allocate(n, 1u);\n");
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "        memcpy(p, p_v.bytes.data, n);\n");
+    String::append(&mut b, "        out.bytes.ptr = p;\n");
+    String::append(&mut b, "        out.bytes.len = n;\n");
+    String::append(&mut b, "        out.bytes.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", stid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = out;\n", &sc);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}
+
+// One piece of `split`, `[lo, hi)` of `v` with path `tk`, pushed: `piece`
+// with its `(LO)`, `(HI)` and `TK` filled in.
+fn split_piece(ref<String, shared> piece, StringView lo, StringView hi, StringView tk) : String
+{
+    String a = String::replace(piece, StringView::of("(LO)"), String::as_view(&sprintf("(%v)", lo)));
+    String c = String::replace(&a, StringView::of("(HI)"), String::as_view(&sprintf("(%v)", hi)));
+    String::replace(&c, StringView::of("TK"), tk)
+}
+
+// `split`'s cut at `[lo, hi)`: both ends checked as character boundaries,
+// the range borrowed from `v`'s path and the piece pushed (cobc's `cut`).
+fn split_cut(ref<String, shared> boundary, ref<String, shared> piece, StringView lo, StringView hi) : String
+{
+    String p = split_piece(piece, lo, hi, StringView::of("tk"));
+    sprintf(
+        "    if (!%s(p_v.bytes, %v) || !%s(p_v.bytes, %v)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n    { uint64_t tk = cb_borrow_range(vt, NULL, 0, %v, %v, CB_SHARED, CB_NOLOC, 0);\n    %s }\n",
+        boundary,
+        lo,
+        boundary,
+        hi,
+        lo,
+        hi,
+        &p
+    )
+}
+
+// `StringView::split(v, sep)` (`spec/21`, D-0113) natively: the body builds
+// `out` by pushing `StringView::sub(v, start, i)` for each piece. Here each
+// piece's checks are `sub`'s (its bounds hold by construction; both ends
+// must be character boundaries, else `diag.not-char-boundary`), its path is
+// `sub`'s -- the range borrowed from `v`'s path -- and it is written
+// straight into `out`'s cells with that path in its slot, as `push`'s
+// `cb_recv_datum` would leave it. `out` is a binding as in the body (its
+// object, bound in a frame, grown through its root, then moved out and
+// sent); `v` is received as the body's parameter is. The search reads `v`'s
+// bytes as `StringView::at` does, unchecked, with `i + m`'s overflow fault.
+export fn native_view_split(ref<Gen, exclusive> g) : Option<String>
+{
+    if (pure_view(
+        g,
+        &String::from_str("std::StringView::split"),
+        0,
+    ) || !pure_direct(g, &String::from_str("std::StringView::boundary"), 0))
+    {
+        return None;
+    }
+    Type svt = view_ty();
+    Type vect = named(StringView::of("std::Vec"), ty1(clone(&svt)));
+    String vc = ctype(g, &vect);
+    String svc = ctype(g, &svt);
+    u32 vtid = type_id(g, &vect);
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ty1(clone(&svt)));
+    String boundary = request_fn(g, StringView::of("std::StringView::boundary"), Vec::new());
+    str ovf = "cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0)";
+    String b = String::new();
+    String::append(&mut b, "    uint64_t vt = cb_recv_datum_tok();\n");
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", &vc);
+    String::appendf(&mut b, "    out.ptr = (%s *)1;\n", &svc);
+    String::append(&mut b, "    out.len = 0;\n");
+    String::append(&mut b, "    out.cap = 0;\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", vtid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    uint64_t n = p_v.bytes.len;\n");
+    String::append(&mut b, "    uint64_t m = p_sep.n;\n");
+    // One piece, `[lo, hi)` of `v` with path `tk`, pushed.
+    String piece = sprintf(
+        "{ if (out.len == out.cap) { %s(((cb_ref){ (void *)&out, root })); } %s *el = out.ptr + out.len; el->bytes.src = p_v.bytes.src; el->bytes.data = p_v.bytes.data + (LO); el->bytes.len = (HI) - (LO); cb_store_ref(&el->bytes.src, TK); out.len += 1; }",
+        &grow,
+        &svc
+    );
+    String::append(&mut b, "    if (m == 0) {\n");
+    // `Vec::push(&mut out, v)`: `v` itself, its own path.
+    String::appendf(
+        &mut b,
+        "    %s\n",
+        &split_piece(&piece, StringView::of("0"), StringView::of("n"), StringView::of("vt")),
+    );
+    String::append(&mut b, "    } else {\n");
+    String::append(&mut b, "    uint64_t start = 0, i = 0;\n");
+    String::append(&mut b, "    for (;;) {\n");
+    String::append(&mut b, "        uint64_t e;\n");
+    String::appendf(&mut b, "        if (__builtin_add_overflow(i, m, &e)) %s;\n", ovf);
+    String::append(&mut b, "        if (!(e <= n)) break;\n");
+    String::append(&mut b, "        if (memcmp(p_v.bytes.data + i, p_sep.p, m) == 0) {\n");
+    String inner = split_cut(&boundary, &piece, StringView::of("start"), StringView::of("i"));
+    String::append(&mut b, &String::replace(&inner, StringView::of("\n    "), StringView::of("\n        ")));
+    String::appendf(&mut b, "            if (__builtin_add_overflow(i, m, &i)) %s;\n", ovf);
+    String::append(&mut b, "            start = i;\n");
+    String::append(&mut b, "        } else {\n");
+    String::appendf(&mut b, "            if (__builtin_add_overflow(i, (uint64_t)1, &i)) %s;\n", ovf);
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, &split_cut(&boundary, &piece, StringView::of("start"), StringView::of("n")));
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = out;\n", &vc);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}
+
+// D-0193: `StringView::split_whitespace(v)` natively, as `split` is
+// (`native_view_split`): each word, `StringView::sub(v, start, i)` in the
+// body, borrowed from `v`'s path and written straight into `out`. Its ends
+// lie next to ASCII bytes (or at `v`'s ends), so `sub`'s character-boundary
+// checks cannot fail and are not repeated.
+//
+// `chars` (D-0128) the same way: a piece from each character's first byte
+// (one that is not `10xxxxxx`) to the next one, or the end.
+export fn native_view_split_whitespace(ref<Gen, exclusive> g, bool chars) : Option<String>
+{
+    String key = String::from_str(if (chars) { "std::StringView::chars" } else { "std::StringView::split_whitespace" });
+    if (pure_view(g, &key, 0))
+    {
+        return None;
+    }
+    Type svt = view_ty();
+    Type vect = named(StringView::of("std::Vec"), ty1(clone(&svt)));
+    String vc = ctype(g, &vect);
+    String svc = ctype(g, &svt);
+    u32 vtid = type_id(g, &vect);
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ty1(clone(&svt)));
+    String b = String::new();
+    String::append(&mut b, "    uint64_t vt = cb_recv_datum_tok();\n");
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", &vc);
+    String::appendf(&mut b, "    out.ptr = (%s *)1;\n", &svc);
+    String::append(&mut b, "    out.len = 0;\n");
+    String::append(&mut b, "    out.cap = 0;\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", vtid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    const uint8_t *d = p_v.bytes.data;\n");
+    String::append(&mut b, "    uint64_t n = p_v.bytes.len, i = 0;\n");
+    String::append(&mut b, "    while (i < n) {\n");
+    if (chars)
+    {
+        String::append(&mut b, "        uint64_t start = i;\n");
+        String::append(&mut b, "        i++;\n");
+        String::append(&mut b, "        while (i < n && (d[i] & 0xc0) == 0x80) i++;\n");
+    }
+    else
+    {
+        String::append(&mut b, "        while (i < n && (d[i] == ' ' || (d[i] >= 9 && d[i] <= 13))) i++;\n");
+        String::append(&mut b, "        uint64_t start = i;\n");
+        String::append(&mut b, "        while (i < n && !(d[i] == ' ' || (d[i] >= 9 && d[i] <= 13))) i++;\n");
+    }
+    String::append(&mut b, "        if (i > start) {\n");
+    String::append(
+        &mut b,
+        "            uint64_t tk = cb_borrow_range(vt, NULL, 0, start, i, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "            if (out.len == out.cap) { %s(((cb_ref){ (void *)&out, root })); }\n", &grow);
+    String::appendf(
+        &mut b,
+        "            %s *el = out.ptr + out.len; el->bytes.src = p_v.bytes.src; el->bytes.data = p_v.bytes.data + start; el->bytes.len = i - start; cb_store_ref(&el->bytes.src, tk); out.len += 1;\n",
+        &svc,
+    );
+    String::append(&mut b, "        }\n");
+    String::append(&mut b, "    }\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = out;\n", &vc);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}
+
+// D-0193: `StringView::parse<T>` and `String::parse<T>` for an integer `T`,
+// natively: the body hands the text's bytes to `parse_check`, then to
+// `parse_value` when they are a `T`, and builds the `Result` from the code
+// (`-1` a number, `-2` `Empty`, `-3` `OutOfRange`, else `Invalid(at)`).
+// Here the same two calls on the same bytes: the view's (received as the
+// body's parameter is) or the `String`'s (after the body's checked read).
+export fn native_parse_int(ref<Gen, exclusive> g, ref<String, shared> name, IntTy it) : Option<String>
+{
+    Type t = Type::TInt(it);
+    Vec<Type> ra = Vec::new();
+    Vec::push(&mut ra, clone(&t));
+    Vec::push(&mut ra, named(StringView::of("std::ParseError"), Vec::new()));
+    String rc = ctype(g, &named(StringView::of("std::Result"), ra));
+    String tc = ctype(g, &t);
+    String b = String::new();
+    if (String::eq_str(name, "std::StringView::parse"))
+    {
+        if (!pure_view(g, name, 0))
+        {
+            String::append(&mut b, "    (void)cb_recv_datum_tok();\n");
+        }
+        String::append(&mut b, "    const uint8_t *p = p_v.bytes.data; uint64_t n = p_v.bytes.len;\n");
+    }
+    else
+    {
+        String sc = ctype(g, &string_ty());
+        String::append(&mut b, "    cb_read(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+        String::appendf(
+            &mut b,
+            "    const uint8_t *p = ((%s *)p_s.p)->bytes.ptr; uint64_t n = ((%s *)p_s.p)->bytes.len;\n",
+            &sc,
+            &sc,
+        );
+    }
+    String head = sprintf(
+        "cb_parse_int((const void *)p, n, %vu, %vu",
+        if (int_signed(it)) { 1 } else { 0 },
+        int_bitwidth(it),
+    );
+    String::appendf(&mut b, "    %s r;\n", &rc);
+    String::appendf(&mut b, "    int64_t code = %s, 0);\n", &head);
+    String::appendf(
+        &mut b,
+        "    if (code == -1) { uint64_t o[2]; %s, o); r.tag = 0u; r.u.v0 = (%s)((((cb_u128)o[0]) << 64) | o[1]); return r; }\n",
+        &head,
+        &tc,
+    );
+    String::append(&mut b, "    r.tag = 1u;\n");
+    String::append(&mut b, "    if (code == -2) r.u.v1.tag = 0u;\n");
+    String::append(&mut b, "    else if (code == -3) r.u.v1.tag = 2u;\n");
+    String::append(&mut b, "    else { r.u.v1.tag = 1u; r.u.v1.u.v1 = (uint64_t)code; }\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// D-0193: `StringView::trim`, `trim_start`, `trim_end` natively: the body
+// reads `v`'s bytes through its fresh binding (which cannot fail), then
+// returns `StringView::sub(v, i, n)`, whose ends lie next to ASCII white
+// space or at `v`'s ends: here `v` received as `sub` receives it, the same
+// range found, borrowed from `v`'s path and sent as the result's one
+// reference (`native_view_sub`).
+export fn native_view_trim(ref<Gen, exclusive> g, ref<String, shared> name) : Option<String>
+{
+    if (pure_view(g, name, 0))
+    {
+        return None;
+    }
+    String svc = ctype(g, &view_ty());
+    String b = String::new();
+    String::append(&mut b, "    uint64_t vt = cb_recv_datum_tok();\n");
+    String::append(&mut b, "    const uint8_t *d = p_v.bytes.data;\n");
+    String::append(&mut b, "    uint64_t n = p_v.bytes.len, i = 0;\n");
+    if (!String::eq_str(name, "std::StringView::trim_end"))
+    {
+        String::append(&mut b, "    while (i < n && (d[i] == ' ' || (d[i] >= 9 && d[i] <= 13))) i++;\n");
+    }
+    if (!String::eq_str(name, "std::StringView::trim_start"))
+    {
+        String::append(&mut b, "    while (n > i && (d[n - 1] == ' ' || (d[n - 1] >= 9 && d[n - 1] <= 13))) n--;\n");
+    }
+    String::append(&mut b, "    uint64_t tk = cb_borrow_range(vt, NULL, 0, i, n, CB_SHARED, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s r;\n", &svc);
+    String::append(&mut b, "    r.bytes.src = p_v.bytes.src;\n");
+    String::append(&mut b, "    r.bytes.data = p_v.bytes.data + i;\n");
+    String::append(&mut b, "    r.bytes.len = n - i;\n");
+    String::append(&mut b, "    cb_send_tok_datum(tk);\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `find`, `contains`, `starts_with` and `ends_with` of a `StringView` or a
+// `String` natively. The bodies read bytes and keep nothing: a view's bytes
+// through its fresh binding, which cannot fail, and a `String`'s through the
+// shared borrow `&(*s)[0..$]` of its bytes, whose check is the one that can
+// (`cb_borrow_check`). Here the views are received as the bodies receive
+// them (none for a pure view parameter, which the caller keeps), the
+// borrow's check made, and the bytes compared at once.
+export fn native_text_search(ref<Gen, exclusive> g, ref<String, shared> name) : Option<String>
+{
+    bool on_string = String::starts_with(name, StringView::of("std::String::"));
+    String b = String::new();
+    usize j = 0;
+    while (j < 2)
+    {
+        if ((j == 1 || !on_string) && !pure_view(g, name, j))
+        {
+            String::append(&mut b, "    (void)cb_recv_datum_tok();\n");
+        }
+        j += 1;
+    }
+    if (on_string)
+    {
+        String sc = ctype(g, &string_ty());
+        String::append(
+            &mut b,
+            "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    const uint8_t *h = ((%s *)p_s.p)->bytes.ptr;\n", &sc);
+        String::appendf(&mut b, "    uint64_t hn = ((%s *)p_s.p)->bytes.len;\n", &sc);
+    }
+    else
+    {
+        String::append(&mut b, "    const uint8_t *h = p_v.bytes.data;\n");
+        String::append(&mut b, "    uint64_t hn = p_v.bytes.len;\n");
+    }
+    String::append(&mut b, "    const uint8_t *n = p_t.bytes.data;\n");
+    String::append(&mut b, "    uint64_t nn = p_t.bytes.len;\n");
+    // The operation: the name's last segment.
+    if (String::ends_with(name, StringView::of("::find")))
+    {
+        String oc = ctype(g, &named(StringView::of("std::Option"), ty1(Type::TInt(IntTy::Usize))));
+        String::append(&mut b, "    uint64_t i = cb_find_bytes(h, hn, n, nn);\n");
+        String::appendf(&mut b, "    %s r;\n", &oc);
+        String::append(&mut b, "    if (i == UINT64_MAX) { r.tag = 1u; return r; }\n");
+        String::append(&mut b, "    r.tag = 0u;\n");
+        String::append(&mut b, "    r.u.v0 = i;\n");
+        String::append(&mut b, "    return r;\n");
+    }
+    else if (String::ends_with(name, StringView::of("::contains")))
+    {
+        String::append(&mut b, "    return (uint8_t)(cb_find_bytes(h, hn, n, nn) != UINT64_MAX);\n");
+    }
+    else if (String::ends_with(name, StringView::of("::starts_with")))
+    {
+        String::append(&mut b, "    return (uint8_t)(nn <= hn && (nn == 0 || memcmp(h, n, (size_t)nn) == 0));\n");
+    }
+    else
+    {
+        String::append(
+            &mut b,
+            "    return (uint8_t)(nn <= hn && (nn == 0 || memcmp(h + (hn - nn), n, (size_t)nn) == 0));\n",
+        );
+    }
+    Some(b)
+}
+
+// `String::from_view(String::view(s, lo, hi))` as one call: the checks
+// `native_string_view` makes, in its order, then the bytes copied into a new
+// `String` returned as `native_string_from_view` returns its. The view's
+// path is never formed: `from_view` would receive it and it would end,
+// unheld, with the statement (D-0018: no check counts an unheld path), and
+// every check its borrow could fail is the whole bytes' check made first.
+export fn substring_helper(ref<Gen, exclusive> g) : String
+{
+    String name = String::from_str("cbn_string_substring");
+    if (g.substring_fn)
+    {
+        return name;
+    }
+    g.substring_fn = true;
+    Type st = string_ty();
+    String sc = ctype(g, &st);
+    u32 stid = type_id(g, &st);
+    String sig = sprintf("%s %s(cb_ref p_s, uint64_t p_lo, uint64_t p_hi)", &sc, &name);
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String::append(&mut b, "    uint64_t n = s->bytes.len;\n");
+    String::append(&mut b, "    if (p_lo > p_hi || p_hi > n) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::append(
+        &mut b,
+        "    if (!cb_char_boundary(s->bytes.ptr, n, p_lo) || !cb_char_boundary(s->bytes.ptr, n, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", &sc);
+    String::append(&mut b, "    out.bytes.ptr = (uint8_t *)1;\n");
+    String::append(&mut b, "    out.bytes.len = 0;\n");
+    String::append(&mut b, "    out.bytes.cap = 0;\n");
+    String::append(&mut b, "    uint64_t k = p_hi - p_lo;\n");
+    String::append(&mut b, "    if (k > 0) {\n");
+    String::append(&mut b, "        uint8_t *p = cb_allocate(k, 1u);\n");
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::append(&mut b, "        memcpy(p, s->bytes.ptr + p_lo, k);\n");
+    String::append(&mut b, "        out.bytes.ptr = p;\n");
+    String::append(&mut b, "        out.bytes.len = k;\n");
+    String::append(&mut b, "        out.bytes.cap = k;\n");
+    String::append(&mut b, "    }\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", stid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = out;\n", &sc);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    String::appendf(&mut g.protos, "%s;\n", &sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &sig, &b);
+    // D-0200: the `_raw` form, for a result with no object
+    // (`Fx::lower_raw_string`): the same checks and copy, no frame.
+    usize at = Option::expect(
+        StringView::find(String::as_view(&b), StringView::of("    uint64_t oo = cb_new(&out")),
+        "the helper's result",
+    );
+    String raw = replace_first(
+        StringView::sub(String::as_view(&b), 0, at),
+        StringView::of("    cb_frame_push();\n"),
+        StringView::of(""),
+    );
+    String::append(&mut raw, "    return out;\n");
+    String raw_sig = sprintf("%s %s_raw(cb_ref p_s, uint64_t p_lo, uint64_t p_hi)", &sc, &name);
+    String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &raw_sig, &raw);
+    name
+}
+
+// `String::append(s, String::view(t, lo, hi))` as one call: the view's
+// checks (`native_string_view`), then `append_view`'s (`native_append_
+// bytes`): nothing when the view is empty; else `s.bytes` borrowed
+// exclusively, where the body's binding of the view clashes exactly when
+// `s` is `t` -- the one way the view's path and `s`'s can meet -- so that
+// is the aliasing fault, made where the check would make it; then `s` grown
+// as the pushes would grow it and the bytes copied. The view's path is never
+// formed: unheld, it would end with the statement, and its range's check is
+// within the whole bytes' check made first, with nothing formed in between.
+export fn append_substring_helper(ref<Gen, exclusive> g) : String
+{
+    String name = String::from_str("cbn_append_substring");
+    if (g.append_substring_fn)
+    {
+        return name;
+    }
+    g.append_substring_fn = true;
+    String sc = ctype(g, &string_ty());
+    String grow = request_fn(g, StringView::of("std::Vec::grow"), ty1(Type::TInt(IntTy::U8)));
+    String sig = sprintf("void %s(cb_ref p_s, cb_ref p_t, uint64_t p_lo, uint64_t p_hi)", &name);
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_t.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *t = (%s *)p_t.p;\n", &sc, &sc);
+    String::append(&mut b, "    uint64_t tn = t->bytes.len;\n");
+    String::append(&mut b, "    if (p_lo > p_hi || p_hi > tn) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::append(
+        &mut b,
+        "    if (!cb_char_boundary(t->bytes.ptr, tn, p_lo) || !cb_char_boundary(t->bytes.ptr, tn, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n",
+    );
+    String::append(&mut b, "    uint64_t n = p_hi - p_lo;\n");
+    String::append(&mut b, "    if (n == 0) return;\n");
+    String::append(&mut b, "    if (p_s.p == p_t.p) cb_fault(\"diag.aliasing-conflict\", CB_NOLOC, 0);\n");
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String::appendf(
+        &mut b,
+        "    while (s->bytes.cap - s->bytes.len < n) { uint64_t gt = cb_borrow_unstamped(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0); %s(((cb_ref){ (void *)&s->bytes, gt })); cb_call_done(gt); }\n",
+        &grow,
+    );
+    String::append(&mut b, "    memcpy(s->bytes.ptr + s->bytes.len, t->bytes.ptr + p_lo, n);\n");
+    String::append(&mut b, "    s->bytes.len += n;\n");
+    String::appendf(&mut g.protos, "%s;\n", &sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &sig, &b);
+    name
+}
+
+// D-0200: `replace(r, v)` natively for a value an objectless local may hold
+// (`objectless_type`): the body receives `v`, binds it as `old`, and
+// `swap_places(r, &mut old)` checks that both places are still there and
+// writes each by `[Write]` (`[Swap-Places]`, D-0235): of those only `r`'s
+// can fail (`r` may be passed on whole beside a live shared reborrow of
+// `*r`), so `r`'s validity and then its write are checked; it exchanges
+// them and returns `old` -- with the object `v` came with, which is what
+// the body's bindings hand on. The same here, without the bindings. Plain
+// data comes with no object: the same checks, nothing received or sent.
+export fn native_replace(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<String>
+{
+    if (plain_data(g, t))
+    {
+        String pc = ctype(g, t);
+        String pb = String::new();
+        String::append(&mut pb, "    cb_valid(p_r.tok, CB_NOLOC, 0);\n");
+        String::append(&mut pb, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+        String::appendf(&mut pb, "    %s old = *(%s *)p_r.p;\n", &pc, &pc);
+        String::appendf(&mut pb, "    *(%s *)p_r.p = p_v;\n", &pc);
+        String::append(&mut pb, "    return old;\n");
+        return Some(pb);
+    }
+    if (!objectless_type(g, t))
+    {
+        return None;
+    }
+    String tc = ctype(g, t);
+    String b = String::new();
+    String::append(&mut b, "    uint64_t o = cb_recv(&p_v);\n");
+    String::append(&mut b, "    cb_valid(p_r.tok, CB_NOLOC, 0);\n");
+    String::append(&mut b, "    cb_write(p_r.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s old = *(%s *)p_r.p;\n", &tc, &tc);
+    String::appendf(&mut b, "    *(%s *)p_r.p = p_v;\n", &tc);
+    String::append(&mut b, "    cb_move_to(o, &old);\n");
+    String::append(&mut b, "    cb_send(o);\n");
+    String::append(&mut b, "    return old;\n");
+    Some(b)
+}
+
+// `String::view(s, lo, hi)` natively: the body borrows `&s.bytes[0..$]`
+// (its check the first that can fail), faults on bounds and then on
+// character boundaries, borrows `[lo, hi)` of that whole-bytes path and
+// returns the view over it as reference data. Here the same checks in the
+// same order, the range borrowed from `s`'s path to its bytes, and sent as
+// the result's one reference (`cb_send_tok_datum`), as `native_view_sub`
+// sends its.
+export fn native_string_view(ref<Gen, exclusive> g) : Option<String>
+{
+    String sc = ctype(g, &string_ty());
+    String svc = ctype(g, &view_ty());
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String::append(&mut b, "    uint64_t n = s->bytes.len;\n");
+    String::append(&mut b, "    if (p_lo > p_hi || p_hi > n) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::append(
+        &mut b,
+        "    if (!cb_char_boundary(s->bytes.ptr, n, p_lo) || !cb_char_boundary(s->bytes.ptr, n, p_hi)) cb_fault(\"diag.not-char-boundary\", CB_NOLOC, 0);\n",
+    );
+    String::append(
+        &mut b,
+        "    uint64_t tk = cb_borrow_range(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, p_lo, p_hi, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s r;\n", &svc);
+    String::append(&mut b, "    r.bytes.src = (void *)&s->bytes;\n");
+    String::append(&mut b, "    r.bytes.data = s->bytes.ptr + p_lo;\n");
+    String::append(&mut b, "    r.bytes.len = p_hi - p_lo;\n");
+    String::append(&mut b, "    cb_send_tok_datum(tk);\n");
+    String::append(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// D-0193: `String::to_ascii_lower` / `to_ascii_upper` natively: the body
+// borrows `s.bytes` for its `foreach` (the one check that can fail), reads
+// each byte through that borrow and pushes its mapping onto a new
+// `String`'s bytes. Here the same borrow's check, then the bytes mapped into
+// one exact allocation (a `String`'s capacity is not observable); a byte
+// with an object over it takes the prelude's body.
+// D-0200: a native body's `__raw` form, where it has one of its own:
+// `native_ascii_case`'s, the new `String` returned with no object and no
+// frame (which held nothing else); the prelude's body's result, when that
+// is taken, received and its record ended.
+export fn native_raw_body(ref<Gen, exclusive> g, ref<String, shared> name, ref<String, shared> body) : Option<String>
+{
+    if (!String::eq_str(name, "std::String::to_ascii_lower") && !String::eq_str(name, "std::String::to_ascii_upper"))
+    {
+        return None;
+    }
+    StringView bv = String::as_view(body);
+    usize bn = StringView::len(bv);
+    StringView lead = StringView::of("if (cb_live_in(s->bytes.ptr, s->bytes.len)) return ");
+    usize at = match (StringView::find(bv, StringView::of("    uint64_t oo = cb_new(&out")))
+    {
+        Some(i) : i,
+        None    : return None,
+    };
+    usize fb_start = match (StringView::find(bv, lead))
+    {
+        Some(i) : i,
+        None    : return None,
+    };
+    usize fb_end = match (StringView::find(StringView::sub(bv, fb_start, bn), StringView::of(";")))
+    {
+        Some(i) : i + fb_start,
+        None    : return None,
+    };
+    StringView call = StringView::sub(bv, fb_start + StringView::len(lead), fb_end);
+    String head = sprintf(
+        "%vif (cb_live_in(s->bytes.ptr, s->bytes.len)) { struct s_std__String r = %v; cb_forget_obj(cb_recv(&r)); return r; }%v",
+        StringView::sub(bv, 0, fb_start),
+        call,
+        StringView::sub(bv, fb_end + 1, at)
+    );
+    // The frame held nothing but the result's object.
+    String out = replace_first(String::as_view(&head), StringView::of("    cb_frame_push();\n"), StringView::of(""));
+    String::append(&mut out, "    return out;\n");
+    Some(out)
+}
+
+export fn native_ascii_case(ref<Gen, exclusive> g, bool upper) : Option<String>
+{
+    Type st = string_ty();
+    String sc = ctype(g, &st);
+    u32 stid = type_id(g, &st);
+    String fb = std_fallback(g);
+    str lo = if (upper) { "'a'" } else { "'A'" };
+    str hi = if (upper) { "'z'" } else { "'Z'" };
+    str delta = if (upper) { "- 32" } else { "+ 32" };
+    String b = String::new();
+    String::append(
+        &mut b,
+        "    cb_borrow_check(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    %s *s = (%s *)p_s.p;\n", &sc, &sc);
+    String::appendf(&mut b, "    if (cb_live_in(s->bytes.ptr, s->bytes.len)) return %s(p_s);\n", &fb);
+    String::append(&mut b, "    cb_frame_push();\n");
+    String::appendf(&mut b, "    %s out;\n", &sc);
+    String::append(&mut b, "    out.bytes.ptr = (uint8_t *)1;\n");
+    String::append(&mut b, "    out.bytes.len = 0;\n");
+    String::append(&mut b, "    out.bytes.cap = 0;\n");
+    String::append(&mut b, "    uint64_t n = s->bytes.len;\n");
+    String::append(&mut b, "    if (n > 0) {\n");
+    String::append(&mut b, "        uint8_t *p = cb_allocate(n, 1u);\n");
+    String::append(&mut b, "        if (!p) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::appendf(
+        &mut b,
+        "        for (uint64_t k = 0; k < n; k++) { uint8_t c = s->bytes.ptr[k]; p[k] = (c >= %s && c <= %s) ? (uint8_t)(c %s) : c; }\n",
+        lo,
+        hi,
+        delta,
+    );
+    String::append(&mut b, "        out.bytes.ptr = p;\n");
+    String::append(&mut b, "        out.bytes.len = n;\n");
+    String::append(&mut b, "        out.bytes.cap = n;\n");
+    String::append(&mut b, "    }\n");
+    String::appendf(&mut b, "    uint64_t oo = cb_new(&out, %vu, CB_NOLOC, 0);\n", stid);
+    String::append(&mut b, "    uint64_t root = cb_bind(oo);\n");
+    String::append(&mut b, "    uint64_t ot = cb_take(root, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s res = out;\n", &sc);
+    String::append(&mut b, "    cb_move_to(ot, &res);\n");
+    String::append(&mut b, "    cb_send(ot);\n");
+    String::append(&mut b, "    cb_frame_pop();\n");
+    String::append(&mut b, "    return res;\n");
+    Some(b)
+}

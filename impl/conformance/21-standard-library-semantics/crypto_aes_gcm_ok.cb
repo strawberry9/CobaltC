@@ -1,0 +1,86 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.crypto [Aes] [Aes-Gcm-Seal] [Aes-Gcm-Open] (D-0165); conf.aes-vectors, conf.aes-gcm-vectors
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 4145532d3132383a2036396334653064383661376230343330643863646237383037306234633535610a4145532d3139323a2064646139376361343836346364666530366561663730613065633064373139310a4145532d3235363a2038656132623763613531363734356266656166633439393034623439363038390a6361736520313a2035386532666363656661376533303631333637663164353761346537343535610a20206f70656e733a20747275650a6361736520323a20303338386461636536306236613339326633323863326239373162326665373861623665343764343263656331336264663533613637623231323537626464660a20206f70656e733a20747275650a6361736520343a2034323833316563323231373737343234346237323231623738346430643439636533616132313266326330326134653033356331376532333239616361313265323164353134623235343636393331633764386636613561616338346161303531626133306233393661306161633937336435386530393135626339346662633332323161356462393466616539356165373132316134370a20206f70656e733a20747275650a636173652031363a2035323264633166303939353637643037663437663337613332613834343237643634336138636463626665356330633937353938613262643235353564316161386362303865343835393064626233646137623038623130353638323838333863356636316536333933626137613061626363396636363237366663366563653066346531373638636464663838353362623264353531620a20206f70656e733a20747275650a6368616e676564206369706865727465787420726566757365643a20747275650a6368616e6765642074616720726566757365643a20747275650a6f746865722061616420726566757365643a20747275650a6f74686572206e6f6e636520726566757365643a20747275650a73686f7274206d65737361676520726566757365643a20747275650a
+//
+// AES-128, AES-192 and AES-256 of FIPS 197 Appendix C's block; AES-GCM
+// against the GCM specification's test cases 1, 2, 4 and 16 (the empty
+// message, one zero block, and a 60-byte message with 20 bytes of aad
+// under a 16- and a 32-byte key); `aes_gcm_open` gives the plaintext back
+// and refuses a changed ciphertext, tag, aad or nonce, and a message
+// shorter than a tag.
+
+import std;
+
+fn bytes(str hex) : Vec<u8>
+{
+    Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new())
+}
+
+fn show(str name, str key, str nonce, str aad, str plain)
+{
+    Vec<u8> k = bytes(key);
+    Vec<u8> n = bytes(nonce);
+    Vec<u8> a = bytes(aad);
+    Vec<u8> p = bytes(plain);
+    Vec<u8> sealed = aes_gcm_seal(&k[0..$], &n[0..$], &a[0..$], &p[0..$]);
+    printf("%s: %s\n", name, &to_hex(&sealed[0..$]));
+    bool back = match (aes_gcm_open(&k[0..$], &n[0..$], &a[0..$], &sealed[0..$]))
+    {
+        Some(q) : Vec::len(&q) == Vec::len(&p) && digest_eq(&q[0..$], &p[0..$]),
+        None    : false,
+    };
+    printf("  opens: %v\n", back);
+}
+
+fn main() : u8
+{
+    array<str, 3> keys = [
+        "000102030405060708090a0b0c0d0e0f",
+        "000102030405060708090a0b0c0d0e0f1011121314151617",
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    ];
+    Vec<u8> block = bytes("00112233445566778899aabbccddeeff");
+    array<u8, 16> b = [0; 16];
+    for (usize i = 0; i < 16; i += 1)
+    {
+        b[i] = block[i];
+    }
+    foreach (k in &keys)
+    {
+        Vec<u8> key = bytes(*k);
+        printf("AES-%u: %s\n", 8 * Vec::len(&key), &to_hex(&aes_encrypt_block(&key[0..$], b)[0..$]));
+    }
+    str zeros16 = "00000000000000000000000000000000";
+    str zeros12 = "000000000000000000000000";
+    str p60 = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39";
+    str a20 = "feedfacedeadbeeffeedfacedeadbeefabaddad2";
+    str iv = "cafebabefacedbaddecaf888";
+    show("case 1", zeros16, zeros12, "", "");
+    show("case 2", zeros16, zeros12, "", zeros16);
+    show("case 4", "feffe9928665731c6d6a8f9467308308", iv, a20, p60);
+    show("case 16", "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", iv, a20, p60);
+    // Refusals: each change on its own.
+    Vec<u8> k = bytes("feffe9928665731c6d6a8f9467308308");
+    Vec<u8> n = bytes(iv);
+    Vec<u8> a = bytes(a20);
+    Vec<u8> p = bytes(p60);
+    Vec<u8> sealed = aes_gcm_seal(&k[0..$], &n[0..$], &a[0..$], &p[0..$]);
+    Vec<u8> changed = Vec::clone(&sealed);
+    changed[5] = changed[5] ^ 1;
+    printf(
+        "changed ciphertext refused: %v\n",
+        Option::is_none(&aes_gcm_open(&k[0..$], &n[0..$], &a[0..$], &changed[0..$])),
+    );
+    Vec<u8> tag = Vec::clone(&sealed);
+    tag[Vec::len(&tag) - 1] = tag[Vec::len(&tag) - 1] ^ 0x80;
+    printf("changed tag refused: %v\n", Option::is_none(&aes_gcm_open(&k[0..$], &n[0..$], &a[0..$], &tag[0..$])));
+    printf("other aad refused: %v\n", Option::is_none(&aes_gcm_open(&k[0..$], &n[0..$], &a[0..19], &sealed[0..$])));
+    Vec<u8> n2 = Vec::clone(&n);
+    n2[11] = n2[11] ^ 1;
+    printf("other nonce refused: %v\n", Option::is_none(&aes_gcm_open(&k[0..$], &n2[0..$], &a[0..$], &sealed[0..$])));
+    printf("short message refused: %v\n", Option::is_none(&aes_gcm_open(&k[0..$], &n[0..$], &a[0..$], &sealed[0..15])));
+    0
+}

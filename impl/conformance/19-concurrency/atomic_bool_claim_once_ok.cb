@@ -1,0 +1,63 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.atomic `AtomicBool` (all operations); D-0253; conf.atomic-bool
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 77696e6e65727320310a776f726b657220370a7420662074206620666f756e6420660a
+//
+// Four threads race to claim a job with `AtomicBool::swap`: exactly one
+// finds it clear. Then a "ready" flag: a worker sleeps in
+// `AtomicBool::wait` until the spawner sets it and notifies. The remaining
+// operations on one thread.
+
+import std;
+
+fn claim(ref<AtomicBool, shared> taken, ref<Atomic<u32>, shared> winners)
+{
+    if (!AtomicBool::swap(taken, true))
+    {
+        _ = Atomic::fetch_add(winners, 1);
+    }
+}
+
+fn main()
+{
+    AtomicBool taken = AtomicBool::new(false);
+    Atomic<u32> winners = Atomic::new(0: u32);
+    {
+        Vec<handle<void>> hs = Vec::new();
+        foreach (k in 0..4)
+        {
+            Vec::push(&mut hs, spawn(claim, &taken, &winners));
+        }
+    }
+    printf("winners %d\n", Atomic::load(&winners));
+    AtomicBool ready = AtomicBool::new(false);
+    {
+        handle<u32> h = spawn(move [](ref<AtomicBool, shared> r) : u32
+        {
+            AtomicBool::wait(r, false);
+            7
+        }, &ready);
+        AtomicBool::store(&ready, true);
+        AtomicBool::notify_one(&ready);
+        printf("worker %d\n", join(h));
+    }
+    AtomicBool f = AtomicBool::new(true);
+    bool a = AtomicBool::fetch_and(&f, false);
+    bool b = AtomicBool::fetch_or(&f, true);
+    bool c = AtomicBool::fetch_xor(&f, true);
+    bool d = AtomicBool::load(&f);
+    match (AtomicBool::compare_exchange(&f, true, false))
+    {
+        Ok(_) : printf("unexpected\n"),
+        Err(v) : printf(
+            "%s %s %s %s found %s\n",
+            if (a) { "t" } else { "f" },
+            if (b) { "t" } else { "f" },
+            if (c) { "t" } else { "f" },
+            if (d) { "t" } else { "f" },
+            if (v) { "t" } else { "f" },
+        ),
+    }
+}

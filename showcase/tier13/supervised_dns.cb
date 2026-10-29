@@ -1,0 +1,346 @@
+// Supervised DNS
+//
+// Shows: a server built the way D-0204 means threads to be used. A DNS
+// server over TCP (RFC 7766: each message preceded by its length in two
+// bytes, as DNS over TLS frames them too) runs one handler thread per
+// connection, each owning its connection. The accept loop is their
+// supervisor: it takes each finished handler with `try_join`, and a
+// handler that hit a bug is reported and the server goes on -- the fault
+// is contained to that thread. One handler has such a bug: its
+// statistics table is indexed by query type without a check, and a
+// query of type ANY (255) runs off its end. At shutdown the supervisor
+// cancels the handlers still waiting on a socket, and takes them too.
+// Every client is a thread of the same program, so the output is the same
+// on every run.
+
+import std;
+
+// ---- the wire format (as in `dns_over_http`) ----
+
+fn push_name(ref<Vec<u8>, exclusive> out, StringView name)
+{
+    Vec<StringView> labels = StringView::split(name, ".");
+    foreach (label in &labels)
+    {
+        Vec::push(out, narrow<u8>(StringView::len(*label)));
+        Vec::extend_from(out, StringView::as_bytes(*label));
+    }
+    Vec::push(out, 0);
+}
+
+fn encode_query(u16 id, StringView name, u16 qtype) : Vec<u8>
+{
+    Vec<u8> m = Vec::new();
+    Vec::push_be(&mut m, id);
+    Vec::push_be(&mut m, 0x0100: u16);
+    Vec::push_be(&mut m, 1: u16);
+    Vec::push_be(&mut m, 0: u16);
+    Vec::push_be(&mut m, 0: u16);
+    Vec::push_be(&mut m, 0: u16);
+    push_name(&mut m, name);
+    Vec::push_be(&mut m, qtype);
+    Vec::push_be(&mut m, 1: u16);
+    m
+}
+
+// The question's name, as dotted text, and the position after it.
+struct Question
+{
+    String name;
+    usize next;
+}
+
+fn read_question(slice<u8, shared> m) : Option<Question>
+{
+    String name = String::new();
+    usize pos = 12;
+    while (pos < slice_len(m) && m[pos] != 0)
+    {
+        usize n = widen<usize>(m[pos]);
+        if (pos + 1 + n > slice_len(m))
+        {
+            return None;
+        }
+        if (String::len(&name) > 0)
+        {
+            String::append(&mut name, ".");
+        }
+        String::append(
+            &mut name,
+            &Result::unwrap_or(String::from_utf8(Vec::from_slice(&m[pos + 1..pos + 1 + n])), String::from_str("?")),
+        );
+        pos += 1 + n;
+    }
+    if (pos + 5 > slice_len(m))
+    {
+        return None;
+    }
+    Some(Question { .name = name, .next = pos + 1 })
+}
+
+// ---- the server ----
+
+// The zone: a name and its address.
+fn lookup(StringView name) : Option<array<u8, 4>>
+{
+    if (StringView::eq(name, "example.test"))
+    {
+        return Some([192, 0, 2, 10]);
+    }
+    if (StringView::eq(name, "www.example.test"))
+    {
+        return Some([192, 0, 2, 11]);
+    }
+    None
+}
+
+// Queries answered, by type: A (1) to TXT (16). The bug: nothing checks
+// the type before indexing, so a type above 16 runs off the end.
+fn count_type(ref<array<u64, 17>, exclusive> by_type, u16 qtype)
+{
+    by_type[widen<usize>(qtype)] += 1;
+}
+
+// The answer to one query: the question echoed, an A record when the name
+// is in the zone, NXDOMAIN when it is not, FORMERR when the message is
+// malformed.
+fn answer(slice<u8, shared> q, ref<array<u64, 17>, exclusive> by_type) : Vec<u8>
+{
+    Vec<u8> r = Vec::new();
+    Vec::push_be(&mut r, read_be<u16>(q, 0));
+    Question question = match (read_question(q))
+    {
+        Some(x) : x,
+        None    :
+        {
+            Vec::push_be(&mut r, 0x8181: u16);
+            for (usize i = 0; i < 4; i += 1)
+            {
+                Vec::push_be(&mut r, 0: u16);
+            }
+            return r;
+        },
+    };
+    u16 qtype = read_be<u16>(q, question.next);
+    count_type(by_type, qtype);
+    Option<array<u8, 4>> found = lookup(String::as_view(&question.name));
+    bool answers = Option::is_some(&found) && qtype == 1;
+    Vec::push_be(&mut r, if (Option::is_some(&found)) { 0x8580: u16 } else { 0x8583: u16 });
+    Vec::push_be(&mut r, 1: u16);
+    Vec::push_be(&mut r, if (answers) { 1: u16 } else { 0: u16 });
+    Vec::push_be(&mut r, 0: u16);
+    Vec::push_be(&mut r, 0: u16);
+    Vec::extend_from(&mut r, &q[12..question.next + 4]);
+    if (answers)
+    {
+        Vec::push_be(&mut r, 0xc00c: u16);
+        Vec::push_be(&mut r, 1: u16);
+        Vec::push_be(&mut r, 1: u16);
+        Vec::push_be(&mut r, 300: u32);
+        Vec::push_be(&mut r, 4: u16);
+        Vec::extend_from(&mut r, &Option::unwrap(found)[0..$]);
+    }
+    r
+}
+
+// One connection, until the client closes it: read a message, answer it.
+// The connection is this thread's alone; the count of answers is shared.
+fn connection(TcpStream conn, ref<mutex<u64>, shared> answered) : u64
+{
+    array<u64, 17> by_type = [0; 17];
+    u64 n = 0;
+    while (true)
+    {
+        Vec<u8> len = Vec::new();
+        if (Result::is_err(&TcpStream::read_exact(&mut conn, &mut len, 2)))
+        {
+            break;
+        }
+        Vec<u8> q = Vec::new();
+        if (Result::is_err(&TcpStream::read_exact(&mut conn, &mut q, widen<usize>(read_be<u16>(&len[0..$], 0)))))
+        {
+            break;
+        }
+        Vec<u8> r = answer(&q[0..$], &mut by_type);
+        Vec<u8> out = Vec::new();
+        Vec::push_be(&mut out, narrow<u16>(Vec::len(&r)));
+        Vec::extend_from(&mut out, &r[0..$]);
+        _ = TcpStream::write(&mut conn, &out[0..$]);
+        {
+            auto g = lock(answered);
+            *g += 1;
+        }
+        n += 1;
+    }
+    n
+}
+
+// What the supervisor saw.
+struct Report
+{
+    u64 finished;
+    u64 failed;
+    u64 cancelled;
+    String failures;
+}
+
+// Takes every finished handler: its count, or its failure, reported.
+fn reap(ref<Vec<handle<u64>>, exclusive> hs, ref<Report, exclusive> rep)
+{
+    usize i = 0;
+    while (i < Vec::len(hs))
+    {
+        if (!is_finished(&hs[i]))
+        {
+            i += 1;
+            continue;
+        }
+        match (try_join(Vec::swap_remove(hs, i)))
+        {
+            Ok(_)  : rep.finished += 1,
+            Err(f) :
+            {
+                if (ThreadFailure::is_cancelled(&f))
+                {
+                    rep.cancelled += 1;
+                }
+                else
+                {
+                    rep.failed += 1;
+                    String::append(
+                        &mut rep.failures,
+                        &sprintf("  a handler failed: %s\n", &ThreadFailure::diagnostic(&f)),
+                    );
+                }
+            },
+        }
+    }
+}
+
+// The accept loop and supervisor, until `stop` is closed; then the
+// handlers still waiting are cancelled, and taken.
+fn serve(TcpListener l, ref<Channel<u8>, shared> stop, ref<mutex<u64>, shared> answered) : Report
+{
+    TcpListener::set_accept_timeout_ms(&mut l, 20);
+    Vec<handle<u64>> hs = Vec::new();
+    Report rep = Report { .finished = 0, .failed = 0, .cancelled = 0, .failures = String::new() };
+    while (!Result::is_err(&Channel::try_recv(stop)))
+    {
+        match (TcpListener::accept(&mut l))
+        {
+            Ok(conn) : Vec::push(&mut hs, spawn(connection, conn, answered)),
+            Err(_)   : {},
+        }
+        reap(&mut hs, &mut rep);
+    }
+    foreach (h in &hs)
+    {
+        cancel(h);
+    }
+    while (Vec::len(&hs) > 0)
+    {
+        reap(&mut hs, &mut rep);
+    }
+    rep
+}
+
+// ---- the clients ----
+
+// One query over `conn`: the answer's address, or what came back instead.
+fn ask(ref<TcpStream, exclusive> conn, u16 id, StringView name, u16 qtype) : String
+{
+    Vec<u8> q = encode_query(id, name, qtype);
+    Vec<u8> out = Vec::new();
+    Vec::push_be(&mut out, narrow<u16>(Vec::len(&q)));
+    Vec::extend_from(&mut out, &q[0..$]);
+    if (Result::is_err(&TcpStream::write(conn, &out[0..$])))
+    {
+        return String::from_str("write failed");
+    }
+    Vec<u8> len = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(conn, &mut len, 2)))
+    {
+        return String::from_str("connection closed");
+    }
+    Vec<u8> r = Vec::new();
+    _ = TcpStream::read_exact(conn, &mut r, widen<usize>(read_be<u16>(&len[0..$], 0)));
+    u16 flags = read_be<u16>(&r[0..$], 2);
+    if ((flags & 15) == 3)
+    {
+        return String::from_str("NXDOMAIN");
+    }
+    if (read_be<u16>(&r[0..$], 6) == 0)
+    {
+        return String::from_str("no answer");
+    }
+    usize n = Vec::len(&r);
+    sprintf("%v.%v.%v.%v", r[n - 4], r[n - 3], r[n - 2], r[n - 1])
+}
+
+// A client asking a few questions over one connection.
+fn client(SocketAddr at, u16 first) : String
+{
+    TcpStream conn = Result::unwrap(TcpStream::connect(at));
+    String seen = String::new();
+    String::append(&mut seen, &ask(&mut conn, first, "example.test", 1));
+    String::append(&mut seen, " ");
+    String::append(&mut seen, &ask(&mut conn, first + 1, "www.example.test", 1));
+    String::append(&mut seen, " ");
+    String::append(&mut seen, &ask(&mut conn, first + 2, "nothing.example.test", 1));
+    seen
+}
+
+// A client that asks for ANY, then for an ordinary name.
+fn careless(SocketAddr at) : String
+{
+    TcpStream conn = Result::unwrap(TcpStream::connect(at));
+    String seen = ask(&mut conn, 7, "example.test", 255);
+    String::append(&mut seen, ", then ");
+    String::append(&mut seen, &ask(&mut conn, 8, "example.test", 1));
+    seen
+}
+
+// A client that connects and says nothing, until the server lets it go.
+fn idle(SocketAddr at) : String
+{
+    TcpStream conn = Result::unwrap(TcpStream::connect(at));
+    Vec<u8> b = Vec::new();
+    match (TcpStream::read(&mut conn, &mut b, 1))
+    {
+        Ok(0) : String::from_str("closed by the server"),
+        _     : String::from_str("something else"),
+    }
+}
+
+fn main()
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    Channel<u8> stop = Channel::new(1);
+    auto answered = Mutex::new(0: u64);
+    auto server = spawn(serve, l, &stop, &answered);
+    auto quiet = spawn(idle, at);
+    Vec<handle<String>> clients = Vec::new();
+    foreach (k in 0..3: u16)
+    {
+        Vec::push(&mut clients, spawn(client, at, 100 * (k + 1)));
+    }
+    String careless_saw = join(spawn(careless, at));
+    while (Vec::len(&clients) > 0)
+    {
+        String saw = join(Option::unwrap(Vec::pop(&mut clients)));
+        printf("client: %s\n", &saw);
+    }
+    printf("careless client: %s\n", &careless_saw);
+    Channel::close(&stop);
+    Report rep = join(server);
+    printf("idle client: %s\n", &join(quiet));
+    printf(
+        "server: %v answers; handlers %v finished, %v failed, %v cancelled at shutdown\n",
+        *lock(&answered),
+        rep.finished,
+        rep.failed,
+        rep.cancelled,
+    );
+    printf("%s", &rep.failures);
+}

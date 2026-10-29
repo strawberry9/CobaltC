@@ -1,0 +1,1158 @@
+// `std::sync` (spec/21 §3c, §3c″, §3c‴): `Channel`, `Atomic`, `AtomicBool`, `AtomicPtr`, `atomic_fence`, `spin_hint`,
+// `Barrier`, `Semaphore`, `Once`.
+
+// A bounded queue between threads (`rule.conc.channel`, spec/19 §3,
+// D-0063), shared by reference as a `mutex` is: `send` waits while it is
+// full, `recv` while it is empty; after `close`, `send` gives its value
+// back and `recv` drains what is left, then gives `None`.
+struct ChannelState<T>
+{
+    Vec<Option<T>> slots;               // a ring of `cap` slots
+    usize head;                         // the oldest value's slot
+    usize count;
+    bool closed;
+}
+
+// The oldest value, taken from its slot; `st.count` is not 0.
+fn ChannelState::pop<T>(ref<ChannelState<T>, exclusive> st) : Option<T>
+{
+    usize at = st.head;
+    Option<T> none = None;
+    Option<T> x = replace(&mut st.slots[at], none);
+    st.head = (at + 1) % Vec::len(&st.slots);
+    st.count = st.count - 1;
+    x
+}
+
+/// A bounded first-in, first-out queue of values between threads.
+///
+/// Shared by reference, as a `mutex` is: every thread works on it through `ref<Channel<T>, shared>`. `send`
+/// waits while it is full and `recv` while it is empty; after `close`, `send` gives its value back and `recv`
+/// drains what is left, then gives `None`. Destroying the channel destroys the values still in it, oldest
+/// first.
+export resource struct Channel<T>
+{
+    mutex<ChannelState<T>> state;
+    usize cap;
+    usize can_send;                     // counts a waiting `send` watches:
+    usize can_recv;                     // `recv` adds to it; and `send` to this
+}
+
+// A channel holding at most `cap` values; `cap` is at least 1.
+// trusted: [Extern-Call] event_op(new) touches no program storage.
+/// An empty open channel holding at most `cap` values.
+///
+/// Faults (`channel_zero_capacity`) when `cap` is 0; 1 makes a hand-over.
+export fn Channel::new<T>(usize cap) : Channel<T>
+{
+    if (cap == 0)
+    {
+        fault(channel_zero_capacity);
+    }
+    Vec<Option<T>> slots = Vec::new();
+    usize i = 0;
+    while (i < cap)
+    {
+        Option<T> none = None;
+        Vec::push(&mut slots, none);
+        i = i + 1;
+    }
+    usize can_send = unsafe
+    {
+        event_op(0, 0, 0)
+    };
+    usize can_recv = unsafe
+    {
+        event_op(0, 0, 0)
+    };
+    ChannelState<T> st = ChannelState { .slots = slots, .head = 0, .count = 0, .closed = false };
+    Channel { .state = Mutex::new(st), .cap = cap, .can_send = can_send, .can_recv = can_recv }
+}
+
+// Puts v at the back, waiting while the channel is full; `Err(v)` once it
+// is closed.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+/// Puts `v` at the back of `ch`, waiting while the channel is full.
+///
+/// `Err(v)`, the value handed back, once the channel is closed. Exclusive references inside `v` are lent to
+/// the receiving thread: the sender's own copies of them clash with them while they live.
+export fn Channel::send<T>(ref<Channel<T>, shared> ch, T v) : Result<void, T>
+{
+    // D-0213 `[Thread-Lend]`: the exclusive references `v` holds are lent
+    // to the thread that receives it; the sender's own copies then clash
+    // with them while they live.
+    lend_places(&mut v);
+    while (true)
+    {
+        usize seen = 0;
+        {
+            auto g = lock(&ch.state);
+            if (g.closed)
+            {
+                return Err(v);
+            }
+            if (g.count < ch.cap)
+            {
+                usize at = (g.head + g.count) % ch.cap;
+                g.slots[at] = Some(v);
+                g.count = g.count + 1;
+                unsafe
+                {
+                    event_op(3, ch.can_recv, 0);
+                }
+                return Ok(());
+            }
+            seen = unsafe
+            {
+                event_op(1, ch.can_send, 0)
+            };
+        }
+        unsafe
+        {
+            event_op(2, ch.can_send, seen);
+        }
+    }
+}
+
+// Takes the value at the front, waiting while the channel is empty;
+// `None` once it is closed and empty.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+/// Takes the value at the front of `ch`, waiting while the channel is empty.
+///
+/// `None` once the channel is closed and empty.
+export fn Channel::recv<T>(ref<Channel<T>, shared> ch) : Option<T>
+{
+    while (true)
+    {
+        usize seen = 0;
+        {
+            auto g = lock(&ch.state);
+            if (g.count > 0)
+            {
+                Option<T> x = ChannelState::pop(&mut *g);
+                unsafe
+                {
+                    event_op(3, ch.can_send, 0);
+                }
+                return x;
+            }
+            if (g.closed)
+            {
+                return None;
+            }
+            seen = unsafe
+            {
+                event_op(1, ch.can_recv, 0)
+            };
+        }
+        unsafe
+        {
+            event_op(2, ch.can_recv, seen);
+        }
+    }
+}
+
+// D-0185: the value at the front if one is waiting, without waiting:
+// `Ok(Some(v))`; `Ok(None)` when the channel is empty; `Err(())` once it
+// is closed and empty, so a loop that also polls something else (a
+// socket, `interrupt_requested`) knows when the senders are done.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+/// Takes the value at the front of `ch` if one is waiting, without waiting.
+///
+/// `Ok(Some(v))` with the value; `Ok(None)` when the channel is empty; `Err(())` once it is closed and empty,
+/// so a loop that also polls something else (a socket, `interrupt_requested`) knows when the senders are
+/// done.
+export fn Channel::try_recv<T>(ref<Channel<T>, shared> ch) : Result<Option<T>, void>
+{
+    auto g = lock(&ch.state);
+    if (g.count > 0)
+    {
+        Option<T> x = ChannelState::pop(&mut *g);
+        unsafe
+        {
+            event_op(3, ch.can_send, 0);
+        }
+        return Ok(x);
+    }
+    if (g.closed)
+    {
+        return Err(());
+    }
+    Ok(None)
+}
+
+/// Empty and open is `Ok(None)`; closed and empty is `Err`.
+unittest "Channel::try_recv: the three outcomes"
+{
+    Channel<i32> ch = Channel::new(1);
+    assert(Option::is_none(&Result::unwrap(Channel::try_recv(&ch))));
+    _ = Channel::send(&ch, 5);
+    Channel::close(&ch);
+    assert(Option::unwrap(Result::unwrap(Channel::try_recv(&ch))) == 5);
+    assert(Result::is_err(&Channel::try_recv(&ch)));
+}
+
+// D-0185: as `recv`, but waiting at most `ms` milliseconds: `Ok(Some(v))`
+// a value, `Ok(None)` none arrived in time, `Err(())` the channel is
+// closed and empty. The wait is a poll (every millisecond at first, then
+// every five), so it ends at most a few milliseconds late.
+// trusted: [Extern-Call] clock_read and sleep_ns touch no program storage.
+/// Takes the value at the front of `ch`, waiting at most `ms` milliseconds for one.
+///
+/// `Ok(Some(v))` with the value; `Ok(None)` when none arrived in time; `Err(())` when the channel is closed
+/// and empty. The wait is a poll (every millisecond at first, then every five), so it ends at most a few
+/// milliseconds late.
+export fn Channel::recv_timeout_ms<T>(ref<Channel<T>, shared> ch, u64 ms) : Result<Option<T>, void>
+{
+    // D-0232: a wait too long for the clock's range waits as long as it can,
+    // rather than wrapping round to a deadline in the past.
+    u64 ns = saturating_mul(ms, 1_000_000: u64);
+    i64 span = if (ns > reinterpret<u64>(max_value<i64>()))
+    {
+        max_value<i64>()
+    }
+    else
+    {
+        reinterpret<i64>(ns)
+    };
+    i64 deadline = saturating_add(unsafe
+    {
+        clock_read(0)
+    }, span);
+    u64 round = 0;
+    while (true)
+    {
+        match (Channel::try_recv(ch))
+        {
+            Ok(Some(v)) : return Ok(Some(v)),
+            Ok(None)    : {},
+            Err(_)      : return Err(()),
+        }
+        i64 now = unsafe
+        {
+            clock_read(0)
+        };
+        if (now >= deadline)
+        {
+            return Ok(None);
+        }
+        i64 ignored = unsafe
+        {
+            sleep_ns(if (round < 20) { 1000000 } else { 5000000 })
+        };
+        round += 1;
+    }
+}
+
+// D-0185: how many threads the machine runs at once (its processors, or
+// what this program may use of them): the size of a worker pool. At
+// least 1.
+/// How many threads the machine runs at once, at least 1: the size of a worker pool.
+///
+/// The processors, or what this program may use of them.
+export fn cpu_count() : usize
+{
+    i64 n = byte_op(1, 19, 0, dangling<u8>(), 0, dangling<u8>(), 0, dangling<u8>(), 0);
+    if (n < 1)
+    {
+        return 1;
+    }
+    reinterpret<usize>(n)
+}
+
+// No more values: `send` fails from now on, and `recv` gives `None` once
+// the channel is empty. Closing a closed channel does nothing.
+// trusted: [Extern-Call] event_op on the channel's own event ids: it touches no program storage.
+/// Marks `ch` as taking no more values.
+///
+/// `send` fails from then on, and `recv` gives `None` once the values already in it are taken. Waiting
+/// senders and receivers wake. Closing a closed channel does nothing.
+export fn Channel::close<T>(ref<Channel<T>, shared> ch)
+{
+    auto g = lock(&ch.state);
+    g.closed = true;
+    unsafe
+    {
+        event_op(3, ch.can_send, 0);
+        event_op(3, ch.can_recv, 0);
+    }
+}
+
+/// After `close`, `send` hands its value back while `recv` still drains what was sent.
+unittest "Channel::close: draining a closed channel"
+{
+    Channel<i32> ch = Channel::new(2);
+    assert(Result::is_ok(&Channel::send(&ch, 1)));
+    assert(Result::is_ok(&Channel::send(&ch, 2)));
+    Channel::close(&ch);
+    assert(Result::is_err(&Channel::send(&ch, 3)));
+    assert(Option::unwrap(Channel::recv(&ch)) == 1);
+    assert(Option::unwrap(Channel::recv(&ch)) == 2);
+    assert(Option::is_none(&Channel::recv(&ch)));
+}
+
+// The values still in the channel are destroyed oldest first.
+// trusted: [Extern-Call] event_op(end) on the channel's own event ids: it touches no program storage.
+/// Destroys the values still in the channel, oldest first; run when a `Channel` is destroyed.
+export fn Channel::drop<T>(ref<Channel<T>, exclusive> self)
+{
+    {
+        auto g = lock(&self.state);
+        while (g.count > 0)
+        {
+            Option<T> x = ChannelState::pop(&mut *g);
+            drop(x);
+        }
+    }
+    unsafe
+    {
+        event_op(4, self.can_send, 0);
+        event_op(4, self.can_recv, 0);
+    }
+}
+
+// D-0204: a spawned thread's fault, contained (spec/18 `[Fault-Contain]`)
+// and handed over by `try_join` instead of raised again.
+/// A spawned thread's fault, contained and handed over by `try_join` instead of raised again.
+///
+/// Its text is kept by the runtime until the program ends.
+export struct ThreadFailure
+{
+    u64 id;
+}
+
+// `join`, with the thread's contained failure handed over as a value
+// instead of raised again (D-0204): how a thread supervises another.
+/// Waits for the thread `h` and gives its result, or its failure as a value instead of raising it again.
+///
+/// `Ok` of the thread's result; `Err(ThreadFailure)` when the thread faulted or was cancelled, and the
+/// failure is then taken, so nothing is raised. How a supervisor keeps going when a worker has a bug; `join`
+/// raises the failure instead.
+export fn try_join<R>(handle<R> h) : Result<R, ThreadFailure>
+{
+    u64 status = join_status(&h, 0);
+    if (status == 1)
+    {
+        return Ok(join(h));
+    }
+    Err(ThreadFailure { .id = status - 2 })
+}
+
+/// A thread that faults gives `Err`, and the fault goes no further.
+unittest "try_join: a contained fault"
+{
+    Option<i32> none = None;
+    auto h = spawn(Option::unwrap<i32>, none);
+    match (try_join(h))
+    {
+        Ok(_)  : assert(false),
+        Err(f) :
+        {
+            String d = ThreadFailure::diagnostic(&f);
+            assert(String::eq_str(&d, "diag.unwrap-failed"));
+            assert(!ThreadFailure::is_cancelled(&f));
+        },
+    }
+}
+
+// Whether the thread has ended, its result (or its failure) waiting for
+// `join` or `try_join`, which then do not wait: how a supervisor finds
+// which of its threads to take, without waiting for any.
+/// Whether the thread `h` has ended, its result or failure waiting for `join` or `try_join`.
+///
+/// Never waits and takes nothing: how a supervisor finds which of its threads to take.
+export fn is_finished<R>(ref<handle<R>, shared> h) : bool
+{
+    join_status(h, 1) != 0
+}
+
+// The report, as the program would have printed it had nothing taken the
+// failure.
+/// The failure's report, as the program would have printed it had nothing taken the failure.
+///
+/// As a fault's report on standard error: its first line names the diagnostic, its second the location.
+export fn ThreadFailure::text(ref<ThreadFailure, shared> f) : String
+{
+    failure_text(0, f.id)
+}
+
+// The diagnostic's name: `diag.index-out-of-bounds`, `diag.thread-cancelled`, …
+/// The name of the failure's diagnostic alone, such as `diag.index-out-of-bounds` or `diag.thread-cancelled`.
+export fn ThreadFailure::diagnostic(ref<ThreadFailure, shared> f) : String
+{
+    failure_text(1, f.id)
+}
+
+// Whether the thread ended because it was asked to (`cancel`), rather
+// than because of a fault of its own.
+/// Whether the thread ended because it was cancelled, rather than by a fault of its own.
+export fn ThreadFailure::is_cancelled(ref<ThreadFailure, shared> f) : bool
+{
+    String d = failure_text(1, f.id);
+    StringView::eq(String::as_view(&d), "diag.thread-cancelled")
+}
+
+// trusted: [Extern-Call] task_op writes [out.ptr, out.ptr + cap), out's reserved buffer.
+fn failure_text(usize what, u64 id) : String
+{
+    Vec<u8> out = Vec::new();
+    usize cap = 256;
+    while (true)
+    {
+        while (out.cap < cap)
+        {
+            Vec::grow(&mut out);
+        }
+        isize n = unsafe
+        {
+            task_op(what, narrow<usize>(id), reinterpret_ptr<u8>(out.ptr), cap)
+        };
+        usize len = reinterpret<usize>(n);
+        if (n >= 0 && len <= cap)
+        {
+            out.len = len;
+            return Result::unwrap(String::from_utf8(out));
+        }
+        cap = len;
+    }
+}
+
+// D-0249: sequentially consistent atomics (`rule.conc.atomic`, spec/19
+// §2a). The one field is private to `std`, and `std` names it only in
+// `Atomic::new`: every other access is `atomic_op`, a std-only intrinsic
+// that checks `a` as a shared access, then reads and writes the integer
+// in one indivisible step, giving the value it found. Its operations:
+// 0 load, 1 store, 2 swap, 3 compare-and-exchange (x expected, y new),
+// 4 add and 5 subtract (faulting on overflow, nothing stored), 6 add and
+// 7 subtract wrapping, 8 and, 9 or, 10 exclusive or.
+/// An integer that threads share and change without a lock.
+///
+/// Shared by reference, as a `mutex` is: every operation takes `ref<Atomic<T>, shared>`, and each one is
+/// indivisible and sequentially consistent, so all threads see all operations on all atomics in one order.
+/// `T` is an integer type of at most 64 bits. For a counter, a flag (an `Atomic<u8>`), a sequence number or a
+/// maximum kept by several threads; state of more than one integer belongs in a `mutex`.
+export resource struct Atomic<T>
+{
+    T atomic_value;
+}
+
+/// A new atomic holding `v`.
+///
+/// `T` is an integer type of at most 64 bits: `Atomic<u128>` is rejected when the program is checked.
+export fn Atomic::new<T: integer>(T v) : Atomic<T>
+{
+    static_assert(sizeof<T>() <= 8, "an Atomic holds an integer of at most 64 bits");
+    Atomic { .atomic_value = v }
+}
+
+/// The value `a` holds.
+export fn Atomic::load<T: integer>(ref<Atomic<T>, shared> a) : T
+{
+    atomic_op(a, 0, 0, 0)
+}
+
+/// Replaces the value `a` holds with `v`.
+export fn Atomic::store<T: integer>(ref<Atomic<T>, shared> a, T v)
+{
+    _ = atomic_op(a, 1, v, 0);
+}
+
+/// Replaces the value `a` holds with `v`, giving the value it held.
+export fn Atomic::swap<T: integer>(ref<Atomic<T>, shared> a, T v) : T
+{
+    atomic_op(a, 2, v, 0)
+}
+
+/// Replaces the value with `new` if it is `expected`, as one step.
+///
+/// `Ok(expected)` when it was replaced; `Err(current)` with the value found when it was not, and then nothing
+/// changed. The step under a lock-free update: read, compute, and try again from `current` when another
+/// thread got there first.
+export fn Atomic::compare_exchange<T: integer>(ref<Atomic<T>, shared> a, T expected, T new) : Result<T, T>
+{
+    T found = atomic_op(a, 3, expected, new);
+    if (found == expected)
+    {
+        Ok(found)
+    }
+    else
+    {
+        Err(found)
+    }
+}
+
+/// Adds `n` to the value `a` holds, giving the value it held.
+///
+/// Faults (`arith_overflow`) when the sum does not fit `T`, as `+` does, and then the value is unchanged.
+/// `fetch_add_wrapping` wraps instead.
+export fn Atomic::fetch_add<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 4, n, 0)
+}
+
+/// Subtracts `n` from the value `a` holds, giving the value it held.
+///
+/// Faults (`arith_overflow`) when the difference does not fit `T`, as `-` does, and then the value is
+/// unchanged. `fetch_sub_wrapping` wraps instead.
+export fn Atomic::fetch_sub<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 5, n, 0)
+}
+
+/// Adds `n` to the value `a` holds modulo 2 to the width of `T`, giving the value it held.
+export fn Atomic::fetch_add_wrapping<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 6, n, 0)
+}
+
+/// Subtracts `n` from the value `a` holds modulo 2 to the width of `T`, giving the value it held.
+export fn Atomic::fetch_sub_wrapping<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 7, n, 0)
+}
+
+/// Replaces the value `a` holds with its bitwise and with `n`, giving the value it held.
+export fn Atomic::fetch_and<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 8, n, 0)
+}
+
+/// Replaces the value `a` holds with its bitwise or with `n`, giving the value it held.
+export fn Atomic::fetch_or<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 9, n, 0)
+}
+
+/// Replaces the value `a` holds with its bitwise exclusive or with `n`, giving the value it held.
+export fn Atomic::fetch_xor<T: integer>(ref<Atomic<T>, shared> a, T n) : T
+{
+    atomic_op(a, 10, n, 0)
+}
+
+/// Eight threads add to one atomic at once; no addition is lost.
+unittest "Atomic::fetch_add: a counter shared by threads"
+{
+    Atomic<u64> hits = Atomic::new(0: u64);
+    {
+        Vec<handle<u64>> hs = Vec::new();
+        foreach (k in 0..8)
+        {
+            Vec::push(&mut hs, spawn(Atomic::fetch_add<u64>, &hits, 5: u64));
+        }
+        while (Vec::len(&hs) > 0)
+        {
+            _ = join(Option::unwrap(Vec::pop(&mut hs)));
+        }
+    }
+    assert(Atomic::load(&hits) == 40);
+}
+
+/// `compare_exchange` replaces only the value it expects, and reports the one it found otherwise.
+unittest "Atomic::compare_exchange: success and failure"
+{
+    Atomic<i32> a = Atomic::new(5: i32);
+    assert(Result::unwrap(Atomic::compare_exchange(&a, 5, 9)) == 5);
+    match (Atomic::compare_exchange(&a, 5, 1))
+    {
+        Ok(_)    : assert(false),
+        Err(now) : assert(now == 9),
+    }
+    assert(Atomic::swap(&a, 2) == 9);
+    Atomic::store(&a, 7);
+    assert(Atomic::load(&a) == 7);
+}
+
+/// The bitwise operations, and wrapping arithmetic at the width of `T`.
+unittest "Atomic::fetch_or: flags and wrapping"
+{
+    Atomic<u8> f = Atomic::new(0: u8);
+    _ = Atomic::fetch_or(&f, 0x05);
+    _ = Atomic::fetch_and(&f, 0x0c);
+    _ = Atomic::fetch_xor(&f, 0x0f);
+    assert(Atomic::load(&f) == 0x0b);
+    assert(Atomic::fetch_add_wrapping(&f, 250) == 0x0b);
+    assert(Atomic::load(&f) == 5);
+    assert(Atomic::fetch_sub_wrapping(&f, 6) == 5);
+    assert(Atomic::load(&f) == 255);
+}
+
+/// Replaces the value `a` holds with the larger of it and `v`, giving the value it held.
+///
+/// A maximum kept by several threads: a high-water mark, the latest timestamp seen.
+export fn Atomic::fetch_max<T: integer>(ref<Atomic<T>, shared> a, T v) : T
+{
+    T current = Atomic::load(a);
+    while (current < v)
+    {
+        match (Atomic::compare_exchange(a, current, v))
+        {
+            Ok(_)      : return current,
+            Err(found) : current = found,
+        }
+    }
+    current
+}
+
+/// Replaces the value `a` holds with the smaller of it and `v`, giving the value it held.
+export fn Atomic::fetch_min<T: integer>(ref<Atomic<T>, shared> a, T v) : T
+{
+    T current = Atomic::load(a);
+    while (current > v)
+    {
+        match (Atomic::compare_exchange(a, current, v))
+        {
+            Ok(_)      : return current,
+            Err(found) : current = found,
+        }
+    }
+    current
+}
+
+/// Replaces the value `a` holds with `f` of it, retrying when another thread changed it meanwhile.
+///
+/// `f` is called with the value found and gives `Some(new)` to store or `None` to leave it. `Ok(previous)`
+/// when `new` was stored, `Err(previous)` when `f` gave `None`. `f` may be called more than once, so it should
+/// compute only from its argument.
+export fn Atomic::fetch_update<T: integer>(ref<Atomic<T>, shared> a, fn(T) : Option<T> f) : Result<T, T>
+{
+    T current = Atomic::load(a);
+    while (true)
+    {
+        match (f(current))
+        {
+            None : return Err(current),
+            Some(new) : match (Atomic::compare_exchange(a, current, new))
+            {
+                Ok(_)      : return Ok(current),
+                Err(found) : current = found,
+            },
+        }
+    }
+}
+
+// D-0253: each atomic has a wake count, kept by the runtime and keyed by
+// the atomic's address: `atomic_wait_op(a, 0, 0)` reads it, `(a, 1, seen)`
+// sleeps until it is no longer `seen` (a wait that can never end is
+// `[Deadlock]`), `(a, 2, 0)` adds one and wakes one waiter, `(a, 3, 0)`
+// adds one and wakes every waiter. Reading the count before the value
+// means a `notify` between the check and the sleep is never lost.
+/// Blocks while `a` holds `expected`, until another thread changes it and calls `notify_one` or `notify_all`.
+///
+/// Returns at once if `a` does not hold `expected`, and otherwise only after it has seen another value, so a
+/// wake-up with the value unchanged waits again. The thread that changes the value calls `notify_one` or
+/// `notify_all` after the change. A wait no thread can end faults (`deadlock`).
+export fn Atomic::wait<T: integer>(ref<Atomic<T>, shared> a, T expected)
+{
+    while (true)
+    {
+        u64 seen = atomic_wait_op(a, 0, 0);
+        if (Atomic::load(a) != expected)
+        {
+            return;
+        }
+        _ = atomic_wait_op(a, 1, seen);
+    }
+}
+
+/// Wakes at least one thread waiting in `Atomic::wait` on `a`, if any waits.
+export fn Atomic::notify_one<T: integer>(ref<Atomic<T>, shared> a)
+{
+    _ = atomic_wait_op(a, 2, 0);
+}
+
+/// Wakes every thread waiting in `Atomic::wait` on `a`.
+export fn Atomic::notify_all<T: integer>(ref<Atomic<T>, shared> a)
+{
+    _ = atomic_wait_op(a, 3, 0);
+}
+
+/// A `bool` that threads share and change without a lock.
+///
+/// As `Atomic`, over a byte that holds 0 or 1: every operation takes `ref<AtomicBool, shared>` and is
+/// indivisible and sequentially consistent. For a stop flag, a "ready" flag, or a once-only claim
+/// (`swap(&f, true)` gives `false` to exactly one thread).
+export struct AtomicBool
+{
+    Atomic<u8> atomic_flag;
+}
+
+fn bool_byte(bool b) : u8
+{
+    if (b)
+    {
+        1
+    }
+    else
+    {
+        0
+    }
+}
+
+/// A new atomic `bool` holding `v`.
+export fn AtomicBool::new(bool v) : AtomicBool
+{
+    AtomicBool { .atomic_flag = Atomic::new(bool_byte(v)) }
+}
+
+/// The value `f` holds.
+export fn AtomicBool::load(ref<AtomicBool, shared> f) : bool
+{
+    Atomic::load(&f.atomic_flag) != 0
+}
+
+/// Replaces the value `f` holds with `v`.
+export fn AtomicBool::store(ref<AtomicBool, shared> f, bool v)
+{
+    Atomic::store(&f.atomic_flag, bool_byte(v));
+}
+
+/// Replaces the value `f` holds with `v`, giving the value it held.
+export fn AtomicBool::swap(ref<AtomicBool, shared> f, bool v) : bool
+{
+    Atomic::swap(&f.atomic_flag, bool_byte(v)) != 0
+}
+
+/// Replaces the value with `new` if it is `expected`, as one step: `Ok(expected)`, or `Err(current)`.
+export fn AtomicBool::compare_exchange(ref<AtomicBool, shared> f, bool expected, bool new) : Result<bool, bool>
+{
+    match (Atomic::compare_exchange(&f.atomic_flag, bool_byte(expected), bool_byte(new)))
+    {
+        Ok(_)      : Ok(expected),
+        Err(found) : Err(found != 0),
+    }
+}
+
+/// Replaces the value `f` holds with its and with `v`, giving the value it held.
+export fn AtomicBool::fetch_and(ref<AtomicBool, shared> f, bool v) : bool
+{
+    Atomic::fetch_and(&f.atomic_flag, bool_byte(v)) != 0
+}
+
+/// Replaces the value `f` holds with its or with `v`, giving the value it held.
+export fn AtomicBool::fetch_or(ref<AtomicBool, shared> f, bool v) : bool
+{
+    Atomic::fetch_or(&f.atomic_flag, bool_byte(v)) != 0
+}
+
+/// Replaces the value `f` holds with its exclusive or with `v`, giving the value it held.
+export fn AtomicBool::fetch_xor(ref<AtomicBool, shared> f, bool v) : bool
+{
+    Atomic::fetch_xor(&f.atomic_flag, bool_byte(v)) != 0
+}
+
+/// Blocks while `f` holds `expected`, as `Atomic::wait`.
+export fn AtomicBool::wait(ref<AtomicBool, shared> f, bool expected)
+{
+    Atomic::wait(&f.atomic_flag, bool_byte(expected));
+}
+
+/// Wakes at least one thread waiting in `AtomicBool::wait` on `f`, if any waits.
+export fn AtomicBool::notify_one(ref<AtomicBool, shared> f)
+{
+    Atomic::notify_one(&f.atomic_flag);
+}
+
+/// Wakes every thread waiting in `AtomicBool::wait` on `f`.
+export fn AtomicBool::notify_all(ref<AtomicBool, shared> f)
+{
+    Atomic::notify_all(&f.atomic_flag);
+}
+
+// D-0253: an address that threads share and change without a lock, for
+// lock-free structures built on `allocate`. Its operations are
+// `atomic_op`'s 0 to 3 on the pointer.
+/// A raw pointer that threads share and change without a lock.
+///
+/// As `Atomic`: shared by reference, every operation indivisible and sequentially consistent. Taking and
+/// storing addresses is safe; reading or writing through one is `unsafe`, as for any `rawptr`. For lock-free
+/// lists and stacks whose nodes come from `allocate`.
+export resource struct AtomicPtr<T>
+{
+    rawptr<T> atomic_ptr;
+}
+
+/// A new atomic pointer holding `p`; `null_rawptr<T>()` for none.
+export fn AtomicPtr::new<T>(rawptr<T> p) : AtomicPtr<T>
+{
+    AtomicPtr { .atomic_ptr = p }
+}
+
+/// The address `a` holds.
+export fn AtomicPtr::load<T>(ref<AtomicPtr<T>, shared> a) : rawptr<T>
+{
+    atomic_op(a, 0, null_rawptr<T>(), null_rawptr<T>())
+}
+
+/// Replaces the address `a` holds with `p`.
+export fn AtomicPtr::store<T>(ref<AtomicPtr<T>, shared> a, rawptr<T> p)
+{
+    _ = atomic_op(a, 1, p, null_rawptr<T>());
+}
+
+/// Replaces the address `a` holds with `p`, giving the address it held.
+export fn AtomicPtr::swap<T>(ref<AtomicPtr<T>, shared> a, rawptr<T> p) : rawptr<T>
+{
+    atomic_op(a, 2, p, null_rawptr<T>())
+}
+
+/// Replaces the address with `new` if it is `expected`, as one step: `Ok(expected)`, or `Err(current)`.
+export fn AtomicPtr::compare_exchange<T>(
+    ref<AtomicPtr<T>, shared> a,
+    rawptr<T> expected,
+    rawptr<T> new,
+) : Result<rawptr<T>, rawptr<T>>
+{
+    rawptr<T> found = atomic_op(a, 3, expected, new);
+    if (found == expected)
+    {
+        Ok(found)
+    }
+    else
+    {
+        Err(found)
+    }
+}
+
+/// A full memory fence: every memory access before it, in this thread, is ordered before every one after it,
+/// as seen by any other thread or device.
+///
+/// CobaltC's own operations are already sequentially consistent, so a program that stays within them never
+/// needs this. It is for raw and volatile accesses and C code, which are outside that guarantee: the
+/// equivalent of C's `atomic_thread_fence(memory_order_seq_cst)`.
+export fn atomic_fence()
+{
+    cpu_op(0);
+}
+
+/// Tells the processor that this thread is spinning, waiting for another thread to change something.
+///
+/// The CPU's pause instruction: it saves power and lets the other hardware thread of the core run. Call it in
+/// the body of a loop that polls an atomic; `Atomic::wait` blocks instead, for waits that may be long.
+export fn spin_hint()
+{
+    cpu_op(1);
+}
+
+/// `fetch_max` and `fetch_min` keep the extremes; `fetch_update` stores what its function gives.
+unittest "Atomic::fetch_max: extremes and updates"
+{
+    Atomic<i32> a = Atomic::new(10: i32);
+    assert(Atomic::fetch_max(&a, 4) == 10);
+    assert(Atomic::fetch_max(&a, 25) == 10);
+    assert(Atomic::fetch_min(&a, 30) == 25);
+    assert(Atomic::fetch_min(&a, -3) == 25);
+    assert(Atomic::load(&a) == -3);
+    assert(Result::unwrap(Atomic::fetch_update(&a, [](i32 x) : Option<i32> { Some(x * 2) })) == -3);
+    match (Atomic::fetch_update(&a, [](i32 x) : Option<i32> { None }))
+    {
+        Ok(_)  : assert(false),
+        Err(v) : assert(v == -6),
+    }
+}
+
+/// A thread sleeps in `wait` until another stores a new value and notifies.
+unittest "Atomic::wait: woken by notify_all"
+{
+    AtomicBool done = AtomicBool::new(false);
+    {
+        handle<void> h = spawn(move [](ref<AtomicBool, shared> d)
+        {
+            AtomicBool::store(d, true);
+            AtomicBool::notify_all(d);
+        }, &done);
+        AtomicBool::wait(&done, false);
+        join(h);
+    }
+    assert(AtomicBool::load(&done));
+    assert(AtomicBool::swap(&done, false));
+}
+
+// D-0260: the three waiting patterns programs build on `Atomic::wait`,
+// each in std under its own name: a meeting point, a count of permits,
+// and something done once. Each is an atomic or two and a wait loop;
+// none takes a lock.
+
+/// A meeting point for a fixed number of threads.
+///
+/// Shared by reference, as a `mutex` is. `Barrier::wait` blocks until `parties` threads have called it, then
+/// releases them all together and is ready for the next round: the phases of a parallel algorithm, where
+/// every thread must finish one before any starts the next.
+export struct Barrier
+{
+    usize parties;
+    Atomic<usize> arrived;              // in the current round
+    Atomic<usize> generation;           // the rounds completed
+}
+
+/// A barrier for `parties` threads.
+///
+/// Faults (`barrier_zero_parties`) when `parties` is 0.
+export fn Barrier::new(usize parties) : Barrier
+{
+    if (parties == 0)
+    {
+        fault(barrier_zero_parties);
+    }
+    Barrier { .parties = parties, .arrived = Atomic::new(0: usize), .generation = Atomic::new(0: usize) }
+}
+
+/// Waits until `parties` threads have called it, then lets them all go on.
+///
+/// `true` for the last thread to arrive, the one that released the others, and `false` for the rest, so one
+/// thread of each round can do something once. A wait that fewer threads than `parties` can ever reach
+/// faults (`deadlock`).
+export fn Barrier::wait(ref<Barrier, shared> b) : bool
+{
+    usize round = Atomic::load(&b.generation);
+    if (Atomic::fetch_add(&b.arrived, 1) + 1 == b.parties)
+    {
+        Atomic::store(&b.arrived, 0);
+        _ = Atomic::fetch_add_wrapping(&b.generation, 1);
+        Atomic::notify_all(&b.generation);
+        return true;
+    }
+    while (Atomic::load(&b.generation) == round)
+    {
+        Atomic::wait(&b.generation, round);
+    }
+    false
+}
+
+/// Four threads, three rounds: in each, every thread writes its slot, then, after the barrier, reads all
+/// four; exactly one thread per round is told it was last.
+unittest "Barrier::wait: rounds, one leader each"
+{
+    Barrier b = Barrier::new(4);
+    Atomic<u32> leaders = Atomic::new(0: u32);
+    Atomic<u32> seen = Atomic::new(0: u32);
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(move [](
+            ref<Barrier, shared> b,
+            ref<Atomic<u32>, shared> leaders,
+            ref<Atomic<u32>, shared> seen,
+            u32 id,
+        )
+        {
+            for (u32 round = 0; round < 3; round += 1)
+            {
+                _ = Atomic::fetch_add(seen, 1);
+                if (Barrier::wait(b))
+                {
+                    _ = Atomic::fetch_add(leaders, 1);
+                    assert(Atomic::load(seen) == 4 * (round + 1));   // everyone wrote before anyone read
+                }
+                _ = Barrier::wait(b);                                 // the read phase ends together too
+            }
+        }, &b, &leaders, &seen, i));
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    assert(Atomic::load(&leaders) == 3 && Atomic::load(&seen) == 12);
+}
+
+/// A count of permits that threads take and give back.
+///
+/// Shared by reference, as a `mutex` is. `acquire` takes one permit, waiting while there is none; `release`
+/// gives one back, or adds one. It bounds how many threads do something at once (connections open, workers
+/// busy); made with 0 permits, it hands events from one thread to another, each `release` letting one
+/// `acquire` through.
+export struct Semaphore
+{
+    Atomic<usize> permits;
+}
+
+/// A semaphore with `permits` permits; 0 is allowed.
+export fn Semaphore::new(usize permits) : Semaphore
+{
+    Semaphore { .permits = Atomic::new(permits) }
+}
+
+/// Takes one permit, waiting while there is none.
+///
+/// Permits are not handed out in arrival order. A wait no thread can end faults (`deadlock`).
+export fn Semaphore::acquire(ref<Semaphore, shared> s)
+{
+    usize n = Atomic::load(&s.permits);
+    while (true)
+    {
+        if (n == 0)
+        {
+            Atomic::wait(&s.permits, 0);
+            n = Atomic::load(&s.permits);
+            continue;
+        }
+        match (Atomic::compare_exchange(&s.permits, n, n - 1))
+        {
+            Ok(_)      : { return; },
+            Err(found) : { n = found; },
+        }
+    }
+}
+
+/// Takes one permit if one is free, without waiting: `true` when it did.
+export fn Semaphore::try_acquire(ref<Semaphore, shared> s) : bool
+{
+    usize n = Atomic::load(&s.permits);
+    while (n != 0)
+    {
+        match (Atomic::compare_exchange(&s.permits, n, n - 1))
+        {
+            Ok(_)      : { return true; },
+            Err(found) : { n = found; },
+        }
+    }
+    false
+}
+
+/// Gives one permit back, or adds one; a thread waiting in `acquire` wakes.
+///
+/// Faults (`arith_overflow`) when the permits would exceed what `usize` counts.
+export fn Semaphore::release(ref<Semaphore, shared> s)
+{
+    _ = Atomic::fetch_add(&s.permits, 1);
+    Atomic::notify_one(&s.permits);
+}
+
+/// How many permits are free now: a snapshot another thread may change at once.
+export fn Semaphore::available(ref<Semaphore, shared> s) : usize
+{
+    Atomic::load(&s.permits)
+}
+
+/// Two permits among six threads bound how many work at once; a semaphore of none hands events over.
+unittest "Semaphore: a bound and a hand-over"
+{
+    Semaphore limit = Semaphore::new(2);
+    Atomic<u32> active = Atomic::new(0: u32);
+    Atomic<u32> peak = Atomic::new(0: u32);
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 0; i < 6; i += 1)
+    {
+        Vec::push(&mut hs, spawn(move [](
+            ref<Semaphore, shared> limit,
+            ref<Atomic<u32>, shared> active,
+            ref<Atomic<u32>, shared> peak,
+        )
+        {
+            Semaphore::acquire(limit);
+            _ = Atomic::fetch_max(peak, Atomic::fetch_add(active, 1) + 1);
+            _ = Atomic::fetch_sub(active, 1);
+            Semaphore::release(limit);
+        }, &limit, &active, &peak));
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    assert(Atomic::load(&peak) <= 2 && Semaphore::available(&limit) == 2);
+    assert(Semaphore::try_acquire(&limit) && Semaphore::try_acquire(&limit) && !Semaphore::try_acquire(&limit));
+
+    Semaphore events = Semaphore::new(0);
+    handle<u32> h = spawn(move [](ref<Semaphore, shared> e) : u32
+    {
+        Semaphore::acquire(e);
+        Semaphore::acquire(e);
+        Semaphore::acquire(e);
+        3
+    }, &events);
+    Semaphore::release(&events);
+    Semaphore::release(&events);
+    Semaphore::release(&events);
+    assert(join(h) == 3 && Semaphore::available(&events) == 0);
+}
+
+/// Something done once, by whichever thread gets there first.
+///
+/// Shared by reference, as a `mutex` is. `Once::call(&o, f)` runs `f` the first time any thread calls it;
+/// every other call, on any thread, returns once that run has finished, without running `f`: initialising
+/// what several threads share, lazily and exactly once. Should `f` fault, the `Once` is as before, and the
+/// next caller runs `f` afresh.
+export struct Once
+{
+    Atomic<u8> state;                   // 0 not done, 1 being done, 2 done
+}
+
+// The run of `f` in progress: ended without `done`, by a fault unwinding
+// through `Once::call`, it gives the `Once` back for the next caller.
+resource struct OnceRun
+{
+    ref<Once, shared> once;
+    bool done;
+}
+
+fn OnceRun::drop(ref<OnceRun, exclusive> self)
+{
+    if (!self.done)
+    {
+        Atomic::store(&self.once.state, 0);
+        Atomic::notify_all(&self.once.state);
+    }
+}
+
+/// A `Once` whose `f` has not run.
+export fn Once::new() : Once
+{
+    Once { .state = Atomic::new(0: u8) }
+}
+
+/// Runs `f` if no call has run it yet; otherwise waits until the call that is running it has finished.
+///
+/// `f` runs on the calling thread. After `call` returns, on any thread, `f` has run to its end exactly once
+/// (unless it faulted, and then the next caller runs it again).
+export fn Once::call(ref<Once, shared> o, fn() f)
+{
+    while (true)
+    {
+        match (Atomic::compare_exchange(&o.state, 0, 1))
+        {
+            Ok(_)  :
+            {
+                OnceRun run = OnceRun { .once = o, .done = false };
+                f();
+                run.done = true;
+                Atomic::store(&o.state, 2);
+                Atomic::notify_all(&o.state);
+                return;
+            },
+            Err(s) :
+            {
+                if (s == 2)
+                {
+                    return;
+                }
+                Atomic::wait(&o.state, 1);
+            },
+        }
+    }
+}
+
+/// Whether `f` has run to its end.
+export fn Once::is_done(ref<Once, shared> o) : bool
+{
+    Atomic::load(&o.state) == 2
+}
+
+/// Four threads call; the initialiser runs once, and every thread sees it done.
+unittest "Once::call: once among four threads"
+{
+    Once o = Once::new();
+    Atomic<u32> runs = Atomic::new(0: u32);
+    Vec<handle<bool>> hs = Vec::new();
+    for (u32 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(move [](ref<Once, shared> o, ref<Atomic<u32>, shared> runs) : bool
+        {
+            Once::call(o, [runs]() { _ = Atomic::fetch_add(runs, 1); });
+            Once::is_done(o)
+        }, &o, &runs));
+    }
+    foreach (h in hs)
+    {
+        assert(join(h));
+    }
+    assert(Atomic::load(&runs) == 1 && Once::is_done(&o));
+}

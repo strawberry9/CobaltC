@@ -1,0 +1,523 @@
+// `std::memory` (spec/21 §3, §3′, §3a): `Box`, `Rc` and `Weak`, `Arc` and `ArcWeak`.
+
+// D-0125: `count` strong handles keep `value`; `weak` handles keep the
+// box. The value ends when `count` reaches 0, the box when both do.
+struct RcBox<T>
+{
+    usize count;
+    usize weak;
+    Option<T> value;
+}
+
+/// A reference-counted handle to a value on the heap that several owners share.
+///
+/// Each `Rc` is one strong handle; the value is destroyed when the last strong handle is, and the memory is
+/// freed once no `Weak` handle remains either. The value is reached only as a shared reference (`Rc::get`),
+/// so changing it needs a `mutex` inside. A cycle of `Rc`s is never freed: a parent pointer, a cache or an
+/// observer list holds a `Weak` instead. `Rc` is not thread-safe (the count is not synchronised); share
+/// across threads with `ref<mutex<T>, shared>`.
+export resource struct Rc<T>
+{
+    rawptr<RcBox<T>> ptr;
+}
+
+// trusted: [Rawptr-Write]/[Rawptr-Move-In] into the box allocate just returned: fresh cells with no object over them.
+/// A new `Rc` holding `v`, the only strong handle to it.
+///
+/// Allocates; faults (`alloc_failure`) when memory cannot be had.
+export fn Rc::new<T>(T v) : Rc<T>
+{
+    rawptr<u8> p = match (allocate(sizeof<RcBox<T>>(), alignof<RcBox<T>>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<RcBox<T>> bp = reinterpret_ptr<RcBox<T>>(p);
+    unsafe
+    {
+        *bp = RcBox { .count = 1, .weak = 0, .value = Some(v) };
+    }
+    Rc { .ptr = bp }
+}
+
+// trusted: [Reclaim] of the box: ptr came from Rc::new and the box lives while any Rc or Weak holds it; only count is borrowed, disjoint from a live Rc::get reference into value.
+/// A second strong handle to the value `r` holds; nothing is copied.
+///
+/// What `clone(&r)` calls for an `Rc`. A reference into the value from `Rc::get` may stay live across it.
+export fn Rc::clone<T>(ref<Rc<T>, shared> r) : Rc<T>
+{
+    unsafe
+    {
+        // Only the count: a reference into the value (`Rc::get` of
+        // another handle) may be live, and is disjoint from it.
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(r.ptr).count;
+        *c = *c + 1;
+    }
+    Rc { .ptr = r.ptr }
+}
+
+// trusted: [Reclaim] of the box, as clone; a live Rc keeps value Some.
+/// The value `r` holds, as a shared reference.
+export fn Rc::get<T>(ref<Rc<T>, shared> r) : ref<T, shared>
+{
+    unsafe
+    {
+        match (&reclaim<RcBox<T>>(r.ptr).value)
+        {
+            Some(v) : v,
+            None    : fault(unwrap_failed, "an Rc whose value has ended"), // never: a live Rc keeps its value
+        }
+    }
+}
+
+// trusted: [Reclaim] of the box, as clone; when count reaches 0 the value is ended through the reclaimed object, and with weak 0 too the box is destroyed and [Deallocate]d once, the single deallocation of what Rc::new allocated.
+/// Ends one strong handle; run when an `Rc` is destroyed, so programs write `drop(r)` or let it go.
+///
+/// When this was the last strong handle the value is destroyed now, and with no `Weak` handle left the
+/// memory is freed too.
+export fn Rc::drop<T>(ref<Rc<T>, exclusive> self)
+{
+    bool last = false;
+    unsafe
+    {
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(self.ptr).count;
+        *c = *c - 1;
+        last = *c == 0;
+    }
+    if (last)
+    {
+        bool unwatched = false;
+        unsafe
+        {
+            overwrite(&mut reclaim<RcBox<T>>(self.ptr).value, None);   // the value ends now (D-0125)
+            unwatched = reclaim<RcBox<T>>(self.ptr).weak == 0;
+        }
+        if (unwatched)
+        {
+            unsafe
+            {
+                drop(reclaim<RcBox<T>>(self.ptr));
+                deallocate(reinterpret_ptr<u8>(self.ptr), sizeof<RcBox<T>>(), alignof<RcBox<T>>());
+            }
+        }
+    }
+}
+
+// D-0125: a handle that does not keep the value alive.
+/// A handle to an `Rc`'s value that does not keep the value alive.
+///
+/// It keeps only the memory: once the last `Rc` ends, the value is gone and `Weak::upgrade` gives `None`.
+/// Dropping the last handle of either kind frees the memory.
+export resource struct Weak<T>
+{
+    rawptr<RcBox<T>> ptr;
+}
+
+// trusted: [Reclaim] of the box, as clone: only weak is borrowed.
+/// A `Weak` handle to the value `r` holds.
+export fn Rc::downgrade<T>(ref<Rc<T>, shared> r) : Weak<T>
+{
+    unsafe
+    {
+        ref<usize, exclusive> w = &mut reclaim<RcBox<T>>(r.ptr).weak;
+        *w = *w + 1;
+    }
+    Weak { .ptr = r.ptr }
+}
+
+// trusted: [Reclaim] of the box, as Rc::clone: the box lives while any Weak holds it; only count is borrowed.
+/// A new strong handle to the value, or `None` when the value has ended.
+///
+/// The value never comes back once ended: after the last `Rc` is destroyed every upgrade gives `None`.
+export fn Weak::upgrade<T>(ref<Weak<T>, shared> w) : Option<Rc<T>>
+{
+    bool alive = false;
+    unsafe
+    {
+        ref<usize, exclusive> c = &mut reclaim<RcBox<T>>(w.ptr).count;
+        if (*c > 0)
+        {
+            *c = *c + 1;
+            alive = true;
+        }
+    }
+    if (alive) { Some(Rc { .ptr = w.ptr }) } else { None }
+}
+
+/// A `Weak` upgrades while any `Rc` remains and gives `None` after the last one ends.
+unittest "Weak::upgrade: after the last Rc"
+{
+    Rc<String> a = Rc::new(String::from_str("shared"));
+    Rc<String> b = Rc::clone(&a);
+    assert(String::len(Rc::get(&b)) == 6);
+    Weak<String> w = Rc::downgrade(&a);
+    drop(a);
+    assert(Option::is_some(&Weak::upgrade(&w)));
+    drop(b);
+    assert(Option::is_none(&Weak::upgrade(&w)));
+}
+
+// trusted: [Reclaim] of the box, as Rc::clone: only weak is borrowed.
+/// A second `Weak` handle to the same value; what `clone(&w)` calls for a `Weak`.
+export fn Weak::clone<T>(ref<Weak<T>, shared> w) : Weak<T>
+{
+    unsafe
+    {
+        ref<usize, exclusive> k = &mut reclaim<RcBox<T>>(w.ptr).weak;
+        *k = *k + 1;
+    }
+    Weak { .ptr = w.ptr }
+}
+
+// trusted: [Reclaim] of the box, as Rc::clone; when both counts are 0 this is the last handle, so the box is destroyed and [Deallocate]d once.
+/// Ends one weak handle; run when a `Weak` is destroyed.
+///
+/// When no strong or weak handle remains, the memory is freed.
+export fn Weak::drop<T>(ref<Weak<T>, exclusive> self)
+{
+    bool last = false;
+    unsafe
+    {
+        ref<usize, exclusive> k = &mut reclaim<RcBox<T>>(self.ptr).weak;
+        *k = *k - 1;
+        last = *k == 0 && reclaim<RcBox<T>>(self.ptr).count == 0;
+    }
+    if (last)
+    {
+        unsafe
+        {
+            drop(reclaim<RcBox<T>>(self.ptr));
+            deallocate(reinterpret_ptr<u8>(self.ptr), sizeof<RcBox<T>>(), alignof<RcBox<T>>());
+        }
+    }
+}
+
+// D-0259: `Rc` for threads. `count` strong handles keep `value`; `weak`
+// counts the `ArcWeak` handles plus one for the strong handles together,
+// so the box lives while `weak` is not 0, and the thread whose decrement
+// brings it to 0 frees it, whichever thread that is. Both counts are
+// atomic, so handles may be cloned and dropped from several threads at
+// once.
+struct ArcBox<T>
+{
+    Atomic<usize> count;
+    Atomic<usize> weak;
+    Option<T> value;
+}
+
+/// A reference-counted handle to a value that several threads share.
+///
+/// `Rc` for threads: each `Arc` is one strong handle, and handles may be cloned into other threads, moved and
+/// dropped there, so a thread owns its share of the value and may outlive the frame that made it, which a
+/// reference to the value does not allow. The counts are atomic, so clones and drops from several threads at
+/// once lose nothing; the value is destroyed, once, by whichever handle ends last. It is reached only as a
+/// shared reference (`Arc::get`), so changing it needs a `mutex` or an `Atomic` inside. An `ArcWeak`
+/// (`Arc::downgrade`) keeps the box but not the value, for a parent pointer or a cache.
+export resource struct Arc<T>
+{
+    rawptr<ArcBox<T>> ptr;
+}
+
+// trusted: [Rawptr-Write]/[Rawptr-Move-In] into the box allocate just returned: fresh cells with no object over them.
+/// A new `Arc` holding `v`, the only strong handle to it.
+///
+/// Allocates; faults (`alloc_failure`) when memory cannot be had.
+export fn Arc::new<T>(T v) : Arc<T>
+{
+    rawptr<u8> p = match (allocate(sizeof<ArcBox<T>>(), alignof<ArcBox<T>>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<ArcBox<T>> bp = reinterpret_ptr<ArcBox<T>>(p);
+    unsafe
+    {
+        *bp = ArcBox { .count = Atomic::new(1: usize), .weak = Atomic::new(1: usize), .value = Some(v) };
+    }
+    Arc { .ptr = bp }
+}
+
+// trusted: [Reclaim] of the box: ptr came from Arc::new and the box lives while any Arc or ArcWeak holds it; only count is touched, atomically, disjoint from a live Arc::get reference into value.
+/// A second strong handle to the value `a` holds; nothing is copied.
+///
+/// What `clone(&a)` calls for an `Arc`. The new handle may go to another thread.
+export fn Arc::clone<T>(ref<Arc<T>, shared> a) : Arc<T>
+{
+    unsafe
+    {
+        _ = Atomic::fetch_add(&reclaim<ArcBox<T>>(a.ptr).count, 1);
+    }
+    Arc { .ptr = a.ptr }
+}
+
+// trusted: [Reclaim] of the box, as clone; a live Arc keeps value Some.
+/// The value `a` holds, as a shared reference.
+export fn Arc::get<T>(ref<Arc<T>, shared> a) : ref<T, shared>
+{
+    unsafe
+    {
+        match (&reclaim<ArcBox<T>>(a.ptr).value)
+        {
+            Some(v) : v,
+            None    : fault(unwrap_failed, "an Arc whose value has ended"), // never: a live Arc keeps its value
+        }
+    }
+}
+
+// trusted: [Reclaim] of the box, as clone; the thread whose fetch_sub brings count to 0 held the last strong handle, so no Arc::get reference is live, and it ends the value through the reclaimed object; then it gives up the strong handles' one hold on the box (release_weak).
+/// Ends one strong handle; run when an `Arc` is destroyed, so programs write `drop(a)` or let it go.
+///
+/// When this was the last strong handle, on whichever thread, the value is destroyed now, and with no
+/// `ArcWeak` handle left the memory is freed too.
+export fn Arc::drop<T>(ref<Arc<T>, exclusive> self)
+{
+    bool last = false;
+    unsafe
+    {
+        last = Atomic::fetch_sub(&reclaim<ArcBox<T>>(self.ptr).count, 1) == 1;
+    }
+    if (last)
+    {
+        unsafe
+        {
+            overwrite(&mut reclaim<ArcBox<T>>(self.ptr).value, None);   // the value ends now, on this thread
+        }
+        ArcBox::release_weak<T>(self.ptr);
+    }
+}
+
+// Gives up one hold on the box, the strong handles' one or an ArcWeak's,
+// and frees the box when that was the last.
+// trusted: [Reclaim] of the box, as Arc::clone; the thread whose fetch_sub brings weak to 0 held the last handle of either kind (the value already ended), so it destroys the box and [Deallocate]s it once, the single deallocation of what Arc::new allocated.
+fn ArcBox::release_weak<T>(rawptr<ArcBox<T>> p)
+{
+    bool last = false;
+    unsafe
+    {
+        last = Atomic::fetch_sub(&reclaim<ArcBox<T>>(p).weak, 1) == 1;
+    }
+    if (last)
+    {
+        unsafe
+        {
+            drop(reclaim<ArcBox<T>>(p));
+            deallocate(reinterpret_ptr<u8>(p), sizeof<ArcBox<T>>(), alignof<ArcBox<T>>());
+        }
+    }
+}
+
+/// Handles cloned into four threads, each changing the value through the `mutex` inside; the last handle to
+/// end destroys the value, once, on whichever thread holds it.
+unittest "Arc: shared by threads, destroyed once"
+{
+    Arc<mutex<u32>> a = Arc::new(Mutex::new(0: u32));
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(move [](Arc<mutex<u32>> h)
+        {
+            auto g = lock(Arc::get(&h));
+            *g += 1;
+        }, Arc::clone(&a)));
+    }
+    ArcWeak<mutex<u32>> w = Arc::downgrade(&a);
+    drop(a);                                  // the workers' handles keep the value
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    assert(Option::is_none(&ArcWeak::upgrade(&w)));   // the last worker's drop ended it
+}
+
+/// A handle that does not keep the value alive.
+///
+/// As `Weak` is to `Rc`: it keeps only the memory. Once the last `Arc` ends, the value is gone and
+/// `ArcWeak::upgrade` gives `None`. Dropping the last handle of either kind frees the memory.
+export resource struct ArcWeak<T>
+{
+    rawptr<ArcBox<T>> ptr;
+}
+
+// trusted: [Reclaim] of the box, as Arc::clone: only weak is touched, atomically.
+/// An `ArcWeak` handle to the value `a` holds.
+export fn Arc::downgrade<T>(ref<Arc<T>, shared> a) : ArcWeak<T>
+{
+    unsafe
+    {
+        _ = Atomic::fetch_add(&reclaim<ArcBox<T>>(a.ptr).weak, 1);
+    }
+    ArcWeak { .ptr = a.ptr }
+}
+
+// trusted: [Reclaim] of the box, as Arc::clone: the box lives while any ArcWeak holds it; only count is touched, by compare_exchange from a value it read, so a count another thread brought to 0 meanwhile is seen and left at 0.
+/// A new strong handle to the value, or `None` when the value has ended.
+///
+/// The value never comes back once ended: after the last `Arc` is destroyed every upgrade gives `None`.
+export fn ArcWeak::upgrade<T>(ref<ArcWeak<T>, shared> w) : Option<Arc<T>>
+{
+    unsafe
+    {
+        ref<Atomic<usize>, shared> c = &reclaim<ArcBox<T>>(w.ptr).count;
+        usize n = Atomic::load(c);
+        while (n != 0)
+        {
+            match (Atomic::compare_exchange(c, n, n + 1))
+            {
+                Ok(_)      : { return Some(Arc { .ptr = w.ptr }); },
+                Err(found) : { n = found; },
+            }
+        }
+    }
+    None
+}
+
+// trusted: [Reclaim] of the box, as Arc::clone: only weak is touched, atomically.
+/// A second `ArcWeak` handle to the same value; what `clone(&w)` calls for an `ArcWeak`.
+export fn ArcWeak::clone<T>(ref<ArcWeak<T>, shared> w) : ArcWeak<T>
+{
+    unsafe
+    {
+        _ = Atomic::fetch_add(&reclaim<ArcBox<T>>(w.ptr).weak, 1);
+    }
+    ArcWeak { .ptr = w.ptr }
+}
+
+/// Ends one weak handle; run when an `ArcWeak` is destroyed.
+///
+/// When no strong or weak handle remains, the memory is freed.
+export fn ArcWeak::drop<T>(ref<ArcWeak<T>, exclusive> self)
+{
+    ArcBox::release_weak<T>(self.ptr);
+}
+
+/// An `ArcWeak` upgrades while any `Arc` remains and gives `None` after the last one ends.
+unittest "ArcWeak::upgrade: after the last Arc"
+{
+    Arc<String> a = Arc::new(String::from_str("shared"));
+    Arc<String> b = clone(&a);
+    assert(String::len(Arc::get(&b)) == 6);
+    ArcWeak<String> w = Arc::downgrade(&a);
+    ArcWeak<String> w2 = clone(&w);
+    drop(a);
+    assert(Option::is_some(&ArcWeak::upgrade(&w)));
+    drop(b);
+    assert(Option::is_none(&ArcWeak::upgrade(&w)) && Option::is_none(&ArcWeak::upgrade(&w2)));
+}
+
+// A value on the heap with one owner (`rule.stdlib.box`, spec/21 §3a,
+// D-0045): `Rc` without the count. It gives recursive types their
+// indirection (`struct Node { i32 v; Option<Box<Node>> next; }`) and
+// moves a large value as a pointer.
+/// A value on the heap with one owner.
+///
+/// It gives recursive types their indirection (`struct Node { i32 v; Option<Box<Node>> next; }`) and moves a
+/// large value as a pointer. A `Box` is a resource: it moves, and destroying it destroys the value and frees
+/// the memory. It allocates `sizeof<T>()` bytes, or one for a zero-sized `T`.
+export resource struct Box<T>
+{
+    rawptr<T> ptr;
+    bool full;                          // false once into_inner has taken the value
+}
+
+// The size Box allocates: at least one byte, so every Box has an address.
+fn Box::cells<T>() : usize
+{
+    if (sizeof<T>() == 0)
+    {
+        1
+    }
+    else
+    {
+        sizeof<T>()
+    }
+}
+
+// trusted: [Rawptr-Write]/[Rawptr-Move-In] into the cells allocate just returned: fresh, with no object over them.
+/// A new `Box` holding `v`.
+///
+/// Allocates; faults (`alloc_failure`) when memory cannot be had.
+export fn Box::new<T>(T v) : Box<T>
+{
+    rawptr<u8> p = match (allocate(Box::cells<T>(), alignof<T>()))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    rawptr<T> bp = reinterpret_ptr<T>(p);
+    unsafe
+    {
+        *bp = v;
+    }
+    Box { .ptr = bp, .full = true }
+}
+
+// trusted: [Reclaim] of the value: ptr came from Box::new and full holds while the Box lives.
+/// The value in `b`, as a shared reference.
+export fn Box::get<T>(ref<Box<T>, shared> b) : ref<T, shared>
+{
+    unsafe
+    {
+        &reclaim<T>(b.ptr)
+    }
+}
+
+// trusted: [Reclaim] of the value, as get.
+/// The value in `b`, as an exclusive reference.
+///
+/// Needs an exclusive borrow of the `Box`, as changing any value does.
+export fn Box::get_mut<T>(ref<Box<T>, exclusive> b) : ref<T, exclusive>
+{
+    // D-0222: the box is accessed exclusively through `b`: a live shared path to it meets the access.
+    _ = &mut *b;
+    unsafe
+    {
+        &mut reclaim<T>(b.ptr)
+    }
+}
+
+// D-0116: a Box of a copy of the value.
+/// A new `Box` holding a copy of the value in `b`; what `clone(&b)` calls for a `Box`.
+export fn Box::clone<T: clone>(ref<Box<T>, shared> b) : Box<T>
+{
+    Box::new(clone(Box::get(b)))
+}
+
+// The value, moved out; the Box's memory is freed.
+// trusted: [Rawptr-Read]/[Rawptr-Move-Out] and [Release] of the value: full was true and is now false, so drop will not reclaim it again; the [Release] faults if another thread holds an exclusive path to the value (D-0214).
+/// The value in `b`, moved out; the `Box`'s memory is freed.
+///
+/// Faults if another thread holds an exclusive path to the value.
+export fn Box::into_inner<T>(Box<T> b) : T
+{
+    b.full = false;
+    unsafe
+    {
+        auto v = *b.ptr;
+        release(reinterpret_ptr<u8>(b.ptr), sizeof<T>());
+        v
+    }
+}
+
+/// Changing a boxed value, copying the `Box`, and taking the value back out.
+unittest "Box::into_inner: get_mut, clone and into_inner"
+{
+    Box<i32> b = Box::new(5);
+    *Box::get_mut(&mut b) = 6;
+    assert(*Box::get(&b) == 6);
+    Box<i32> c = clone(&b);
+    assert(Box::into_inner(c) == 6);
+}
+
+// trusted: [Reclaim] of the value when full, then [Deallocate] of the one allocation Box::new made, under [Destroy]'s single-use authority.
+/// Destroys the value and frees the memory; run when a `Box` is destroyed.
+export fn Box::drop<T>(ref<Box<T>, exclusive> self)
+{
+    unsafe
+    {
+        if (self.full)
+        {
+            drop(reclaim<T>(self.ptr));
+        }
+        deallocate(reinterpret_ptr<u8>(self.ptr), Box::cells<T>(), alignof<T>());
+    }
+}

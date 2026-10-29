@@ -1,0 +1,276 @@
+// The stage-4 analyses' answers for a function body, dumped as cobc's
+// `dump_analyses` dumps them (`COBC_DUMP_ANALYSES`, CHG-0368): one line per
+// analysis, its answers sorted; names as they are, nodes as `e:LINE:COL`
+// (an expression) or `a:LINE:COL` (a match arm, by its body), with `+m`
+// (moved), `+1` (compared), `+2` (indexed) for `objectless_strings`' marks.
+
+import std;
+import ast;
+import state;
+import vec_scan;
+import strings4;
+import refs4;
+import typeops;
+import direct;
+import stage1a;
+
+// An arm's entry in an analysis set: its body's id with this bit set (cobc
+// keys arms by their own address).
+export const usize ARM_BIT = 1 << 62;
+
+fn pos_expr(ref<Expr, shared> e, ref<HashMap<usize, String>, exclusive> pos)
+{
+    HashMap::insert(pos, e.id, sprintf("e:%v:%v", e.line, e.col));
+    match (&e.kind)
+    {
+        ExprKind::EMatch(m) :
+        {
+            foreach (a in &Box::get(m).arms)
+            {
+                ref<Expr, shared> b = Box::get(&a.body);
+                HashMap::insert(pos, b.id | ARM_BIT, sprintf("a:%v:%v", b.line, b.col));
+            }
+        },
+        _                   : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                pos_expr(&f.value, pos);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                pos_expr(a, pos);
+            }
+        },
+        ExprKind::EArrayRepeat(a) : pos_expr(&Box::get(a).value, pos),
+        ExprKind::EUnary(u)       : pos_expr(&Box::get(u).e, pos),
+        ExprKind::EBinary(b)      :
+        {
+            pos_expr(&Box::get(b).a, pos);
+            pos_expr(&Box::get(b).b, pos);
+        },
+        ExprKind::EBorrow(bb)     : pos_expr(&Box::get(bb).e, pos),
+        ExprKind::ESliceOf(s)     :
+        {
+            pos_expr(&Box::get(s).base, pos);
+            pos_expr(&Box::get(s).lo, pos);
+            pos_expr(&Box::get(s).hi, pos);
+        },
+        ExprKind::EDeref(a)       : pos_expr(Box::get(a), pos),
+        ExprKind::EField(f)       : pos_expr(&Box::get(f).e, pos),
+        ExprKind::EIndex(p)       :
+        {
+            pos_expr(&Box::get(p).a, pos);
+            pos_expr(&Box::get(p).b, pos);
+        },
+        ExprKind::ECall(c)        :
+        {
+            pos_expr(&Box::get(c).callee, pos);
+            foreach (a in &Box::get(c).args)
+            {
+                pos_expr(a, pos);
+            }
+        },
+        ExprKind::EAssign(p)      :
+        {
+            pos_expr(&Box::get(p).a, pos);
+            pos_expr(&Box::get(p).b, pos);
+        },
+        ExprKind::EPropagate(a)   : pos_expr(Box::get(a), pos),
+        ExprKind::EBlock(b)       : pos_block(b, pos),
+        ExprKind::EUnsafe(b)      : pos_block(b, pos),
+        ExprKind::EIf(i)          :
+        {
+            pos_expr(&Box::get(i).cond, pos);
+            pos_block(&Box::get(i).then_, pos);
+            match (&Box::get(i).else_)
+            {
+                Some(f) : pos_expr(f, pos),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            pos_expr(&Box::get(w).cond, pos);
+            pos_block(&Box::get(w).body, pos);
+            match (&Box::get(w).step)
+            {
+                Some(s) : pos_expr(s, pos),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            pos_expr(&Box::get(m).scrut, pos);
+            foreach (a in &Box::get(m).arms)
+            {
+                pos_expr(Box::get(&a.body), pos);
+            }
+        },
+        ExprKind::EReturn(v)      :
+        {
+            match (v)
+            {
+                Some(r) : pos_expr(Box::get(r), pos),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(c)     : pos_block(&Box::get(c).body, pos),
+        ExprKind::EParen(a)       : pos_expr(Box::get(a), pos),
+        _                         : {},
+    }
+}
+
+fn pos_block(ref<Block, shared> b, ref<HashMap<usize, String>, exclusive> pos)
+{
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : pos_expr(e, pos),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : pos_expr(&Box::get(d).init, pos),
+            Stmt::SExpr(e)        : pos_expr(Box::get(e), pos),
+            Stmt::SBlockLike(e)   : pos_expr(Box::get(e), pos),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : pos_expr(Box::get(t), pos),
+        None    : {},
+    }
+}
+
+fn node(ref<HashMap<usize, String>, shared> pos, usize id, str mark) : String
+{
+    match (HashMap::get(pos, &id))
+    {
+        Some(p) : sprintf("%s%s", p, mark),
+        None    : sprintf("?%v%s", id, mark),
+    }
+}
+
+fn sorted_line(Vec<String> v) : String
+{
+    Vec::sort(&mut v);
+    String::join(&v[0..$], " ")
+}
+
+fn ids_line(
+    ref<HashMap<usize, String>, shared> pos,
+    ref<HashSet<usize>, shared> s,
+    str mark,
+    ref<Vec<String>, exclusive> out,
+)
+{
+    foreach (id in s)
+    {
+        Vec::push(out, node(pos, *id, mark));
+    }
+}
+
+fn names_line(ref<HashSet<String>, shared> s) : String
+{
+    Vec<String> v = Vec::new();
+    foreach (n in s)
+    {
+        Vec::push(&mut v, String::clone(n));
+    }
+    sorted_line(v)
+}
+
+// The dump for function `name` (cobc's `dump_analyses`), when
+// `COBC_DUMP_ANALYSES` is set.
+export fn dump_analyses(
+    ref<Gen, exclusive> g,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+)
+{
+    match (env_var(StringView::of("COBC_DUMP_ANALYSES")))
+    {
+        Ok(Some(_)) : {},
+        _           : return,
+    }
+    Vec<String> names = Vec::new();
+    Vec<String> owned = Vec::new();
+    foreach (p in &f.params)
+    {
+        Vec::push(&mut names, String::clone(&p.name));
+        match (&p.ty)
+        {
+            Type::TNamed(n) :
+            {
+                if (String::eq_str(&Box::get(n).name, "std::Vec") && Vec::len(&Box::get(n).args) == 1)
+                {
+                    Vec::push(&mut owned, String::clone(&p.name));
+                }
+            },
+            _               : {},
+        }
+    }
+    HashSet<String> c = confined_vecs(g, &f.body, &names, &owned);
+    Objectless o = objectless_strings(g, &f.body, &names);
+    HashSet<usize> e = elem_ref_lets(g, &f.body, &names);
+    HashSet<usize> q = quiet_locals(g, &f.body, &names, &e);
+    HashSet<String> h = held_locals(&f.body);
+    HashMap<usize, String> pos = HashMap::new();
+    pos_block(&f.body, &mut pos);
+    Vec<String> ov = Vec::new();
+    ids_line(&pos, &o.ids, "", &mut ov);
+    ids_line(&pos, &o.moved, "+m", &mut ov);
+    ids_line(&pos, &o.compared, "+1", &mut ov);
+    ids_line(&pos, &o.indexed, "+2", &mut ov);
+    Vec<String> ev = Vec::new();
+    ids_line(&pos, &e, "", &mut ev);
+    Vec<String> qv = Vec::new();
+    ids_line(&pos, &q, "", &mut qv);
+    eprintf("ANALYSES %v confined [%s]\n", name, &names_line(&c));
+    eprintf("ANALYSES %v objectless [%s]\n", name, &sorted_line(ov));
+    eprintf("ANALYSES %v elem_refs [%s]\n", name, &sorted_line(ev));
+    eprintf("ANALYSES %v quiet [%s]\n", name, &sorted_line(qv));
+    eprintf("ANALYSES %v held [%s]\n", name, &names_line(&h));
+    // The stage-1 analyses, past their `--all-checks` gate.
+    HashSet<String> cf = confined_fields(&f.body, &names);
+    HashSet<String> rc = read_confined_vecs(&f.body, &names);
+    String key = String::from_view(name);
+    Vec<String> pd = Vec::new();
+    for (usize j = 0; j < Vec::len(&f.params); j += 1)
+    {
+        Vec<String> visiting = Vec::new();
+        if (pure_direct_in(g, &key, j, &mut visiting))
+        {
+            Vec::push(&mut pd, sprintf("%v", j));
+        }
+    }
+    String dual = match (dual_direct_params(g, &f.params, &f.body, subst))
+    {
+        Some(d) : String::join(&d[0..$], " "),
+        None    : String::from_str("-"),
+    };
+    HashSet<String> dr = direct_refs_core(g, &f.params, &f.body, subst, true);
+    eprintf("ANALYSES %v confined_fields [%s]\n", name, &names_line(&cf));
+    eprintf("ANALYSES %v read_confined [%s]\n", name, &names_line(&rc));
+    eprintf("ANALYSES %v pure_direct [%s]\n", name, &String::join(&pd[0..$], " "));
+    eprintf("ANALYSES %v dual [%s]\n", name, &dual);
+    eprintf("ANALYSES %v direct [%s]\n", name, &names_line(&dr));
+}
+
+export fn empty_objectless() : Objectless
+{
+    Objectless { .ids = HashSet::new(), .moved = HashSet::new(), .compared = HashSet::new(), .indexed = HashSet::new() }
+}
