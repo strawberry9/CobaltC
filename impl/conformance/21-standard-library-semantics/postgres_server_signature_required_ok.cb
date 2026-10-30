@@ -1,0 +1,115 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.postgres [Pg-Auth] (D-0180, RFC 5802); conf.postgres-server-signature-required (CHG-0276)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 736b69707065642066696e616c3a2061757468656e7469636174696f6e206661696c65640a6561726c792066696e616c3a2061757468656e7469636174696f6e206661696c65640a
+//
+// Once SCRAM-SHA-256 has begun, the client accepts AuthenticationOk only
+// after the server's final message carried the signature the exchange
+// expects: a server that does not know the password cannot pass by
+// skipping it. A mock backend on a loopback port offers SCRAM, then (1)
+// answers the client's first message with AuthenticationOk at once, and
+// (2) sends its final message `v=` before the client could compute the
+// signature to expect. Both are `AuthFailed`.
+
+import std;
+
+fn msg(u8 kind, slice<u8, shared> body) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, kind);
+    Vec::push_be(&mut out, narrow<u32>(slice_len(body) + 4));
+    Vec::extend_from(&mut out, body);
+    out
+}
+
+fn auth(u32 code, slice<u8, shared> data) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push_be(&mut b, code);
+    Vec::extend_from(&mut b, data);
+    msg(b'R', &b[0..$])
+}
+
+// Reads `n` bytes, or false at the end.
+fn take(ref<TcpStream, exclusive> t, usize n) : bool
+{
+    Vec<u8> b = Vec::new();
+    Result::is_ok(&TcpStream::read_exact(t, &mut b, n))
+}
+
+// The startup message (its length, then the rest), then the client's
+// SASLInitialResponse after the offer.
+fn session(ref<TcpStream, exclusive> t, bool early_final)
+{
+    Vec<u8> head = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut head, 4)))
+    {
+        return;
+    }
+    usize len = widen<usize>(read_be<u32>(&head[0..$], 0));
+    if (len < 8 || !take(t, len - 4))
+    {
+        return;
+    }
+    _ = TcpStream::write(t, &auth(10, &b"SCRAM-SHA-256\x00\x00"[0..$])[0..$]);
+    Vec<u8> h = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut h, 5)))
+    {
+        return;
+    }
+    usize n = widen<usize>(read_be<u32>(&h[0..$], 1));
+    if (n < 4 || !take(t, n - 4))
+    {
+        return;
+    }
+    Vec<u8> out = Vec::new();
+    Vec<u8> nothing = Vec::new();
+    if (early_final)
+    {
+        Vec::append(&mut out, auth(12, &b"v="[0..$]));
+    }
+    Vec::append(&mut out, auth(0, &nothing[0..$]));
+    Vec::append(&mut out, msg(b'Z', &b"I"[0..$]));
+    _ = TcpStream::write(t, &out[0..$]);
+}
+
+fn serve(TcpListener l)
+{
+    for (usize i = 0; i < 2; i += 1)
+    {
+        TcpStream t = match (TcpListener::accept(&mut l))
+        {
+            Ok(t)  : t,
+            Err(_) : return,
+        };
+        TcpStream::set_read_timeout_ms(&mut t, 20000);
+        session(&mut t, i == 1);
+    }
+}
+
+fn attempt(str label, ref<String, shared> url)
+{
+    match (PgConnection::connect(String::as_view(url)))
+    {
+        Ok(c)  :
+        {
+            printf("%s: connected\n", label);
+            PgConnection::close(&mut c);
+        },
+        Err(e) : printf("%s: %s\n", label, &PgError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    auto server = spawn(serve, l);
+    String url = sprintf("postgres://user:pencil@127.0.0.1:%u/db?sslmode=disable", at.port);
+    attempt("skipped final", &url);
+    attempt("early final", &url);
+    join(server);
+    0
+}

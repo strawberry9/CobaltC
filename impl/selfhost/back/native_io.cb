@@ -1,0 +1,385 @@
+// cobc's lower/native_io.rs, written in CobaltC (D-0274 stage 5): the
+// native C bodies for std's line reading, File and channels.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+
+fn nm0(str name) : Type
+{
+    named(StringView::of(name), Vec::new())
+}
+
+fn nm1(str name, ref<Type, shared> a) : Type
+{
+    Vec<Type> args = Vec::new();
+    Vec::push(&mut args, clone(a));
+    named(StringView::of(name), args)
+}
+
+fn nm2(str name, ref<Type, shared> a, ref<Type, shared> b) : Type
+{
+    Vec<Type> args = Vec::new();
+    Vec::push(&mut args, clone(a));
+    Vec::push(&mut args, clone(b));
+    named(StringView::of(name), args)
+}
+
+// `Result<Option<String>, FileError>`, what both `read_line`s return.
+fn line_result() : Type
+{
+    Type st = nm0("std::String");
+    Type ot = nm1("std::Option", &st);
+    Type fe = nm0("std::FileError");
+    nm2("std::Result", &ot, &fe)
+}
+
+// `slice<u8, shared>`.
+fn byte_slice() : Type
+{
+    Type::TSlice(Box::new(ModedTy { .inner = Type::TInt(IntTy::U8), .mode = Mode::Shared }))
+}
+
+// D-0200: `read_line()` natively: the body's steps on its `Vec<u8>`
+// with none of its checks (a local no path ever reaches): `reserve`'s
+// growth (the same capacities, its arithmetic and allocation faults),
+// each read into the spare capacity (`cb_read_line_in`), the line end
+// dropped (`\n`, then a `\r` before it); then `String::from_utf8`'s
+// check, `utf8_error_at` over the bytes (called as its pure slice
+// parameter takes them). The buffer is freed where the body's `Vec`
+// would be destroyed, and the result given an object and sent as the
+// body's is.
+export fn native_read_line(ref<Gen, exclusive> g) : Option<String>
+{
+    if (!pure_direct(g, &String::from_str("std::utf8_error_at"), 0))
+    {
+        return None;
+    }
+    Type rt = line_result();
+    String rc = ctype(g, &rt);
+    u32 rtid = type_id(g, &rt);
+    String uea = request_fn(g, StringView::of("std::utf8_error_at"), Vec::new());
+    String slc = ctype(g, &byte_slice());
+    String b = String::new();
+    String give = sprintf("uint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro); return r;", rtid);
+    str free = "if (cap > 0) cb_deallocate_plain(p, cap);";
+    String::appendf(&mut b, "    uint8_t *p = (uint8_t *)1; uint64_t len = 0, cap = 0; uint8_t any = 0;\n");
+    String::appendf(&mut b, "    %s r;\n", &rc);
+    String::appendf(&mut b, "    for (;;) {\n");
+    String::appendf(
+        &mut b,
+        "        uint64_t need; if (__builtin_add_overflow(len, (uint64_t)128, &need)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "        if (need > cap) {\n");
+    String::appendf(&mut b, "            uint64_t nc = need;\n");
+    String::appendf(
+        &mut b,
+        "            if (cap > need - cap && __builtin_mul_overflow(cap, (uint64_t)2, &nc)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "            uint8_t *np = (uint8_t *)cb_allocate(nc, 1u);\n");
+    String::appendf(&mut b, "            if (!np) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "            if (len > 0) memcpy(np, p, len);\n");
+    String::appendf(&mut b, "            %s\n", free);
+    String::appendf(&mut b, "            p = np; cap = nc;\n");
+    String::appendf(&mut b, "        }\n");
+    String::appendf(&mut b, "        int64_t n = cb_read_line_in((void *)(p + len), cap - len);\n");
+    String::appendf(&mut b, "        if (n < 0) { %s r.tag = 1u; r.u.v1.tag = 2u; %s }\n", free, &give);
+    String::appendf(&mut b, "        if (n == 0) break;\n");
+    String::appendf(&mut b, "        any = 1; len += (uint64_t)n;\n");
+    String::appendf(
+        &mut b,
+        "        if (p[len - 1] == 10) { len -= 1; if (len > 0 && p[len - 1] == 13) len -= 1; break; }\n",
+    );
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    if (!any) { %s r.tag = 0u; r.u.v0.tag = 1u; %s }\n", free, &give);
+    String::appendf(&mut b, "    %s sl; sl.src = NULL; sl.data = p; sl.len = len;\n", &slc);
+    String::appendf(&mut b, "    uint64_t at = %s(sl);\n", &uea);
+    String::appendf(
+        &mut b,
+        "    if (at < len) { %s r.tag = 1u; r.u.v1.tag = 3u; r.u.v1.u.v3.offset = at; %s }\n",
+        free,
+        &give,
+    );
+    String::appendf(
+        &mut b,
+        "    r.tag = 0u; r.u.v0.tag = 0u; r.u.v0.u.v0.bytes.ptr = p; r.u.v0.u.v0.bytes.len = len; r.u.v0.u.v0.bytes.cap = cap;\n",
+    );
+    String::appendf(&mut b, "    %s\n", &give);
+    Some(b)
+}
+
+// D-0200: `File::read_line(f)` natively, as `native_read_line`: the
+// checked read of `f.id`, the line's length (`file_op` 4) and its
+// error, `File::take`'s growth of the new `Vec<u8>` (`Vec::grow`: 4,
+// then doubling, its arithmetic and allocation faults) and its read
+// (`file_op` 3, after its own read of `f.id`), the line end dropped,
+// then `String::from_utf8`'s check; the buffer freed where the body
+// would destroy it, the result given an object and sent.
+export fn native_file_read_line(ref<Gen, exclusive> g) : Option<String>
+{
+    if (!pure_direct(g, &String::from_str("std::utf8_error_at"), 0))
+    {
+        return None;
+    }
+    Type rt = line_result();
+    String rc = ctype(g, &rt);
+    u32 rtid = type_id(g, &rt);
+    String fc = ctype(g, &nm0("std::File"));
+    String uea = request_fn(g, StringView::of("std::utf8_error_at"), Vec::new());
+    String ferr = request_fn(g, StringView::of("std::file_error"), Vec::new());
+    String slc = ctype(g, &byte_slice());
+    String give = sprintf("uint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro); return r;", rtid);
+    str free = "if (cap > 0) cb_deallocate_plain(p, cap);";
+    String b = String::new();
+    String::appendf(&mut b, "    %s r;\n", &rc);
+    String::appendf(&mut b, "    cb_read(p_f.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t id = ((%s *)p_f.p)->id;\n", &fc);
+    String::appendf(&mut b, "    int64_t r0 = cb_file_op(4, id, (void *)1, 0);\n");
+    String::appendf(&mut b, "    if (r0 < 0) { r.tag = 1u; r.u.v1 = %s(r0); %s }\n", &ferr, &give);
+    String::appendf(&mut b, "    if (r0 == 0) { r.tag = 0u; r.u.v0.tag = 1u; %s }\n", &give);
+    String::appendf(&mut b, "    uint8_t *p = (uint8_t *)1; uint64_t len = 0, cap = 0, want = (uint64_t)r0;\n");
+    String::appendf(&mut b, "    while (cap - len < want) {\n");
+    String::appendf(&mut b, "        uint64_t nc = 4;\n");
+    String::appendf(
+        &mut b,
+        "        if (cap != 0 && __builtin_mul_overflow(cap, (uint64_t)2, &nc)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "        uint8_t *np = (uint8_t *)cb_allocate(nc, 1u);\n");
+    String::appendf(&mut b, "        if (!np) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        if (len > 0) memcpy(np, p, len);\n");
+    String::appendf(&mut b, "        %s\n", free);
+    String::appendf(&mut b, "        p = np; cap = nc;\n");
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    cb_read(p_f.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    int64_t rr = cb_file_op(3, ((%s *)p_f.p)->id, (void *)(p + len), want);\n", &fc);
+    String::appendf(&mut b, "    if (rr < 0) { %s r.tag = 1u; r.u.v1 = %s(rr); %s }\n", free, &ferr, &give);
+    String::appendf(&mut b, "    uint64_t n = (uint64_t)rr; len += n;\n");
+    String::appendf(&mut b, "    if (n > 0 && p[n - 1] == 10) { len -= 1; if (n > 1 && p[n - 2] == 13) len -= 1; }\n");
+    String::appendf(&mut b, "    %s sl; sl.src = NULL; sl.data = p; sl.len = len;\n", &slc);
+    String::appendf(&mut b, "    uint64_t at = %s(sl);\n", &uea);
+    String::appendf(
+        &mut b,
+        "    if (at < len) { %s r.tag = 1u; r.u.v1.tag = 3u; r.u.v1.u.v3.offset = at; %s }\n",
+        free,
+        &give,
+    );
+    String::appendf(
+        &mut b,
+        "    r.tag = 0u; r.u.v0.tag = 0u; r.u.v0.u.v0.bytes.ptr = p; r.u.v0.u.v0.bytes.len = len; r.u.v0.u.v0.bytes.cap = cap;\n",
+    );
+    String::appendf(&mut b, "    %s\n", &give);
+    Some(b)
+}
+
+// D-0200: `File::write(f, data)` and `File::write_text(f, text)`
+// natively: the bytes' datum received as the body's parameter receives
+// it (unless the callers send none: a pure slice or view), then the
+// body's steps -- nothing for no bytes; the checked read of `f.id`;
+// the first byte's index and element access (`&data[0]`, which
+// `rawptr_of` takes); the write (`file_op` 5) and its error. `write_text`
+// is `write` of its text's bytes, whose hand-off checks nothing. The
+// bindings and the datum's objects, which nothing else reaches, are
+// not made.
+export fn native_file_write(ref<Gen, exclusive> g, ref<String, shared> name) : Option<String>
+{
+    bool text = String::eq_str(name, "std::File::write_text");
+    bool pure = if (text) { pure_view(g, name, 1) } else { pure_direct(g, name, 1) };
+    Type ft = nm0("std::File");
+    String fc = ctype(g, &ft);
+    Type fe = nm0("std::FileError");
+    Type rt = nm2("std::Result", &Type::TVoid, &fe);
+    if (is_resource(g, &rt) || has_refs(g, &rt))
+    {
+        return None;
+    }
+    String rc = ctype(g, &rt);
+    u32 u8tid = type_id(g, &Type::TInt(IntTy::U8));
+    String ferr = request_fn(g, StringView::of("std::file_error"), Vec::new());
+    str d = if (text) { "p_text.bytes" } else { "p_data" };
+    String b = String::new();
+    if (!pure)
+    {
+        String::appendf(&mut b, "    (void)cb_recv_datum_tok();\n");
+    }
+    String::appendf(&mut b, "    %s r;\n", &rc);
+    String::appendf(&mut b, "    uint64_t n = %s.len;\n", d);
+    String::appendf(&mut b, "    if (n == 0) { r.tag = 0u; return r; }\n");
+    String::appendf(&mut b, "    cb_read(p_f.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t id = ((%s *)p_f.p)->id;\n", &fc);
+    String::appendf(
+        &mut b,
+        "    cb_elem_access((void *)&%s.data[0], 1u, %vu, CB_SHARED, 0u, CB_NOLOC, 0);\n",
+        d,
+        u8tid,
+    );
+    String::appendf(&mut b, "    int64_t w = cb_file_op(5, id, (void *)%s.data, n);\n", d);
+    String::appendf(&mut b, "    if (w < 0) { r.tag = 1u; r.u.v1 = %s(w); return r; }\n", &ferr);
+    String::appendf(&mut b, "    r.tag = 0u;\n");
+    String::appendf(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `native_channel`'s `fin`: a send's result handed back, `ind` its indent.
+fn chan_fin(ref<String, exclusive> b, bool res, bool robj, u32 rtid, str ind)
+{
+    if (res)
+    {
+        String::appendf(b, "%scb_forget_obj(vo);\n", ind);
+    }
+    if (robj)
+    {
+        String::appendf(b, "%suint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro);\n", ind, rtid);
+    }
+    String::appendf(b, "%sreturn r;\n", ind);
+}
+
+// D-0200: `Channel::send` and `recv` natively, for values holding no
+// reference, no `fn` and no destructor of the program's own: the same
+// steps under the same lock and the same events (`event_op`: the count
+// a waiter watches read under the lock, the wait after it is
+// released, the signal under it). The body's `lock(&ch.state)` makes
+// a guard whose path every access to the state goes through; the
+// state is reachable through nothing else (a private field, locked
+// only by these bodies, each releasing it before it returns), and
+// the lock excludes every other thread, so no check through the guard
+// can fail: the first, of `ch` itself (`&ch.state`), is made, then the
+// ring is used directly between `cb_lock_bare` and `cb_unlock_bare`.
+// A value enters a slot as bytes (its record ending, as `cb_raw_move_in`
+// ends one) and leaves with a new one; a slot a value left holds `None`
+// as the body leaves it. Results of resource types are given objects
+// and sent, as the body's are.
+export fn native_channel(ref<Gen, exclusive> g, bool send, ref<Type, shared> t) : Option<String>
+{
+    u64 size = size_align(g, t).size;
+    bool res = is_resource(g, t) && objectless_type(g, t);
+    if (size == 0 || !(plain_data(g, t) || res))
+    {
+        return None;
+    }
+    String cc = ctype(g, &nm1("std::Channel", t));
+    Type ot = nm1("std::Option", t);
+    String b = String::new();
+    String::appendf(&mut b, "    %s *ch = (%s *)p_ch.p;\n", &cc, &cc);
+    if (send)
+    {
+        Type rt = nm2("std::Result", &Type::TVoid, t);
+        String rc = ctype(g, &rt);
+        bool robj = is_resource(g, &rt);
+        u32 rtid = if (robj) { type_id(g, &rt) } else { 0 };
+        if (res)
+        {
+            String::appendf(&mut b, "    uint64_t vo = cb_recv(&p_v);\n");
+        }
+        String::appendf(
+            &mut b,
+            "    cb_borrow_check(p_ch.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    for (;;) {\n");
+        String::appendf(&mut b, "        cb_lock_bare((void *)&ch->state, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "        if (ch->state.inner.closed) {\n");
+        String::appendf(&mut b, "            cb_unlock_bare((void *)&ch->state);\n");
+        String::appendf(&mut b, "            %s r; r.tag = 1u; r.u.v1 = p_v;\n", &rc);
+        chan_fin(&mut b, res, robj, rtid, "            ");
+        String::appendf(&mut b, "        }\n");
+        String::appendf(&mut b, "        if (ch->state.inner.count < ch->cap) {\n");
+        String::appendf(
+            &mut b,
+            "            uint64_t at = (ch->state.inner.head + ch->state.inner.count) %% ch->cap;\n",
+        );
+        String::appendf(
+            &mut b,
+            "            if (at >= ch->state.inner.slots.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n",
+        );
+        String::appendf(
+            &mut b,
+            "            ch->state.inner.slots.ptr[at].tag = 0u; ch->state.inner.slots.ptr[at].u.v0 = p_v;\n",
+        );
+        String::appendf(&mut b, "            ch->state.inner.count += 1;\n");
+        String::appendf(&mut b, "            cb_unlock_signal((void *)&ch->state, ch->can_recv);\n");
+        String::appendf(&mut b, "            %s r; r.tag = 0u;\n", &rc);
+        chan_fin(&mut b, res, robj, rtid, "            ");
+        String::appendf(&mut b, "        }\n");
+        String::appendf(&mut b, "        uint64_t seen = cb_event_op(1, ch->can_send, 0);\n");
+        String::appendf(&mut b, "        cb_unlock_bare((void *)&ch->state);\n");
+        String::appendf(&mut b, "        (void)cb_event_op(2, ch->can_send, seen);\n");
+        String::appendf(&mut b, "    }\n");
+        // The `_raw` form, for a value made with no object
+        // (`Fx::lower_channel_send_fresh`): nothing to receive or end.
+        if (res && Option::is_some(&g.native_ctx))
+        {
+            String sig = match (&g.native_ctx)
+            {
+                Some(c) : String::clone(&c.sig),
+                None    : String::new(),
+            };
+            usize open = Option::expect(String::find(&sig, "("), "a signature");
+            String raw_sig = sprintf(
+                "%v_raw%v",
+                String::view(&sig, 0, open),
+                String::view(&sig, open, String::len(&sig)),
+            );
+            String raw = String::new();
+            foreach (l in StringView::lines(String::as_view(&b)))
+            {
+                if (!StringView::contains(
+                    l,
+                    StringView::of("cb_recv(&p_v)"),
+                ) && !StringView::contains(l, StringView::of("cb_forget_obj(vo)")))
+                {
+                    String::appendf(&mut raw, "%v\n", l);
+                }
+            }
+            String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+            String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &raw_sig, &raw);
+        }
+    }
+    else
+    {
+        String oc = ctype(g, &ot);
+        bool oobj = is_resource(g, &ot);
+        u32 otid = if (oobj) { type_id(g, &ot) } else { 0 };
+        String give = if (oobj)
+        {
+            sprintf(
+                " uint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro);",
+                otid,
+            )
+        }
+        else { String::new() };
+        String::appendf(
+            &mut b,
+            "    cb_borrow_check(p_ch.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_SHARED, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    for (;;) {\n");
+        String::appendf(&mut b, "        cb_lock_bare((void *)&ch->state, CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "        if (ch->state.inner.count > 0) {\n");
+        String::appendf(&mut b, "            uint64_t at = ch->state.inner.head;\n");
+        String::appendf(
+            &mut b,
+            "            if (at >= ch->state.inner.slots.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "            %s r = ch->state.inner.slots.ptr[at];\n", &oc);
+        String::appendf(&mut b, "            ch->state.inner.slots.ptr[at].tag = 1u;\n");
+        String::appendf(&mut b, "            ch->state.inner.head = (at + 1) %% ch->state.inner.slots.len;\n");
+        String::appendf(&mut b, "            ch->state.inner.count -= 1;\n");
+        String::appendf(&mut b, "            cb_unlock_signal((void *)&ch->state, ch->can_send);\n");
+        String::appendf(&mut b, "           %s\n", &give);
+        String::appendf(&mut b, "            return r;\n");
+        String::appendf(&mut b, "        }\n");
+        String::appendf(&mut b, "        if (ch->state.inner.closed) {\n");
+        String::appendf(&mut b, "            cb_unlock_bare((void *)&ch->state);\n");
+        String::appendf(&mut b, "            %s r; r.tag = 1u;%s\n", &oc, &give);
+        String::appendf(&mut b, "            return r;\n");
+        String::appendf(&mut b, "        }\n");
+        String::appendf(&mut b, "        uint64_t seen = cb_event_op(1, ch->can_recv, 0);\n");
+        String::appendf(&mut b, "        cb_unlock_bare((void *)&ch->state);\n");
+        String::appendf(&mut b, "        (void)cb_event_op(2, ch->can_recv, seen);\n");
+        String::appendf(&mut b, "    }\n");
+    }
+    Some(b)
+}

@@ -1,0 +1,49 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.postgres [Pg-Auth] (D-0180); conf.scram-sha256-vectors
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 636c69656e742d6669727374206e2c2c6e3d757365722c723d724f70724e476677456265525767624e456b714f0a636c69656e742d66696e616c20633d626977732c723d724f70724e476677456265525767624e456b714f25687659447057556132526154434166757846496c6a29684e6c46246b302c703d30427953326736585a45746f76384d523134304d465273456679382f582b6261636670506f6656744b6a453d0a7365727665722d66696e616c206f6b20747275650a77726f6e67207369676e61747572652066616c73650a6572726f7220616e737765722066616c73650a65736361706564206e2c2c6e3d75733d324365723d33442c723d724f70724e476677456265525767624e456b714f0a6f74686572206e6f6e63653a2061757468656e7469636174696f6e206661696c65640a6e6f2073616c743a20746865207365727665722773206d657373616765206973206d616c666f726d65640a73616c74656420656638303435323065636236313864396334316134386237613761373638306234636638626463343735343635386539306339643835653662366236633038630a
+//
+// RFC 7677 §3's SCRAM-SHA-256 exchange (user "user", password "pencil",
+// the nonces and the salt as the RFC gives them) with the iteration count
+// 4 instead of 4096, which the interpreter would take minutes over (the
+// values confirmed with Python's hashlib; the RFC's own 4096-iteration
+// values are checked by stress/postgres/scram_rfc7677.cb under cobc)
+// through `Scram`: the client-first message, the client-final message
+// with its proof for the server's first message, and the server's final
+// message verified; a wrong server signature, an `e=` answer and a server
+// nonce that does not continue the client's each refused; the salted
+// password as `scram_salted_password` gives it.
+
+import std;
+
+fn main() : u8
+{
+    Scram s = Scram::start("user", "rOprNGfwEbeRWgbNEkqO");
+    printf("client-first %s\n", &Scram::client_first(&s));
+    StringView server_first = StringView::of("r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4");
+    match (Scram::respond(&mut s, server_first, "pencil"))
+    {
+        Ok(m)  : printf("client-final %s\n", &m),
+        Err(e) : printf("client-final error %s\n", &PgError::text(&e)),
+    }
+    printf("server-final ok %v\n", Scram::verify(&s, "v=ITrN4zX09+hsD398Qk6ol73eg0shWPnOWwnwS83jitc="));
+    printf("wrong signature %v\n", Scram::verify(&s, "v=JTrN4zX09+hsD398Qk6ol73eg0shWPnOWwnwS83jitc="));
+    printf("error answer %v\n", Scram::verify(&s, "e=invalid-proof"));
+    Scram t = Scram::start("us,er=", "rOprNGfwEbeRWgbNEkqO");
+    printf("escaped %s\n", &Scram::client_first(&t));
+    match (Scram::respond(&mut t, "r=differentnonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4", "pencil"))
+    {
+        Ok(_)  : printf("nonce not checked\n"),
+        Err(e) : printf("other nonce: %s\n", &PgError::text(&e)),
+    }
+    match (Scram::respond(&mut t, "r=rOprNGfwEbeRWgbNEkqOxyz,i=4", "pencil"))
+    {
+        Ok(_)  : printf("salt not required\n"),
+        Err(e) : printf("no salt: %s\n", &PgError::text(&e)),
+    }
+    Vec<u8> salt = Result::unwrap(base64_decode("W22ZaJ0SNY7soEsUEjb6gQ=="));
+    printf("salted %s\n", &to_hex(&scram_salted_password("pencil", &salt[0..$], 4)[0..$]));
+    0
+}

@@ -1,0 +1,1116 @@
+// cobc's fresh.rs call shortcuts (`lower_map_fresh_key`, `lower_push_fresh`,
+// `lower_set_insert_fresh`, `lower_channel_send_fresh`, `taken_objectless`),
+// its inert-literal tests (`inert_expr`, `inert_value`, `inert_box_new`) and
+// closures.rs's `lower_box_new`, written in CobaltC (D-0274 stage 3). Each
+// shortcut returns `None` where the call is not its shape.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+import native_misc;
+import gen;
+import flights;
+
+fn string_type() : Type
+{
+    Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::String"), .args = Vec::new() }))
+}
+
+// A callee's key as cobc resolves it: the path as written when it names a
+// function, else under `std::`.
+fn std_key(ref<Gen, shared> g, ref<Vec<String>, shared> segs) : String
+{
+    String k = String::join(&segs[0..$], "::");
+    if (HashMap::contains(&g.prog.table.fns, &k)) { k } else { sprintf("std::%s", &k) }
+}
+
+// Whether `k` is a function of the prelude (cobc's
+// `items.fns.get(k).map_or(false, in_prelude)`).
+fn prelude_fn(ref<Gen, exclusive> g, ref<String, shared> k) : bool
+{
+    match (get_fn(g, k))
+    {
+        Some(pf) : in_prelude(String::as_view(k), &pf),
+        None     : false,
+    }
+}
+
+// `probe_type` where cobc asks whether it succeeded: the probe's own
+// failure, the flag as it was left around it.
+fn probe_ok(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    ref<Type, exclusive> out,
+) : bool
+{
+    // Cached, as cobc's `probe_type` is: a probe made again lowers its
+    // expression again, which may take a raw call the real lowering expects.
+    bool saved = x.probe_failed;
+    x.probe_failed = false;
+    *out = probe_type(g, x, e, None);
+    bool ok = !x.probe_failed;
+    x.probe_failed = saved;
+    ok
+}
+
+// `&mut v` of a local passed with its root path after the borrow's check
+// (as `native_map_passthrough` does for an ordinary call): the binding.
+fn passed_local(ref<Fx, exclusive> x, ref<Expr, shared> a0) : Option<Binding>
+{
+    ref<Expr, shared> place = match (&a0.kind)
+    {
+        ExprKind::EBorrow(bb) :
+        {
+            if (Box::get(bb).mode != Mode::Exclusive)
+            {
+                return None;
+            }
+            &Box::get(bb).e
+        },
+        _                     : return None,
+    };
+    String n = match (path_name_raw(place))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    Binding b = match (lookup(x, String::as_view(&n)))
+    {
+        Some(b) : b,
+        None    : return None,
+    };
+    bool local = match (&b.kind)
+    {
+        BindKind::Local : true,
+        _               : false,
+    };
+    if (local && String::len(&b.root) > 0 && !HashSet::contains(&x.direct_refs, &b.c) && !HashMap::contains(
+        &x.unstored,
+        &b.c,
+    ) && !is_ref_type(&b.ty))
+    {
+        return Some(b);
+    }
+    None
+}
+
+// The passed local's value: a reference made of its address and root, the
+// borrow checked first.
+fn pass_local(ref<Gen, exclusive> g, ref<Fx, exclusive> x, Binding b, usize line) : V
+{
+    String lc = loc(g, x.std_body, line);
+    emit(x, String::as_view(&sprintf("cb_borrow_unminted(%s, NULL, 0, CB_EXCLUSIVE, %s);", &b.root, &lc)));
+    V { .c = sprintf(
+        "((cb_ref){ (void *)&(%s), %s })",
+        &b.c,
+        &b.root,
+    ), .ty = ref_ty(clone(&b.ty), Mode::Exclusive), .obj = None }
+}
+
+// A literal that owns nothing: a variant without a payload (`None`), or a
+// struct literal of a struct with no destructor, not declared `resource`,
+// each field of which is plain data (no reference, no `fn` value) or itself
+// inert. Built in place, it needs no object: there is nothing to destroy if
+// a fault ends the statement first, and nothing can reach it before the
+// aggregate around it absorbs it.
+export fn inert_expr(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    // D-0274: not in the bootstrap form.
+    if (boot(g, 2))
+    {
+        return false;
+    }
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::EPath(p)       :
+        {
+            ref<Vec<String>, shared> segs = &Box::get(p).segs;
+            if (Vec::len(segs) == 1 && Option::is_some(&lookup(x, String::as_view(&segs[0]))))
+            {
+                return false;
+            }
+            match (variant_of(g, segs))
+            {
+                Some(vr) :
+                {
+                    match (enum_decl(g, &vr.ename))
+                    {
+                        Some(ed) : Option::is_none(&ed.variants[vr.vi].payload),
+                        None     : false,
+                    }
+                },
+                None     : false,
+            }
+        },
+        ExprKind::EStructLit(sl) :
+        {
+            ref<StructLitExpr, shared> lit = Box::get(sl);
+            String name = String::join(&lit.segs[0..$], "::");
+            StructDecl sd = match (struct_decl(g, &name))
+            {
+                Some(d) : d,
+                None    : return false,
+            };
+            if (sd.resource_ || Option::is_some(&sd.bits) || HashMap::contains(
+                &g.prog.table.fns,
+                &sprintf("%s::drop", &name),
+            ))
+            {
+                return false;
+            }
+            // By each field's declared type (a generic one is not judged:
+            // not inert).
+            foreach (fi in &lit.fields)
+            {
+                Option<Type> fty = None;
+                foreach (fd in &sd.fields)
+                {
+                    if (String::eq(&fd.name, &fi.name))
+                    {
+                        fty = Some(clone(&fd.ty));
+                        break;
+                    }
+                }
+                Type ft = match (fty)
+                {
+                    Some(t) : t,
+                    None    : return false,
+                };
+                if (!resolved(&ft, &sd.type_params) || Vec::len(&sd.type_params) > 0)
+                {
+                    return false;
+                }
+                bool ok = if (is_resource(g, &ft)) { inert_expr(g, x, &fi.value) } else { plain_data(g, &ft) };
+                if (!ok)
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        _                        : false,
+    }
+}
+
+// An inert literal (`inert_expr`), or a variant whose payload is one or is a
+// `Box` of one (`inert_box_new`): destroying it runs no destructor.
+export fn inert_value(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    // D-0274: not in the bootstrap form.
+    if (boot(g, 2))
+    {
+        return false;
+    }
+    if (inert_expr(g, x, e))
+    {
+        return true;
+    }
+    ref<CallExpr, shared> call = match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return false,
+    };
+    ref<Vec<String>, shared> segs = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : &Box::get(p).segs,
+        _                  : return false,
+    };
+    if (Vec::len(&call.args) != 1 || (Vec::len(segs) == 1 && Option::is_some(&lookup(
+        x,
+        String::as_view(&segs[0]),
+    ))) || HashMap::contains(&g.prog.table.fns, &String::join(&segs[0..$], "::")))
+    {
+        return false;
+    }
+    VariantRef vr = match (variant_of(g, segs))
+    {
+        Some(v) : v,
+        None    : return false,
+    };
+    bool has_payload = match (enum_decl(g, &vr.ename))
+    {
+        Some(ed) : Option::is_some(&ed.variants[vr.vi].payload),
+        None     : false,
+    };
+    if (!has_payload)
+    {
+        return false;
+    }
+    inert_expr(g, x, &call.args[0]) || inert_box_new(g, x, &call.args[0])
+}
+
+// `Box::new(x)` that `lower_box_new` builds natively, `x` inert: as a
+// variant's payload, a `Box` that needs no object (`objectless`).
+export fn inert_box_new(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    // D-0274: `Box::new` takes the general call path (`lower_box_new` is off).
+    if (boot(g, 2))
+    {
+        return false;
+    }
+    ref<CallExpr, shared> call = match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return false,
+    };
+    ref<Vec<String>, shared> segs = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : &Box::get(p).segs,
+        _                  : return false,
+    };
+    String bn = String::from_str("std::Box::new");
+    if (!String::eq_str(&String::join(&segs[0..$], "::"), "std::Box::new") || Vec::len(&call.args) != 1 || !prelude_fn(
+        g,
+        &bn,
+    ))
+    {
+        return false;
+    }
+    Type t = Type::TVoid;
+    if (!probe_ok(g, x, &call.args[0], &mut t))
+    {
+        return false;
+    }
+    bool shut = match (&t)
+    {
+        Type::TClosure(_) : true,
+        Type::TNever      : true,
+        _                 : false,
+    };
+    if (has_refs(g, &t) || holds_fn(g, &t) || shut)
+    {
+        return false;
+    }
+    inert_expr(g, x, &call.args[0])
+}
+
+// `replace(&mut x, String::new())` or `replace(&mut x, Vec::new())`, `x` an
+// objectless local (a whole binding, no object) of type `elem`, a resource
+// holding no reference whose `_raw` push exists (`native_vec_push`): `x`'s
+// binding.
+export fn taken_objectless(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    ref<Type, shared> elem,
+) : Option<Binding>
+{
+    ref<CallExpr, shared> call = match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> path = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&path.targs) > 0 || Vec::len(&call.args) != 2 || (Vec::len(&path.segs) == 1 && Option::is_some(&lookup(
+        x,
+        String::as_view(&path.segs[0]),
+    ))))
+    {
+        return None;
+    }
+    String k = std_key(g, &path.segs);
+    if (!String::eq_str(&k, "std::replace") || !prelude_fn(g, &k))
+    {
+        return None;
+    }
+    ref<Expr, shared> place = match (&strip_parens(&call.args[0]).kind)
+    {
+        ExprKind::EBorrow(bb) :
+        {
+            if (Box::get(bb).mode != Mode::Exclusive)
+            {
+                return None;
+            }
+            &Box::get(bb).e
+        },
+        _                     : return None,
+    };
+    String pn = match (path_name_raw(place))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    Binding b = match (lookup(x, String::as_view(&pn)))
+    {
+        Some(b) : b,
+        None    : return None,
+    };
+    bool local = match (&b.kind)
+    {
+        BindKind::Local : true,
+        _               : false,
+    };
+    if (!type_eq(&b.ty, elem) || !HashSet::contains(&x.objectless_c, &b.c) || !local)
+    {
+        return None;
+    }
+    ref<CallExpr, shared> ncall = match (&strip_parens(&call.args[1]).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> npath = match (&ncall.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    String nk = std_key(g, &npath.segs);
+    bool made = if (String::eq_str(&nk, "std::String::new"))
+    {
+        is_string_ty(elem)
+    }
+    else if (String::eq_str(&nk, "std::Vec::new"))
+    {
+        match (elem)
+        {
+            Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::Vec"),
+            _               : false,
+        }
+    }
+    else
+    {
+        false
+    };
+    if (!made || Vec::len(&ncall.args) > 0 || Vec::len(&npath.targs) > 0 || !prelude_fn(g, &nk))
+    {
+        return None;
+    }
+    if (!is_resource(g, elem) || has_refs(g, elem) || holds_fn(g, elem) || !objectless_type(g, elem))
+    {
+        return None;
+    }
+    Some(b)
+}
+
+// The callee of a `String` maker call `e` that `lower_raw_string` makes raw:
+// `String::clone(…)` / `String::from_str(…)` of one argument, of the prelude
+// (its shapes, checked before anything is lowered).
+fn raw_maker(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    ref<CallExpr, shared> call = match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return false,
+    };
+    ref<PathExpr, shared> path = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return false,
+    };
+    if (Vec::len(&path.targs) > 0 || (Vec::len(&path.segs) == 1 && Option::is_some(&lookup(
+        x,
+        String::as_view(&path.segs[0]),
+    ))) || Vec::len(&call.args) != 1)
+    {
+        return false;
+    }
+    String k = std_key(g, &path.segs);
+    if (!(String::eq_str(
+        &k,
+        "std::String::clone",
+    ) || String::eq_str(&k, "std::String::from_str")) || !prelude_fn(g, &k))
+    {
+        return false;
+    }
+    true
+}
+
+// D-0200: `HashSet::insert(s, k)` of `String`s, `k` made with no object
+// (`lower_raw_string`): the native's `_raw` form (`native_set_insert_string`),
+// the set's argument evaluated first.
+export fn lower_set_insert_fresh(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Expr>, shared> args,
+    usize line,
+) : Option<V>
+{
+    if (!StringView::eq_str(name, "std::HashSet::insert") || !in_prelude(name, f) || Vec::len(args) != 2)
+    {
+        return None;
+    }
+    Type string = string_type();
+    Type t0 = probe_type(g, x, &args[0], None);
+    bool set_ok = match (&t0)
+    {
+        Type::TRef(m) :
+        {
+            Box::get(m).mode == Mode::Exclusive && match (&Box::get(m).inner)
+            {
+                Type::TNamed(n) :
+                {
+                    String::eq_str(&Box::get(n).name, "std::HashSet") && Vec::len(&Box::get(n).args) == 1 && type_eq(
+                        &Box::get(n).args[0],
+                        &string,
+                    )
+                },
+                _               : false,
+            }
+        },
+        _             : false,
+    };
+    if (!set_ok)
+    {
+        return None;
+    }
+    // Only a key `lower_raw_string` makes raw (its shapes, checked here before
+    // anything is lowered).
+    if (!raw_maker(g, x, &args[1]))
+    {
+        return None;
+    }
+    V sv0 = lower_expr(g, x, &args[0], None);
+    if (is_never(&sv0.ty))
+    {
+        return Some(never());
+    }
+    V sv = into_temp(g, x, sv0, line);
+    V kv = match (lower_raw_string(g, x, &args[1]))
+    {
+        Some(v) : v,
+        None    :
+        {
+            assert(false, "cobc: a raw key that was not made");
+            return None;
+        },
+    };
+    if (is_never(&kv.ty))
+    {
+        return Some(never());
+    }
+    Vec<Type> targs = Vec::new();
+    Vec::push(&mut targs, string);
+    String cname = request_fn(g, name, targs);
+    String t = fresh(g, "t");
+    at(g, x, line);
+    emit(x, String::as_view(&sprintf("uint8_t %s = %s_raw(%s, %s);", &t, &cname, &sv.c, &kv.c)));
+    Some(V { .c = t, .ty = Type::TBool, .obj = None })
+}
+
+// D-0200: `Channel::send(ch, v)` of `String`s, `v` a copy made with no object
+// (`String::clone`/`from_str`, `lower_raw_string`): the native's `_raw` form
+// (`native_channel`), the channel's argument first.
+export fn lower_channel_send_fresh(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Expr>, shared> args,
+    usize line,
+) : Option<V>
+{
+    if (!StringView::eq_str(name, "std::Channel::send") || !in_prelude(name, f) || Vec::len(args) != 2)
+    {
+        return None;
+    }
+    Type string = string_type();
+    Type t0 = probe_type(g, x, &args[0], None);
+    bool chan_ok = match (&t0)
+    {
+        Type::TRef(m) :
+        {
+            Box::get(m).mode == Mode::Shared && match (&Box::get(m).inner)
+            {
+                Type::TNamed(n) :
+                {
+                    String::eq_str(&Box::get(n).name, "std::Channel") && Vec::len(&Box::get(n).args) == 1 && type_eq(
+                        &Box::get(n).args[0],
+                        &string,
+                    )
+                },
+                _               : false,
+            }
+        },
+        _             : false,
+    };
+    if (!chan_ok)
+    {
+        return None;
+    }
+    if (!raw_maker(g, x, &args[1]))
+    {
+        return None;
+    }
+    V cv0 = lower_expr(g, x, &args[0], None);
+    if (is_never(&cv0.ty))
+    {
+        return Some(never());
+    }
+    V cv = into_temp(g, x, cv0, line);
+    V vv = match (lower_raw_string(g, x, &args[1]))
+    {
+        Some(v) : v,
+        None    :
+        {
+            assert(false, "cobc: a raw value that was not made");
+            return None;
+        },
+    };
+    if (is_never(&vv.ty))
+    {
+        return Some(never());
+    }
+    Vec<Type> rargs = Vec::new();
+    Vec::push(&mut rargs, Type::TVoid);
+    Vec::push(&mut rargs, clone(&string));
+    Type rt = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Result"), .args = rargs }));
+    Vec<Type> targs = Vec::new();
+    Vec::push(&mut targs, string);
+    String cname = request_fn(g, name, targs);
+    String rc = ctype(g, &rt);
+    String t = fresh(g, "t");
+    at(g, x, line);
+    emit(x, String::as_view(&sprintf("%s %s = %s_raw(%s, %s);", &rc, &t, &cname, &cv.c, &vv.c)));
+    if (is_resource(g, &rt))
+    {
+        String o = take_result(g, x, &t, &rt, line);
+        return Some(V { .c = t, .ty = rt, .obj = Some(o) });
+    }
+    Some(V { .c = t, .ty = rt, .obj = None })
+}
+
+export fn lower_push_fresh(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Expr>, shared> args,
+    usize line,
+) : Option<V>
+{
+    if (!StringView::eq_str(name, "std::Vec::push") || !in_prelude(name, f) || Vec::len(args) != 2)
+    {
+        return None;
+    }
+    Type t0 = probe_type(g, x, &args[0], None);
+    Type vt = match (&t0)
+    {
+        Type::TRef(m) :
+        {
+            if (Box::get(m).mode != Mode::Exclusive)
+            {
+                return None;
+            }
+            clone(&Box::get(m).inner)
+        },
+        _             : return None,
+    };
+    ref<NamedTy, shared> vn = match (&vt)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return None,
+    };
+    if (Vec::len(&vn.args) != 1)
+    {
+        return None;
+    }
+    ref<Type, shared> elem = &vn.args[0];
+    if (!String::eq_str(&vn.name, "std::Vec"))
+    {
+        return None;
+    }
+    // D-0200: `replace(&mut x, String::new())` / `Vec::new()` of an objectless
+    // local `x` (`take`): its value moved out as bytes, `x` left empty in
+    // place; neither has an object to make or end.
+    // D-0200: an objectless local moved in (`push(v, x)`): its bytes go into
+    // the cell with no object, as `read_place` would move it out (stale if
+    // moved already; its moved flag set, or a `String` left empty in place).
+    Option<Binding> moved_in = match (path_name_raw(&args[1]))
+    {
+        Some(n) : lookup(x, String::as_view(&n)),
+        None    : None,
+    };
+    match (moved_in)
+    {
+        Some(mx) :
+        {
+            bool local = match (&mx.kind)
+            {
+                BindKind::Local : true,
+                _               : false,
+            };
+            if (type_eq(&mx.ty, elem) && HashSet::contains(&x.objectless_c, &mx.c) && local && is_resource(
+                g,
+                elem,
+            ) && !has_refs(g, elem) && !holds_fn(g, elem))
+            {
+                bool has_flag = HashMap::contains(&x.moved_flag, &mx.c);
+                bool is_string = is_string_ty(elem);
+                if ((has_flag || is_string) && Option::is_none(&confined_local(x, &args[0])) && x.probing == 0)
+                {
+                    V vv0 = lower_expr(g, x, &args[0], None);
+                    if (is_never(&vv0.ty))
+                    {
+                        return Some(never());
+                    }
+                    V vv = into_temp(g, x, vv0, line);
+                    objectless_use(g, x, &mx.c, line);
+                    String sc = ctype(g, elem);
+                    String kt = fresh(g, "k");
+                    emit(x, String::as_view(&sprintf("%s %s = %s;", &sc, &kt, &mx.c)));
+                    Option<String> fl = match (HashMap::get(&x.moved_flag, &mx.c))
+                    {
+                        Some(s) : Some(String::clone(s)),
+                        None    : None,
+                    };
+                    match (fl)
+                    {
+                        Some(s) : emit(x, String::as_view(&sprintf("%s = 1;", &s))),
+                        None    :
+                        {
+                            emit(
+                                x,
+                                String::as_view(&sprintf(
+                                    "%s.bytes.ptr = (uint8_t *)1; %s.bytes.len = 0; %s.bytes.cap = 0;",
+                                    &mx.c,
+                                    &mx.c,
+                                    &mx.c,
+                                )),
+                            );
+                        },
+                    }
+                    Vec<Type> ta = Vec::new();
+                    Vec::push(&mut ta, clone(elem));
+                    String pushn = request_fn(g, name, ta);
+                    emit(x, String::as_view(&sprintf("%s_raw(%s, %s);", &pushn, &vv.c, &kt)));
+                    return Some(unit());
+                }
+            }
+        },
+        None     : {},
+    }
+    match (taken_objectless(g, x, &args[1], elem))
+    {
+        Some(tx) :
+        {
+            if (Option::is_some(&confined_local(x, &args[0])))
+            {
+                return None;
+            }
+            // cobc asks whether the push can be requested (it always can
+            // here): the request is made, as cobc's is.
+            Vec<Type> ta0 = Vec::new();
+            Vec::push(&mut ta0, clone(elem));
+            request_fn(g, name, ta0);
+            V vv0 = lower_expr(g, x, &args[0], None);
+            if (is_never(&vv0.ty))
+            {
+                return Some(never());
+            }
+            V vv = into_temp(g, x, vv0, line);
+            objectless_use(g, x, &tx.c, line);
+            String sc = ctype(g, elem);
+            String kt = fresh(g, "k");
+            emit(x, String::as_view(&sprintf("%s %s = %s;", &sc, &kt, &tx.c)));
+            String init = empty_value_init(g, elem);
+            emit(x, String::as_view(&String::replace(&init, StringView::of("@"), String::as_view(&tx.c))));
+            Vec<Type> ta = Vec::new();
+            Vec::push(&mut ta, clone(elem));
+            String pushn = request_fn(g, name, ta);
+            emit(x, String::as_view(&sprintf("%s_raw(%s, %s);", &pushn, &vv.c, &kt)));
+            return Some(unit());
+        },
+        None     : {},
+    }
+    if (!is_string_ty(elem))
+    {
+        return None;
+    }
+    ref<CallExpr, shared> call = match (&strip_parens(&args[1]).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<Vec<String>, shared> segs = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : &Box::get(p).segs,
+        _                  : return None,
+    };
+    String prod = String::join(&segs[0..$], "::");
+    if (!(String::eq_str(
+        &prod,
+        "std::String::from_str",
+    ) || String::eq_str(&prod, "std::String::clone") || String::eq_str(
+        &prod,
+        "std::String::from_view",
+    )) || Vec::len(&call.args) != 1)
+    {
+        return None;
+    }
+    if (!prelude_fn(g, &prod))
+    {
+        return None;
+    }
+    // A confined vector has its own path (`lower_confined_call`).
+    if (Option::is_some(&confined_local(x, &args[0])))
+    {
+        return None;
+    }
+    V vv = match (passed_local(x, &args[0]))
+    {
+        Some(b) : pass_local(g, x, b, args[0].line),
+        None    :
+        {
+            V vv0 = lower_expr(g, x, &args[0], None);
+            if (is_never(&vv0.ty))
+            {
+                return Some(never());
+            }
+            into_temp(g, x, vv0, line)
+        },
+    };
+    Type st = Type::TStr;
+    V a0 = if (String::eq_str(
+        &prod,
+        "std::String::from_str",
+    )) { lower_expr(g, x, &call.args[0], Some(&st)) } else { lower_expr(g, x, &call.args[0], None) };
+    if (is_never(&a0.ty))
+    {
+        return Some(never());
+    }
+    V a = into_temp(g, x, a0, line);
+    String pname = request_fn(g, String::as_view(&prod), Vec::new());
+    String sc = ctype(g, elem);
+    String kt = fresh(g, "k");
+    emit(x, String::as_view(&sprintf("%s %s = %s_raw(%s);", &sc, &kt, &pname, &a.c)));
+    Vec<Type> ta = Vec::new();
+    Vec::push(&mut ta, clone(elem));
+    String pushn = request_fn(g, name, ta);
+    emit(x, String::as_view(&sprintf("%s_raw(%s, %s);", &pushn, &vv.c, &kt)));
+    Some(unit())
+}
+
+// `HashMap::entry(m, k, x)` / `insert(m, k, x)`, natively for a `String` key
+// and a plain value (`native_map_op`), where `k` is `String::from_str(s)` or
+// `String::clone(r)` (`sprintf` is the former) and `x` a literal or a local:
+// the new `String` goes from the copy to the map body with no object. Its
+// object would be established, sent, received, moved, sent and received
+// again, then destroyed or moved into the keys' cells (where an object ends
+// at once, being reference-free) -- with nothing in between that could see
+// it (`x` forms no path; a fault ends the program). So the `_raw` copy and
+// the `_rawk` body pass it as a value.
+export fn lower_map_fresh_key(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Expr>, shared> args,
+    usize line,
+) : Option<V>
+{
+    bool is_entry = StringView::eq_str(name, "std::HashMap::entry");
+    if (!(is_entry || StringView::eq_str(name, "std::HashMap::insert")) || !in_prelude(name, f) || Vec::len(args) != 3)
+    {
+        return None;
+    }
+    Type t0 = probe_type(g, x, &args[0], None);
+    Type mt = match (&t0)
+    {
+        Type::TRef(m) :
+        {
+            if (Box::get(m).mode != Mode::Exclusive)
+            {
+                return None;
+            }
+            clone(&Box::get(m).inner)
+        },
+        _             : return None,
+    };
+    ref<NamedTy, shared> hn = match (&mt)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return None,
+    };
+    if (Vec::len(&hn.args) != 2)
+    {
+        return None;
+    }
+    ref<Type, shared> k = &hn.args[0];
+    ref<Type, shared> v = &hn.args[1];
+    if (!String::eq_str(&hn.name, "std::HashMap") || !is_string_ty(k))
+    {
+        return None;
+    }
+    if (size_align(g, v).size == 0 || !plain_data(g, v) || has_refs(g, v) || holds_fn(g, v))
+    {
+        return None;
+    }
+    ref<CallExpr, shared> call = match (&strip_parens(&args[1]).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<Vec<String>, shared> segs = match (&call.callee.kind)
+    {
+        ExprKind::EPath(p) : &Box::get(p).segs,
+        _                  : return None,
+    };
+    String prod = String::join(&segs[0..$], "::");
+    if (!(String::eq_str(
+        &prod,
+        "std::String::from_str",
+    ) || String::eq_str(&prod, "std::String::clone") || String::eq_str(
+        &prod,
+        "std::String::from_view",
+    )) || Vec::len(&call.args) != 1)
+    {
+        return None;
+    }
+    if (!prelude_fn(g, &prod))
+    {
+        return None;
+    }
+    bool lit = match (&strip_parens(&args[2]).kind)
+    {
+        ExprKind::EInt(_)   : true,
+        ExprKind::EFloat(_) : true,
+        ExprKind::EBool(_)  : true,
+        _                   : false,
+    };
+    bool inert = lit || match (path_name_raw(&args[2]))
+    {
+        Some(n) : !String::starts_with(&n, StringView::of("__")),
+        None    : false,
+    };
+    if (!inert)
+    {
+        return None;
+    }
+    V mv = match (passed_local(x, &args[0]))
+    {
+        // As `native_map_passthrough` does for an ordinary call.
+        Some(b) : pass_local(g, x, b, args[0].line),
+        None    :
+        {
+            V mv0 = lower_expr(g, x, &args[0], None);
+            if (is_never(&mv0.ty))
+            {
+                return Some(never());
+            }
+            into_temp(g, x, mv0, line)
+        },
+    };
+    // D-0200: a bare view (`direct_refs`: a fused loop's piece, or one trimmed
+    // from it) is its bytes alone; no check reads them, so it is handed over
+    // as it is, with no object of its own.
+    Option<Binding> bare = None;
+    if (String::eq_str(&prod, "std::String::from_view"))
+    {
+        match (path_name_raw(&call.args[0]))
+        {
+            Some(n) :
+            {
+                match (lookup(x, String::as_view(&n)))
+                {
+                    Some(b) :
+                    {
+                        if (HashSet::contains(&x.direct_refs, &sprintf("%s.bytes", &b.c)))
+                        {
+                            bare = Some(b);
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            None    : {},
+        }
+    }
+    V a = match (bare)
+    {
+        Some(b) :
+        {
+            Binding { c, ty, root, kind } = b;
+            V { .c = c, .ty = ty, .obj = None }
+        },
+        None    :
+        {
+            Type st = Type::TStr;
+            V a0 = if (String::eq_str(
+                &prod,
+                "std::String::from_str",
+            )) { lower_expr(g, x, &call.args[0], Some(&st)) } else { lower_expr(g, x, &call.args[0], None) };
+            if (is_never(&a0.ty))
+            {
+                return Some(never());
+            }
+            into_temp(g, x, a0, line)
+        },
+    };
+    String pname = request_fn(g, String::as_view(&prod), Vec::new());
+    String sc = ctype(g, k);
+    String kt = fresh(g, "k");
+    emit(x, String::as_view(&sprintf("%s %s = %s_raw(%s);", &sc, &kt, &pname, &a.c)));
+    V xv0 = lower_expr(g, x, &args[2], Some(v));
+    V xv = into_temp(g, x, xv0, line);
+    Vec<Type> ta = Vec::new();
+    Vec::push(&mut ta, clone(k));
+    Vec::push(&mut ta, clone(v));
+    String ename = request_fn(g, name, ta);
+    Type ret = if (is_entry)
+    {
+        ref_ty(clone(v), Mode::Exclusive)
+    }
+    else
+    {
+        Vec<Type> oa = Vec::new();
+        Vec::push(&mut oa, clone(v));
+        Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Option"), .args = oa }))
+    };
+    if (opt_eq(&x.map_acc, &Some(args_key(args))) && is_entry)
+    {
+        x.map_acc = None;
+        String vc = ctype(g, v);
+        String pv = fresh(g, "pv");
+        emit(x, String::as_view(&sprintf("%s *%s = %s_rawk_acc(%s, %s, %s);", &vc, &pv, &ename, &mv.c, &kt, &xv.c)));
+        x.map_acc_used = true;
+        return Some(V { .c = pv, .ty = ret, .obj = None });
+    }
+    String c = sprintf("%s_rawk(%s, %s, %s)", &ename, &mv.c, &kt, &xv.c);
+    Some(finish_call(g, x, c, ret, line))
+}
+
+// `Box::new(v)` for a `T` with no reference and no `fn` value in it: `std`'s
+// body inline (`spec/21` §0: its bodies are normative for what they do, not
+// how). The cells `Box::cells<T>()` allocates, the alloc fault, the value
+// stored, and `Box { .ptr, .full = true }`. The body's `*bp = v` moves `v`
+// into raw memory, where a reference-free object ends at once
+// (`cb_raw_move_in`); here `v`'s object, if it has one, ends the same way,
+// and a value built in place never gets one. The `Box` gets its object as any
+// fresh resource value does.
+export fn lower_box_new(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    usize line,
+) : Option<V>
+{
+    if (!StringView::eq_str(name, "std::Box::new") || !in_prelude(name, f) || Vec::len(args) != 1)
+    {
+        return None;
+    }
+    bool objectless = replace(&mut x.objectless, false);
+    // `T` as the call would infer it: written, from the `Box<T>` expected (a
+    // literal argument takes it, D-0079), or the argument's.
+    Option<Type> from_expected = match (expected)
+    {
+        Some(et) :
+        {
+            match (et)
+            {
+                Type::TNamed(n) :
+                {
+                    if (String::eq_str(&Box::get(n).name, "std::Box") && Vec::len(&Box::get(n).args) == 1)
+                    {
+                        Some(clone(&Box::get(n).args[0]))
+                    }
+                    else
+                    {
+                        None
+                    }
+                },
+                _               : None,
+            }
+        },
+        None     : None,
+    };
+    Type t = if (Vec::len(targs) > 0)
+    {
+        apply(&targs[0], &x.subst)
+    }
+    else
+    {
+        match (from_expected)
+        {
+            Some(et) : et,
+            None     :
+            {
+                Type pt = Type::TVoid;
+                if (!probe_ok(g, x, &args[0], &mut pt))
+                {
+                    // cobc's error, handed on: in a probe, the probe fails.
+                    x.probe_failed = true;
+                    return Some(unit());
+                }
+                pt
+            },
+        }
+    };
+    bool shut = match (&t)
+    {
+        Type::TClosure(_) : true,
+        Type::TNever      : true,
+        _                 : false,
+    };
+    if (has_refs(g, &t) || holds_fn(g, &t) || shut)
+    {
+        return None;
+    }
+    x.objectless = inert_expr(g, x, &args[0]);
+    // D-0294: in a decided program a call's result goes into the box with
+    // no object, when its end frees memory alone (the allocation between it
+    // and the store can fault, `objectless_type`).
+    if (objectless_type(g, &t))
+    {
+        arm_inert(g, x, &args[0], true);
+    }
+    V v = lower_expr(g, x, &args[0], Some(&t));
+    x.objectless = false;
+    x.inert_result = None;
+    if (is_never(&v.ty))
+    {
+        return Some(never());
+    }
+    SizeAlign sa = size_align(g, &t);
+    String tc = ctype(g, &t);
+    Vec<Type> ba = Vec::new();
+    Vec::push(&mut ba, clone(&t));
+    Type bt = Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Box"), .args = ba }));
+    String bc = ctype(g, &bt);
+    at(g, x, line);
+    String p = fresh(g, "bx");
+    u64 cells = if (sa.size > 0) { sa.size } else { 1 };
+    emit(x, String::as_view(&sprintf("uint8_t *%s = cb_allocate(%vu, %vu);", &p, cells, sa.align)));
+    emit(x, String::as_view(&sprintf("if (!%s) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);", &p)));
+    if (sa.size > 0)
+    {
+        emit(x, String::as_view(&sprintf("*(%s *)%s = %s;", &tc, &p, &v.c)));
+    }
+    match (&v.obj)
+    {
+        Some(o) : emit(x, String::as_view(&sprintf("cb_raw_move_in(%s, %s);", o, &p))),
+        None    : {},
+    }
+    String b = fresh(g, "b");
+    emit(x, String::as_view(&sprintf("%s %s;", &bc, &b)));
+    emit(x, String::as_view(&sprintf("%s.ptr = (%s *)%s;", &b, &tc, &p)));
+    emit(x, String::as_view(&sprintf("%s.full = 1;", &b)));
+    // As a variant's payload (`inert_box_new`) it is absorbed next, with
+    // nothing evaluated between: no object.
+    if (objectless)
+    {
+        HashSet::insert(&mut x.inert_c, String::clone(&b));
+        return Some(V { .c = b, .ty = bt, .obj = None });
+    }
+    // Its object, established over it as a struct literal's is.
+    u32 tid = type_id(g, &bt);
+    String lc = loc(g, x.std_body, line);
+    String o = fresh(g, "o");
+    emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &b, tid, &lc)));
+    Some(V { .c = b, .ty = bt, .obj = Some(o) })
+}

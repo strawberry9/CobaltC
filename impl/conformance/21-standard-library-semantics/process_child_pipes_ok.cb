@@ -1,0 +1,79 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: spec/21 §2k [Child-Pipes]; conf.process-child-pipes
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 74616b656e2074776963653a207472756520747275650a6669727374206c696e6520323030300a6d6f76656420383839332062797465732c2032303030206c696e65732c207374617475736573203020300a616674657220746865204368696c643a2068656c6c6f202f20776f726c640a656e6420747275650a
+// platform: unix
+//
+// one child's output pumped into another's input by a thread of its own
+// while this thread reads the second child's output; each end taken once;
+// an output end read after its Child is gone (D-0195)
+
+import std;
+
+// Copies everything from one child's output into another child's input.
+fn pump(ChildOutput from, ChildInput to) : u64
+{
+    u64 total = 0;
+    Vec<u8> buf = Vec::new();
+    while (true)
+    {
+        Vec::clear(&mut buf);
+        usize n = Result::unwrap(ChildOutput::read(&mut from, &mut buf, 65536));
+        if (n == 0)
+        {
+            break;
+        }
+        Result::unwrap(ChildInput::write(&mut to, &buf[0..$]));
+        total += narrow<u64>(n);
+    }
+    total
+}
+
+fn main()
+{
+    Command a = Command::new(StringView::of("seq"));
+    Command::arg(&mut a, StringView::of("1"));
+    Command::arg(&mut a, StringView::of("2000"));
+    Command b = Command::new(StringView::of("sort"));
+    Command::arg(&mut b, StringView::of("-rn"));
+    Child ca = Result::unwrap(Command::spawn(&a));
+    Child cb = Result::unwrap(Command::spawn(&b));
+    ChildOutput out_a = Option::unwrap(Child::take_output(&mut ca));
+    ChildInput in_b = Option::unwrap(Child::take_input(&mut cb));
+    printf(
+        "taken twice: %v %v\n",
+        Option::is_none(&Child::take_output(&mut ca)),
+        Option::is_none(&Child::take_input(&mut cb)),
+    );
+    u64 moved = 0;
+    {
+        auto h = spawn(pump, out_a, in_b);
+        // Meanwhile this thread reads sort's output (sort writes only at the end of its input).
+        String first = Option::unwrap(Result::unwrap(Child::read_output_line(&mut cb)));
+        moved = join(h);
+        printf("first line %s\n", &first);
+    }
+    u64 lines = 1;
+    while (Some(l) = Result::unwrap(Child::read_output_line(&mut cb)))
+    {
+        lines += 1;
+    }
+    printf(
+        "moved %v bytes, %v lines, statuses %v %v\n",
+        moved,
+        lines,
+        Result::unwrap(Child::wait(&mut ca)),
+        Result::unwrap(Child::wait(&mut cb)),
+    );
+    Command c = Command::new(StringView::of("cat"));
+    Child cc = Result::unwrap(Command::spawn(&c));
+    ChildOutput oc = Option::unwrap(Child::take_output(&mut cc));
+    Result::unwrap(Child::write_input(&mut cc, StringView::as_bytes(StringView::of("hello\nworld\n"))));
+    Child::close_input(&mut cc);
+    drop(cc);
+    printf("after the Child: %s", &Option::unwrap(Result::unwrap(ChildOutput::read_line(&mut oc))));
+    printf(" / %s\n", &Option::unwrap(Result::unwrap(ChildOutput::read_line(&mut oc))));
+    printf("end %v\n", Option::is_none(&Result::unwrap(ChildOutput::read_line(&mut oc))));
+}

@@ -1,0 +1,55 @@
+// First answer
+//
+// Shows: "take whichever answers first, stop the rest", with no `select`:
+// one thread per resolver, all sending to one channel, and `cancel` for
+// the ones still working once an answer is in. A cancelled thread's wait
+// -- here a sleep standing in for a slow network -- ends at once with
+// `diag.thread-cancelled`, contained to that thread; `try_join` shows it
+// as a value. Nothing outlives the block that started it.
+
+import std;
+
+struct Resolver
+{
+    str name;
+    u64 delay_ms;
+    str address;
+}
+
+// Asks one (simulated) resolver, then sends what it said.
+fn ask(Resolver r, ref<Channel<String>, shared> answers) : u8
+{
+    sleep_ms(r.delay_ms);
+    _ = Channel::send(answers, sprintf("%s says %s", r.name, r.address));
+    0
+}
+
+fn main()
+{
+    Vec<Resolver> resolvers = Vec::new();
+    Vec::push(&mut resolvers, Resolver { .name = "slow", .delay_ms = 60000, .address = "192.0.2.1" });
+    Vec::push(&mut resolvers, Resolver { .name = "quick", .delay_ms = 10, .address = "192.0.2.2" });
+    Vec::push(&mut resolvers, Resolver { .name = "sluggish", .delay_ms = 50000, .address = "192.0.2.3" });
+    Channel<String> answers = Channel::new(4);
+    Vec<handle<u8>> hs = Vec::new();
+    while (Vec::len(&resolvers) > 0)
+    {
+        Vec::push(&mut hs, spawn(ask, Vec::remove(&mut resolvers, 0), &answers));
+    }
+    String first = Option::unwrap(Channel::recv(&answers));
+    printf("first: %s\n", &first);
+    foreach (h in &hs)
+    {
+        cancel(h);
+    }
+    u32 cancelled = 0;
+    while (Vec::len(&hs) > 0)
+    {
+        match (try_join(Vec::remove(&mut hs, 0)))
+        {
+            Ok(_)  : {},
+            Err(f) : if (ThreadFailure::is_cancelled(&f)) { cancelled += 1; },
+        }
+    }
+    printf("stopped %v still waiting\n", cancelled);
+}
