@@ -706,12 +706,24 @@ mod located_diag_tests {
 
     #[test]
     fn a_fault_in_a_tail_variant_payload_reports_the_tail_line() {
-        // `Some(out)` as the body's tail is built with its expected type,
-        // a path that bypasses `eval`'s own line tagging. `keep` gives `h`
-        // a resource, so it holds `out` to its block's end (D-0133).
-        let src = "import std;\nstruct H { ref<Vec<i32>, exclusive> r; Vec<i32> keep; }\nfn f() : Option<Vec<i32>>\n{\n    Vec<i32> out = Vec::new();\n    H h = H { .r = &mut out, .keep = Vec::new() };\n    Some(out)\n}\nfn main()\n{\n    auto o = f();\n}\n";
+        // `Some(a / z)` as the body's tail is built with its expected type,
+        // a path that bypasses `eval`'s own line tagging.
+        let src = "import std;\nfn f(i32 z) : Option<i32>\n{\n    i32 a = 10;\n    Some(a / z)\n}\nfn main()\n{\n    auto o = f(0);\n}\n";
         let outcome = run_source_phased_located(src);
         let OutcomeLocated::Dynamic(raw) = outcome else { panic!("expected a dynamic fault, got {:?}", outcome) };
+        let (id, line) = resolve_user_line(&raw);
+        assert_eq!(id, "diag.div-by-zero");
+        assert_eq!(line, Some(5), "line 5 is the tail `Some(a / z)`");
+    }
+
+    #[test]
+    fn a_move_in_a_tail_variant_payload_is_rejected_at_the_tail_line() {
+        // `keep` gives `h` a resource, so it holds `out` to its block's end
+        // (D-0133); the move out of `out` while `h` holds it is found before
+        // the run (D-0282, `rule.control.frame-references`).
+        let src = "import std;\nstruct H { ref<Vec<i32>, exclusive> r; Vec<i32> keep; }\nfn f() : Option<Vec<i32>>\n{\n    Vec<i32> out = Vec::new();\n    H h = H { .r = &mut out, .keep = Vec::new() };\n    Some(out)\n}\nfn main()\n{\n    auto o = f();\n}\n";
+        let outcome = run_source_phased_located(src);
+        let OutcomeLocated::Static(raw) = outcome else { panic!("expected a static rejection, got {:?}", outcome) };
         let (id, line) = resolve_user_line(&raw);
         assert_eq!(id, "diag.move-while-aliased");
         assert_eq!(line, Some(7), "line 7 is the tail `Some(out)`");

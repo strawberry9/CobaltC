@@ -8466,6 +8466,9 @@ crossing to C by value.
 - `cobc --run`/`cbc --run` remove their directory on every early return but the C compiler's failure.
 - `cbrt.h`: `cb_point_check`'s contract names `[Read]`/`[Write]` (`runtime_contract.py --check` had failed since
   D-0283); `spec/IMPLEMENTATION-NOTES.md` §6 regenerated. New case `conf.format-in-place` (3.285.0).
+- `coby` (`src/lib.rs`, `located_diag_tests`): the tail-payload test expected `diag.move-while-aliased` at run time,
+  which D-0282 finds before the run (it had failed since D-0282 unseen: the release suites do not
+  run `coby`'s unit tests); it is now a static case at the tail's line, beside a division by zero in a tail payload.
 - Measured: `hashcount` 210 M → 120 M instructions (Rust 216 M), `strings` 282 M → 236 M (Rust 243 M), `cbc` on
   `anagrams.cb` 5.21 G → 5.11 G. Verified: `compare_c.sh` (1,164; 755 with `--all-checks`; 92 per form),
   `fixpoint.sh`, the undecided sweep (8,825 decided, as before), the release suites.
