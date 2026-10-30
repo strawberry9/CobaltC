@@ -15,6 +15,7 @@ import natives;
 import native_vec;
 import gen;
 import bodies;
+import flights;
 
 // The `std::Vec` calls, besides `push`, `pop`, `reserve`, `len` and indexing,
 // that keep a vector confined (cobc's `CONFINING_CALLS`).
@@ -528,12 +529,18 @@ fn lower_slice_of_unminted(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Slic
             &lc,
         )),
     );
+    // D-0292: the container's place and type, for a light base.
+    u32 ptid = type_id(g, &pb.ty);
+    // D-0294: a slice of an objectless local in a decided program: the bounds
+    // above, and token 0 (no path exists to clash with).
+    bool objectless_src = g.decided && Option::is_none(&pb.base) && Option::is_none(&parent) && Option::is_none(&pb.raw)
+        && objectless_root(x, &sl.base);
     match (&parent)
     {
         Some(t0) : emit(
             x,
             String::as_view(&sprintf(
-                "cb_borrow_range_unminted(%s, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                "cb_borrow_range_unminted(%s, NULL, 0u, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
                 t0,
                 &at.c,
                 &bt.c,
@@ -543,19 +550,24 @@ fn lower_slice_of_unminted(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Slic
         ),
         None :
         {
-            String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
-            emit(
-                x,
-                String::as_view(&sprintf(
-                    "cb_borrow_range_unminted(%s, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
-                    &base,
-                    &projs_args(&pb.projs),
-                    &at.c,
-                    &bt.c,
-                    m,
-                    &lc,
-                )),
-            );
+            if (!objectless_src)
+            {
+                String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
+                emit(
+                    x,
+                    String::as_view(&sprintf(
+                        "cb_borrow_range_unminted(%s, (void *)&(%s), %vu, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                        &base,
+                        &pb.c,
+                        ptid,
+                        &projs_args(&pb.projs),
+                        &at.c,
+                        &bt.c,
+                        m,
+                        &lc,
+                    )),
+                );
+            }
         },
     }
     Type sty = Type::TSlice(Box::new(ModedTy { .inner = elem, .mode = sl.mode }));

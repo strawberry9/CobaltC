@@ -1,0 +1,237 @@
+// D-0283 (impl/cobc/src/lower/user_calls.rs, `emit_point_checks`): a call's
+// point checks, its arguments lowered: each access the callee's summary
+// declares through an argument a point check names is checked here, as if
+// made at the call, through the argument's path.
+
+import std;
+import ast;
+import items;
+import state;
+import layout;
+import typeops;
+import cnames;
+import passes;
+
+// The path of an argument the callee will hold: a reference's token, a
+// slice's or a `StringView`'s stored one.
+fn tok_of(ref<V, shared> v) : Option<String>
+{
+    match (&v.ty)
+    {
+        Type::TRef(_)   : Some(sprintf("(%s).tok", &v.c)),
+        Type::TSlice(_) : Some(sprintf("cb_load_ref(&(%s).src)", &v.c)),
+        Type::TNamed(n) :
+        {
+            if (String::eq_str(&Box::get(n).name, "std::StringView") && Vec::len(&Box::get(n).args) == 0)
+            {
+                Some(sprintf("cb_load_ref(&(%s).bytes.src)", &v.c))
+            }
+            else
+            {
+                None
+            }
+        },
+        _               : None,
+    }
+}
+
+export fn emit_point_checks(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Vec<PointCheck>, shared> pcs,
+    ref<Vec<V>, shared> argv,
+    usize line,
+)
+{
+    String lc = loc(g, x.std_body, line);
+    // A struct argument (D-0290: a frame-held aggregate): the paths of the
+    // references kept in its fields, each checked as a read, as the run does
+    // in `coby`.
+    Vec<Vec<String>> kept = Vec::new();
+    foreach (v in argv)
+    {
+        Vec<String> out = Vec::new();
+        bool lvalue = String::len(&v.c) > 0;
+        foreach (b in String::as_bytes(&v.c))
+        {
+            if (!(ascii_is_alnum(*b) || *b == b'_'))
+            {
+                lvalue = false;
+            }
+        }
+        if (lvalue)
+        {
+            kept_ref_tokens(g, &v.c, &v.ty, &mut out, 0);
+        }
+        Vec::push(&mut kept, out);
+    }
+    Vec<String> held = Vec::new();
+    foreach (v in argv)
+    {
+        match (tok_of(v))
+        {
+            Some(t) : Vec::push(&mut held, t),
+            None    : {},
+        }
+    }
+    foreach (ks in &kept)
+    {
+        foreach (k in ks)
+        {
+            Vec::push(&mut held, String::clone(k));
+        }
+    }
+    String held_c = if (Vec::len(&held) == 0) { String::from_str("NULL, 0") } else
+    {
+        sprintf("(uint64_t[]){ %s }, %v", &String::join(&held[0..$], ", "), Vec::len(&held))
+    };
+    foreach (pc in pcs)
+    {
+        if (pc.arg >= Vec::len(argv))
+        {
+            continue;
+        }
+        ref<V, shared> v = &argv[pc.arg];
+        String msg = point_check_message(pc);
+        String tok = match (tok_of(v))
+        {
+            Some(t) : t,
+            None    :
+            {
+                foreach (kt in &kept[pc.arg])
+                {
+                    emit(
+                        x,
+                        String::as_view(&sprintf(
+                            "cb_point_check(%s, %s, NULL, 0, 0u, (const uint8_t *)\"%s\", %vu, %s);",
+                            &held_c,
+                            kt,
+                            &c_escape(String::as_view(&msg)),
+                            String::len(&msg),
+                            &lc,
+                        )),
+                    );
+                }
+                continue;
+            },
+        };
+        Vec<String> projs = Vec::new();
+        match (&v.ty)
+        {
+            Type::TRef(m) :
+            {
+                Type t = clone(&Box::get(m).inner);
+                foreach (fname in &pc.fields)
+                {
+                    String n = match (&t)
+                    {
+                        Type::TNamed(nt) : String::clone(&Box::get(nt).name),
+                        _                : break,
+                    };
+                    StructDecl sd = match (HashMap::get(&g.prog.table.structs, &n))
+                    {
+                        Some(d) : clone(d),
+                        None    : break,
+                    };
+                    if (Vec::len(&sd.type_params) > 0)
+                    {
+                        break;
+                    }
+                    Option<usize> at = None;
+                    for (usize i = 0; i < Vec::len(&sd.fields); i += 1)
+                    {
+                        if (Option::is_none(&at) && String::eq(&sd.fields[i].name, fname))
+                        {
+                            at = Some(i);
+                        }
+                    }
+                    usize i = match (at)
+                    {
+                        Some(i) : i,
+                        None    : break,
+                    };
+                    Vec::push(&mut projs, sprintf("{ CB_FIELD, %vu }", i));
+                    t = clone(&sd.fields[i].ty);
+                }
+            },
+            _             : {},
+        }
+        String ps = if (Vec::len(&projs) == 0) { String::from_str("NULL, 0") } else
+        {
+            sprintf("(cb_proj[]){ %s }, %v", &String::join(&projs[0..$], ", "), Vec::len(&projs))
+        };
+        bool ref_or_slice = match (&v.ty)
+        {
+            Type::TRef(_)   : true,
+            Type::TSlice(_) : true,
+            _               : false,
+        };
+        u8 excl = if (pc.mode == Mode::Exclusive && ref_or_slice) { 1 } else { 0 };
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "cb_point_check(%s, %s, %s, %vu, (const uint8_t *)\"%s\", %vu, %s);",
+                &held_c,
+                &tok,
+                &ps,
+                excl,
+                &c_escape(String::as_view(&msg)),
+                String::len(&msg),
+                &lc,
+            )),
+        );
+    }
+}
+
+// The paths of the references a struct value `c` of type `t` keeps in its
+// fields, nested structs' included.
+fn kept_ref_tokens(
+    ref<Gen, exclusive> g,
+    ref<String, shared> c,
+    ref<Type, shared> t,
+    ref<Vec<String>, exclusive> out,
+    usize depth,
+)
+{
+    if (depth > 8)
+    {
+        return;
+    }
+    ref<NamedTy, shared> nt = match (t)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return,
+    };
+    if (String::starts_with(&nt.name, StringView::of("std::")))
+    {
+        return;
+    }
+    StructDecl sd = match (struct_decl(g, &nt.name))
+    {
+        Some(d) : d,
+        None    : return,
+    };
+    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+    foreach (fd in &sd.fields)
+    {
+        String fc = sprintf("%s.%s", c, &san(String::as_view(&fd.name)));
+        Type ft = apply(&fd.ty, &sub);
+        match (&ft)
+        {
+            Type::TRef(_)   : Vec::push(out, sprintf("cb_load_ref(&%s)", &fc)),
+            Type::TSlice(_) : Vec::push(out, sprintf("cb_load_ref(&(%s).src)", &fc)),
+            Type::TNamed(m) :
+            {
+                if (String::eq_str(&Box::get(m).name, "std::StringView") && Vec::len(&Box::get(m).args) == 0)
+                {
+                    Vec::push(out, sprintf("cb_load_ref(&(%s).bytes.src)", &fc));
+                }
+                else
+                {
+                    kept_ref_tokens(g, &fc, &ft, out, depth + 1);
+                }
+            },
+            _               : {},
+        }
+    }
+}

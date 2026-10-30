@@ -77,6 +77,15 @@ discharges at run time, except those the compiler proves cannot fail.
 It checks every arithmetic operation for overflow (spec/06), so Rust
 with overflow checks is the like-for-like comparison.
 
+Every workload here is a *decided* program (D-0284; `cobc -v` says
+"lowered pathless and decided"): the static pass settles every
+conflict between references before the run, so the executable keeps no
+record of references and checks none at run time. What a `cobc` build
+still does that Rust's does not is the checks the rules leave to the run
+whatever the references (bounds, overflow, a `Box`'s or element's
+object where the runtime may have placed one), and the costs of its own
+code generation.
+
 - **`collatz`** is plain arithmetic on locals, and `cobc`'s code
   executes about as many instructions as Rust's. What separates the
   builds is one branch, `if (x % 2 == 0)`, whose outcome is close to
@@ -146,7 +155,9 @@ with overflow checks is the like-for-like comparison.
   so it is compiled a second time, for confined arguments, with no
   checks through that parameter.
   Its `fill` still pushes, element by element, through the reference:
-  that is the shape it measures.
+  that is the shape it measures. Choosing the confined body at each
+  call costs a test (2% more instructions since Updates 137–145, in
+  the same time).
 - **`records`** updates structs in a `Vec` through `step(&mut ps[i])`, and
   reads them in `energy`'s `foreach`. The `Vec` is confined: each element
   is handed to a function that only reads and writes its fields and
@@ -162,21 +173,20 @@ with overflow checks is the like-for-like comparison.
   behind, so they get no run-time object. What remains is a check per
   level that nothing else holds a path into the node, made inline while
   the runtime tracks no object over heap memory, the teardown of the
-  tree at the end, and the allocator.
+  tree at the end, and the allocator. Each call also still chooses
+  between the function's two bodies (D-0188) with an atomic load.
+  `tree`'s count rose between
+  2026-10-08 and Update 135 (109 M to 136 M instructions), and the
+  decided lowering has brought it back to 125 M.
 - **`strings`** builds words with `sprintf` into a `Vec<String>`, counts
-  them in a `HashMap<String, u32>`, sorts them and sums their lengths. A
-  `foreach` over `&words` whose body hands each `String` only to functions
-  that read it and keep nothing (`String::len`, `String::clone`) reaches
-  the element directly, with no run-time path: the loop holds the `Vec`
-  shared throughout, so no read through it can fail. What remains is a
-  run-time check on `words` or `counts` per push, per map lookup and per
-  loop step (a `Vec<String>` that is also sorted is not one the compiler
-  can prove confined), and the formatting, sorting, allocations and
-  copies Rust makes too.
+  them in a `HashMap<String, u32>`, sorts them and sums their lengths. No
+  push, map lookup or loop step checks a reference at run time; what
+  remains beyond Rust's work is chiefly the formatting, which
+  `sprintf` does through the runtime's general formatter.
 - **`hashcount`** counts `sprintf`-built keys in a `HashMap<String, u32>`.
-  The map's operations are native code; each lookup still checks the
-  map at run time, and the rest is the formatting, hashing and
-  allocation Rust does as well.
+  The map's operations are native code and, the program being decided,
+  no lookup checks the map at run time: `cobc`'s code executes about as
+  many instructions as Rust's.
 
 `impl/COBC-PLAN.md` §10 gives the argument for each check the compiler
 leaves out, and `impl/STATUS.md` what each change measured at the time.

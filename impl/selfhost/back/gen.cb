@@ -33,6 +33,9 @@ import state;
 import typeops;
 import layout;
 import libheader;
+import flights;
+import program;
+import points;
 
 // ---- the program ----
 
@@ -42,6 +45,7 @@ import libheader;
 // each with a C-callable stub in the tail (`lib_tail`).
 export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
 {
+    g.lib = lib;
     String main_c = if (lib) { String::new() } else { request_fn(g, StringView::of("main"), Vec::new()) };
     bool main_u8 = match (HashMap::get(&g.prog.table.fns, &String::from_str("main")))
     {
@@ -56,7 +60,46 @@ export fn generate_parts(ref<Gen, exclusive> g, bool lib) : Generated
         usize start = String::len(&g.fns);
         bool pure = String::starts_with(&r.name, "std::") && all_std_only(&r.targs);
         lower_fn(g, &r);
+        if (Option::is_some(&g.unsupported))
+        {
+            return unsupported_parts(g);
+        }
         String text = String::from_view(String::view(&g.fns, start, String::len(&g.fns)));
+        // D-0286: a decided program's natives and helpers, whose fixed text
+        // puts values in flight, made to hand them over instead
+        // (`ground_native`); text it does not know keeps the program on the
+        // first lowering.
+        if (g.decided && (String::contains(&text, "cb_send(") || String::contains(&text, "cb_recv(")))
+        {
+            FnDecl f = Option::expect(get_fn(g, &r.name), "a lowered function");
+            HashMap<String, Type> subst = subst_of(&f.type_params, &r.targs);
+            Vec<ParamTid> tids = Vec::new();
+            foreach (p in &f.params)
+            {
+                Type pty = apply(&p.ty, &subst);
+                if (is_resource(g, &pty))
+                {
+                    Vec::push(
+                        &mut tids,
+                        ParamTid { .name = sprintf("p_%s", &san(String::as_view(&p.name))), .tid = type_id(g, &pty) },
+                    );
+                }
+            }
+            text = match (ground_native(&text, &tids))
+            {
+                Ok(t)  : t,
+                Err(e) :
+                {
+                    set_unsupported(g, sprintf("a value in flight in `%s`: %s", &r.name, &e));
+                    return unsupported_parts(g);
+                },
+            };
+            if (String::contains(&text, "cb_send(") || String::contains(&text, "cb_recv("))
+            {
+                set_unsupported(g, sprintf("a value in flight in `%s`", &r.name));
+                return unsupported_parts(g);
+            }
+        }
         pure = pure && !String::contains(&text, "struct cb_env_");
         Vec::push(&mut g.units, Unit { .text = text, .pure_std = pure });
     }
@@ -285,20 +328,64 @@ export fn emit_fn_body(
     }
     HashSet<String> confined_names = HashSet::new();
     Objectless objectless_names = empty_objectless();
+    HashMap<usize, HashSet<String>> objectless_fields = HashMap::new();
     HashSet<usize> elem_ref_ids = HashSet::new();
     HashSet<usize> quiet_ids = HashSet::new();
     if (!boot(g, 4))
     {
         confined_names = confined_vecs(g, &f.body, &pnames, &owned_vecs);
-        objectless_names = objectless_strings(g, &f.body, &pnames);
+        // D-0286: a decided program's by-value resource parameters are
+        // candidates too, each by its declaration (cobc: its address; cbc:
+        // its index with `PARAM_BIT`).
+        Vec<Cand> cands = Vec::new();
+        if (g.decided)
+        {
+            for (usize pi = 0; pi < Vec::len(&f.params); pi += 1)
+            {
+                if (is_resource(g, &apply(&f.params[pi].ty, subst)))
+                {
+                    Vec::push(&mut cands, Cand { .name = String::clone(&f.params[pi].name), .id = param_cand_id(pi) });
+                }
+            }
+        }
+        objectless_names = objectless_strings_with(g, &f.body, &pnames, &cands, &mut objectless_fields);
         elem_ref_ids = elem_ref_lets(g, &f.body, &pnames);
         quiet_ids = quiet_locals(g, &f.body, &pnames, &elem_ref_ids);
+    }
+    // D-0292: a body whose references the run records: a library's or an
+    // `--all-checks` program's every body, one the static pass left a
+    // conflict in (`Items::tracking_needed`), or one with a point check
+    // (D-0283). Every other body forms light references.
+    bool tracked = false;
+    {
+        Vec<Type> targs_now = Vec::new();
+        foreach (tp in &f.type_params)
+        {
+            match (HashMap::get(subst, tp))
+            {
+                Some(t) : Vec::push(&mut targs_now, clone(t)),
+                None    : {},
+            }
+        }
+        String bkey = body_key(name, &targs_now);
+        tracked = g.lib || all_checks(g) || HashMap::contains(
+            &g.prog.table.tracking_needed,
+            &bkey,
+        ) || HashSet::contains(
+            &g.prog.table.point_check_fns,
+            &bkey,
+        );
     }
     Fx x = Fx {
         // cobc's `loc` reports no location for a prelude line: every line of
         // a `std` function's body (`in_prelude` decides by its first
         // statement, which may be a destructuring `let`).
         .std_body = StringView::starts_with(name, StringView::of("std::")),
+        .pc_site = None,
+        .tracked = tracked,
+        .objectless_fields = HashMap::new(),
+        .inert_result = None,
+        .inert_now = None,
         .out = String::new(),
         .ind = 1,
         .cleanup = Vec::new(),
@@ -379,10 +466,11 @@ export fn emit_fn_body(
         .read_confined = HashSet::new(),
     };
     Vec::push(&mut x.scopes, HashMap::new());
-    push_frame(g, &mut x);
+    push_frame_fn(g, &mut x, tracked);
     x.root_frame = g.nscope;
     x.confined_names = confined_names;
     x.objectless_names = objectless_names;
+    x.objectless_fields = objectless_fields;
     x.elem_ref_ids = elem_ref_ids;
     x.quiet_ids = quiet_ids;
     if (!all_checks(g))
@@ -394,6 +482,12 @@ export fn emit_fn_body(
     x.entry_tested = replace(&mut g.pending_tested, false);
     bool bare = replace(&mut g.pending_bare, false);
     x.raw_ret = replace(&mut g.pending_raw_ret, false);
+    // D-0286: every resource result of a decided program leaves as a
+    // `__raw` form's does.
+    if (g.decided && !StringView::eq_str(name, "main") && is_resource(g, ret))
+    {
+        x.raw_ret = true;
+    }
     if (bare)
     {
         // The bare form: no dispatcher has tested its slices.
@@ -478,6 +572,28 @@ export fn emit_fn_body(
             };
             String vec_c = ctype(g, &inner);
             String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
+            // D-0292: its uses go through the parameter's own token:
+            // recorded on arrival in a recording frame.
+            if (x.tracked)
+            {
+                u32 itid = type_id(g, &inner);
+                bool excl = match (&pty)
+                {
+                    Type::TRef(m) : Box::get(m).mode == Mode::Exclusive,
+                    _             : false,
+                };
+                emit(
+                    &mut x,
+                    String::as_view(&sprintf(
+                        "%s.tok = cb_rec_ref(%s.tok, %s.p, %vu, %s, 1u, CB_NOLOC, 0);",
+                        &pc,
+                        &pc,
+                        &pc,
+                        itid,
+                        if (excl) { "CB_EXCLUSIVE" } else { "CB_SHARED" },
+                    )),
+                );
+            }
             HashMap::insert(
                 &mut x.confined_params,
                 String::clone(&p.name),
@@ -490,7 +606,7 @@ export fn emit_fn_body(
         }
         else
         {
-            bind_param(g, &mut x, p, subst);
+            bind_param(g, &mut x, p, subst, pj);
         }
     }
     V v = lower_block_body(g, &mut x, &f.body, Some(ret), None);
@@ -514,10 +630,7 @@ export fn emit_fn_body(
     }
     else
     {
-        elide_implied_checks(&drop_dead_locations(
-            &resolve_scopes(&fold_zero_tokens(&drop_quiet_checks(&x.out, &x.quiet_roots))),
-            g.line_directives,
-        ))
+        text_passes(g, &drop_quiet_checks(&x.out, &x.quiet_roots))
     };
     // D-0077: a call too deep for the stack faults here, at the call. A body
     // that calls nothing cannot go deeper: its caller's check covers it.
@@ -543,6 +656,26 @@ export fn emit_fn_body(
         &mut g.fns,
         &sprintf("%s\n{\n%s%s%s%s%s}\n\n", sig, &entry, check, &prologue, &body, &exit),
     );
+}
+
+// D-0286: a by-value parameter's candidate id (`objectless_strings_with`,
+// cobc: the `Param`'s address): its index with `PARAM_BIT`, apart from every
+// expression's id and every arm's (`ARM_BIT`).
+export const usize PARAM_BIT = 1 << 60;
+
+export fn param_cand_id(usize pi) : usize
+{
+    (pi + 1) | PARAM_BIT
+}
+
+// The text passes after `drop_quiet_checks` (cobc's `dumped_text_passes`):
+// D-0294: a decided program's records that nothing reads go first, then
+// the scopes resolve knowing the program is decided (D-0285).
+export fn text_passes(ref<Gen, shared> g, ref<String, shared> text) : String
+{
+    String z = fold_zero_tokens(text);
+    String z2 = if (g.decided) { elide_record_chains(&z) } else { z };
+    elide_implied_checks(&drop_dead_locations(&resolve_scopes_in(&z2, g.decided), g.line_directives))
 }
 
 // D-0269: the body is lowered. Its objectless locals' table (`cb_nt`, one
@@ -709,13 +842,77 @@ export fn objectless_binding(ref<Gen, exclusive> g, ref<Fx, exclusive> x, usize 
         },
         _               : false,
     };
+    // D-0286: a field read by value is plain data (no field is moved out).
+    // D-0294: a field written (`=f`) is plain data or of a quiet type, whose
+    // old value the write destroys (`lower_assign`).
+    bool fields_plain = match (HashMap::get(&x.objectless_fields, &id))
+    {
+        Some(fs) :
+        {
+            match (ty)
+            {
+                Type::TNamed(n) :
+                {
+                    match (struct_decl(g, &Box::get(n).name))
+                    {
+                        Some(sd) :
+                        {
+                            HashMap<String, Type> sub = subst_of(&sd.type_params, &Box::get(n).args);
+                            bool all = true;
+                            foreach (f in fs)
+                            {
+                                bool written = String::starts_with(f, "=");
+                                StringView fname = if (written)
+                                {
+                                    StringView::sub(
+                                        String::as_view(f),
+                                        1,
+                                        String::len(f),
+                                    )
+                                }
+                                else
+                                {
+                                    String::as_view(f)
+                                };
+                                bool found = false;
+                                foreach (fd in &sd.fields)
+                                {
+                                    if (StringView::eq(String::as_view(&fd.name), fname))
+                                    {
+                                        Type t = apply(&fd.ty, &sub);
+                                        if ((plain_data(
+                                            g,
+                                            &t,
+                                        ) && !has_refs(g, &t) && !holds_fn(g, &t)) || (written && quiet_ty(
+                                            &g.prog.table,
+                                            &t,
+                                        )))
+                                        {
+                                            found = true;
+                                        }
+                                    }
+                                }
+                                all = all && found;
+                            }
+                            all
+                        },
+                        None     : false,
+                    }
+                },
+                _               : false,
+            }
+        },
+        None     : true,
+    };
+    // D-0294: assigned whole (`id | 4`) only as a quiet type.
+    bool assigned_ok = !HashSet::contains(&x.objectless_names.assigned, &id) || quiet_ty(&g.prog.table, ty);
     HashSet::contains(
         &x.objectless_names.ids,
         &id,
-    ) && (!HashSet::contains(&x.objectless_names.indexed, &id) || plain_vec) && (is_string || (objectless_type(
-        g,
-        ty,
-    ) && !HashSet::contains(&x.objectless_names.compared, &id)))
+    ) && fields_plain && assigned_ok && (!HashSet::contains(
+        &x.objectless_names.indexed,
+        &id,
+    ) || plain_vec) && (is_string || (objectless_type(g, ty) && !HashSet::contains(&x.objectless_names.compared, &id)))
 }
 
 // A value in a named C local; a reference as a `cb_ref`; a value that needs
@@ -828,13 +1025,15 @@ export fn emit_return(ref<Gen, exclusive> g, ref<Fx, exclusive> x, V v)
         Type ret = clone(&x.ret);
         if (is_resource(g, &ret))
         {
+            // D-0286: so does every result in a decided program.
+            bool raw = x.raw_ret || g.decided;
             match (&t.obj)
             {
                 // D-0200: a `__raw` form's result leaves with no object: the
                 // caller binds it objectless.
                 Some(o) :
                 {
-                    if (x.raw_ret)
+                    if (raw)
                     {
                         emit(x, String::as_view(&sprintf("cb_forget_obj(%s);", o)));
                     }
@@ -843,7 +1042,7 @@ export fn emit_return(ref<Gen, exclusive> g, ref<Fx, exclusive> x, V v)
                         emit(x, String::as_view(&sprintf("cb_send(%s);", o)));
                     }
                 },
-                None    : assert(x.raw_ret, "cobc: a resource result without an object"),
+                None    : assert(raw, "cobc: a resource result without an object"),
             }
         }
         else if (match (&ret)
@@ -1175,18 +1374,54 @@ export fn lower_block_body(
                 x.stmt_match = is_match(te);
                 // D-0200: a `__raw` form's last `match` (`raw_tail`), or a
                 // local named alone (`raw_return_path`).
-                if (Option::is_none(&sink) && x.raw_ret)
+                // D-0286: in a decided program, a raw sink's block (a `__raw`
+                // form's last block, `unsafe { … }` say) ends the same way.
+                bool raw_sink = g.decided && match (&sink)
+                {
+                    Some(sk) : match (&sk.ov)
+                    {
+                        Some(o) : HashSet::contains(&x.raw_sinks, o),
+                        None    : false,
+                    },
+                    None : false,
+                };
+                if ((Option::is_none(&sink) && x.raw_ret) || raw_sink)
                 {
                     match (&strip_parens(te).kind)
                     {
-                        ExprKind::EMatch(m) : x.raw_tail = arms_key(&Box::get(m).arms),
-                        ExprKind::EPath(_)  : x.raw_return_path = true,
-                        _                   : {},
+                        ExprKind::EMatch(m)   : x.raw_tail = arms_key(&Box::get(m).arms),
+                        ExprKind::EBlock(ib)  :
+                        {
+                            if (g.decided)
+                            {
+                                x.raw_tail = Some(block_id(ib));
+                            }
+                        },
+                        ExprKind::EUnsafe(ib) :
+                        {
+                            if (g.decided)
+                            {
+                                x.raw_tail = Some(block_id(ib));
+                            }
+                        },
+                        ExprKind::EPath(_)    : x.raw_return_path = true,
+                        _                     : {},
+                    }
+                    // D-0286: a call's result returned with no object.
+                    arm_inert(g, x, te, true);
+                    // D-0294: in a decided program a literal, or a `Box` of a
+                    // value, that is the result leaves with no object: the
+                    // one made would be forgotten at once (`emit_return`).
+                    if (raw_sink || g.decided)
+                    {
+                        x.objectless = literal_expr(g, x, te) || (g.decided && box_new_expr(g, x, te));
                     }
                 }
                 V v = lower_expr(g, x, te, expected);
                 x.stmt_match = false;
                 x.raw_return_path = false;
+                x.inert_result = None;
+                x.objectless = false;
                 if (is_never(&v.ty))
                 {
                     end_diverged(x);
@@ -2925,11 +3160,14 @@ export fn lower_as_view_unminted(ref<Gen, exclusive> g, ref<Fx, exclusive> x, re
     String sc = sprintf("(*(%s *)%s.p)", &string_c, &r.c);
     String t = fresh(g, "t");
     emit(x, String::as_view(&sprintf("cb_borrow_unminted(%s.tok, NULL, 0, CB_SHARED, %s);", &r.c, &lc)));
+    u32 btid = bytes_tid(g);
     emit(
         x,
         String::as_view(&sprintf(
-            "cb_borrow_range_unminted(%s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
+            "cb_borrow_range_unminted(%s.tok, (void *)&((%s).bytes), %vu, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
             &r.c,
+            &sc,
+            btid,
             &sc,
             &lc,
         )),
@@ -3364,9 +3602,17 @@ export fn lower_substring(
         return Some(V { .c = t, .ty = st, .obj = None });
     }
     emit(x, String::as_view(&sprintf("%s %s = %s(%s, %s, %s);", &sc, &t, &helper, &sv.c, &lo.c, &hi.c)));
-    String o = fresh(g, "o");
-    emit(x, String::as_view(&sprintf("uint64_t %s = cb_recv(&%s);", &o, &t)));
+    String o = take_result(g, x, &t, &st, line);
     Some(V { .c = t, .ty = st, .obj = Some(o) })
+}
+
+// D-0292: the type id of a `String`'s bytes (`Vec<u8>`), the place a view's
+// range borrow names.
+export fn bytes_tid(ref<Gen, exclusive> g) : u32
+{
+    Vec<Type> a = Vec::new();
+    Vec::push(&mut a, Type::TInt(IntTy::U8));
+    type_id(g, &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = a })))
 }
 
 // `String::as_view(r)`: its body, `&(*r)[0..$]`, made here on the argument's
@@ -3404,12 +3650,15 @@ export fn lower_as_view(
     String t = fresh(g, "t");
     String o = fresh(g, "o");
     emit(x, String::as_view(&sprintf("uint64_t %s = cb_borrow(%s.tok, NULL, 0, CB_SHARED, %s);", &tok, &r.c, &lc)));
+    u32 btid = bytes_tid(g);
     emit(
         x,
         String::as_view(&sprintf(
-            "uint64_t %s = cb_borrow_range(%s, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
+            "uint64_t %s = cb_borrow_range(%s, (void *)&((%s).bytes), %vu, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
             &rt,
             &tok,
+            &sc,
+            btid,
             &sc,
             &lc,
         )),
@@ -3525,6 +3774,21 @@ export fn lower_box_get_unminted(
         String::as_view(&sprintf("cb_ref %s = (cb_ref){ %s, cb_elem_borrow(%s, %vu, %s) };", &r, &av, &av, tid, md)),
     );
     emit(x, StringView::of("cb_recv_ref();"));
+    if (x.tracked)
+    {
+        // D-0292: recorded on arrival in a recording frame.
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "%s.tok = cb_rec_ref(%s.tok, %s.p, %vu, %s, 0u, CB_NOLOC, 0);",
+                &r,
+                &r,
+                &r,
+                tid,
+                md,
+            )),
+        );
+    }
     Some(V { .c = r, .ty = ref_ty(elem, mode), .obj = None })
 }
 
@@ -4864,6 +5128,7 @@ export fn lower_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Stmt, shar
                         None    : lower_expr(g, x, e, None),
                     };
                     x.raw_call = None;
+                    x.inert_result = None;
                     // A closure-typed binding the body borrows or captures
                     // (`pinned_names`) is kept as a callable box: a reference
                     // to it is then a reference to a `fn` value, as the
@@ -4874,9 +5139,12 @@ export fn lower_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Stmt, shar
                         Type::TClosure(i) : *i,
                         _                 : 0,
                     };
+                    // So is one the body assigns whole: the closure assigned
+                    // is of another type (`f = move [b]() …` after `auto f =
+                    // move [a]() …`), boxed as well.
                     bool pin_box = Option::is_none(&declared)
                         && is_closure(&v0.ty)
-                        && HashSet::contains(&x.pinned, &l.name);
+                        && (HashSet::contains(&x.pinned, &l.name) || HashSet::contains(&x.assigned, &l.name));
                     V v = if (pin_box)
                     {
                         ClosureInfo info = clone(Option::expect(
@@ -5239,6 +5507,51 @@ export fn lower_array_repeat(
     register_temp(g, x, t, ty, line)
 }
 
+// D-0292: a reference type's referent type id and mode, as `cb_hold_ref`
+// and `cb_rec_ref` take them: `Tu, CB_SHARED`.
+export fn ref_tid_mode(ref<Gen, exclusive> g, ref<Type, shared> ty) : String
+{
+    match (ty)
+    {
+        Type::TRef(m) :
+        {
+            u32 itid = type_id(g, &Box::get(m).inner);
+            sprintf("%vu, %s", itid, mode_c(Box::get(m).mode))
+        },
+        _             :
+        {
+            assert(false, "cobc: a reference's place for a type that is no reference");
+            String::new()
+        },
+    }
+}
+
+// D-0292: `R.tok = cb_rec_ref(R.tok, R.p, Tu, mode, K, loc);`: the reference
+// `r` (a `cb_ref` lvalue) recorded on arrival in a recording frame, as a
+// parameter's (`k` 1) or a call's result (`k` 0).
+export fn emit_rec_ref(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> r,
+    ref<Type, shared> ty,
+    bool param,
+    ref<String, shared> lc,
+)
+{
+    emit(
+        x,
+        String::as_view(&sprintf(
+            "%s.tok = cb_rec_ref(%s.tok, %s.p, %s, %su, %s);",
+            r,
+            r,
+            r,
+            &ref_tid_mode(g, ty),
+            if (param) { "1" } else { "0" },
+            lc,
+        )),
+    );
+}
+
 export fn store(ref<Gen, exclusive> g, ref<Fx, exclusive> x, StringView dst, ref<Type, shared> ty, ref<V, shared> v)
 {
     if (is_void(ty) || is_never(ty))
@@ -5249,8 +5562,19 @@ export fn store(ref<Gen, exclusive> g, ref<Fx, exclusive> x, StringView dst, ref
     {
         Type::TRef(_) :
         {
+            // D-0292: the reference's place goes with it: a light one
+            // becomes a holder here.
             emit(x, String::as_view(&sprintf("%s = (%s).p;", dst, &v.c)));
-            emit(x, String::as_view(&sprintf("cb_store_ref(&%s, (%s).tok);", dst, &v.c)));
+            emit(
+                x,
+                String::as_view(&sprintf(
+                    "cb_hold_ref(&%s, (%s).tok, (%s).p, %s, CB_NOLOC, 0);",
+                    dst,
+                    &v.c,
+                    &v.c,
+                    &ref_tid_mode(g, ty),
+                )),
+            );
             return;
         },
         _             : {},
@@ -6529,7 +6853,7 @@ export fn read_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, P p, usize lin
                 }
             },
         }
-        if (x.raw_ret && replace(&mut x.raw_return_path, false))
+        if ((x.raw_ret || g.decided) && replace(&mut x.raw_return_path, false))
         {
             // A `__raw` form returns it as it is: no object at all.
             HashSet::insert(&mut x.inert_c, String::clone(&t));
@@ -7213,6 +7537,7 @@ export fn bind_param(
     ref<Fx, exclusive> x,
     ref<ParamDecl, shared> p,
     ref<HashMap<String, Type>, shared> subst,
+    usize param_index,
 )
 {
     Type ty = apply(&p.ty, subst);
@@ -7263,6 +7588,12 @@ export fn bind_param(
         // is never written, borrowed or captured.
         String ul = sprintf("l_%s", &pc);
         emit(x, String::as_view(&sprintf("void *%s = %s.p;", &ul, &pc)));
+        // D-0292: in a recording frame the parameter's reference is
+        // recorded on arrival, held by the frame for the call.
+        if (x.tracked)
+        {
+            emit_rec_ref(g, x, &pc, &ty, true, &String::from_str(NOLOC));
+        }
         HashMap::insert(&mut x.unstored, String::clone(&ul), sprintf("%s.tok", &pc));
         bind_in_scope(x, name, Binding { .c = ul, .ty = ty, .root = String::new(), .kind = BindKind::Local });
         return;
@@ -7282,10 +7613,44 @@ export fn bind_param(
     String cname = if (is_ref)
     {
         String l = sprintf("l_%s", &pc);
+        // D-0292: in a recording frame the reference is recorded on
+        // arrival, held by the frame: the binding's slot and every use of
+        // the parameter's own token (a `move` closure's captures are read
+        // through `self`'s) see the record.
+        if (x.tracked)
+        {
+            emit_rec_ref(g, x, &pc, &ty, true, &String::from_str(NOLOC));
+        }
         emit(x, String::as_view(&sprintf("void *%s = %s.p;", &l, &pc)));
         emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &l, tid, NOLOC)));
-        emit(x, String::as_view(&sprintf("cb_store_ref(&%s, %s.tok);", &l, &pc)));
+        emit(
+            x,
+            String::as_view(&sprintf(
+                "cb_hold_ref(&%s, %s.tok, %s.p, %s, CB_NOLOC, 0);",
+                &l,
+                &pc,
+                &pc,
+                &ref_tid_mode(g, &ty),
+            )),
+        );
         l
+    }
+    else if (is_resource(g, &ty) && g.decided)
+    {
+        // D-0286: it arrives with no object. Objectless where the analysis
+        // allows (a candidate by its declaration); otherwise it takes one
+        // here.
+        usize id = param_cand_id(param_index);
+        if (objectless_binding(g, x, id, &ty))
+        {
+            Option<usize> saved = replace(&mut x.cur_let, Some(id));
+            objectless_bound(g, x, &pc, tid, &ty);
+            x.cur_let = saved;
+            bind_in_scope(x, name, Binding { .c = pc, .ty = ty, .root = String::new(), .kind = BindKind::Local });
+            return;
+        }
+        emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &pc, tid, NOLOC)));
+        String::clone(&pc)
     }
     else if (is_resource(g, &ty))
     {
@@ -8027,6 +8392,11 @@ export fn set_raw_call(
     if (Vec::len(&path.targs) == 0 && Option::is_none(&lookup(x, String::as_view(&k))) && raw_ret_ok(g, &k) && fits)
     {
         x.raw_call = Some(request_fn(g, String::as_view(&k), Vec::new()));
+    }
+    else if (fits)
+    {
+        // D-0286: any call's, in a decided program.
+        arm_inert(g, x, e, true);
     }
 }
 
@@ -9312,8 +9682,7 @@ export fn lower_args(
         };
         if (is_resource(g, pty))
         {
-            String o = Option::expect(clone(&vals[i].obj), "resource argument has object");
-            emit(x, String::as_view(&sprintf("cb_send(%s);", &o)));
+            give_arg(g, x, &vals[i], "a closure's or `fn` value's argument");
         }
         else if (has_refs(g, pty) && !is_ref)
         {
@@ -9606,6 +9975,11 @@ export fn lower_closure_body(
         StrMark saved_strs = str_mark(g);
         Fx fx = Fx {
             .std_body = outer.std_body,
+            .pc_site = None,
+            .tracked = outer.tracked,
+            .objectless_fields = HashMap::new(),
+            .inert_result = None,
+            .inert_now = None,
             .out = String::new(),
             .ind = 1,
             .cleanup = Vec::new(),
@@ -9686,7 +10060,7 @@ export fn lower_closure_body(
             .read_confined = HashSet::new(),
         };
         Vec::push(&mut fx.scopes, HashMap::new());
-        push_frame(g, &mut fx);
+        push_frame_fn(g, &mut fx, fx.tracked);
         fx.root_frame = g.nscope;
         // A closure that captures nothing never reaches `self`: it is bound
         // as a bare address, and its own parameters may be direct as a
@@ -9760,10 +10134,10 @@ export fn lower_closure_body(
                 HashSet::insert(&mut g.pure_closures, id);
             }
         }
-        bind_param(g, &mut fx, &ParamDecl { .ty = clone(&self_ty), .name = String::from_str("self") }, &outer.subst);
-        foreach (pd in params)
+        bind_param(g, &mut fx, &ParamDecl { .ty = clone(&self_ty), .name = String::from_str("self") }, &outer.subst, 0);
+        for (usize pi = 0; pi < Vec::len(params); pi += 1)
         {
-            bind_param(g, &mut fx, pd, &outer.subst);
+            bind_param(g, &mut fx, &params[pi], &outer.subst, pi + 1);
         }
         for (usize i = 0; i < Vec::len(&info.fields); i += 1)
         {
@@ -9814,7 +10188,7 @@ export fn lower_closure_body(
         }
         else
         {
-            elide_implied_checks(&drop_dead_locations(&resolve_scopes(&fold_zero_tokens(&fx.out)), g.line_directives))
+            text_passes(g, &fx.out)
         };
         if (outer.probing == 0)
         {
@@ -10109,6 +10483,8 @@ export fn lower_call(
     {
         Some(f) :
         {
+            // D-0283: the call's site, for its point checks.
+            x.pc_site = Some(site_key(callee.line, callee.col));
             return lower_user_call(g, x, String::as_view(&name), &f, &path.targs, args, expected, line);
         },
         None    : {},
@@ -10279,6 +10655,8 @@ export fn lower_user_call_access(
     Option<bool> access
 ) : V
 {
+    // D-0283: the call's site, for its point checks (`emit_point_checks`).
+    Option<String> site = replace(&mut x.pc_site, None);
     bool prelude = in_prelude(name, f);
     if (prelude)
     {
@@ -10481,7 +10859,39 @@ export fn lower_user_call_access(
             String len = sprintf("(((%s *)(%s).p))->len", &vc, &argv[0].c);
             lower_index_arg(g, x, len, a)
         }
-        else if (known) { lower_expr(g, x, a, Some(&hint)) } else { lower_expr(g, x, a, None) };
+        else
+        {
+            // D-0286: a by-value resource argument of a decided program goes
+            // over with no object where it can: an inert literal built with
+            // none, a call's result taken with none (`arm_inert`), an
+            // objectless local moved with none (`read_place`).
+            bool p_by_ref = match (&p.ty)
+            {
+                Type::TRef(_)   : true,
+                Type::TSlice(_) : true,
+                Type::TFn(_)    : true,
+                _               : false,
+            };
+            bool by_value = g.decided && !p_by_ref && (!known || is_resource(g, &hint));
+            if (by_value)
+            {
+                x.objectless = inert_expr(g, x, a);
+                arm_inert(g, x, a, false);
+                x.raw_return_path = match (&strip_parens(a).kind)
+                {
+                    ExprKind::EPath(_) : true,
+                    _                  : false,
+                };
+            }
+            V bv = if (known) { lower_expr(g, x, a, Some(&hint)) } else { lower_expr(g, x, a, None) };
+            if (by_value)
+            {
+                x.objectless = false;
+                x.inert_result = None;
+                x.raw_return_path = false;
+            }
+            bv
+        };
         if (is_never(&v.ty))
         {
             return never();
@@ -10588,6 +10998,25 @@ export fn lower_user_call_access(
         }
     }
     at_after_arg_calls(g, x, prelude, args, line);
+    match (&site)
+    {
+        Some(sk) :
+        {
+            if (g.prog.table.any_point_checks)
+            {
+                match (HashMap::get(&g.prog.table.point_checks, sk))
+                {
+                    Some(pcs) :
+                    {
+                        Vec<PointCheck> pcs2 = clone(pcs);
+                        emit_point_checks(g, x, &pcs2, &argv, line);
+                    },
+                    None      : {},
+                }
+            }
+        },
+        None     : {},
+    }
     match (access)
     {
         Some(write) :
@@ -10635,8 +11064,7 @@ export fn lower_user_call_access(
         };
         if (is_resource(g, &pty))
         {
-            String o = Option::expect(clone(&argv[j].obj), "a resource argument without an object");
-            emit(x, String::as_view(&sprintf("cb_send(%s);", &o)));
+            give_arg(g, x, &argv[j], "a resource argument");
         }
         else if (is_slice && pure_direct(g, &String::from_view(name), j))
         {
@@ -10797,7 +11225,24 @@ export fn lower_user_call_access(
                 x.datum_tok_out = Some(tk);
                 V { .c = t, .ty = ret, .obj = None }
             }
-            else { finish_call(g, x, call, ret, line) }
+            else
+            {
+                // D-0286: the consumer took this call's result inert
+                // (`arm_inert`).
+                Option<bool> inert_last = match (&x.inert_result)
+                {
+                    Some(ir) : if (ir.key == args_key(args)) { Some(ir.last) } else { None },
+                    None     : None,
+                };
+                if (Option::is_some(&inert_last))
+                {
+                    x.inert_now = inert_last;
+                    x.inert_result = None;
+                }
+                V fv = finish_call(g, x, call, ret, line);
+                x.inert_now = None;
+                fv
+            }
         },
     };
     foreach (o in &weakened)
@@ -10992,6 +11437,12 @@ export fn finish_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, String call, 
             String r = fresh(g, "r");
             emit(x, String::as_view(&sprintf("cb_ref %s = %s;", &r, &call)));
             emit(x, StringView::of("cb_recv_ref();"));
+            // D-0292: recorded on arrival in a recording frame.
+            if (x.tracked)
+            {
+                String lc = loc(g, x.std_body, line);
+                emit_rec_ref(g, x, &r, &ret, false, &lc);
+            }
             return V { .c = r, .ty = ret, .obj = None };
         },
         _             : {},
@@ -11021,12 +11472,21 @@ export fn finish_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, String call, 
         None    : {},
     }
     emit(x, String::as_view(&sprintf("%s %s = %s;", &c, &t, &call)));
+    // D-0286: asked for inert (`arm_inert`): no object.
+    bool inert = match (replace(&mut x.inert_now, None))
+    {
+        Some(last) : last || objectless_type(g, &ret),
+        None       : false,
+    };
+    if (inert && is_resource(g, &ret) && !has_refs(g, &ret))
+    {
+        HashSet::insert(&mut x.inert_c, String::clone(&t));
+        return V { .c = t, .ty = ret, .obj = None };
+    }
     Option<String> obj = None;
     if (is_resource(g, &ret))
     {
-        String o = fresh(g, "o");
-        emit(x, String::as_view(&sprintf("uint64_t %s = cb_recv(&%s);", &o, &t)));
-        obj = Some(o);
+        obj = Some(take_result(g, x, &t, &ret, line));
     }
     else if (has_refs(g, &ret))
     {
@@ -11426,7 +11886,31 @@ export fn lower_branch(
             V v = match (raw)
             {
                 Some(rv) : rv,
-                None     : lower_expr(g, x, e, expected),
+                None     :
+                {
+                    if (g.decided && raw_sink)
+                    {
+                        // D-0286: in a decided program, the value of a raw sink
+                        // (the function's result) is made with no object: a
+                        // literal, a call's result, an objectless local moved.
+                        x.objectless = literal_expr(g, x, e);
+                        arm_inert(g, x, e, true);
+                        x.raw_return_path = match (&strip_parens(e).kind)
+                        {
+                            ExprKind::EPath(_) : true,
+                            _                  : false,
+                        };
+                        V dv = lower_expr(g, x, e, expected);
+                        x.objectless = false;
+                        x.inert_result = None;
+                        x.raw_return_path = false;
+                        dv
+                    }
+                    else
+                    {
+                        lower_expr(g, x, e, expected)
+                    }
+                },
             };
             if (is_never(&v.ty))
             {
@@ -11454,8 +11938,14 @@ export fn lower_branch(
             {
                 // An arm of a `match` that is a whole statement: its own
                 // scope, which `resolve_scopes` drops if it is unused.
+                // CHG-0391: a `match` that is the arm's whole value is the
+                // arm's last evaluation, as a block's tail `match` is its
+                // statement's: its own arms get their scopes, so their
+                // temporaries end before the frame of their bindings does.
                 push_stmt_at(g, x, Some(e.line));
+                x.stmt_match = is_match(e);
                 V v = lower_expr(g, x, e, expected);
+                x.stmt_match = false;
                 if (is_never(&v.ty))
                 {
                     end_diverged(x);
@@ -11594,7 +12084,9 @@ export fn lower_block(
         String r = fresh(g, "b");
         String c = reg_ctype(g, &value_ty);
         emit(x, String::as_view(&sprintf("%s %s;", &c, &r)));
-        Option<String> ov = sink_obj_var(g, x, &value_ty);
+        // D-0286: raw as a `match`'s is, when the block is a `__raw` form's
+        // last expression (`raw_tail`).
+        Option<String> ov = match_sink_obj_var(g, x, &value_ty, Some(block_id(b)));
         sink = Some(Sink { .dst = r, .ty = clone(&value_ty), .ov = ov });
     }
     emit(x, StringView::of("{"));
@@ -11613,7 +12105,22 @@ export fn lower_block(
     emit(x, StringView::of("}"));
     match (sink)
     {
-        Some(sk) : V { .c = String::clone(&sk.dst), .ty = value_ty, .obj = clone(&v.obj) },
+        Some(sk) :
+        {
+            // A raw sink's value has no object (`inert_c`).
+            match (&sk.ov)
+            {
+                Some(o) :
+                {
+                    if (HashSet::contains(&x.raw_sinks, o))
+                    {
+                        HashSet::insert(&mut x.inert_c, String::clone(&sk.dst));
+                    }
+                },
+                None    : {},
+            }
+            V { .c = String::clone(&sk.dst), .ty = value_ty, .obj = clone(&v.obj) }
+        },
         None     : v,
     }
 }
@@ -11922,7 +12429,81 @@ export fn lower_assign(
         },
         None       :
         {
-            if (res && Option::is_none(&p.raw) && direct_place(x, &tplace))
+            if (res && Option::is_none(&p.raw) && g.decided && objectless_root(x, place))
+            {
+                // D-0294: a write into an objectless local, whole or a field
+                // (`objectless_strings`, decided): the old value, live unless
+                // the whole binding was moved away (its flag), is destroyed by
+                // the write, a quiet type's in place (`cb_write_quiet`), any
+                // other's a fault as a direct parameter's below; the binding
+                // holds the new value after.
+                u32 tid = type_id(g, &p.ty);
+                String root_c = String::new();
+                {
+                    ref<Expr, shared> re = strip_parens(place);
+                    while (true)
+                    {
+                        match (&re.kind)
+                        {
+                            ExprKind::EField(fe) : re = strip_parens(&Box::get(fe).e),
+                            _                    : break,
+                        }
+                    }
+                    match (path_name(re))
+                    {
+                        Some(n) : match (lookup(x, String::as_view(&n)))
+                        {
+                            Some(b) : root_c = String::clone(&b.c),
+                            None    : {},
+                        },
+                        None : {},
+                    }
+                }
+                bool whole = Vec::len(&p.projs) == 0 && match (&strip_parens(place).kind)
+                {
+                    ExprKind::EPath(_) : true,
+                    _                  : false,
+                };
+                Option<String> flag = match (HashMap::get(&x.moved_flag, &root_c))
+                {
+                    Some(f) : Some(String::clone(f)),
+                    None    : None,
+                };
+                if (!whole)
+                {
+                    // A field of a moved-away binding is stale (`objectless_use`).
+                    objectless_use(g, x, &root_c, e.line);
+                }
+                String destroy = if (quiet_ty(&g.prog.table, &p.ty))
+                {
+                    sprintf("cb_write_quiet(0, NULL, 0, (void *)&(%s), %vu, %s);", &p.c, tid, &lc)
+                }
+                else
+                {
+                    String target = if (always_owns(&g.prog.table, &p.ty)) { String::from_str("1") } else
+                    {
+                        sprintf("cb_owns(&(%s), %vu)", &p.c, tid)
+                    };
+                    sprintf("if (%s) cb_fault(\"diag.overwrite-of-live-resource\", %s);", &target, &lc)
+                };
+                match (&flag)
+                {
+                    Some(fl) :
+                    {
+                        if (whole)
+                        {
+                            emit(x, String::as_view(&sprintf("if (!%s) { %s }", fl, &destroy)));
+                            emit(x, String::as_view(&sprintf("%s = 0;", fl)));
+                        }
+                        else
+                        {
+                            emit(x, String::as_view(&destroy));
+                        }
+                    },
+                    None     : emit(x, String::as_view(&destroy)),
+                }
+            }
+            else if (res && Option::is_none(&p.raw) && direct_place(x, &tplace))
             {
                 if (quiet_ty(&g.prog.table, &p.ty))
                 {
@@ -11967,7 +12548,29 @@ export fn lower_assign(
             }
         },
     }
+    // D-0089: a plain value holding `fn` values that is overwritten ends, as
+    // a discarded one does: its closures end with it, and so do the
+    // references they hold (`f = move [b]() …` after `f = move [a]() …` lets
+    // `a` go). The slot owns its closures: a read copies them, or empties
+    // the slot (`cb_fn_read`).
+    Option<String> old_fns = None;
+    if (!res && Option::is_none(&p.raw) && holds_fn(g, &p.ty))
+    {
+        String oc = ctype(g, &p.ty);
+        String ot = fresh(g, "old");
+        emit(x, String::as_view(&sprintf("%s %s = %s;", &oc, &ot, &p.c)));
+        old_fns = Some(ot);
+    }
     store(g, x, String::as_view(&p.c), &p.ty, &v);
+    match (&old_fns)
+    {
+        Some(ot) :
+        {
+            u32 tid = type_id(g, &p.ty);
+            emit(x, String::as_view(&sprintf("cb_drop_value(&%s, %vu);", ot, tid)));
+        },
+        None     : {},
+    }
     if (res && !HashSet::contains(&x.inert_c, &v.c))
     {
         String o = Option::expect(clone(&v.obj), "resource value has object");
@@ -12188,13 +12791,20 @@ export fn lower_return(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Option<B
         {
             // D-0200: a `__raw` form returning a local named alone
             // (`raw_return_path`).
-            x.raw_return_path = x.raw_ret && match (&strip_parens(Box::get(e)).kind)
+            x.raw_return_path = (x.raw_ret || g.decided) && match (&strip_parens(Box::get(e)).kind)
             {
                 ExprKind::EPath(_) : true,
                 _                  : false,
             };
+            // D-0286: a call's result returned with no object.
+            arm_inert(g, x, Box::get(e), true);
+            // D-0294: a literal returned in a decided program gets none
+            // either (as a block's tail, `lower_block_body`).
+            x.objectless = g.decided && (literal_expr(g, x, Box::get(e)) || box_new_expr(g, x, Box::get(e)));
             V rv = lower_expr(g, x, Box::get(e), Some(&ret));
+            x.objectless = false;
             x.raw_return_path = false;
+            x.inert_result = None;
             rv
         },
         None    : unit(),
@@ -12489,11 +13099,16 @@ export fn native_elem_access(
     // D-0222: element i taken exclusively through `v`.
     if (exclusive)
     {
+        Vec<Type> va2 = Vec::new();
+        Vec::push(&mut va2, clone(elem));
+        u32 vtid = type_id(g, &Type::TNamed(Box::new(NamedTy { .name = String::from_str("std::Vec"), .args = va2 })));
         emit(
             x,
             String::as_view(&sprintf(
-                "cb_borrow_range_unminted(%s.tok, NULL, 0, %s, %s + 1, CB_EXCLUSIVE, CB_NOLOC, 0);",
+                "cb_borrow_range_unminted(%s.tok, %s.p, %vu, NULL, 0, %s, %s + 1, CB_EXCLUSIVE, CB_NOLOC, 0);",
                 &r.c,
+                &r.c,
+                vtid,
                 &i.c,
                 &i.c,
             )),
@@ -12913,6 +13528,15 @@ export fn lower_borrow(
         String ad = fresh(g, "ad");
         emit(x, String::as_view(&sprintf("void *%s = (void *)&(%s);", &ad, &p.c)));
         return V { .c = sprintf("((cb_ref){ %s, 0 })", &ad), .ty = ref_ty(clone(&p.ty), mode), .obj = None };
+    }
+    // D-0286: a field of an objectless local (a decided program's,
+    // `objectless_strings_with`): its address, token 0.
+    if (Option::is_none(&p.base) && Option::is_none(&p.raw) && !is_never(&p.ty) && objectless_root(x, inner))
+    {
+        return V { .c = sprintf(
+            "((cb_ref){ (void *)&(%s), 0 })",
+            &p.c,
+        ), .ty = ref_ty(clone(&p.ty), mode), .obj = None };
     }
     String base = match (&p.base)
     {
@@ -13418,6 +14042,12 @@ export fn lower_slice_of_as(
             &lc,
         )),
     );
+    // D-0292: the container's place and type, for a light base.
+    u32 ptid = type_id(g, &pb.ty);
+    // D-0294: a slice of an objectless local in a decided program: the bounds
+    // above, and token 0 (no path exists to clash with).
+    bool objectless_src = g.decided && Option::is_none(&pb.base) && Option::is_none(&parent) && Option::is_none(&pb.raw)
+        && objectless_root(x, &sl.base);
     if (!minted)
     {
         match (&parent)
@@ -13425,7 +14055,7 @@ export fn lower_slice_of_as(
             Some(t0) : emit(
                 x,
                 String::as_view(&sprintf(
-                    "cb_borrow_range_unminted(%s, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                    "cb_borrow_range_unminted(%s, NULL, 0u, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
                     t0,
                     &at.c,
                     &bt.c,
@@ -13435,19 +14065,24 @@ export fn lower_slice_of_as(
             ),
             None :
             {
-                String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
-                emit(
-                    x,
-                    String::as_view(&sprintf(
-                        "cb_borrow_range_unminted(%s, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
-                        &base,
-                        &projs_args(&pb.projs),
-                        &at.c,
-                        &bt.c,
-                        m,
-                        &lc,
-                    )),
-                );
+                if (!objectless_src)
+                {
+                    String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
+                    emit(
+                        x,
+                        String::as_view(&sprintf(
+                            "cb_borrow_range_unminted(%s, (void *)&(%s), %vu, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                            &base,
+                            &pb.c,
+                            ptid,
+                            &projs_args(&pb.projs),
+                            &at.c,
+                            &bt.c,
+                            m,
+                            &lc,
+                        )),
+                    );
+                }
             },
         }
         Type sty = Type::TSlice(Box::new(ModedTy { .inner = elem, .mode = sl.mode }));
@@ -13467,7 +14102,7 @@ export fn lower_slice_of_as(
         Some(t0) : emit(
             x,
             String::as_view(&sprintf(
-                "uint64_t %s = cb_borrow_range(%s, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                "uint64_t %s = cb_borrow_range(%s, NULL, 0u, NULL, 0, (uint64_t)%s, (uint64_t)%s, %s, %s);",
                 &tok,
                 t0,
                 &at.c,
@@ -13478,20 +14113,29 @@ export fn lower_slice_of_as(
         ),
         None :
         {
-            String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
-            emit(
-                x,
-                String::as_view(&sprintf(
-                    "uint64_t %s = cb_borrow_range(%s, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
-                    &tok,
-                    &base,
-                    &projs_args(&pb.projs),
-                    &at.c,
-                    &bt.c,
-                    m,
-                    &lc,
-                )),
-            );
+            if (objectless_src)
+            {
+                emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &tok)));
+            }
+            else
+            {
+                String base = Option::expect(clone(&pb.base), "cobc: slice of an unchecked place");
+                emit(
+                    x,
+                    String::as_view(&sprintf(
+                        "uint64_t %s = cb_borrow_range(%s, (void *)&(%s), %vu, %s, (uint64_t)%s, (uint64_t)%s, %s, %s);",
+                        &tok,
+                        &base,
+                        &pb.c,
+                        ptid,
+                        &projs_args(&pb.projs),
+                        &at.c,
+                        &bt.c,
+                        m,
+                        &lc,
+                    )),
+                );
+            }
         },
     }
     Type sty = Type::TSlice(Box::new(ModedTy { .inner = elem, .mode = sl.mode }));
@@ -13550,18 +14194,29 @@ export fn lower_slice_string(
     P p0 = lower_place(g, x, &sl.base);
     x.temp_root = false;
     P p = auto_deref(g, x, p0);
-    String b = Option::expect(clone(&p.base), "cobc: a view of a String with no access path");
     String tok = fresh(g, "tok");
-    emit(
-        x,
-        String::as_view(&sprintf(
-            "uint64_t %s = cb_borrow(%s, %s, CB_SHARED, %s);",
-            &tok,
-            &b,
-            &projs_args(&p.projs),
-            &lc,
-        )),
-    );
+    match (&p.base)
+    {
+        Some(b) : emit(
+            x,
+            String::as_view(&sprintf(
+                "uint64_t %s = cb_borrow(%s, %s, CB_SHARED, %s);",
+                &tok,
+                b,
+                &projs_args(&p.projs),
+                &lc,
+            )),
+        ),
+        None :
+        {
+            // D-0294: an objectless local's text in a decided program: token 0.
+            assert(
+                g.decided && Option::is_none(&p.raw) && objectless_root(x, &sl.base),
+                "cobc: a view of a String with no access path",
+            );
+            emit(x, String::as_view(&sprintf("uint64_t %s = 0;", &tok)));
+        },
+    }
     bool lo0 = match (&sl.lo.kind)
     {
         ExprKind::EInt(l) : Box::get(l).v == 0,
@@ -13580,12 +14235,15 @@ export fn lower_slice_string(
         String rt = fresh(g, "tok");
         String t = fresh(g, "t");
         String o = fresh(g, "o");
+        u32 btid = bytes_tid(g);
         emit(
             x,
             String::as_view(&sprintf(
-                "uint64_t %s = cb_borrow_range(%s, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
+                "uint64_t %s = cb_borrow_range(%s, (void *)&((%s).bytes), %vu, (cb_proj[]){ { CB_FIELD, 0u } }, 1, 0u, (%s).bytes.len, CB_SHARED, %s);",
                 &rt,
                 &tok,
+                &p.c,
+                btid,
                 &p.c,
                 &lc,
             )),
@@ -13595,6 +14253,12 @@ export fn lower_slice_string(
         emit(x, String::as_view(&sprintf("cb_store_ref(&%s.bytes.src, %s);", &t, &rt)));
         emit(x, String::as_view(&sprintf("%s.bytes.data = (%s).bytes.ptr;", &t, &p.c)));
         emit(x, String::as_view(&sprintf("%s.bytes.len = (%s).bytes.len;", &t, &p.c)));
+        // D-0294: in a decided program a view holds nothing the runtime
+        // follows (`has_refs`): no object.
+        if (g.decided)
+        {
+            return V { .c = t, .ty = vty, .obj = None };
+        }
         emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, &t, tid, &lc)));
         return V { .c = t, .ty = vty, .obj = Some(o) };
     }
@@ -13643,13 +14307,7 @@ export fn call_std_values(
         }
         else if (is_resource(g, pt))
         {
-            emit(
-                x,
-                String::as_view(&sprintf(
-                    "cb_send(%s);",
-                    &Option::expect(clone(&args[j].obj), "resource argument has object"),
-                )),
-            );
+            give_arg(g, x, &args[j], "a std function's argument");
         }
         else if (has_refs(g, pt) && !is_ref)
         {
@@ -14944,6 +15602,17 @@ export fn spawn_probe_safe(ref<Gen, exclusive> g, ref<Expr, shared> e) : bool
 // this statement); the new thread runs a trampoline that makes an ordinary
 // call from the block, through the callee's thunk, and leaves the result at
 // the block's start.
+// D-0289: an exclusive reference or slice type.
+fn excl_ref_or_slice(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(m)   : Box::get(m).mode == Mode::Exclusive,
+        Type::TSlice(m) : Box::get(m).mode == Mode::Exclusive,
+        _               : false,
+    }
+}
+
 export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared> args, usize line) : V
 {
     // A generic function item spawned without type arguments is instantiated
@@ -15041,6 +15710,25 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
             Type::TVoid
         },
     };
+    // D-0289: whether the thread is lent an exclusive reference, as
+    // `cb_thread_start` finds from the paths it holds; a pathless program has
+    // none, so the trampoline says so itself (spec/18 `contained`). A thread
+    // that runs a `fn` value is never pathless (the static pass leaves it to
+    // the run).
+    bool lent_excl = match (&fv0.ty)
+    {
+        Type::TClosure(id) :
+        {
+            bool any = false;
+            Vec<Type> cfs = closure_fields(g, *id);
+            foreach (ct in &cfs)
+            {
+                any = any || excl_ref_or_slice(ct);
+            }
+            any
+        },
+        _                  : false,
+    };
     V fv = if (is_closure(&fv0.ty)) { box_closure(g, x, fv0, clone(&fty), line) } else { fv0 };
     FnTy ft = match (&fty)
     {
@@ -15051,6 +15739,10 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
             return unit();
         },
     };
+    foreach (pt in &ft.params)
+    {
+        lent_excl = lent_excl || excl_ref_or_slice(pt);
+    }
     Type ret = clone(&ft.ret);
     String h = fresh(g, "h");
     emit(x, String::as_view(&sprintf("void *%s = %s;", &h, &fv.c)));
@@ -15110,7 +15802,17 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
         if (is_ref_type(pty))
         {
             emit(x, String::as_view(&sprintf("%s->a%v = %s.p;", &e, i, &t.c)));
-            emit(x, String::as_view(&sprintf("cb_store_ref(&%s->a%v, %s.tok);", &e, i, &t.c)));
+            emit(
+                x,
+                String::as_view(&sprintf(
+                    "cb_hold_ref(&%s->a%v, %s.tok, %s.p, %s, CB_NOLOC, 0);",
+                    &e,
+                    i,
+                    &t.c,
+                    &t.c,
+                    &ref_tid_mode(g, pty),
+                )),
+            );
             String::appendf(&mut body, "    cb_ref r%v = { e->a%v, cb_load_ref(&e->a%v) };\n", i, i, i);
             Vec::push(&mut call_args, sprintf("r%v", i));
             continue;
@@ -15122,7 +15824,9 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
             emit(x, String::as_view(&sprintf("cb_move_to(%s, &%s->a%v);", &o, &e, i)));
             emit(x, String::as_view(&sprintf("cb_hold(%s);", &o)));
             emit(x, String::as_view(&sprintf("%s->o%v = %s;", &e, i, &o)));
-            String::appendf(&mut body, "    cb_send(e->o%v);\n", i);
+            // D-0286: in a decided program the thread takes the value alone,
+            // as a callee does (`give_arg`).
+            String::appendf(&mut body, "    %s(e->o%v);\n", if (g.decided) { "cb_forget_obj" } else { "cb_send" }, i);
         }
         else if (has_refs(g, pty))
         {
@@ -15152,14 +15856,25 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
         String::appendf(&mut body, "    cb_ref rr = %s;\n", &call);
         String::append(&mut body, "    cb_recv_ref();\n");
         String::append(&mut body, "    e->res = rr.p;\n");
-        String::append(&mut body, "    cb_store_ref(&e->res, rr.tok);\n");
+        String::appendf(
+            &mut body,
+            "    cb_hold_ref(&e->res, rr.tok, rr.p, %s, CB_NOLOC, 0);\n",
+            &ref_tid_mode(g, &ret),
+        );
         String::append(&mut body, "    cb_env_forget((uint8_t *)e + sizeof(void *), sizeof(*e) - sizeof(void *));\n");
     }
     else
     {
         String::appendf(&mut body, "    e->res = %s;\n", &call);
         String::append(&mut body, "    cb_env_forget(e, sizeof(*e));\n");
-        if (is_resource(g, &ret))
+        if (is_resource(g, &ret) && g.decided)
+        {
+            // D-0286: the result returns as its bytes (`take_result`).
+            String rlc = loc(g, x.std_body, line);
+            String::appendf(&mut body, "    uint64_t o = cb_new(&e->res, %vu, %s);\n", rtid, &rlc);
+            done = String::from_str("o");
+        }
+        else if (is_resource(g, &ret))
         {
             String::append(&mut body, "    uint64_t o = cb_recv(&e->res);\n");
             done = String::from_str("o");
@@ -15179,12 +15894,13 @@ export fn lower_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>
         String::appendf(&mut g.thunks_out, "struct %s { %s };\n", &env, &fields);
         String::appendf(
             &mut g.thunks_out,
-            "static __attribute__((noinline)) void %s_run(struct %s *e)\n{\n%s}\nvoid %s(void *p)\n{\n    struct %s *e = p;\n    jmp_buf jb;\n    if (setjmp(jb) == 0)\n    {\n    cb_thread_jmp((void *)jb);\n    cb_thread_start((void *)e, sizeof(*e), (void *)e->h);\n    %s_run(e);\n    }\n    else\n    {\n    cb_env_forget(e, sizeof(*e));\n    cb_drop_fn(e->h);\n    cb_thread_failed();\n    }\n}\n",
+            "static __attribute__((noinline)) void %s_run(struct %s *e)\n{\n%s}\nvoid %s(void *p)\n{\n    struct %s *e = p;\n    jmp_buf jb;\n    if (setjmp(jb) == 0)\n    {\n    cb_thread_jmp((void *)jb);\n    cb_thread_start((void *)e, sizeof(*e), (void *)e->h);\n%s    %s_run(e);\n    }\n    else\n    {\n    cb_env_forget(e, sizeof(*e));\n    cb_drop_fn(e->h);\n    cb_thread_failed();\n    }\n}\n",
             &tramp,
             &env,
             &body,
             &tramp,
             &env,
+            if (lent_excl) { "#ifdef CB_PATHLESS\n    cb_thread_lent();\n#endif\n" } else { "" },
             &tramp,
         );
     }
@@ -15259,6 +15975,10 @@ export fn lower_join(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>,
         emit(x, String::as_view(&sprintf("cb_ref %s = { %s, cb_load_ref(&%s) };", &rr, &t, &t)));
         emit(x, String::as_view(&sprintf("cb_send_ref(%s.tok);", &rr)));
         emit(x, "cb_recv_ref();");
+        if (x.tracked)
+        {
+            emit_rec_ref(g, x, &rr, &rty, false, &String::from_str(NOLOC));
+        }
         emit(x, String::as_view(&sprintf("cb_env_forget((uint8_t *)&%s, sizeof(%s));", &t, &t)));
         return V { .c = rr, .ty = rty, .obj = None };
     }
@@ -15309,7 +16029,9 @@ export fn lower_lock(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>,
     };
     V mt = into_temp(g, x, mv, line);
     String gt = fresh(g, "tok");
-    emit(x, String::as_view(&sprintf("uint64_t %s = cb_lock(%s.tok, %s.p, %s);", &gt, &mt.c, &mt.c, &lc)));
+    // D-0292: the mutex's type, for its place behind a light reference.
+    u32 mtid = type_id(g, &Type::TMutex(Box::new(clone(&inner))));
+    emit(x, String::as_view(&sprintf("uint64_t %s = cb_lock(%s.tok, %s.p, %vu, %s);", &gt, &mt.c, &mt.c, mtid, &lc)));
     // D-0204: an interior that may hold an exclusive reference lends its
     // locker another's data.
     if (may_hold_excl_ref(&g.prog.table, &inner))
@@ -15433,10 +16155,19 @@ export fn lower_map_err(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Exp
         String t = fresh(g, "t");
         String c = ctype(g, &e_ty);
         emit(x, String::as_view(&sprintf("%s %s = %s;", &c, &t, &ev1.c)));
-        u32 tid = type_id(g, &e_ty);
-        String oo = fresh(g, "o");
-        emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &oo, &t, tid, &lc)));
-        V { .c = t, .ty = clone(&e_ty), .obj = Some(oo) }
+        if (g.decided)
+        {
+            // D-0286: handed over as it is, with no object.
+            HashSet::insert(&mut x.inert_c, String::clone(&t));
+            V { .c = t, .ty = clone(&e_ty), .obj = None }
+        }
+        else
+        {
+            u32 tid = type_id(g, &e_ty);
+            String oo = fresh(g, "o");
+            emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &oo, &t, tid, &lc)));
+            V { .c = t, .ty = clone(&e_ty), .obj = Some(oo) }
+        }
     }
     else
     {
@@ -15449,8 +16180,7 @@ export fn lower_map_err(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Exp
     };
     if (e_res)
     {
-        String oo = Option::expect(clone(&ev.obj), "an object");
-        emit(x, String::as_view(&sprintf("cb_send(%s);", &oo)));
+        give_arg(g, x, &ev, "map_err's error");
     }
     else if (has_refs(g, &e_ty) && !e_ref)
     {
@@ -16582,9 +17312,20 @@ export fn construct_variant(
             bool known = resolved(&hint, &ed.type_params);
             // The payload is the last thing evaluated before the variant is:
             // an inert literal, or a `Box` of one, needs no object of its own.
-            x.objectless = inert_expr(g, x, pe) || inert_box_new(g, x, pe);
+            x.objectless = inert_expr(g, x, pe) || inert_box_new(g, x, pe) || (g.decided && literal_expr(g, x, pe));
+            // D-0286: a call's result, a literal, or an objectless local
+            // moved, goes in with no object (nothing is evaluated after it
+            // before the variant absorbs it).
+            arm_inert(g, x, pe, true);
+            x.raw_return_path = g.decided && match (&strip_parens(pe).kind)
+            {
+                ExprKind::EPath(_) : true,
+                _                  : false,
+            };
             V v = if (known) { lower_expr(g, x, pe, Some(&hint)) } else { lower_expr(g, x, pe, None) };
             x.objectless = false;
+            x.inert_result = None;
+            x.raw_return_path = false;
             if (is_never(&v.ty))
             {
                 return never();
@@ -16720,8 +17461,18 @@ export fn lower_struct_lit(
         // An inert field owns nothing: a fault in a later field leaves
         // nothing of it to destroy (`inert_expr`).
         x.objectless = inert_expr(g, x, &fi.value);
+        // D-0286: a call's result, or an objectless local moved, goes in
+        // with no object.
+        arm_inert(g, x, &fi.value, false);
+        x.raw_return_path = g.decided && known && objectless_type(g, &hint) && match (&strip_parens(&fi.value).kind)
+        {
+            ExprKind::EPath(_) : true,
+            _                  : false,
+        };
         V v = if (known) { lower_expr(g, x, &fi.value, Some(&hint)) } else { lower_expr(g, x, &fi.value, None) };
         x.objectless = false;
+        x.inert_result = None;
+        x.raw_return_path = false;
         if (is_never(&v.ty))
         {
             return never();
@@ -17218,6 +17969,9 @@ export fn lower_match(
     // D-0049: a place scrutinee of a resource enum (or text) type is matched
     // in place; an arm that moves its payload out of a whole binding takes it.
     Option<String> place_root = None;
+    // D-0294: the moved flag of an objectless binding matched in place ("" when
+    // it has none).
+    Option<String> scrut_flag = None;
     bool res_place = match (&strip_parens(scrut).kind)
     {
         ExprKind::EPath(p)  :
@@ -17280,8 +18034,10 @@ export fn lower_match(
                         emit(x, String::as_view(&sprintf("cb_read(%s, %s, %s);", &base, &pa, &flc)));
                         fused_base = base;
                     }
-                    else if (!(Option::is_none(&fp.raw) && direct_place(x, place)))
+                    else if (!(Option::is_none(&fp.raw) && (direct_place(x, place) || objectless_root(x, place))))
                     {
+                        // D-0286: or an objectless local's (or a field of one):
+                        // nothing to check either.
                         assert(false, "cobc: a fused match scrutinee was lowered without a base");
                     }
                     // A field of a direct parameter (`box_rec_uses`): no check
@@ -17329,7 +18085,10 @@ export fn lower_match(
             x.map_get_acc = call_key;
             x.map_get_acc_out = None;
         }
+        // D-0286: a decided program's call result matched with no object.
+        arm_inert(g, x, scrut, false);
         V cv = lower_expr(g, x, scrut, None);
+        x.inert_result = None;
         x.datum_tok = None;
         x.map_get_acc = None;
         datum_tok = replace(&mut x.datum_tok_out, None);
@@ -17350,14 +18109,36 @@ export fn lower_match(
                     place_root = Some(String::clone(base));
                 }
             },
-            None       : {},
+            None       :
+            {
+                if (p.is_binding && Vec::len(&p.projs) == 0 && Option::is_none(&p.raw) && HashSet::contains(
+                    &x.objectless_c,
+                    &p.c,
+                ))
+                {
+                    // D-0294: an objectless binding matched in place (decided):
+                    // stale if moved away; an arm that moves its payload out
+                    // sets its flag (`bind_match_arm`), as `cb_take` would mark
+                    // the binding's object.
+                    objectless_use(g, x, &p.c, line);
+                    scrut_flag = Some(match (HashMap::get(&x.moved_flag, &p.c))
+                    {
+                        Some(f) : String::clone(f),
+                        None    : String::new(),
+                    });
+                }
+            },
         }
         P { c, ty, base, projs, is_binding, raw } = p;
         V { .c = c, .ty = ty, .obj = None }
     }
     else
     {
-        lower_expr(g, x, scrut, None)
+        // D-0286: a decided program's call result matched with no object.
+        arm_inert(g, x, scrut, false);
+        V cv = lower_expr(g, x, scrut, None);
+        x.inert_result = None;
+        cv
     };
     if (is_never(&sv.ty))
     {
@@ -17573,19 +18354,37 @@ export fn lower_match(
             &by_ref_tok,
             &by_ref_prefix,
             &place_root,
+            &scrut_flag,
             &acc_ptr,
             line,
         );
-        if (scrut_res && moved_out)
+        if (scrut_res)
         {
-            // D-0049: consumed only by an arm that moved the payload out.
-            emit(
-                x,
-                String::as_view(&sprintf(
-                    "cb_end_moved_out(%s);",
-                    &Option::expect(clone(&s.obj), "resource scrutinee has object"),
-                )),
-            );
+            match (&s.obj)
+            {
+                // D-0049: consumed only by an arm that moved the payload out;
+                // otherwise the temporary ends with its statement.
+                Some(o) :
+                {
+                    if (moved_out)
+                    {
+                        emit(x, String::as_view(&sprintf("cb_end_moved_out(%s);", o)));
+                    }
+                },
+                // D-0286: an inert one (`arm_inert`), whose end frees memory
+                // alone: an arm that moves nothing out drops it where the arm
+                // ends.
+                None    :
+                {
+                    assert(HashSet::contains(&x.inert_c, &s.c), "cobc: a resource scrutinee without an object");
+                    if (!moved_out)
+                    {
+                        u32 stid = type_id(g, &s.ty);
+                        String d = objectless_drop(g, &s.c, stid, &s.ty);
+                        push_drop(x, d);
+                    }
+                },
+            }
         }
         x.branch_scope = arm_scopes && Option::is_none(&sink);
         Option<Type> ae = clone(&arm_expected);
@@ -17684,6 +18483,7 @@ export fn bind_match_arm(
     ref<String, shared> by_ref_tok,
     ref<Vec<String>, shared> by_ref_prefix,
     ref<Option<String>, shared> place_root,
+    ref<Option<String>, shared> scrut_flag,
     ref<Option<String>, shared> acc_ptr,
     usize line
 ) : bool
@@ -17778,9 +18578,15 @@ export fn bind_match_arm(
                 None : false,
             };
             assert(
-                box_use || String::len(&ref_tok) > 0,
+                box_use || String::len(&ref_tok) > 0 || g.decided,
                 "cobc: a binder through a direct place used other than by `Box::get`",
             );
+            // D-0286: in a decided program, through an objectless local:
+            // token 0 (every borrow is decided).
+            if (String::len(&ref_tok) == 0 && !box_use)
+            {
+                ref_tok = String::from_str("0");
+            }
             if (box_use)
             {
                 if (String::len(&ref_tok) > 0)
@@ -17873,11 +18679,34 @@ export fn bind_match_arm(
             Some(o) : emit(x, String::as_view(&sprintf("cb_end_moved_out(%s);", o))),
             None    : {},
         }
+        // D-0294: the payload left an objectless binding: moved away (its
+        // flag), so its drop runs nothing.
+        if (Option::is_none(place_root))
+        {
+            match (scrut_flag)
+            {
+                Some(fl) :
+                {
+                    assert(
+                        String::len(fl) > 0,
+                        "cobc: a payload moved out of an objectless binding that has no moved flag",
+                    );
+                    emit(x, String::as_view(&sprintf("%s = 1;", fl)));
+                },
+                None     : {},
+            }
+        }
         u32 tid = type_id(g, &pty);
         // D-0200: an objectless binder (`objectless_strings`): the payload's
         // bytes, no object.
+        // D-0286: in a decided program, by `objectless_binding`'s whole test
+        // (its fields read by value are plain data).
         usize arm_id = Box::get(&arm.body).id | ARM_BIT;
-        if (HashSet::contains(&x.objectless_names.ids, &arm_id) && objectless_type(g, &pty) && x.probing == 0)
+        if (HashSet::contains(
+            &x.objectless_names.ids,
+            &arm_id,
+        ) && objectless_type(g, &pty) && x.probing == 0 && (!g.decided
+            || objectless_binding(g, x, arm_id, &pty)))
         {
             Option<usize> saved = replace(&mut x.cur_let, Some(arm_id));
             objectless_bound(g, x, &cname, tid, &pty);
@@ -18043,10 +18872,22 @@ export fn lower_match_scalar(
                     {
                         // D-0127: a `String` binding matched against text
                         // literals, moved out whole into the binder.
-                        String root0 = Option::expect(
-                            clone(&place_root),
-                            "cobc: a `String` scrutinee moved out of a place that is not a binding",
-                        );
+                        String root0 = match (clone(&place_root))
+                        {
+                            Some(r) : r,
+                            None    :
+                            {
+                                // cobc's internal error: the lowering cannot
+                                // go on (a decided lowering falls back).
+                                set_unsupported(
+                                    g,
+                                    String::from_str(
+                                        "internal error in cobc: a `String` scrutinee moved out of a place that is not a binding",
+                                    ),
+                                );
+                                return never();
+                            },
+                        };
                         String lc = loc(g, x.std_body, line);
                         String o = fresh(g, "o");
                         emit(x, String::as_view(&sprintf("uint64_t %s = cb_take(%s, %s);", &o, &root0, &lc)));
@@ -19352,7 +20193,12 @@ export fn lower_intrinsic_more(
                 }
                 else
                 {
-                    emit(x, String::as_view(&sprintf("cb_destroy_via(%s, %s);", b, lc)));
+                    // D-0292: the referent's place, for a light reference.
+                    u32 dtid = type_id(g, &p.ty);
+                    emit(
+                        x,
+                        String::as_view(&sprintf("cb_destroy_via(%s, (void *)&(%s), %vu, %s);", b, &p.c, dtid, lc)),
+                    );
                 }
             },
             None    : assert(false, "cobc: drop of a place with no path"),
@@ -19754,6 +20600,14 @@ export struct Generated
     export String tail;
     // D-0257: the C header of a library's entry points (`--lib`).
     export String header_text;
+    // D-0281 step 4c: lowered pathless (`None`), or why not (`Some(why)`;
+    // cobc's `Result<(), String>`).
+    export Option<String> kept;
+    // D-0285: lowered knowing the program is decided (`Gen::decided`).
+    export bool decided;
+    // cobc's `Unsupported`: what the lowering could not write; then the
+    // other parts are empty.
+    export Option<String> unsupported;
 }
 
 // The program's C, the C file's name `c_name` (for the `#line` that returns
@@ -19761,6 +20615,86 @@ export struct Generated
 export fn generate(ref<Gen, exclusive> g, StringView c_name) : String
 {
     combined(&generate_parts(g, false), c_name)
+}
+
+// What the driver gets from `generate_program`: the parts, and the `-v`
+// notes the two-pass lowering makes (each as `note` prints it, without the
+// `cobc: ` prefix), or what the first lowering could not write
+// (`unsupported`: cobc's status 3).
+export struct Lowered
+{
+    export Generated gen;
+    export Vec<String> notes;
+    export Option<String> unsupported;
+}
+
+// cobc's `real_main` lowering (D-0284, D-0285): the program lowered once;
+// found decided (`pathless` with no blocker) and COBALTC_DECIDED not "0",
+// lowered again knowing it (`Gen::decided`); on `Unsupported` or kept paths
+// the first lowering is used, with a note. COBALTC_PATHLESS=0 keeps the
+// paths. `level` is `Gen::bootstrap`, `all_checks` whether the driver asked
+// for every check.
+export fn generate_program(Checked prog, bool lib, u8 level, bool all_checks, bool line_directives) : Lowered
+{
+    bool pathless_env = env_not_zero("COBALTC_PATHLESS");
+    Vec<String> notes = Vec::new();
+    Gen first = new_gen(prog);
+    first.bootstrap = level;
+    first.all_checks = first.all_checks || all_checks || level > 0;
+    first.line_directives = line_directives;
+    first.pathless = pathless_env;
+    first.decided = false;
+    Generated gen = generate_parts(&mut first, lib);
+    Option<String> first_unsupported = clone(&gen.unsupported);
+    if (Option::is_some(&first_unsupported))
+    {
+        return Lowered { .gen = gen, .notes = notes, .unsupported = first_unsupported };
+    }
+    if (Option::is_none(&gen.kept) && env_not_zero("COBALTC_DECIDED"))
+    {
+        Gen { prog, .. } = first;
+        Gen second = new_gen(prog);
+        second.bootstrap = level;
+        second.all_checks = second.all_checks || all_checks || level > 0;
+        second.line_directives = line_directives;
+        second.pathless = pathless_env;
+        second.decided = true;
+        Generated g2 = generate_parts(&mut second, lib);
+        match (&g2.unsupported)
+        {
+            Some(what) : Vec::push(
+                &mut notes,
+                sprintf("decided lowering: unsupported: %s; the first lowering is used", what),
+            ),
+            None :
+            {
+                match (&g2.kept)
+                {
+                    None : gen = g2,
+                    Some(why) : Vec::push(
+                        &mut notes,
+                        sprintf("decided lowering kept paths (%s); the first lowering is used", why),
+                    ),
+                }
+            },
+        }
+    }
+    match (&gen.kept)
+    {
+        None      :
+        {
+            if (gen.decided)
+            {
+                Vec::push(&mut notes, String::from_str("lowered pathless and decided (D-0284, D-0285)"));
+            }
+            else
+            {
+                Vec::push(&mut notes, String::from_str("lowered pathless (D-0284)"));
+            }
+        },
+        Some(why) : Vec::push(&mut notes, sprintf("kept paths: %s; lowered with holders (D-0292)", why)),
+    }
+    Lowered { .gen = gen, .notes = notes, .unsupported = None }
 }
 
 // `Generated::header`: the runtime's C interface every C file begins with.
@@ -19778,7 +20712,8 @@ export fn combined(ref<Generated, shared> gen, StringView c_name) : String
 
 fn combined_text(ref<Generated, shared> gen) : String
 {
-    String out = String::from_str(HEADER);
+    String out = prefix(gen);
+    String::append(&mut out, HEADER);
     String::append(&mut out, "\n/* ---- types ---- */\n");
     String::append(&mut out, &gen.fwd);
     String::append(&mut out, &gen.types);
@@ -19991,7 +20926,8 @@ export fn split_parts(ref<Generated, shared> gen, usize k) : Vec<String>
     }
     for (usize p = 0; p < k; p += 1)
     {
-        String t = String::from_str(HEADER);
+        String t = prefix(gen);
+        String::append(&mut t, HEADER);
         String::append(&mut t, "\n/* ---- types ---- */\n");
         String::append(&mut t, &gen.fwd);
         String::append(&mut t, &gen.types);
@@ -20159,8 +21095,11 @@ fn global_decl(StringView l) : Option<GlobalDecl>
 }
 
 // The parts, taken out of `g` (cobc's `generate` consumes its `Gen`).
+// D-0281 step 4c: whether the program is lowered pathless, or why not
+// (`pathless_blocker`, when it was asked); D-0285: lowered decided.
 fn parts(ref<Gen, exclusive> g, String descs, String tail, String header_text) : Generated
 {
+    Option<String> kept = if (g.pathless) { pathless_blocker(g) } else { Some(String::from_str("COBALTC_PATHLESS=0")) };
     Generated {
         .fwd = replace(&mut g.fwd, String::new()),
         .types = replace(&mut g.types, String::new()),
@@ -20171,6 +21110,60 @@ fn parts(ref<Gen, exclusive> g, String descs, String tail, String header_text) :
         .units = replace(&mut g.units, Vec::new()),
         .tail = tail,
         .header_text = header_text,
+        .decided = g.decided && Option::is_none(&kept),
+        .kept = kept,
+        .unsupported = None,
+    }
+}
+
+// cobc's `Err(Unsupported)` from `generate`: a `Generated` carrying only the
+// reason (`Gen::unsupported`); its text is nothing.
+fn unsupported_parts(ref<Gen, exclusive> g) : Generated
+{
+    Generated {
+        .fwd = String::new(),
+        .types = String::new(),
+        .strings = String::new(),
+        .protos = String::new(),
+        .thunks = String::new(),
+        .descs = String::new(),
+        .units = Vec::new(),
+        .tail = String::new(),
+        .header_text = String::new(),
+        .decided = false,
+        .kept = None,
+        .unsupported = clone(&g.unsupported),
+    }
+}
+
+// What comes before `cbrt.h`: its `CB_PATHLESS` switch (cobc's
+// `Generated::prefix`).
+export fn prefix(ref<Generated, shared> gen) : String
+{
+    match (&gen.kept)
+    {
+        None      :
+        {
+            if (gen.decided)
+            {
+                String::from_str("#define CB_PATHLESS 1\n#define CB_DECIDED 1\n")
+            }
+            else
+            {
+                String::from_str("#define CB_PATHLESS 1\n")
+            }
+        },
+        Some(why) :
+        {
+            if (String::len(why) == 0)
+            {
+                String::new()
+            }
+            else
+            {
+                sprintf("/* cobc: kept paths: %s */\n", &String::replace(why, "*/", "* /"))
+            }
+        },
     }
 }
 

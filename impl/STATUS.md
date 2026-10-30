@@ -121,31 +121,28 @@ CobaltC (`selfhost/front/`, CHG-0350). `selfhost/compare.sh` runs both formatter
 file five ways and on the command line's errors, and compares their output, messages and exit statuses
 byte for byte; `selfhost/compare_parser.sh` compares the two front ends on every tracked file (the parse,
 the program resolved and folded, and the static pass's verdict) and on mutated copies of each. The type checker in
-CobaltC (`front/typecheck.cb` with `items.cb`, `each.cb`, `fmtcheck.cb` and `consteval.cb`, CHG-0355) parses a
+CobaltC (`front/typecheck.cb` with `tier.cb`, `items.cb`, `each.cb`, `fmtcheck.cb` and `consteval.cb`, CHG-0355, CHG-0391) parses a
 `std` function's body when it first reaches it, from the text `front/prelude.cb` carries. Name resolution in CobaltC (`front/derive.cb`,
 `front/modres.cb`, CHG-0352) reads `std`'s declarations from `front/prelude.cb`; the compiled front end is
-about 20 times slower than coby's on large inputs (the runtime's object tracking, spread over every
-operation).
+about three times slower than coby's on large inputs (`cbparse` checks `cbc`'s own source in 34 seconds,
+`coby` in 11; a decided program, it keeps no record of references, D-0284).
 
 `cbc` (`selfhost/cbc/`, with `selfhost/back/`) is `cobc` written in CobaltC, over that front end
 (D-0276): the same command line (`cbc [options] FILE.cb`, every option `cobc` takes, the
 stale-runtime check, `--lib`, `--unittest`, `--run`, `--target`), the same C compiler invocation and linking
 against `cbrt`, and the same C, byte for byte, as `cobc` writes in every form (the default, `--all-checks`,
 `-g`, `--no-line-directives`, `--lib`, and each level of D-0274's bootstrap form, `COBALTC_BOOTSTRAP_UPTO=N`).
-`cbc --emit-c [--c-name NAME] FILE` prints the C alone. `selfhost/build.sh` builds it with `cobc`;
-`selfhost/compare_c.sh` compares the two compilers' C on any set of files (`LEVEL=`, `FLAGS=`);
-`selfhost/fixpoint.sh` checks the fixed point: `cbc` built by `cobc` writes its own C, which is `cobc`'s; the
-C compiler builds a second `cbc` from that C, which writes the same C again (about 45 minutes at the default
-level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the compiler under test. `cbc` compiles about
-15 to 45 times slower than `cobc` (its own C: about 18 minutes against 26 seconds; the runtime's
-object tracking, as in the front end, chiefly of `StringView` copies); the programs it builds
-are the same programs. `cobc` stays in the tree as the Rust reference and the oracle. Since D-0278 the Rust
-toolchain leads: `cbc`, `cbparse` and `cobfmt-cb` accept the language of edition 2026.102501 and are ported
-forward at milestones, so a program using anything newer is compiled by `cobc` alone until the next port. Edition 2026.102503 (D-0282) makes the conflicts of frame-held references compile-time errors; until the port,
-`cbc` accepts those programs and finds the conflicts at run time, so the conformance rows D-0282 made static are
-`cobc`'s alone. D-0283 checks a conflict at a call that only values decide when the call is made; `cbc` still finds it at
-the callee's first conflicting access. D-0284 builds decided programs with no record of references; `cbc`
-still keeps it.
+`cbc --emit-c [--c-name NAME] [-o OUT] FILE` prints the C alone. `selfhost/build.sh` builds it with `cobc`;
+`selfhost/compare_c.sh` compares the two compilers' C on any set of files (`LEVEL=`, `FLAGS=`; exit status 1 on a
+difference; the battery runs it on the showcases); `selfhost/fixpoint.sh` checks the fixed point: `cbc` built by
+`cobc` writes its own C, which is `cobc`'s; the C compiler builds a second `cbc` from that C, which writes the same
+C again (about 30 minutes at the default level). `cobc`'s tests take `COBC=PATH` and pass with `cbc` as the
+compiler under test. `cbc` is a decided program (D-0284), so it runs pathless and objectless; it compiles about
+2.5 times slower than `cobc` on a small program and about 8.5 times on a large one (its own C: about 11 minutes
+against 79 seconds); the programs it builds are the same programs. `cobc` stays in the tree as the Rust reference
+and the oracle. The toolchain written in CobaltC accepts the current edition: D-0278 froze it at edition
+2026.102501 while D-0281 was built, and D-0296 (Update 151) ported it forward in one step; since then a change to
+the static pass or the lowering lands in both toolchains in the same Update.
 
 ## `std`
 

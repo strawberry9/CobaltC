@@ -174,6 +174,24 @@ export struct Gen
     // The function a native body is being made for (cobc's `native_ctx`):
     // `std_fallback` emits the prelude's own body beside it.
     export Option<NativeCtx> native_ctx;
+    // D-0257: the program is a library (`--lib`, cobc's `Gen::lib`).
+    export bool lib;
+    // D-0281 step 4c: lower the program pathless when it is eligible
+    // (`pathless_blocker`): every reference carries token 0 and `cbrt.h`'s
+    // `CB_PATHLESS` block makes the path entries no-ops.
+    export bool pathless;
+    // D-0285: the program was found decided by a first lowering (D-0284),
+    // and this lowering knows it: a reference or a slice in a value is
+    // nothing the runtime tracks (`has_refs`), so such a value owns no
+    // object and its copies copy no holds.
+    export bool decided;
+    // cobc's `Unsupported`: what this lowering cannot write (a native text
+    // `ground_native` does not know); the lowering stops at once and the
+    // driver falls back (D-0285) or reports it.
+    export Option<String> unsupported;
+    // The types given a descriptor id (`type_id`), in order: what
+    // `pathless_blocker` walks as cobc walks `type_ids.keys()`.
+    export Vec<Type> id_types;
 }
 
 export struct NativeCtx
@@ -252,11 +270,36 @@ export fn closure_fields(ref<Gen, shared> g, u64 id) : Vec<Type>
 }
 
 // One function body being lowered.
+// D-0286: the call whose resource result the consumer being lowered takes
+// with no object (cobc's `inert_result`: by its arguments' key, and
+// whether nothing is evaluated after it).
+export struct InertResult
+{
+    export usize key;
+    export bool last;
+}
+
 export struct Fx
 {
     // Whether the function is `std`'s own: its lines are the prelude's,
     // and no location is reported inside it.
     export bool std_body;
+    // D-0283: the site (`site_key` of the callee's line and column) of the
+    // call `lower_call` is lowering, for its point checks; taken as it
+    // starts (cobc's `pc_site`).
+    export Option<String> pc_site;
+    // D-0292: the body's frame records every reference formed in it (the
+    // static pass left it a conflict, or a point check): `cb_frame_push_rec`,
+    // and references arriving in it are recorded (`cb_rec_ref`).
+    export bool tracked;
+    // D-0286: by candidate, the fields the body reads by value
+    // (`objectless_strings_with`).
+    export HashMap<usize, HashSet<String>> objectless_fields;
+    // D-0286: the call whose resource result the consumer being lowered
+    // takes with no object (`arm_inert`), and the same for the
+    // `finish_call` about to run.
+    export Option<InertResult> inert_result;
+    export Option<bool> inert_now;
     export String out;
     export usize ind;
     export Vec<Cleanup> cleanup;
@@ -494,6 +537,32 @@ export fn new_gen(Checked prog) : Gen
         .pending_field_confined = None,
         .substring_fn = false,
         .append_substring_fn = false,
+        .lib = false,
+        .pathless = false,
+        .decided = false,
+        .unsupported = None,
+        .id_types = Vec::new(),
+    }
+}
+
+// An environment variable that is set and is not "0" (cobc's
+// `COBALTC_PATHLESS` / `COBALTC_DECIDED` tests: unset counts as yes).
+export fn env_not_zero(str name) : bool
+{
+    match (env_set(name))
+    {
+        Some(v) : !String::eq_str(&v, "0"),
+        None    : true,
+    }
+}
+
+// cobc's `unsupported`: the first reason this lowering cannot go on, kept
+// for the driver; the lowering's text after it is discarded.
+export fn set_unsupported(ref<Gen, exclusive> g, String what)
+{
+    if (Option::is_none(&g.unsupported))
+    {
+        g.unsupported = Some(what);
     }
 }
 
@@ -703,6 +772,18 @@ export fn scope_marker(ref<Fx, exclusive> x, u8 kind, u32 id)
 export fn push_frame(ref<Gen, exclusive> g, ref<Fx, exclusive> x)
 {
     push_frame_at(g, x, None);
+}
+
+// D-0292: a function's own frame. `R`: the body's references are recorded
+// (`Fx::tracked`), emitted as `cb_frame_push_rec` whether or not anything
+// binds into it; `G`: a decided body, light, emitted as `cb_frame_push_fn`
+// where the frame is used.
+export fn push_frame_fn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, bool tracked)
+{
+    g.nscope += 1;
+    u32 id = g.nscope;
+    scope_marker(x, if (tracked) { b'R' } else { b'G' }, id);
+    Vec::push(&mut x.cleanup, Cleanup::CFrame(id));
 }
 
 // A frame whose end reports `line` for a destruction fault: the marker

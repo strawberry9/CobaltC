@@ -462,9 +462,16 @@ impl<'g, 'a> Fx<'g, 'a> {
             }
             // An arm of a `match` that is a whole statement (`stmt_match`):
             // its own scope, which `resolve_scopes` drops if it is unused.
+            // CHG-0391: a `match` that is the arm's whole value is the arm's
+            // last evaluation, as a block's tail `match` is its statement's:
+            // its own arms get their scopes, so their temporaries end before
+            // the frame of their bindings does.
             (_, None) if own_scope => {
                 self.push_stmt_at(Some(e.line));
-                let v = self.lower_expr(e, expected)?;
+                self.stmt_match = matches!(e.kind, ExprKind::Match(..));
+                let v = self.lower_expr(e, expected);
+                self.stmt_match = false;
+                let v = v?;
                 if matches!(v.ty, Type::Never) {
                     self.end_diverged();
                 } else {

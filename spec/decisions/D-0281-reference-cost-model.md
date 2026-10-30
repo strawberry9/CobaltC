@@ -4,7 +4,7 @@ Status: ACCEPTED IN DIRECTION (2026-10-25: the owner handed the proposal to the 
 with authorisation given to make all necessary decisions to push CobaltC in the direction it needs to go in order
 for it to be considered a serious systems programming language"). Adopted: the review's verdict in §12, and the
 order measurement (`cobc --cost`), invariant map and per-operation cost contract, rule text, prototypes. The tier-S
-rules are normative since D-0282 (`rule.control.frame-references`, Update 137); each phase takes its own change records. D-0278 (the Rust toolchain leads) and D-0279
+rules are normative since D-0282 (`rule.control.frame-references`, Update 137); each phase takes its own change records. COMPLETE (2026-10-30, D-0296, Update 151): phases 1–4 and the single port of the self-hosted toolchain are done (§25). D-0278 (the Rust toolchain leads) and D-0279
 (no untracked build) were decided first. Drafted PROPOSED 2026-10-25 at the owner's request ("put all options on
 the table … so that sentence does not become the main criticism of CobaltC").
 Kind: Decision (`spec/02-schema.md`)
@@ -854,3 +854,14 @@ program whose profile asks for it. §14's tier-D lines are restated in `spec/14`
 (an O(k) move; an address-keyed lookup for raw storage; O(h) per write to or end of an owner with h holders), the
 provisional marks withdrawn; granularity stays per element (§16). What remains of D-0281 is the single port of the
 self-hosted toolchain (D-0278's amendment) and its measurement.
+
+## 25. Complete (2026-10-30): the self-hosted toolchain ported (D-0296)
+
+The last item is done: the toolchain written in CobaltC is ported to the current edition in one step (D-0278's
+amendment), so `cbc` writes `cobc`'s C byte for byte for every tracked program, in every form, to a fixed point,
+and a decided program it compiles runs pathless and objectless. Both toolchains are kept in step again (D-0278
+option 1). D-0281 is complete: phase 1 (D-0282, D-0290, D-0291), phase 2 (D-0283–D-0289), phase 3 (D-0292–D-0295),
+phase 4 (§24: O3 and O5 not adopted, on corpus evidence) and the port. What stays open is recorded where it was
+found, for a program whose profile asks for it: phase 3's steps 6–7 (D-0295 item 3), the statement scopes and
+frames of the objects that remain (D-0294), D-0280's views, and the decided lowering's fallback for a `String`
+scrutinee moved out of a place that is not a binding (D-0296 item 4).

@@ -116,7 +116,7 @@ fn any_part(ref<Gen, shared> g, ref<NamedTy, shared> n, u8 what) : bool
             foreach (f in &sd.fields)
             {
                 Type ft = apply(&f.ty, &sub);
-                if ((what == 0 && holds_fn(g, &ft)) || (what == 1 && has_refs(g, &ft)))
+                if ((what == 0 && holds_fn(g, &ft)) || (what == 1 && holds_refs(g, &ft)))
                 {
                     return true;
                 }
@@ -137,7 +137,7 @@ fn any_part(ref<Gen, shared> g, ref<NamedTy, shared> n, u8 what) : bool
                     Some(p) :
                     {
                         Type pt = apply(p, &sub);
-                        if ((what == 0 && holds_fn(g, &pt)) || (what == 1 && has_refs(g, &pt)))
+                        if ((what == 0 && holds_fn(g, &pt)) || (what == 1 && holds_refs(g, &pt)))
                         {
                             return true;
                         }
@@ -177,7 +177,25 @@ export fn holds_fn(ref<Gen, shared> g, ref<Type, shared> t) : bool
 }
 
 // Whether a value of this type holds references (slots the runtime tracks).
+// D-0285: in a decided program (`Gen::decided`) no reference is tracked, so
+// a value that holds one inside it (a view, a struct with a reference field)
+// holds none of these slots. A reference or a slice itself still answers
+// yes: its C form (`cb_ref`, a token beside the address) is chosen by this
+// answer.
 export fn has_refs(ref<Gen, shared> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(_)   : true,
+        Type::TSlice(_) : true,
+        Type::TGuard(_) : true,
+        _               : if (g.decided) { false } else { holds_refs(g, t) },
+    }
+}
+
+// Whether a value of `t` holds a reference somewhere (`has_refs` before
+// D-0285).
+export fn holds_refs(ref<Gen, shared> g, ref<Type, shared> t) : bool
 {
     match (t)
     {
@@ -188,7 +206,7 @@ export fn has_refs(ref<Gen, shared> g, ref<Type, shared> t) : bool
             Vec<Type> fts = closure_fields(g, *id);
             foreach (ft in &fts)
             {
-                if (has_refs(g, ft))
+                if (holds_refs(g, ft))
                 {
                     return true;
                 }
@@ -196,9 +214,9 @@ export fn has_refs(ref<Gen, shared> g, ref<Type, shared> t) : bool
             false
         },
         Type::TNamed(n)    : any_part(g, Box::get(n), 1),
-        Type::TArray(a)    : has_refs(g, &Box::get(a).inner),
+        Type::TArray(a)    : holds_refs(g, &Box::get(a).inner),
         Type::TGuard(_)    : true,
-        Type::TMutex(i)    : has_refs(g, Box::get(i)),
+        Type::TMutex(i)    : holds_refs(g, Box::get(i)),
         _                  : false,
     }
 }
@@ -710,6 +728,7 @@ export fn type_id(ref<Gen, exclusive> g, ref<Type, shared> t) : u32
     Vec::push(&mut g.descs, None);
     Vec::push(&mut g.desc_ids, id);
     HashMap::insert(&mut g.type_ids, key, id);
+    Vec::push(&mut g.id_types, clone(t));
     String cty = ctype(g, t);
     u8 is_res = flag(is_resource(g, t));
     u8 refs = flag(has_refs(g, t));

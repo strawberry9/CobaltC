@@ -55,6 +55,92 @@ export struct Items
     // joined by `\u{1}`, to the one enum directly in that module with the
     // variant (`None` where there are several).
     export HashMap<String, Option<String>> module_variant;
+    // D-0292 (impl/src/tier.rs, `Items::tracking_needed`): by body key
+    // (`body_key`), why a body's references the run records: the static
+    // pass left it a conflict (`rule.control.frame-references`).
+    export HashMap<String, String> tracking_needed;
+    // D-0283 (`Items::point_check_fns`): the bodies with a point check.
+    export HashSet<String> point_check_fns;
+    // D-0283 (`Items::point_checks`): the point checks at a call, by the
+    // callee's site (`site_key`), each once.
+    export HashMap<String, Vec<PointCheck>> point_checks;
+    export bool any_point_checks;
+    // D-0282 (`Items::tier_summaries`): the access summaries, computed once
+    // when first asked for (`tier::summaries`).
+    export Option<Summaries> tier_summaries;
+}
+
+// D-0282 (impl/src/tier.rs): a function's access summary, by reference
+// parameter: the projections (field paths from the referent, cut at the
+// first index; the empty path the whole referent) it may read and write.
+export struct ParamAccess
+{
+    export Vec<Vec<String>> reads;
+    export Vec<Vec<String>> writes;
+}
+
+export struct Summaries
+{
+    export HashMap<String, Vec<ParamAccess>> by_fn;
+}
+
+// D-0283 (`tier::PointCheck`): a point check at a call. The callee may
+// access, through argument `arg`, the projection `fields` of its referent
+// with `mode`; whether that meets `other` depends on values, so the run
+// compares the places when the call is made.
+export enum PointOther
+{
+    Arg(usize),
+    Holder(String),
+}
+
+export struct PointCheck
+{
+    export usize arg;
+    export Vec<String> fields;
+    export Mode mode;
+    export PointOther other;
+    export Mode other_mode;
+    // The callee as a message names it.
+    export String callee;
+}
+
+// The fault's message (`PointCheck::message`).
+export fn point_check_message(ref<PointCheck, shared> pc) : String
+{
+    str what = match (pc.mode)
+    {
+        Mode::Exclusive : "write",
+        Mode::Shared    : "read",
+    };
+    sprintf(
+        "`%s` may %s through argument %v, and a live reference reaches the same place: the call is checked when it is made (D-0283)",
+        &pc.callee,
+        what,
+        pc.arg + 1,
+    )
+}
+
+// A checked body's name (`tier::body_key`): the function's, with its type
+// arguments.
+export fn body_key(StringView name, ref<Vec<Type>, shared> targs) : String
+{
+    if (Vec::len(targs) == 0)
+    {
+        return String::from_view(name);
+    }
+    Vec<String> parts = Vec::new();
+    foreach (t in targs)
+    {
+        Vec::push(&mut parts, type_display(t));
+    }
+    sprintf("%s<%s>", name, &String::join(&parts[0..$], ","))
+}
+
+// The key of a call's site (`point_checks`): the callee's line and column.
+export fn site_key(usize line, usize col) : String
+{
+    sprintf("%v:%v", line, col)
 }
 
 // What `holds_ref` finds for a struct or an enum `N<P1, …>`: its values
@@ -170,6 +256,11 @@ export fn build_items(Program program) : Items
         .res_info = HashMap::new(),
         .variant_payload = HashMap::new(),
         .module_variant = HashMap::new(),
+        .tracking_needed = HashMap::new(),
+        .point_check_fns = HashSet::new(),
+        .point_checks = HashMap::new(),
+        .any_point_checks = false,
+        .tier_summaries = None,
     };
     Program { items, .. } = program;
     Vec<String> path = Vec::new();

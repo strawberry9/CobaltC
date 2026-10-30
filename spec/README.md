@@ -8,7 +8,7 @@ map, not a normative artifact.
 
 ## Edition
 
-**CobaltC specification edition 2026.102905.**
+**CobaltC specification edition 2026.103001.**
 
 The specification as a whole is identified by its edition,
 `YYYY.MMDDnn`: the date it was published (UTC) and a two-digit counter
@@ -80,6 +80,7 @@ unchanged, are in `EDITIONS-HISTORY.md`.
 | 2026.102903 | Commit Update 148, 2026-10-29 | D-0293 (`CHG-0388`): the token-kind tests of D-0292 inline in the runtime header — a light reference, and an owner's binding whose object has no recorded reference on it (one byte per object, `cb_marks`), make no runtime call for a borrow check, a read, or, in a decided body, a borrow; the oracles `COBALTC_RECORD=full\|check` turn the inline tests off. No rule, diagnostic or outcome changes; `spec/IMPLEMENTATION-NOTES.md`'s runtime contract regenerated. D-0281 phase 3 step 4 (§24 amended). The toolchain written in CobaltC still accepts edition 2026.102501 (D-0278). |
 | 2026.102904 | Commit Update 149, 2026-10-29 | D-0294 (`CHG-0389`): the objectless remainder — in a decided program the lowering places no object where no check could read it: recursive types are objectless, an objectless local may be assigned, matched in place, sliced and moved, results built in place leave with no object, every reference parameter is unstored, and a record nothing reads is removed from the generated C (the self-hosted compiler runs in half the instructions). No rule, diagnostic or outcome changes. D-0281 §24 (the objectless remainder) done. The toolchain written in CobaltC still accepts edition 2026.102501 (D-0278). |
 | 2026.102905 | Commit Update 150, 2026-10-29 | D-0295 (`CHG-0390`): light element references — in a program the run checks, an element reference formed in a function the static pass decided carries no record when the element's object persists, and a reference's flight leaves the statement's scope pending; the tier-D lines of the cost contract (`spec/14` §6) restated as this edition's promises (D-0281 §14's provisional marks withdrawn); D-0281 phase 3 closed, its steps 6–7 (frame shadows, block objects) recorded as not built. No rule, diagnostic or outcome changes. The toolchain written in CobaltC still accepts edition 2026.102501 (D-0278). |
+| 2026.103001 | Commit Update 151, 2026-10-30 | D-0296 (`CHG-0391`): the toolchain written in CobaltC is ported to this edition — `cbparse` checks as `coby` does (the frame-reference rules, point checks, closure, lending and holder facts of D-0282–D-0291), and `cbc` writes `cobc`'s C byte for byte in every form, so a decided program it compiles runs pathless and objectless, and it compiles itself to a fixed point; both toolchains are changed together again (D-0278 amended). A `match` that is a match arm's whole value now gives its own arms statement scopes, so a temporary view of a binder ends with the binder (a false `diag.destroy-while-aliased` fault in programs that keep paths; one conformance row added, `spec/conformance.md` 3.284.0). D-0281 is complete (§25). |
 
 **Licence.** Copyright © 2026 strawberry9. This specification — every
 file in this directory — is licensed under the Creative Commons

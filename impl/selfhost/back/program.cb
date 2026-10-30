@@ -1,0 +1,173 @@
+// D-0281 step 4c / D-0284 (impl/cobc/src/lower/program.rs): whether the
+// program keeps its paths (`pathless_blocker`), and `modeless`.
+
+import std;
+import ast;
+import loader;
+import items;
+import typecheck;
+import state;
+import diags;
+
+// D-0291: `t` with every reference and slice made shared, so that two
+// signatures compare as one when only their modes differ.
+export fn modeless(ref<Type, shared> t) : Type
+{
+    match (t)
+    {
+        Type::TRef(m)   : Type::TRef(Box::new(ModedTy { .inner = modeless(&Box::get(m).inner), .mode = Mode::Shared })),
+        Type::TSlice(m) : Type::TSlice(Box::new(ModedTy { .inner = modeless(&Box::get(m).inner), .mode = Mode::Shared })),
+        Type::TArray(a) : Type::TArray(Box::new(SizedTy { .inner = modeless(&Box::get(a).inner), .n = Box::get(a).n })),
+        Type::TNamed(n) :
+        {
+            Vec<Type> args = Vec::new();
+            foreach (a in &Box::get(n).args)
+            {
+                Vec::push(&mut args, modeless(a));
+            }
+            Type::TNamed(Box::new(NamedTy { .name = String::clone(&Box::get(n).name), .args = args }))
+        },
+        Type::TFn(f)    :
+        {
+            Vec<Type> ps = Vec::new();
+            foreach (p in &Box::get(f).params)
+            {
+                Vec::push(&mut ps, modeless(p));
+            }
+            Type::TFn(Box::new(FnTy { .params = ps, .ret = modeless(&Box::get(f).ret) }))
+        },
+        other           : clone(other),
+    }
+}
+
+// "line N: …" in the combined text's line space, shown as the file and line
+// it came from (cobc's `coby::locate`: the program's files, or `<std>/…`).
+fn located_why(ref<Gen, shared> g, ref<String, shared> why) : String
+{
+    StringView rest = match (String::strip_prefix(why, "line "))
+    {
+        Some(r) : r,
+        None    : return String::clone(why),
+    };
+    usize sep = match (StringView::find(rest, ": "))
+    {
+        Some(k) : k,
+        None    : return String::clone(why),
+    };
+    usize n = match (StringView::parse<usize>(StringView::sub(rest, 0, sep)))
+    {
+        Ok(n)  : n,
+        Err(_) : return String::clone(why),
+    };
+    StringView after = StringView::sub(rest, sep + 2, StringView::len(rest));
+    match (resolve_line(&g.prog.ex, n))
+    {
+        Some(o) : return sprintf("%s:%v: %v", &o.file, o.line, after),
+        None    : {},
+    }
+    match (std_location(if (n >= STD_LINE) { n - STD_LINE } else { n }))
+    {
+        Some(o) : sprintf("<std>/%s:%v: %v", &o.file, o.line, after),
+        None    : String::clone(why),
+    }
+}
+
+// D-0281 step 4c: why the program must keep its paths, if it must: it is a
+// library (C callers keep what they like), it asks for every check, a
+// function it lowers has a conflict the static pass left to the run
+// (`Items::tracking_needed`), or a type it uses keeps references in data the
+// static pass does not follow (a `fn` value's, D-0290).
+export fn pathless_blocker(ref<Gen, shared> g) : Option<String>
+{
+    if (g.lib)
+    {
+        return Some(String::from_str("a library (`--lib`)"));
+    }
+    if (all_checks(g))
+    {
+        return Some(String::from_str("every check was asked for"));
+    }
+    // (cobc walks `fn_names`' keys: every function requested plainly.)
+    Vec<String> fns = Vec::new();
+    foreach (r in &g.queue)
+    {
+        if (r.mask == 0)
+        {
+            Vec::push(&mut fns, body_key(String::as_view(&r.name), &r.targs));
+        }
+    }
+    Vec::sort(&mut fns);
+    foreach (key in &fns)
+    {
+        match (HashMap::get(&g.prog.table.tracking_needed, key))
+        {
+            Some(why) :
+            {
+                String shown = match (String::strip_prefix(key, "std::"))
+                {
+                    Some(k) : String::from_view(k),
+                    None    : String::clone(key),
+                };
+                return Some(sprintf("`%s`, %s", &shown, &located_why(g, why)));
+            },
+            None      : {},
+        }
+    }
+    // A closure that borrows what it captures, or captures a reference,
+    // keeps references in its environment: a `fn` value kept in data may
+    // then be one. In a frame the static pass holds what such a closure
+    // reaches as a borrow (D-0288), so only data keeps paths.
+    // D-0291: a `fn` value may be such a closure only when one of its
+    // signature does (modes aside: a named function keeps nothing).
+    Vec<FnSig> sigs = Vec::new();
+    for (usize i = 0; i < HashMap::len(&g.closures); i += 1)
+    {
+        ref<ClosureInfo, shared> c = HashMap::value_at(&g.closures, i);
+        bool keeps = !c.is_move && Vec::len(&c.fields) > 0;
+        foreach (f in &c.fields)
+        {
+            bool ref_or_view = match (&f.ty)
+            {
+                Type::TRef(_)   : true,
+                Type::TSlice(_) : true,
+                Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::StringView"),
+                _               : false,
+            };
+            keeps = keeps || keeps_refs_in_data(&g.prog.table, &f.ty, true) || ref_or_view;
+        }
+        if (keeps)
+        {
+            Vec<Type> ps = Vec::new();
+            foreach (p in &c.params)
+            {
+                Vec::push(&mut ps, modeless(p));
+            }
+            Vec::push(&mut sigs, FnSig { .params = ps, .ret = modeless(&c.ret) });
+        }
+    }
+    // D-0290: a type whose values the static pass follows as holders (no
+    // `fn` value, guard, lock or handle in it) is checked where it is used:
+    // a function that keeps one where the facts do not see it is in
+    // `tracking_needed` above.
+    Vec<String> tys = Vec::new();
+    foreach (t in &g.id_types)
+    {
+        if (keeps_refs_in_data_by(&g.prog.table, t, &sigs) && !frame_holdable(&g.prog.table, t))
+        {
+            Vec::push(&mut tys, type_display(t));
+        }
+    }
+    Vec::sort(&mut tys);
+    if (Vec::len(&tys) > 0)
+    {
+        return Some(sprintf("the type `%s` keeps references in data (tier D)", &tys[0]));
+    }
+    foreach (u in &g.units)
+    {
+        if (String::contains(&u.text, "cb_point_check("))
+        {
+            return Some(String::from_str("a call is checked when it is made (D-0283)"));
+        }
+    }
+    None
+}

@@ -60,7 +60,7 @@ intro_body += p("""A third program, <strong>`cbc`</strong>, is `cobc` written in
 (the repository's `impl/selfhost/`, over a front end that is likewise `coby`'s written in CobaltC). It
 takes the same options and writes the same C, byte for byte, for every program; built by `cobc`, it
 compiles its own source to that same C again, so CobaltC's compiler can rebuild itself without the Rust
-one (D-0276). Its programs are `cobc`'s programs, but it compiles them many times more slowly, so the
+one (D-0276). Its programs are `cobc`'s programs, but it compiles them several times more slowly, so the
 examples in this guide say `cobc`.""")
 intro_body += p("""On Linux the two work side by side, and everything in this guide runs under
 either. On Windows, `coby` runs programs, the formatter `cobfmt` (below) runs there too, and

@@ -32,7 +32,8 @@ const str FREE_NAMES =
     "cb_bytes_lt cb_bytes_cmp cb_find_bytes cb_char_boundary cb_popcount64 cb_popcount128 cb_clz cb_clz128 cb_ctz "
     "cb_ctz128 cb_rotl cb_rotl128 cb_rotr cb_rotr128 cb_rotl8 cb_rotl16 cb_rotl32 cb_rotl64 cb_rotr8 cb_rotr16 "
     "cb_rotr32 cb_rotr64 cb_fnv_more cb_live_at cb_read cb_write cb_write_quiet cb_borrow_unminted "
-    "cb_borrow_range_unminted cb_borrow_unstamped cb_call_done cb_load_ref cb_store_ref cb_copy_datum cb_move_to "
+    "cb_borrow_range_unminted cb_borrow_unstamped cb_call_done cb_load_ref cb_store_ref cb_hold_ref cb_copy_datum "
+    "cb_move_to "
     "cb_send cb_send_ref cb_send_datum cb_borrow_check cb_elem_access cb_elem_access_if cb_live_in cb_owns cb_note "
     "cb_nt cb_nt_on cb_notes_push cb_notes_pop cb_threaded cb_allocate cb_drop_local cb_drop_plain_buf "
     "cb_stack_check cb_atomic_point cb_atomic_wait cb_spin_hint";
@@ -40,13 +41,23 @@ const str FREE_NAMES =
 // The runtime's names that record in the innermost statement scope
 // (`resolve_scopes`'s `SCOPE`).
 const str SCOPE_NAMES =
-    "cb_new cb_new_uninit cb_recv cb_recv_ref cb_recv_datum cb_recv_datum_tok cb_forget_obj cb_take cb_borrow "
-    "cb_borrow_range cb_absorb cb_absorb_refs cb_elem_borrow cb_raw_move_in";
+    "cb_new cb_new_uninit cb_recv cb_recv_ref cb_rec_ref cb_recv_datum cb_recv_datum_tok cb_forget_obj cb_take "
+    "cb_borrow cb_borrow_range cb_absorb cb_absorb_refs cb_elem_borrow cb_raw_move_in";
+
+// `resolve_scopes_in`'s `DECIDED_FREE`: the entries `cbrt.h` makes constants
+// in a decided program (`CB_PATHLESS`, `CB_DECIDED`), which record nothing
+// in any scope there.
+const str DECIDED_FREE_NAMES =
+    "cb_borrow cb_borrow_range cb_elem_borrow cb_elem_borrow_here cb_elem_borrow_datum cb_valid cb_frame_hold "
+    "cb_frame_unhold cb_send_tok_datum cb_send_datum_none cb_recv_datum cb_recv_datum_tok cb_peek_datum_tok "
+    "cb_frozen_ok";
 
 struct NameSets
 {
     HashSet<String> free;
     HashSet<String> scope;
+    HashSet<String> decided_free;
+    bool decided;
 }
 
 fn name_set(str names) : HashSet<String>
@@ -136,7 +147,10 @@ fn effects(StringView line, ref<NameSets, shared> sets, ref<Vec<Eff>, exclusive>
             // A fn value's call thunk (`Gen::thunk`) records nothing in
             // the caller's scopes (`cb_call_self`), as a direct call.
             String key = String::from_view(id);
-            if (StringView::starts_with(id, StringView::of("cb_call_")))
+            if (StringView::starts_with(id, StringView::of("cb_call_")) || (sets.decided && HashSet::contains(
+                &sets.decided_free,
+                &key,
+            )))
             {
             }
             else if (HashSet::contains(&sets.scope, &key))
@@ -152,9 +166,10 @@ fn effects(StringView line, ref<NameSets, shared> sets, ref<Vec<Eff>, exclusive>
                 Vec::push(out, Eff::EAll);
             }
         }
-        else if (len >= 4 && b[e - 4] == b'_' && b[e - 3] == b'p' && b[e - 2] == b'r' && b[e - 1] == b'e' && e < n
-            && b[e] == b'(')
+        else if (!sets.decided && len >= 4 && b[e - 4] == b'_' && b[e - 3] == b'p' && b[e - 2] == b'r'
+            && b[e - 1] == b'e' && e < n && b[e] == b'(')
         {
+            // (D-0285: in a decided program an element's reference has no path.)
             Vec::push(out, Eff::EScope);
         }
         i = e;
@@ -225,7 +240,20 @@ struct Open
 // holds something (a binding, a temporary, a path), else nothing.
 export fn resolve_scopes(ref<String, shared> out) : String
 {
-    NameSets sets = NameSets { .free = name_set(FREE_NAMES), .scope = name_set(SCOPE_NAMES) };
+    resolve_scopes_in(out, false)
+}
+
+// `resolve_scopes`, `decided` for a decided program's lowering (D-0285): the
+// entries `cbrt.h` makes constants there (`CB_PATHLESS`, `CB_DECIDED`) record
+// nothing in any scope, and an element's reference (`_pre`) has no path.
+export fn resolve_scopes_in(ref<String, shared> out, bool decided) : String
+{
+    NameSets sets = NameSets {
+        .free = name_set(FREE_NAMES),
+        .scope = name_set(SCOPE_NAMES),
+        .decided_free = name_set(DECIDED_FREE_NAMES),
+        .decided = decided,
+    };
     Vec<StringView> lines = String::lines(out);
     Vec<Open> open = Vec::new();
     HashSet<u32> used = HashSet::new();
@@ -236,9 +264,15 @@ export fn resolve_scopes(ref<String, shared> out) : String
         {
             Some(m) :
             {
-                if (m.kind == b'F' || m.kind == b'S')
+                if (m.kind == b'F' || m.kind == b'G' || m.kind == b'S')
                 {
-                    Vec::push(&mut open, Open { .frame = m.kind == b'F', .id = m.id });
+                    Vec::push(&mut open, Open { .frame = m.kind != b'S', .id = m.id });
+                }
+                else if (m.kind == b'R')
+                {
+                    // D-0292: a recording body's frame is always emitted.
+                    Vec::push(&mut open, Open { .frame = true, .id = m.id });
+                    HashSet::insert(&mut used, m.id);
                 }
                 else if (m.kind == b'f' || m.kind == b's' || m.kind == b'e')
                 {
@@ -302,6 +336,14 @@ export fn resolve_scopes(ref<String, shared> out) : String
                     {
                         call = String::from_str("cb_frame_push();");
                     }
+                    else if (m.kind == b'G')
+                    {
+                        call = String::from_str("cb_frame_push_fn();");
+                    }
+                    else if (m.kind == b'R')
+                    {
+                        call = String::from_str("cb_frame_push_rec();");
+                    }
                     else if (m.kind == b'S')
                     {
                         call = String::from_str("cb_stmt_push();");
@@ -324,6 +366,13 @@ export fn resolve_scopes(ref<String, shared> out) : String
                     String::append(&mut res, indent_of(*line));
                     String::append(&mut res, &call);
                     String::push_ascii(&mut res, b'\n');
+                }
+                // D-0293: a decided body's borrows from vouched tokens are
+                // light inline (`cbrt.h`'s `cb_lf`), frame or no frame.
+                if (m.kind == b'G')
+                {
+                    String::append(&mut res, indent_of(*line));
+                    String::append(&mut res, "enum { cb_lf = 1 };\n");
                 }
             },
             None    :
@@ -1871,4 +1920,306 @@ export fn localize(
         }
     }
     *protos = ps;
+}
+
+// ---- D-0294: the record chains nothing reads ----
+
+// `uint64_t NAME = CALL(ARG…);`: NAME and the text after `CALL(`.
+struct ChainDecl
+{
+    String name;
+    String args;
+}
+
+fn record_decl(StringView t, str call) : Option<ChainDecl>
+{
+    StringView rest = match (StringView::strip_prefix(t, StringView::of("uint64_t ")))
+    {
+        Some(r) : r,
+        None    : return None,
+    };
+    usize eq = match (StringView::find(rest, " = "))
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    StringView name = StringView::sub(rest, 0, eq);
+    if (StringView::len(name) == 0)
+    {
+        return None;
+    }
+    foreach (c in StringView::as_bytes(name))
+    {
+        if (!ident_char(*c))
+        {
+            return None;
+        }
+    }
+    StringView after = StringView::sub(rest, eq + 3, StringView::len(rest));
+    StringView a1 = match (StringView::strip_prefix(after, StringView::of(call)))
+    {
+        Some(r) : r,
+        None    : return None,
+    };
+    StringView a2 = match (StringView::strip_prefix(a1, StringView::of("(")))
+    {
+        Some(r) : r,
+        None    : return None,
+    };
+    StringView args = match (StringView::strip_suffix(a2, StringView::of(");")))
+    {
+        Some(r) : r,
+        None    : return None,
+    };
+    Some(ChainDecl { .name = String::from_view(name), .args = String::from_view(args) })
+}
+
+fn first_arg_of(StringView args) : StringView
+{
+    Vec<StringView> parts = StringView::split(args, ",");
+    if (Vec::len(&parts) == 0)
+    {
+        return StringView::of("");
+    }
+    StringView::trim(parts[0])
+}
+
+// How often `x` occurs in `text` as a whole identifier.
+fn count_in(StringView text, ref<String, shared> x) : usize
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize n = slice_len(b);
+    usize xn = String::len(x);
+    usize count = 0;
+    usize at = 0;
+    while (at < n)
+    {
+        usize i = match (StringView::find(StringView::sub(text, at, n), String::as_view(x)))
+        {
+            Some(k) : at + k,
+            None    : break,
+        };
+        usize j = i + xn;
+        if ((i == 0 || !ident_char(b[i - 1])) && (j >= n || !ident_char(b[j])))
+        {
+            count += 1;
+        }
+        at = j;
+    }
+    count
+}
+
+// `a` with the prefix `pre` and the suffix `);` taken off, if it has both.
+fn stmt_args(StringView t, str pre) : Option<StringView>
+{
+    match (StringView::strip_prefix(t, StringView::of(pre)))
+    {
+        Some(a) : StringView::strip_suffix(a, StringView::of(");")),
+        None    : None,
+    }
+}
+
+// D-0294: in a decided program a record that nothing reads is not kept. An
+// object made (`uint64_t o = cb_new(&v, …);`), perhaps bound and taken back
+// (`cb_bind`, `cb_take`), moved (`cb_move_to`), promoted (`cb_result`) and
+// ended (`cb_forget_obj`, `cb_absorb`, `cb_raw_move_in`) in one straight
+// run of statements -- no branch, no call that could fault (a destructor
+// run at the fault is observable) and no frame's end between, a scope's end
+// only once the object was promoted past it or is bound -- with its ids
+// named nowhere else, is a record no check reads (every path entry is a
+// constant there) whose end comes before any scope's that could destroy
+// the value: a struct or variant literal that leaves as a result or an
+// argument, a `std` body's result bound and taken back. The statements go.
+// Run before the scopes are resolved, so they open no scope for it.
+export fn elide_record_chains(ref<String, shared> out) : String
+{
+    Vec<StringView> views = String::lines(out);
+    Vec<String> lines = Vec::new();
+    foreach (v in &views)
+    {
+        Vec::push(&mut lines, String::from_view(*v));
+    }
+    usize n = Vec::len(&lines);
+    Vec<usize> drop = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        ChainDecl d0 = match (record_decl(StringView::trim(String::as_view(&lines[i])), "cb_new"))
+        {
+            Some(d) : d,
+            None    : continue,
+        };
+        ChainDecl { name, .. } = d0;
+        String start = name;
+        String live = String::clone(&start);
+        Vec<String> ids = Vec::new();
+        Vec::push(&mut ids, String::clone(&start));
+        Vec<usize> chain = Vec::new();
+        Vec::push(&mut chain, i);
+        Option<String> root = None;
+        bool promoted = false;
+        bool ok = false;
+        for (usize j = i + 1; j < n; j += 1)
+        {
+            StringView t = StringView::trim(String::as_view(&lines[j]));
+            if (StringView::len(t) == 0 || StringView::starts_with(t, "#line"))
+            {
+                continue;
+            }
+            bool named = false;
+            foreach (x in &ids)
+            {
+                if (count_in(t, x) > 0)
+                {
+                    named = true;
+                }
+            }
+            if (!named)
+            {
+                if (StringView::eq_str(t, "cb_stmt_pop();"))
+                {
+                    if (Option::is_none(&root) && !promoted)
+                    {
+                        break;
+                    }
+                    promoted = false;
+                    continue;
+                }
+                // A statement that could fault (any call: a destructor the
+                // fault would run on the value is observable) ends the run;
+                // a plain store or declaration, a position, a scope's start
+                // cannot.
+                bool plain = !StringView::contains(t, "(") || StringView::starts_with(t, "cb_at(")
+                    || StringView::starts_with(t, "cb_stmt_push_at(");
+                bool control = false;
+                foreach (k in [
+                    "if ", "if(", "while ", "while(", "for ", "for(", "switch", "case ", "default:", "do ", "do{",
+                    "return", "goto ", "break;", "continue;", "else",
+                ])
+                {
+                    control = control || StringView::starts_with(t, StringView::of(k));
+                }
+                if (!plain || StringView::contains(
+                    t,
+                    "{",
+                ) || StringView::contains(t, "}") || !StringView::ends_with(t, ";")
+                    || control)
+                {
+                    break;
+                }
+                continue;
+            }
+            match (record_decl(t, "cb_bind"))
+            {
+                Some(d) :
+                {
+                    if (Option::is_some(&root) || !String::eq(&d.args, &live))
+                    {
+                        break;
+                    }
+                    root = Some(String::clone(&d.name));
+                    Vec::push(&mut ids, String::clone(&d.name));
+                    Vec::push(&mut chain, j);
+                    continue;
+                },
+                None    : {},
+            }
+            match (record_decl(t, "cb_take"))
+            {
+                Some(d) :
+                {
+                    bool from_root = match (&root)
+                    {
+                        Some(r) : StringView::eq(String::as_view(r), first_arg_of(String::as_view(&d.args))),
+                        None    : false,
+                    };
+                    if (!from_root)
+                    {
+                        break;
+                    }
+                    root = None;
+                    live = String::clone(&d.name);
+                    Vec::push(&mut ids, String::clone(&d.name));
+                    promoted = false;
+                    Vec::push(&mut chain, j);
+                    continue;
+                },
+                None    : {},
+            }
+            if (Option::is_some(&root))
+            {
+                break;
+            }
+            if (StringView::eq(t, String::as_view(&sprintf("cb_result(%s);", &live))))
+            {
+                promoted = true;
+                Vec::push(&mut chain, j);
+                continue;
+            }
+            bool moved = match (stmt_args(t, "cb_move_to("))
+            {
+                Some(a) : StringView::eq(first_arg_of(a), String::as_view(&live)) && StringView::contains(a, ", &"),
+                None    : false,
+            };
+            if (moved)
+            {
+                Vec::push(&mut chain, j);
+                continue;
+            }
+            bool raw_in = match (stmt_args(t, "cb_raw_move_in("))
+            {
+                Some(a) : StringView::eq(first_arg_of(a), String::as_view(&live)),
+                None    : false,
+            };
+            if (StringView::eq(t, String::as_view(&sprintf("cb_forget_obj(%s);", &live))) || StringView::eq(
+                t,
+                String::as_view(&sprintf("cb_absorb(%s);", &live)),
+            ) || raw_in)
+            {
+                Vec::push(&mut chain, j);
+                ok = true;
+                break;
+            }
+            break;
+        }
+        if (!ok)
+        {
+            continue;
+        }
+        // Every id named only in the chain's own statements.
+        bool elsewhere = false;
+        foreach (x in &ids)
+        {
+            usize in_chain = 0;
+            foreach (k in &chain)
+            {
+                in_chain += count_in(String::as_view(&lines[*k]), x);
+            }
+            if (count_in(String::as_view(out), x) != in_chain)
+            {
+                elsewhere = true;
+            }
+        }
+        if (elsewhere)
+        {
+            continue;
+        }
+        foreach (k in &chain)
+        {
+            Vec::push(&mut drop, *k);
+        }
+    }
+    if (Vec::len(&drop) == 0)
+    {
+        return String::clone(out);
+    }
+    foreach (i in &drop)
+    {
+        lines[*i] = String::from_str(";");
+    }
+    String s = String::join(&lines[0..$], "\n");
+    if (String::ends_with(out, "\n"))
+    {
+        String::push_ascii(&mut s, b'\n');
+    }
+    s
 }

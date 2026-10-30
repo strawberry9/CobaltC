@@ -14,6 +14,7 @@ import direct;
 import natives;
 import native_misc;
 import gen;
+import flights;
 
 fn string_type() : Type
 {
@@ -48,8 +49,11 @@ fn probe_ok(
     ref<Type, exclusive> out,
 ) : bool
 {
+    // Cached, as cobc's `probe_type` is: a probe made again lowers its
+    // expression again, which may take a raw call the real lowering expects.
     bool saved = x.probe_failed;
-    *out = probe_try(g, x, e, None);
+    x.probe_failed = false;
+    *out = probe_type(g, x, e, None);
     bool ok = !x.probe_failed;
     x.probe_failed = saved;
     ok
@@ -571,8 +575,7 @@ export fn lower_channel_send_fresh(
     emit(x, String::as_view(&sprintf("%s %s = %s_raw(%s, %s);", &rc, &t, &cname, &cv.c, &vv.c)));
     if (is_resource(g, &rt))
     {
-        String o = fresh(g, "o");
-        emit(x, String::as_view(&sprintf("uint64_t %s = cb_recv(&%s);", &o, &t)));
+        String o = take_result(g, x, &t, &rt, line);
         return Some(V { .c = t, .ty = rt, .obj = Some(o) });
     }
     Some(V { .c = t, .ty = rt, .obj = None })
@@ -1059,8 +1062,16 @@ export fn lower_box_new(
         return None;
     }
     x.objectless = inert_expr(g, x, &args[0]);
+    // D-0294: in a decided program a call's result goes into the box with
+    // no object, when its end frees memory alone (the allocation between it
+    // and the store can fault, `objectless_type`).
+    if (objectless_type(g, &t))
+    {
+        arm_inert(g, x, &args[0], true);
+    }
     V v = lower_expr(g, x, &args[0], Some(&t));
     x.objectless = false;
+    x.inert_result = None;
     if (is_never(&v.ty))
     {
         return Some(never());

@@ -1516,6 +1516,49 @@ fn rewrite_call(ref<CallExpr, exclusive> call, usize line, usize col) : Option<E
     };
     StringView k = String::as_view(&key);
     usize n = Vec::len(&call.args);
+    if (StringView::eq_str(k, "$each_lazy") && n == 1)
+    {
+        // D-0287: a consuming `foreach` over a call (the parser's
+        // wrapping). Over a text splitter, the loop holds a `std::Parts`
+        // that finds each part as it is taken (each.cb); over anything
+        // else, the call itself.
+        Expr inner = Vec::remove(&mut call.args, 0);
+        match (&mut inner.kind)
+        {
+            ExprKind::ECall(cb) : match (&mut Box::get_mut(cb).callee.kind)
+            {
+                ExprKind::EPath(pb) :
+                {
+                    ref<PathExpr, exclusive> p = Box::get_mut(pb);
+                    String joined_name = joined(&p.segs);
+                    str lazy = match (String::as_view(&joined_name))
+                    {
+                        "std::StringView::split"            : "split",
+                        "std::StringView::lines"            : "lines",
+                        "std::StringView::split_whitespace" : "words",
+                        "std::StringView::chars"            : "chars",
+                        "std::String::split"                : "string_split",
+                        "std::String::lines"                : "string_lines",
+                        "std::String::split_whitespace"     : "string_words",
+                        "std::String::chars"                : "string_chars",
+                        _                                   : "",
+                    };
+                    if (StringView::len(StringView::of(lazy)) > 0 && Vec::len(&p.targs) == 0)
+                    {
+                        Vec<String> segs = Vec::new();
+                        Vec::push(&mut segs, String::from_str("std"));
+                        Vec::push(&mut segs, String::from_str("Parts"));
+                        Vec::push(&mut segs, String::from_str(lazy));
+                        p.segs = segs;
+                    }
+                },
+                _                   : {},
+            },
+            _ : {},
+        }
+        Expr { kind, .. } = inner;
+        return Some(kind);
+    }
     if (StringView::eq_str(k, "checked_neg") && n == 1)
     {
         Expr a = Vec::remove(&mut call.args, 0);

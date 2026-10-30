@@ -13,11 +13,12 @@
 #   impl/selfhost/compare_c.sh [-j JOBS] [FILE...]
 #
 # Results in $OUT/results (`same`, `DIFF`, `skip`), the two C files of each
-# DIFF in $OUT/run. cbc is impl/target/selfhost/cbc (impl/selfhost/build.sh).
+# DIFF in $OUT/run; exit status 1 if any differs. cbc is
+# impl/target/selfhost/cbc (impl/selfhost/build.sh).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../.." && pwd)
-cobc="$root/impl/target/release/cobc"
+root=${ROOT:-$(cd "$here/../.." && pwd)}
+cobc="${COBC:-$root/impl/target/release/cobc}"
 cbc="${CBC:-$root/impl/target/selfhost/cbc}"
 jobs=3
 while getopts "j:" o; do
@@ -92,3 +93,4 @@ export root cobc cbc OUT LEVEL FLAGS
 xargs -P "$jobs" -I{} bash -c 'one "$@"' _ {} < "$OUT/files" >> "$OUT/results"
 sort -o "$OUT/results" "$OUT/results"
 printf '%s same, %s DIFF, %s skip\n' "$(grep -c '^same' "$OUT/results")" "$(grep -c '^DIFF' "$OUT/results")" "$(grep -c '^skip' "$OUT/results")"
+! grep -q '^DIFF' "$OUT/results"

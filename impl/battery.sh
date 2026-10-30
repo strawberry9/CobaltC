@@ -274,11 +274,13 @@ stage1() {
         # clash refutes, in any interleaving of any sample program.
         step "model sample as licensed (cobmodel check --as-licensed)" timeout -k 30 1800 "$R/impl/target/release/cobmodel" check --as-licensed $R/impl/model/sample/*.cb
     fi
-    # CHG-0346, CHG-0350: the toolchain written in CobaltC, built by cobc and
-    # compared with the Rust originals on the showcases and the surface-syntax
-    # cases (the whole corpus: impl/selfhost/compare.sh, compare_parser.sh).
+    # CHG-0346, CHG-0350, CHG-0391: the toolchain written in CobaltC, built by
+    # cobc and compared with the Rust originals on the showcases and the
+    # surface-syntax cases (the whole corpus: impl/selfhost/compare.sh,
+    # compare_parser.sh, compare_c.sh; D-0296 keeps both toolchains in step).
     if has_part tests; then
-        step "selfhost build (cobfmt-cb, cbparse)" timeout -k 30 1800 "$R/impl/selfhost/build.sh"
+        step "selfhost build (cobfmt-cb, cbparse, cbc)" timeout -k 30 1800 "$R/impl/selfhost/build.sh"
+        step "selfhost compilers compared" bash -c "cd '$R' && OUT='$D/selfhost-c' timeout -k 30 3600 impl/selfhost/compare_c.sh \$(git ls-files 'showcase/*.cb')"
         step "selfhost formatters compared" bash -c "cd '$R' && OUT='$D/selfhost-fmt' timeout -k 30 3600 impl/selfhost/compare.sh -m plain,narrow,messy \$(git ls-files 'showcase/*.cb' 'impl/conformance/22-surface-syntax/*.cb')"
         step "selfhost parsers compared" bash -c "cd '$R' && OUT='$D/selfhost-parse' timeout -k 30 3600 impl/selfhost/compare_parser.sh \$(git ls-files 'showcase/*.cb' 'impl/conformance/22-surface-syntax/*.cb')"
     fi

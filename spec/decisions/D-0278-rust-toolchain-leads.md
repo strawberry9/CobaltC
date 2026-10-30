@@ -112,6 +112,12 @@ static pass's frame rules, the decided lowering, then a new tier-D runtime): a p
 code the next phase rewrites. The single port includes `cbc --emit-c -o` (as `cobc` has it) and the closure and
 spawn rules; until then `cbc` keeps paths for every closure and spawn (D-0288, D-0289). D-0281 §23.
 
+**Amendment (2026-10-30, D-0296, Update 151).** The single port is made: `cbc`, `cbparse` and `cobfmt-cb` accept
+the current edition and write `cobc`'s C byte for byte, to a fixed point. With D-0281 complete, option 5 ends and
+option 1 resumes: every change to the static pass or the lowering lands in the Rust tools and in `impl/selfhost/`
+in the same Update, and the battery compares the two compilers' C. Retiring `cobc` (option 2) is still not
+decided (D-0296 item 2): the bootstrap seed is not chosen, and the oracle keeps finding bugs.
+
 ## Recommendation (as drafted, 2026-10-24, superseded by the decision)
 
 Option 1 now, and option 2 as a later decision once its preconditions hold: P4 has brought `cbc` within

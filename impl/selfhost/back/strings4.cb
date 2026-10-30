@@ -15,14 +15,33 @@ import refs4;
 import analyses;
 
 // `objectless_strings`' answer: the candidate bindings (a `let`'s
-// initializer's id, an arm's `body.id | ARM_BIT`), and those of them moved
-// away (cobc's `!id`), compared (`id | 1`) and indexed (`id | 2`).
+// initializer's id, an arm's `body.id | ARM_BIT`, a by-value parameter's
+// `(index + 1) | PARAM_BIT` in a decided program), and those of them moved
+// away (cobc's `!id`), compared (`id | 1`), indexed (`id | 2`) and, D-0294,
+// assigned whole (`id | 4`).
 export struct Objectless
 {
     export HashSet<usize> ids;
     export HashSet<usize> moved;
     export HashSet<usize> compared;
     export HashSet<usize> indexed;
+    export HashSet<usize> assigned;
+}
+
+// D-0286: a by-value parameter that is a candidate (cobc: the `Param`'s
+// address): its name and its id.
+export struct Cand
+{
+    export String name;
+    export usize id;
+}
+
+// A candidate at the root of `x`, `x.f`, `x.f.g`…, and the first field
+// named, if any (cobc's `field_root`).
+struct FieldRoot
+{
+    usize id;
+    Option<String> first;
 }
 
 // ---- small syntax helpers (cobc's uses.rs) ----
@@ -1309,8 +1328,16 @@ struct OW
     HashSet<usize> moved;
     HashSet<usize> compared;
     HashSet<usize> indexed;
+    // D-0294: the candidates assigned whole (`x = e`, decided).
+    HashSet<usize> assigned;
     HashMap<usize, String> names;
     usize depth;
+    // D-0286: by candidate, the fields read by value (and `=f` written).
+    HashMap<usize, HashSet<String>> fields;
+    // D-0286: the next block walked is the function's last expression
+    // (`unsafe { … x }` ending the body): its own last expression is the
+    // function's result too.
+    bool tail_next;
 }
 
 // The binding a name resolves to here: 0 for one that is not a candidate (a
@@ -1355,6 +1382,94 @@ fn mark_bad(ref<OW, exclusive> w, ref<String, shared> n)
             HashSet::insert(&mut w.bad, id);
         },
         None     : {},
+    }
+}
+
+// D-0286: `x`, `x.f`, `x.f.g`…: the candidate at its root (not 0), and the
+// first field named, if any.
+fn ow_field_root(ref<OW, shared> w, ref<Expr, shared> e) : Option<FieldRoot>
+{
+    ref<Expr, shared> r = strip(e);
+    Option<String> first = None;
+    while (true)
+    {
+        match (&r.kind)
+        {
+            ExprKind::EField(f) :
+            {
+                first = Some(String::clone(&Box::get(f).name));
+                r = strip(&Box::get(f).e);
+            },
+            _                   : break,
+        }
+    }
+    ref<PathExpr, shared> pe = match (&r.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&pe.segs) != 1 || Vec::len(&pe.targs) != 0)
+    {
+        return None;
+    }
+    match (ow_cand(w, &pe.segs[0]))
+    {
+        Some(id) : Some(FieldRoot { .id = id, .first = first }),
+        None     : None,
+    }
+}
+
+// A field read or written (`=f`) of candidate `id` (cobc's `fields`).
+fn ow_note_field(ref<OW, exclusive> w, usize id, String f)
+{
+    match (HashMap::get_mut(&mut w.fields, &id))
+    {
+        Some(set) :
+        {
+            _ = HashSet::insert(set, f);
+        },
+        None      :
+        {
+            HashSet<String> set = HashSet::new();
+            HashSet::insert(&mut set, f);
+            HashMap::insert(&mut w.fields, id, set);
+        },
+    }
+}
+
+// A `match`'s arms (cobc's `match_arms`).
+fn ow_match_arms(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Vec<Arm>, shared> arms)
+{
+    foreach (a in arms)
+    {
+        w.depth += 1;
+        Vec::push(&mut w.scopes, HashMap::new());
+        // D-0200: an arm's binder is a candidate as a `let` is, by the arm
+        // (its body's id with `ARM_BIT`; `Fx::lower_match` binds it
+        // objectless when it takes a payload of such a type by value).
+        match (&a.binder)
+        {
+            Some(b) :
+            {
+                usize id = Box::get(&a.body).id | ARM_BIT;
+                HashMap::insert(&mut w.names, id, String::clone(b));
+                ow_bind(w, b, id);
+            },
+            None    : {},
+        }
+        match (&a.lit)
+        {
+            Some(l) : ow_expr(g, w, Box::get(l)),
+            None    : {},
+        }
+        // D-0294 (decided): an arm whose body is a candidate alone moves it
+        // out, as a block's tail does.
+        if (!(g.decided && move_out(w, Box::get(&a.body))))
+        {
+            ow_expr(g, w, Box::get(&a.body));
+        }
+        Vec::pop(&mut w.scopes);
+        w.depth -= 1;
     }
 }
 
@@ -1591,6 +1706,7 @@ fn ow_nested(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
 
 fn ow_block(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
 {
+    bool tail_here = replace(&mut w.tail_next, false);
     w.depth += 1;
     Vec::push(&mut w.scopes, HashMap::new());
     foreach (st in &b.stmts)
@@ -1633,15 +1749,70 @@ fn ow_block(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
     {
         Some(t) :
         {
-            if (!(w.depth == 1 && move_out(w, Box::get(t))))
+            ref<Expr, shared> te = Box::get(t);
+            bool at_tail = w.depth == 1 || (tail_here && g.decided);
+            // D-0286: a block (or `unsafe` block) that is the function's
+            // last expression, and no fused text loop: its own last
+            // expression is the function's result too.
+            Option<ref<Block, shared>> inner = None;
+            if (at_tail)
             {
-                ow_expr(g, w, Box::get(t));
+                match (&strip(te).kind)
+                {
+                    ExprKind::EBlock(ib)  :
+                    {
+                        if (Option::is_none(&fusion_plan(g, ib, ow_fusion_local(w, ib))))
+                        {
+                            inner = Some(ib);
+                        }
+                    },
+                    ExprKind::EUnsafe(ib) :
+                    {
+                        if (Option::is_none(&fusion_plan(g, ib, ow_fusion_local(w, ib))))
+                        {
+                            inner = Some(ib);
+                        }
+                    },
+                    _                     : {},
+                }
+            }
+            if (Option::is_some(&inner) && g.decided)
+            {
+                w.tail_next = true;
+                ow_nested(g, w, Option::unwrap(inner));
+            }
+            else if (!((at_tail || g.decided) && move_out(w, te)))
+            {
+                // (D-0294: in a decided program any block's tail that is a
+                // candidate alone moves it out, `read_place`.)
+                ow_expr(g, w, te);
             }
         },
         None    : {},
     }
     Vec::pop(&mut w.scopes);
     w.depth -= 1;
+}
+
+// `fusion_plan`'s `local` for a block: whether the loop's name is bound in
+// any scope of the walk.
+fn ow_fusion_local(ref<OW, shared> w, ref<Block, shared> b) : bool
+{
+    match (fusion_name(b))
+    {
+        Some(n) :
+        {
+            foreach (m in &w.scopes)
+            {
+                if (HashMap::contains(m, &n))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        None    : false,
+    }
 }
 
 fn ow_call(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<CallExpr, shared> call)
@@ -1830,6 +2001,21 @@ fn ow_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Expr, shared> e)
             {
                 ExprKind::EIndex(p) :
                 {
+                    // D-0294 (decided): `&x[i]` of a candidate is a borrow of
+                    // `x` (its address, token 0) and a bounds check.
+                    if (g.decided)
+                    {
+                        match (path_cand(w, &Box::get(p).a))
+                        {
+                            Some(id) :
+                            {
+                                HashSet::insert(&mut w.seen, id);
+                                ow_expr(g, w, &Box::get(p).b);
+                                return;
+                            },
+                            None     : {},
+                        }
+                    }
                     match (path_name(&Box::get(p).a))
                     {
                         Some(n) :
@@ -1843,13 +2029,58 @@ fn ow_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Expr, shared> e)
                 },
                 _                   : {},
             }
+            // D-0286: in a decided program, a borrow of a candidate or of a
+            // field of one (its address, token 0).
+            if (g.decided)
+            {
+                match (ow_field_root(w, x))
+                {
+                    Some(fr) :
+                    {
+                        HashSet::insert(&mut w.seen, fr.id);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
             ow_expr(g, w, x);
         },
         ExprKind::EArrayRepeat(a) : ow_expr(g, w, &Box::get(a).value),
         ExprKind::EUnary(u)       : ow_expr(g, w, &Box::get(u).e),
         ExprKind::EDeref(a)       : ow_expr(g, w, Box::get(a)),
-        ExprKind::EField(f)       : ow_expr(g, w, &Box::get(f).e),
-        ExprKind::EPropagate(a)   : ow_expr(g, w, Box::get(a)),
+        ExprKind::EField(f)       :
+        {
+            // D-0286: a field read of a candidate (recorded: only plain data
+            // may be read so).
+            if (g.decided)
+            {
+                match (ow_field_root(w, e))
+                {
+                    Some(fr) :
+                    {
+                        FieldRoot { id, first } = fr;
+                        HashSet::insert(&mut w.seen, id);
+                        match (first)
+                        {
+                            Some(fname) : ow_note_field(w, id, fname),
+                            None        : {},
+                        }
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+            ow_expr(g, w, &Box::get(f).e);
+        },
+        ExprKind::EPropagate(a)   :
+        {
+            // D-0294 (decided): `x?` moves the candidate out.
+            if (g.decided && move_out(w, Box::get(a)))
+            {
+                return;
+            }
+            ow_expr(g, w, Box::get(a));
+        },
         ExprKind::EParen(a)       : ow_expr(g, w, Box::get(a)),
         ExprKind::EBinary(bx)     :
         {
@@ -1905,11 +2136,95 @@ fn ow_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Expr, shared> e)
         },
         ExprKind::EAssign(p)      :
         {
-            ow_expr(g, w, &Box::get(p).a);
-            ow_expr(g, w, &Box::get(p).b);
+            ref<Expr, shared> a = &Box::get(p).a;
+            ref<Expr, shared> b = &Box::get(p).b;
+            if (g.decided)
+            {
+                // D-0294: a field of a candidate written (recorded as `=f`:
+                // `Fx::objectless_binding` allows it of plain data and quiet
+                // types, whose old value the write destroys, `lower_assign`),
+                // or the candidate assigned whole (`id | 4`, a quiet type).
+                bool a_field = match (&strip(a).kind)
+                {
+                    ExprKind::EField(_) : true,
+                    _                   : false,
+                };
+                if (a_field)
+                {
+                    match (ow_field_root(w, a))
+                    {
+                        Some(fr) :
+                        {
+                            FieldRoot { id, first } = fr;
+                            HashSet::insert(&mut w.seen, id);
+                            match (first)
+                            {
+                                Some(fname) : ow_note_field(w, id, sprintf("=%s", &fname)),
+                                None        : {},
+                            }
+                            ow_expr(g, w, b);
+                            return;
+                        },
+                        None     : {},
+                    }
+                }
+                match (path_cand(w, a))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.assigned, id);
+                        bool other_name = match (path_name(b))
+                        {
+                            Some(nb) : match (path_name(a))
+                            {
+                                Some(na) : !String::eq(&nb, &na),
+                                None     : true,
+                            },
+                            None : false,
+                        };
+                        if (!(other_name && move_out(w, b)))
+                        {
+                            ow_expr(g, w, b);
+                        }
+                        return;
+                    },
+                    None     : {},
+                }
+                // D-0294 (decided): a candidate moved into a place (`p.f = x`),
+                // the place not naming it.
+                bool moved_in = match (path_name(b))
+                {
+                    Some(nb) : !names_in(a, &nb) && move_out(w, b),
+                    None     : false,
+                };
+                if (moved_in)
+                {
+                    ow_expr(g, w, a);
+                    return;
+                }
+            }
+            ow_expr(g, w, a);
+            ow_expr(g, w, b);
         },
         ExprKind::ESliceOf(s)     :
         {
+            // D-0294 (decided): `&x[a..b]`, a read of `x` (its slice carries
+            // token 0).
+            if (g.decided)
+            {
+                match (path_cand(w, &Box::get(s).base))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        ow_expr(g, w, &Box::get(s).lo);
+                        ow_expr(g, w, &Box::get(s).hi);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
             ow_expr(g, w, &Box::get(s).base);
             ow_expr(g, w, &Box::get(s).lo);
             ow_expr(g, w, &Box::get(s).hi);
@@ -1941,34 +2256,44 @@ fn ow_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Expr, shared> e)
         ExprKind::EMatch(m)       :
         {
             ref<MatchExpr, shared> x = Box::get(m);
-            ow_expr(g, w, &x.scrut);
-            foreach (a in &x.arms)
+            // D-0294 (decided): a candidate matched in place (`lower_match`'s
+            // place scrutinee): moved away when an arm binds a payload (the
+            // arm sets its flag). Not an arm binding the whole value
+            // (`other : …`), which moves it out of the binding's object
+            // (`lower_match_scalar`).
+            if (g.decided)
             {
-                w.depth += 1;
-                Vec::push(&mut w.scopes, HashMap::new());
-                // D-0200: an arm's binder is a candidate as a `let` is, by
-                // the arm (its body's id with `ARM_BIT`; `Fx::lower_match`
-                // binds it objectless when it takes a payload of such a type
-                // by value).
-                match (&a.binder)
+                match (path_cand(w, &x.scrut))
                 {
-                    Some(b) :
+                    Some(id) :
                     {
-                        usize id = Box::get(&a.body).id | ARM_BIT;
-                        HashMap::insert(&mut w.names, id, String::clone(b));
-                        ow_bind(w, b, id);
+                        bool whole = false;
+                        bool any_binder = false;
+                        foreach (a in &x.arms)
+                        {
+                            whole = whole || (Option::is_none(&a.variant) && Option::is_some(&a.binder));
+                            any_binder = any_binder || Option::is_some(&a.binder);
+                        }
+                        if (whole)
+                        {
+                            mark_bad(w, &Option::expect(path_name(&x.scrut), "a candidate's name"));
+                        }
+                        else
+                        {
+                            HashSet::insert(&mut w.seen, id);
+                            if (any_binder)
+                            {
+                                HashSet::insert(&mut w.moved, id);
+                            }
+                        }
+                        ow_match_arms(g, w, &x.arms);
+                        return;
                     },
-                    None    : {},
+                    None     : {},
                 }
-                match (&a.lit)
-                {
-                    Some(l) : ow_expr(g, w, Box::get(l)),
-                    None    : {},
-                }
-                ow_expr(g, w, Box::get(&a.body));
-                Vec::pop(&mut w.scopes);
-                w.depth -= 1;
             }
+            ow_expr(g, w, &x.scrut);
+            ow_match_arms(g, w, &x.arms);
         },
         ExprKind::EClosure(cl)    :
         {
@@ -2069,12 +2394,40 @@ export fn objectless_strings(
     ref<Vec<String>, shared> params,
 ) : Objectless
 {
+    HashMap<usize, HashSet<String>> fields = HashMap::new();
+    objectless_strings_with(g, body, params, &Vec::new(), &mut fields)
+}
+
+// `objectless_strings`, the parameters `cands` (name, id) candidates as a
+// `let` with an initializer is (D-0286: a decided program's by-value
+// parameters, which arrive with no object). In a decided program (D-0286) a
+// candidate may also be borrowed whole or by a field anywhere (the borrow is
+// its address, token 0), and its fields read; `fields` gets, by candidate,
+// the fields read by value, which `Fx::objectless_binding` allows only of
+// plain data (no field is moved out of an objectless local).
+export fn objectless_strings_with(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> body,
+    ref<Vec<String>, shared> params,
+    ref<Vec<Cand>, shared> cands,
+    ref<HashMap<usize, HashSet<String>>, exclusive> fields,
+) : Objectless
+{
     HashSet<String> bound = bound_names(body);
     HashMap<String, usize> top = HashMap::new();
     foreach (p in params)
     {
         HashSet::insert(&mut bound, String::clone(p));
-        HashMap::insert(&mut top, String::clone(p), 0);
+        usize id = 0;
+        foreach (c in cands)
+        {
+            if (String::eq(&c.name, p))
+            {
+                id = c.id;
+                break;
+            }
+        }
+        HashMap::insert(&mut top, String::clone(p), id);
     }
     Vec<HashMap<String, usize>> scopes = Vec::new();
     Vec::push(&mut scopes, top);
@@ -2086,13 +2439,23 @@ export fn objectless_strings(
         .moved = HashSet::new(),
         .compared = HashSet::new(),
         .indexed = HashSet::new(),
+        .assigned = HashSet::new(),
         .names = HashMap::new(),
         .depth = 0,
+        .fields = HashMap::new(),
+        .tail_next = false,
     };
     ow_block(g, &mut w, body);
+    *fields = replace(&mut w.fields, HashMap::new());
     // A candidate moved away is recorded in `moved` too (cobc's `!id`): its
     // binding gets a moved flag (`Fx::objectless_bound`).
-    Objectless o = Objectless { .ids = HashSet::new(), .moved = HashSet::new(), .compared = HashSet::new(), .indexed = HashSet::new() };
+    Objectless o = Objectless {
+        .ids = HashSet::new(),
+        .moved = HashSet::new(),
+        .compared = HashSet::new(),
+        .indexed = HashSet::new(),
+        .assigned = HashSet::new(),
+    };
     foreach (x in &w.seen)
     {
         if (!HashSet::contains(&w.bad, x))
@@ -2109,6 +2472,10 @@ export fn objectless_strings(
             if (HashSet::contains(&w.indexed, x))
             {
                 HashSet::insert(&mut o.indexed, *x);
+            }
+            if (HashSet::contains(&w.assigned, x))
+            {
+                HashSet::insert(&mut o.assigned, *x);
             }
         }
     }

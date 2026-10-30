@@ -116,13 +116,26 @@ export fn objectless_type(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
     objectless_type_in(g, t, &mut seen)
 }
 
+// D-0294: in a decided program no reference inside a value is tracked
+// (`has_refs`), so a value with no resource and no `fn` in it is as plain
+// data here.
 fn ol_elem(ref<Gen, exclusive> g, ref<Type, shared> x, ref<Vec<String>, exclusive> seen) : bool
 {
-    (plain_data(g, x) && !has_refs(g, x) && !holds_fn(g, x)) || objectless_type_in(g, x, seen)
+    (plain_data(
+        g,
+        x,
+    ) && !has_refs(g, x) && !holds_fn(g, x)) || (g.decided && decided_plain(g, x)) || objectless_type_in(
+        g,
+        x,
+        seen,
+    )
 }
 
-// `seen`: the struct types being answered, by type code; a type holding
-// itself is answered no there.
+// `seen`: the struct and enum types being answered, by type code.
+// D-0294: a type met again on the walk (`struct N { Vec<N> kids; }`, a
+// syntax tree through `Box`) is answered yes there: the whole's answer is
+// its other parts' (coinductively; before D-0294 it was no, and a recursive
+// type never objectless).
 export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec<String>, exclusive> seen) : bool
 {
     String code = type_code(t);
@@ -130,7 +143,7 @@ export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec
     {
         if (String::eq(s, &code))
         {
-            return false;
+            return true;
         }
     }
     match (t)
@@ -143,6 +156,14 @@ export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec
             {
                 return true;
             }
+            // D-0294: in a decided program a `Box`, whose end the runtime
+            // makes natively from the type descriptor (`box_of`), over such
+            // a value (in a tracked one its contents' paths would need the
+            // object `cb_raw_move_in` keeps).
+            if (String::eq_str(&nt.name, "std::Box") && k == 1 && g.decided)
+            {
+                return ol_elem(g, &nt.args[0], seen);
+            }
             if ((String::eq_str(
                 &nt.name,
                 "std::Vec",
@@ -154,27 +175,67 @@ export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec
             {
                 return ol_elem(g, &nt.args[0], seen) && ol_elem(g, &nt.args[1], seen);
             }
-            if (String::starts_with(&nt.name, StringView::of("std::")))
+            // (D-0294: a struct's; before, this arm took every name of the
+            // program's, and an enum of the program's never reached the
+            // next, D-0286's.)
+            if (!String::starts_with(&nt.name, StringView::of("std::")))
+            {
+                match (struct_decl(g, &nt.name))
+                {
+                    Some(sd) :
+                    {
+                        if (sd.resource_ || Option::is_some(&sd.bits))
+                        {
+                            return false;
+                        }
+                        HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+                        Vec::push(seen, String::clone(&code));
+                        bool ok = true;
+                        foreach (fd in &sd.fields)
+                        {
+                            if (ok)
+                            {
+                                Type ft = apply(&fd.ty, &sub);
+                                ok = ol_elem(g, &ft, seen);
+                            }
+                        }
+                        Vec::pop(seen);
+                        return ok;
+                    },
+                    None     : {},
+                }
+            }
+            // D-0286: in a decided program, an enum (`Option`, `Result`, the
+            // program's own) not declared `resource`, with no destructor of
+            // its own, whose payloads are such values or plain data.
+            if (!g.decided)
             {
                 return false;
             }
-            match (struct_decl(g, &nt.name))
+            match (enum_decl(g, &nt.name))
             {
-                Some(sd) :
+                Some(ed) :
                 {
-                    if (sd.resource_ || Option::is_some(&sd.bits))
+                    if (ed.resource_ || HashMap::contains(&g.prog.table.fns, &sprintf("%s::drop", &nt.name)))
                     {
                         return false;
                     }
-                    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &nt.args);
                     Vec::push(seen, String::clone(&code));
                     bool ok = true;
-                    foreach (fd in &sd.fields)
+                    foreach (v in &ed.variants)
                     {
-                        if (ok)
+                        match (&v.payload)
                         {
-                            Type ft = apply(&fd.ty, &sub);
-                            ok = ol_elem(g, &ft, seen);
+                            Some(p) :
+                            {
+                                if (ok)
+                                {
+                                    Type pt = apply(p, &sub);
+                                    ok = ol_elem(g, &pt, seen);
+                                }
+                            },
+                            None    : {},
                         }
                     }
                     Vec::pop(seen);
@@ -184,6 +245,79 @@ export fn objectless_type_in(ref<Gen, exclusive> g, ref<Type, shared> t, ref<Vec
             }
         },
         _               : false,
+    }
+}
+
+// D-0294: `plain_data` for a decided program (`Gen::decided`): a reference
+// or slice, which no runtime state follows there, counts as plain, in a
+// value as alone; a struct or enum the program declares (not a type
+// parameter's bare name) over such values too.
+export fn decided_plain(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_)    : true,
+        Type::TF32       : true,
+        Type::TF64       : true,
+        Type::TBool      : true,
+        Type::TStr       : true,
+        Type::TRawptr(_) : true,
+        Type::TRef(_)    : true,
+        Type::TSlice(_)  : true,
+        Type::TArray(a)  : decided_plain(g, &Box::get(a).inner),
+        Type::TSimd(a)   : decided_plain(g, &Box::get(a).inner),
+        Type::TNamed(n)  :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            match (struct_decl(g, &nt.name))
+            {
+                Some(sd) :
+                {
+                    if (sd.resource_)
+                    {
+                        return false;
+                    }
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+                    foreach (fd in &sd.fields)
+                    {
+                        if (!decided_plain(g, &apply(&fd.ty, &sub)))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                None     : {},
+            }
+            match (enum_decl(g, &nt.name))
+            {
+                Some(ed) :
+                {
+                    if (ed.resource_)
+                    {
+                        return false;
+                    }
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &nt.args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) :
+                            {
+                                if (!decided_plain(g, &apply(p, &sub)))
+                                {
+                                    return false;
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                    true
+                },
+                None     : false,
+            }
+        },
+        _                : false,
     }
 }
 

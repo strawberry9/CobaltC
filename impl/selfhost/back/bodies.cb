@@ -488,6 +488,17 @@ fn lower_fn_frozen(
     String tail = sig_tail(sig);
     String frz_sig = sprintf("%s %s%s", ret_c, &frz, &tail);
     String chk_sig = sprintf("%s %s%s", ret_c, &chk, &tail);
+    // D-0294: in a decided program the entry test is the constant 1
+    // (`cb_frozen_ok` under `CB_PATHLESS`): the frozen body is the function,
+    // with no twin and no dispatcher.
+    if (g.decided)
+    {
+        g.frozen_mode = true;
+        g.pending_raw_ret = raw;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, None);
+        g.frozen_mode = false;
+        return;
+    }
     usize start = String::len(&g.fns);
     g.frozen_mode = true;
     g.pending_raw_ret = raw;
@@ -1038,9 +1049,51 @@ export fn vouched_args(
     }
     if (Vec::len(&refs) == 1)
     {
-        return fresh_ref_arg(g, x, &args[refs[0]]);
+        // A reference formed before a later argument is computed is fresh at
+        // the call only if that argument cannot act on what it reaches first
+        // (`set(&mut v[0], grow(&mut v))` moves the element): one with a
+        // call, a block or an assignment may.
+        usize i = refs[0];
+        if (!fresh_ref_arg(g, x, &args[i]))
+        {
+            return false;
+        }
+        for (usize k = i + 1; k < Vec::len(args); k += 1)
+        {
+            if (arg_has_call(&args[k]))
+            {
+                return false;
+            }
+        }
+        return true;
     }
     false
+}
+
+// Whether `e` contains a call, whose evaluation may have an effect
+// (coby's `parser::has_call`).
+fn arg_has_call(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(_)      : true,
+        ExprKind::EUnary(b)     : arg_has_call(&Box::get(b).e),
+        ExprKind::EBorrow(b)    : arg_has_call(&Box::get(b).e),
+        ExprKind::EDeref(x)     : arg_has_call(Box::get(x)),
+        ExprKind::EField(b)     : arg_has_call(&Box::get(b).e),
+        ExprKind::EPropagate(x) : arg_has_call(Box::get(x)),
+        ExprKind::EParen(x)     : arg_has_call(Box::get(x)),
+        ExprKind::EBinary(b)    : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EIndex(b)     : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EAssign(b)    : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EPath(_)      : false,
+        ExprKind::EInt(_)       : false,
+        ExprKind::EFloat(_)     : false,
+        ExprKind::EStr(_)       : false,
+        ExprKind::EBool(_)      : false,
+        ExprKind::EUnit         : false,
+        _                       : true,
+    }
 }
 
 export fn fresh_ref_arg(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> a) : bool

@@ -38,6 +38,7 @@ enum Coll
     CSetDrain,
     CMapDrain,
     CSlice,
+    CParts,
 }
 
 struct CollOf
@@ -64,6 +65,7 @@ fn coll(ref<Type, shared> t) : Option<CollOf>
                 "std::Drain"     : Coll::CDrain,
                 "std::SetDrain"  : Coll::CSetDrain,
                 "std::HashDrain" : Coll::CMapDrain,
+                "std::Parts"     : Coll::CParts,
                 _                : return None,
             };
             Some(CollOf { .c = c, .n = 0, .mode = Mode::Shared })
@@ -322,7 +324,7 @@ export fn each_expand(
         {
             return bad();
         }
-        if ((c == Coll::CVec || c == Coll::CArray || c == Coll::CSet || c == Coll::CSlice) && Option::unwrap_or(
+        if ((c == Coll::CVec || c == Coll::CArray || c == Coll::CSet || c == Coll::CSlice || c == Coll::CParts) && Option::unwrap_or(
             int_arg(args, 1),
             0,
         ) == 3)
@@ -331,6 +333,14 @@ export fn each_expand(
         }
         // A slice (D-0047) is a borrow already.
         if (c == Coll::CSlice || c == Coll::CArray)
+        {
+            return Ok(a0);
+        }
+        // D-0287: a text splitter's parts, found as they are taken
+        // (`std::Parts`, which `modres` made the loop hold): the holder is
+        // the `Parts` itself, and the bound grows by one while a part is
+        // left.
+        if (c == Coll::CParts)
         {
             return Ok(a0);
         }
@@ -362,6 +372,10 @@ export fn each_expand(
         if (c == Coll::CArray)
         {
             return Ok(at(&m, ExprKind::EInt(Box::new(IntLit { .v = co.n, .sfx = None }))));
+        }
+        if (c == Coll::CParts && none_mode)
+        {
+            return Ok(call1(&m, "std::Parts::bound", a0));
         }
         if (!none_mode)
         {
@@ -404,6 +418,30 @@ export fn each_expand(
             Expr ix = index(&m, a0, a1);
             return Ok(if (co.mode == Mode::Shared) { shared(&m, ix) } else { excl(&m, ix) });
         }
+        // `{ $d = std::Parts::next($d); std::StringView::sub($d.v, $d.lo,
+        // $d.hi) }`: the holder goes by value, never borrowed.
+        if (c == Coll::CParts)
+        {
+            Expr step = at(
+                &m,
+                ExprKind::EAssign(Box::new(PairExpr { .a = clone(&a0), .b = call1(
+                    &m,
+                    "std::Parts::next",
+                    clone(&a0),
+                ) })),
+            );
+            Vec<Stmt> stmts = Vec::new();
+            Vec::push(&mut stmts, Stmt::SExpr(Box::new(step)));
+            Vec<Expr> sub_args = Vec::new();
+            Vec::push(&mut sub_args, field(&m, clone(&a0), "v"));
+            Vec::push(&mut sub_args, field(&m, clone(&a0), "lo"));
+            Vec::push(&mut sub_args, field(&m, a0, "hi"));
+            Expr sub = at(
+                &m,
+                ExprKind::ECall(Box::new(CallExpr { .callee = path_of(&m, "std::StringView::sub"), .args = sub_args })),
+            );
+            return Ok(at(&m, ExprKind::EBlock(Block { .stmts = stmts, .tail = Some(Box::new(sub)) })));
+        }
         if (c == Coll::CDrain)
         {
             return Ok(call1(&m, "std::Drain::take", excl(&m, a0)));
@@ -428,7 +466,7 @@ export fn each_expand(
         {
             return bad();
         }
-        if (c == Coll::CSlice || c == Coll::CDrain || c == Coll::CArray || c == Coll::CSetDrain)
+        if (c == Coll::CSlice || c == Coll::CDrain || c == Coll::CArray || c == Coll::CSetDrain || c == Coll::CParts)
         {
             return Ok(a1);
         }

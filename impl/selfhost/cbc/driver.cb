@@ -78,7 +78,7 @@ const str USAGE =
     "       cobc [--explain] --lib [-o libNAME.a] [--target TRIPLE] [--cc COMPILER] FILE.cb\n"
     "       cobc [--explain] [--warn-shadow] --check PATH...\n"
     "       cobc --check-syntax [--origin PATH] (FILE | -)\n"
-    "       cobc --emit-c [--c-name NAME] FILE";
+    "       cobc --emit-c [--c-name NAME] [-o OUT] FILE";
 
 const str HELP =
     "Compile a CobaltC program to a native executable.\n"
@@ -206,11 +206,13 @@ const str HELP =
     "               as part of that program, not on its own. Nothing is printed\n"
     "               for an accepted program. `coby --check` does the same\n"
     "               without the `extern` files.\n"
-    "  --emit-c [--c-name NAME] FILE\n"
-    "               The program's C on standard output, nothing compiled or\n"
-    "               linked: the file `--keep-c` keeps, NAME the name its `#line`\n"
-    "               directives give it (default a.c). A program the static pass\n"
-    "               rejects gets its diagnostic and status 1.\n"
+    "  --emit-c [--c-name NAME] [-o OUT] FILE\n"
+    "               The program's C, nothing compiled or linked: the file\n"
+    "               `--keep-c` keeps, written to OUT, or on standard output\n"
+    "               without -o or with `-o -`. NAME is the name its `#line`\n"
+    "               directives give it (default OUT, else a.c). A program the\n"
+    "               static pass rejects gets its diagnostic and status 1, and\n"
+    "               OUT is not written.\n"
     "  --check-syntax [--origin PATH] (FILE | -)\n"
     "               Whether one text parses, and nothing else: FILE, or standard\n"
     "               input for `-`, its `module m \"./m.cb\";` files found\n"
@@ -822,15 +824,41 @@ export fn driver_main() : u8
     Expansion ex = clone(&prog.ex);
 
     u64 t_lower = monotonic_ns();
-    Gen lowering = new_gen(prog);
-    lowering.bootstrap = level;
     // `--all-checks` is in the driver's flags, not the environment `new_gen` reads.
-    lowering.all_checks = lowering.all_checks || env_flag("COBALTC_ALL_CHECKS") || lowering.bootstrap > 0;
-    lowering.line_directives = line_directives && !report_tracking;
-    Generated gen = generate_parts(&mut lowering, lib);
+    Lowered lowered = generate_program(
+        prog,
+        lib,
+        level,
+        env_flag("COBALTC_ALL_CHECKS"),
+        line_directives && !report_tracking,
+    );
+    match (&lowered.unsupported)
+    {
+        Some(what) :
+        {
+            eprintf("unsupported: %s\n", what);
+            return 3;
+        },
+        None       : {},
+    }
+    Lowered { gen, notes, .. } = lowered;
+    foreach (n in &notes)
+    {
+        note(String::as_view(n));
+    }
     if (report_tracking)
     {
-        String text = report::report(String::as_view(&combined(&gen, "report.c")), String::as_view(&file));
+        String text = match (&gen.kept)
+        {
+            None : String::from_str(
+                "no run-time tracking: every conflict is decided before the run, so the program keeps no record of references (D-0284)\n",
+            ),
+            Some(why) : sprintf(
+                "The program keeps a record of references: %s\n%s",
+                why,
+                &report::report(String::as_view(&combined(&gen, "report.c")), String::as_view(&file)),
+            ),
+        };
         return if (print_out(String::as_view(&text))) { 0 } else { 1 };
     }
     note(String::as_view(&sprintf("lowered to C in %v ms (%v units)", ms_since(t_lower), Vec::len(&gen.units))));

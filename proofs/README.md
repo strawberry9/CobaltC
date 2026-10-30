@@ -143,6 +143,12 @@ frame is `[Block-Enter]`, its binding is a step, its body is the fragment's othe
 composition of `[Temp-Root]`, `[Relocate-Out]` of the payload, the scrutinee's end and a binding, each a
 step), channels, atomics and foreign calls remain outside (below).
 
+The theorems are about the dynamic machine. The static rules that discharge its premises before the run —
+`rule.control.flow-analysis` and, since D-0282, `rule.control.frame-references` (`spec/14` §6), on which
+D-0281's decided programs rely to keep no record of their references — are not mechanised here: the model
+checker's statics (`impl/model/src/statics.rs`, `frames.rs`) check them against its exploration of every
+interleaving (`model.proven-but-false`), and the replay checks that exploration's steps against this machine.
+
 ## Coverage of `spec/23`'s rules
 
 Of the 70 rule labels `spec/23` names, the fragment has 35 as steps: `[Object-Establish-Plain]`,
@@ -166,9 +172,11 @@ count, never a lock state), and foreign calls (`[Extern-Call]`, `[Trust-Transiti
     lake exe replay prog.tr                     # admitted whole, stopped outside, or REFUSED
     python3 impl/tools/replay_model.py impl/model/sample --check
 
-Over the model checker's 315 sample programs (2026-10-19): 178 runs replay whole, 137 stop where the
-model leaves the fragment (vectors 82, channels 30, closures 14, arrays 4, swaps 3, jobs 3, atomics 1),
-none refused; 7,181 actions admitted, 205 gaps applied. A refusal is a finding: a model step the
+Over the model checker's 315 sample programs (2026-10-30, edition 2026.103001): 199 runs replay whole, 116
+stop where the model leaves the fragment (vectors 65, channels 30, closures 12, arrays 4, jobs 3, atomics 1,
+swaps 1), none refused; 6,728 actions admitted, 219 gaps applied. (2026-10-19: 178 whole, 137 outside, 7,181
+actions; the difference is the samples D-0282's frame-reference rule now refutes before the run: a statically
+rejected program has no run, and its empty trace replays whole.) A refusal is a finding: a model step the
 fragment's rules do not admit, to be settled as a fragment gap, a model defect or a text defect.
 
 ## Building

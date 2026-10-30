@@ -16,7 +16,7 @@ CobaltC is already well formed, but currently still in experimental stage.
 
 This project began on 19 September 2026, based on the instructions provided (to the AI) by the project owner (me), as set out in [CobaltC_Master_Instructions.md](CobaltC_Master_Instructions.md).
 
-Commit Update 150, 2026-10-29 20:14 UTC. Specification edition 2026.102905. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
+Commit Update 151, 2026-10-30 11:33 UTC. Specification edition 2026.103001. The repository is kept as a single commit that each update replaces, so this line, rather than the history, says when that last happened; the edition, recorded in [spec/README.md](spec/README.md), changes only when the specification does.
 
 The language specification (which is also well developed, but not yet final) is available [here](https://github.com/strawberry9/CobaltC/tree/main/spec)
 
@@ -48,7 +48,7 @@ Another good place to begin learning is viewing the many showcase examples (see 
 
 Everything is a standard Rust Cargo workspace with no dependencies outside the Rust standard library; the compiler additionally needs a C compiler (`cc`) on the path.
 
-NOTE: CobaltC is self-hosting - see impl/selfhost: `cbc`, the compiler written in CobaltC, takes the same options as `cobc`, writes the same C byte for byte, and compiles itself (`impl/STATUS.md` says how it is built and checked). While the reference cost model is built, the Rust toolchain leads and the CobaltC one follows at milestones (D-0278); it accepts the language of edition 2026.102501.
+NOTE: CobaltC is self-hosting - see impl/selfhost: `cbc`, the compiler written in CobaltC, takes the same options as `cobc`, writes the same C byte for byte, and compiles itself (`impl/STATUS.md` says how it is built and checked). Both toolchains accept the current edition and are changed together (D-0296).
 
 The Rust Cargo workspace has been developed and verified on:
 
@@ -235,7 +235,7 @@ On Windows the same commands apply: `cobfmt`, like `coby`, uses only the standar
 - `front/`: coby's whole front end: the lexer, the abstract syntax, the parser (function for function with coby's: the same grammar, rewrites and messages), the loader of file-backed modules, the parse check, the derived functions and name resolution (`derive.cb`, `modres.cb`: the module tree, imports and re-exports, visibility, every reference rewritten to its qualified name), the folding of constants and the views of text literals (`consts.cb`, `views.cb`), and the type checker (`typecheck.cb`, function for function with coby's, with `items.cb`, `each.cb`, `fmtcheck.cb` and `consteval.cb`). What these take from `std` is generated (`front/prelude.cb`, by `coby --prelude-summary`: the tokens the parser's pre-scans read, `std`'s declarations with every function's body empty, and each body's text) instead of parsing 28,000 lines of `std` on every run; a `std` function's body is parsed when the checker first reaches it.
 - `cbparse/`: that front end standing alone. `cbparse --dump-ast FILE` prints the program's own part of the parse in the text `coby --dump-ast` prints, `cbparse --dump-resolved FILE` that part once its names are resolved `--dump-folded` once its constants are folded too, and `--dump-checked` the static pass's verdict, as `coby` prints them, and `cbparse --check-syntax FILE` answers as `cobc --check-syntax` does.
 - `cobfmt/`: `cobfmt` again, a module for each of the Rust formatter's (the layout, line breaking, the safety check, the diff, finding and writing files), with the same options, messages and exit statuses, deciding whether a text parses with the parser above.
-- `back/` and `cbc/`: `cobc`'s code generator, over the front end above. `cbc --emit-c FILE` prints the C that `cobc --bootstrap-form` writes for the program (the general checked form, every optimisation off, D-0274), byte for byte; it does not run the C compiler. `cbc` compiles itself: built by `cobc`, it writes its own C, a C compiler builds a second `cbc` from that, and the second writes the same C again, so the compiler written in CobaltC reproduces itself without the Rust one. Its output is not optimised, so `cobc` stays the compiler in use; the interpreter and the runtime stay in Rust.
+- `back/` and `cbc/`: `cobc` again, over the front end above (D-0276): the same command line, the same C compiler invocation and linking, and the same C, byte for byte, in every form `cobc` writes (the default, optimised one, `--all-checks`, `-g`, `--lib`, and D-0274's bootstrap form); `cbc --emit-c [-o OUT] FILE` prints the C alone. `cbc` compiles itself: built by `cobc`, it writes its own C, a C compiler builds a second `cbc` from that, and the second writes the same C again, so the compiler written in CobaltC reproduces itself without the Rust one. It compiles more slowly than `cobc`, which stays in the tree as the reference and the oracle; the interpreter and the runtime stay in Rust.
 
 ```
 cd impl
@@ -243,8 +243,8 @@ cargo build --release -p coby -p cobc -p cbrt -p cobfmt
 selfhost/build.sh                         # target/selfhost/cobfmt-cb, cbparse and cbc
 selfhost/compare.sh                       # the two formatters on every tracked .cb file, compared
 selfhost/compare_parser.sh                # the two front ends on every tracked .cb file and mutated copies
-selfhost/compare_c.sh "$PWD"/conformance/*/*.cb   # cbc's C and cobc --bootstrap-form's, compared
-selfhost/fixpoint.sh                      # cbc compiling itself to a fixed point (about two hours)
+selfhost/compare_c.sh "$PWD"/conformance/*/*.cb   # cbc's C and cobc's, compared
+selfhost/fixpoint.sh                      # cbc compiling itself to a fixed point (about 30 minutes)
 ```
 
 `compare.sh` runs both formatters on every `.cb` file git tracks, five ways (as the files are, with `--no-wrap`, at `--width 40`, with every line's indentation removed, and with tabs, doubled spaces and `\r\n` line ends), and on the command line's options and errors (in-place writing and backups included, a rewritten file's permissions too), and compares standard output, standard error and the exit status byte for byte; the one difference by design is the usage text. `compare_parser.sh` compares the two front ends' dumps (parsed, resolved and folded) and parse checks on every tracked file, and the parses of seven mutated copies of each (a line or a character deleted, a stray `(`, `}` or `;` inserted), nearly all of them errors, so the messages and their positions are compared too; it also checks that `front/prelude.cb` is current. The Rust tools stay the reference.

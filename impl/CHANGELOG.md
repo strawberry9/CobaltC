@@ -302,6 +302,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0293 — The token-kind tests inline: a decided function's references cost no call in any program
 - D-0294 — The objectless remainder: a decided program's values keep no object where no check could read it
 - D-0295 — Light element references: a decided function's element references carry no record in any program; phase 3 closed
+- D-0296 — The self-hosted toolchain ported to the current edition: `cbc` writes `cobc`'s C again, and D-0281 is complete
 
 ---
 
@@ -8450,6 +8451,35 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0391: the self-hosted toolchain ported to the current edition; an arm's nested `match` scopes its arms (D-0296, 2026-10-30)
+
+- The single port of D-0278's amendment: `impl/selfhost/front/` gets the static pass of Updates 136–150
+  (`typecheck.cb`; `tier.cb`, new, the port of `tier.rs`; D-0287's `$each_lazy` in `parser.cb`, `modres.cb`,
+  `each.cb`), with the facts the code generator reads kept on `Items` (`tracking_needed`, `point_check_fns`,
+  `point_checks`, the access summaries) and three type questions (`keeps_refs_in_data`, `keeps_refs_in_data_by`,
+  `frame_holdable`); `impl/selfhost/back/` and `cbc/` get `cobc`'s lowering of the same Updates (new:
+  `program.cb`, `flights.cb`, `points.cb`) and `cbc --emit-c -o`. `front/prelude.cb`, `back/header.cb` and
+  `back/std_values.cb` regenerated. About 20,200 lines added and 7,400 replaced. The two halves were ported side by
+  side against that interface; joined, three differences were integration: point checks recorded in the Rust's
+  order (`typecheck.cb`), and `fresh3.cb`'s `probe_ok` using the cached probe as `fresh.rs` does (an uncached
+  probe lowered a nested call twice).
+- `cobc` (`lower/operators.rs` `lower_branch`) and `cbc` (`gen.cb`): a `match` that is a match arm's whole value now
+  gives its own arms statement scopes. Before, its arms' temporaries went to the outer arm's scope, so a view of a
+  binder made for a call outlived the binder, and in a program that keeps paths the frame's end faulted
+  `diag.destroy-while-aliased` falsely. Found by the port (an interim `cbparse` that kept paths faulted). New case
+  `conf.nested-match-arm-temporaries-end` (`spec/conformance.md` 3.284.0).
+- `compare_c.sh` takes `ROOT` and `COBC` from the environment and exits 1 on a difference; the battery's selfhost
+  stage compares the two compilers' C on the showcases.
+- Recorded, not changed: `cobc`'s decided lowering falls back (a `-v` note) on `match_text_patterns_ok`, a `String`
+  scrutinee moved out of a place that is not a binding (D-0294's `match` rule).
+- Verified (0 differences each): `compare_parser.sh`, every mode, every tracked file (21,157); the tier report over
+  the corpus (1,249 bodies); `compare_c.sh` over every tracked file (1,162), the conformance suite with
+  `--all-checks` (753), the showcases and controls with `-g`, `--no-line-directives` and `LEVEL=10` (92 each);
+  `compare.sh` (5,304); `fixpoint.sh` (stage 2 = stage 1 = `cobc`'s C); `COBC=cbc cargo test -p cobc --release`
+  (52 tests, GCC and Clang). Bench (`runs/port` against `runs/elem`): `cbc` on `anagrams.cb` 3.44 G → 5.21 G
+  instructions, the work of D-0282–D-0295 it now does; every other row within 0.3%. `cbc` writes its own C in
+  about 11 minutes (`cobc`: 79 s). D-0281 is complete (§25); D-0278 option 1 resumes.
 
 ## CHG-0390: light element references, a decided function's element references carry no record in any program; phase 3 closed (D-0295, 2026-10-29)
 
