@@ -253,6 +253,12 @@ names a rule or is marked internal.
 | `cb_parse_float` | standard library externs | — | — |
 | `cb_parse_bool` | standard library externs | D-0181 | — |
 | `cb_format` | standard library externs | `$fmt` (rule.stdlib.format) | — |
+| `cb_fmt_space` | standard library externs | D-0297: a literal format of the common specifiers, written in place by the generated code: this thread's space for `n` bytes (not cb_format's buffer, which an argument may still point into), and each number's text as cb_format writes it. | — |
+| `cb_fmt_u64` (inline) | standard library externs | D-0297: a literal format of the common specifiers, written in place by the generated code: this thread's space for `n` bytes (not cb_format's buffer, which an argument may still point into), and each number's text as cb_format writes it. | — |
+| `cb_fmt_i64` (inline) | standard library externs | — | — |
+| `cb_fmt_u64` | standard library externs | — | — |
+| `cb_fmt_hex` (inline) | standard library externs | — | — |
+| `cb_fmt_pad` (inline) | standard library externs | The `n` bytes at `out` widened to `w`: `how` 0 spaces before, 1 spaces after (`-`), 2 zeros after the sign (`0`). | — |
 | `cb_file_read` | standard library externs | `read_file` (rule.stdlib.file) | — |
 | `cb_file_write` | standard library externs | — | — |
 | `cb_file_op` | standard library externs | `File` (rule.stdlib.file-handle) | — |
@@ -280,6 +286,7 @@ names a rule or is marked internal.
 | `cb_bytes_less` | bit operations | key_less on text (D-0062) | — |
 | `cb_bytes_lt` (inline) | bit operations | The same, inline, for a native sort's inner loop: byte order, a prefix first. | — |
 | `cb_sort_plain` | bit operations | Vec::sort of integers or bools (D-0062) | — |
+| `cb_sort_text` | bit operations | Vec::sort of String (0) or str (1), stably by bytes (D-0297) | — |
 | `cb_round` (inline) | bit operations | `round`, half away from zero, from `trunc` (exact: the dropped fraction is representable), not the C library's: MinGW's over msvcrt gives 1 for 0.49999999999999994 (D-0255). coby's `round_f64` is the same. | — |
 | `cb_roundf` (inline) | bit operations | — | — |
 | `cb_index_check` (inline) | bit operations | — | — |
@@ -308,7 +315,7 @@ names a rule or is marked internal.
 | `cb_borrow_range` | access paths | a slice's range (D-0070) — [Slice-Form]: [Borrow] whose last step is the range lo..hi (D-0070) | `[Slice-Form]`, `[Borrow]` |
 | `cb_read` | access paths | [Read]'s premises on the place: temporally valid, ¬clash(shared), [Thread-Affine]; the C reads the value itself | `[Read]`, `[Thread-Affine]` |
 | `cb_write` | access paths | [Write]'s premises: temporally valid, mode exclusive, ¬clash(exclusive), ¬live-resource-at when `target_resource`; the C stores the value itself | `[Write]` |
-| `cb_point_check` | access paths | D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call, the call's argument paths `args` counted as held | — |
+| `cb_point_check` | access paths | D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call — [Read]'s ¬clash(shared), or [Write]'s ¬clash(exclusive) when `exclusive` — the call's argument paths `args` counted as held | `[Read]`, `[Write]` |
 | `cb_write_quiet` | access paths | D-0194: a quiet place's old value destroyed by the write — [Write-Quiet-Replace] (D-0194): the old quiet value at `addr` is destroyed ([Destroy]) and the place written | `[Write-Quiet-Replace]`, `[Destroy]` |
 | `cb_owns` | access paths | D-0049: the value there owns a resource now — `owns(τ, v)` of [Write]'s live-resource-at (D-0049): whether the value at `addr` owns a resource now | `[Write]` |
 | `cb_store_ref` | reference data | [Write] of a reference value: the slot's holder gains the path (held-by), keyed by the slot's address | `[Write]` |

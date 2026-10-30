@@ -336,44 +336,24 @@ impl<'a> Gen<'a> {
         if size == 0 || self.has_refs(elem) || self.holds_fn(elem) {
             return Ok(None);
         }
-        // Text: the elements themselves, merged stably (the same order
-        // as the merge over positions below: a stable sort's result is
-        // determined), each comparison an inline `memcmp`.
+        // Text (D-0297): the elements themselves, sorted stably by the
+        // runtime (`cb_sort_text`: the same order as the merge over
+        // positions below, a stable sort's result being determined), after
+        // their objects are ended and their cells released as `sort`'s.
         let text = match elem {
-            Type::Named(n, a) if n == "std::String" && a.is_empty() => Some(("bytes.ptr", "bytes.len")),
-            Type::Str => Some(("p", "n")),
+            Type::Named(n, a) if n == "std::String" && a.is_empty() => Some(0),
+            Type::Str => Some(1),
             _ => None,
         };
-        if let Some((pf, nf)) = text {
-            let elem_c = self.reg_ctype(elem)?;
+        if let Some(kind) = text {
             let mut b = String::new();
             writeln!(b, "    cb_read(p_v.tok, (cb_proj[]){{ {{ CB_FIELD, 1u }} }}, 1, CB_NOLOC, 0);").unwrap();
             writeln!(b, "    {} *v = ({} *)p_v.p;", vec_c, vec_c).unwrap();
             writeln!(b, "    uint64_t n = v->len;").unwrap();
             writeln!(b, "    if (n < 2) return;").unwrap();
-            writeln!(b, "    {} *x = ({} *)malloc(n * sizeof({}));", elem_c, elem_c, elem_c).unwrap();
-            writeln!(b, "    {} *y = ({} *)malloc(n * sizeof({}));", elem_c, elem_c, elem_c).unwrap();
-            writeln!(b, "    if (!x || !y) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);").unwrap();
-            writeln!(b, "    memcpy(x, v->ptr, n * sizeof({}));", elem_c).unwrap();
-            writeln!(b, "    for (uint64_t width = 1; width < n; width = width > n / 2 ? n : width * 2) {{").unwrap();
-            writeln!(b, "        for (uint64_t lo = 0; lo < n; ) {{").unwrap();
-            writeln!(b, "            uint64_t mid = n - lo > width ? lo + width : n;").unwrap();
-            writeln!(b, "            uint64_t hi = n - mid > width ? mid + width : n;").unwrap();
-            writeln!(b, "            uint64_t l = lo, r = mid, k = lo;").unwrap();
-            writeln!(b, "            while (l < mid && r < hi) {{").unwrap();
-            writeln!(b, "                if (cb_bytes_lt((const void *)x[r].{p}, x[r].{n}, (const void *)x[l].{p}, x[l].{n})) y[k++] = x[r++]; else y[k++] = x[l++];", p = pf, n = nf).unwrap();
-            writeln!(b, "            }}").unwrap();
-            writeln!(b, "            while (l < mid) y[k++] = x[l++];").unwrap();
-            writeln!(b, "            while (r < hi) y[k++] = x[r++];").unwrap();
-            writeln!(b, "            lo = hi;").unwrap();
-            writeln!(b, "        }}").unwrap();
-            writeln!(b, "        {} *t = x; x = y; y = t;", elem_c).unwrap();
-            writeln!(b, "    }}").unwrap();
             writeln!(b, "    cb_vec_drop_plain(v->ptr, n, {}u);", size).unwrap();
             writeln!(b, "    cb_release((uint8_t *)v->ptr, n * {}u);", size).unwrap();
-            writeln!(b, "    memcpy(v->ptr, x, n * sizeof({}));", elem_c).unwrap();
-            writeln!(b, "    free(x);").unwrap();
-            writeln!(b, "    free(y);").unwrap();
+            writeln!(b, "    cb_sort_text(v->ptr, n, {}u);", kind).unwrap();
             writeln!(b, "    cb_write(p_v.tok, NULL, 0, 0u, CB_NOLOC, 0);").unwrap();
             return Ok(Some(b));
         }

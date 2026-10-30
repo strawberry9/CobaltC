@@ -572,66 +572,30 @@ export fn native_vec_sort_keys(
     {
         return None;
     }
-    // Text: the elements themselves, merged stably (the same order as the
-    // merge over positions below), each comparison an inline `memcmp`.
+    // Text (D-0297): the elements themselves, sorted stably by the runtime
+    // (`cb_sort_text`: the same order as the merge over positions below, a
+    // stable sort's result being determined), after their objects are ended
+    // and their cells released as `sort`'s.
     bool text = true;
-    str pf = "";
-    str nf = "";
-    if (is_string_ty(elem))
-    {
-        pf = "bytes.ptr";
-        nf = "bytes.len";
-    }
-    else
+    u32 kind = 0;
+    if (!is_string_ty(elem))
     {
         match (elem)
         {
-            Type::TStr :
-            {
-                pf = "p";
-                nf = "n";
-            },
+            Type::TStr : kind = 1,
             _          : text = false,
         }
     }
     if (text)
     {
-        String elem_c = reg_ctype(g, elem);
         String b = String::new();
         String::append(&mut b, "    cb_read(p_v.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_NOLOC, 0);\n");
         String::appendf(&mut b, "    %s *v = (%s *)p_v.p;\n", vec_c, vec_c);
         String::append(&mut b, "    uint64_t n = v->len;\n");
         String::append(&mut b, "    if (n < 2) return;\n");
-        String::appendf(&mut b, "    %s *x = (%s *)malloc(n * sizeof(%s));\n", &elem_c, &elem_c, &elem_c);
-        String::appendf(&mut b, "    %s *y = (%s *)malloc(n * sizeof(%s));\n", &elem_c, &elem_c, &elem_c);
-        String::append(&mut b, "    if (!x || !y) cb_fault(\"diag.alloc-failure\", CB_NOLOC, 0);\n");
-        String::appendf(&mut b, "    memcpy(x, v->ptr, n * sizeof(%s));\n", &elem_c);
-        String::append(&mut b, "    for (uint64_t width = 1; width < n; width = width > n / 2 ? n : width * 2) {\n");
-        String::append(&mut b, "        for (uint64_t lo = 0; lo < n; ) {\n");
-        String::append(&mut b, "            uint64_t mid = n - lo > width ? lo + width : n;\n");
-        String::append(&mut b, "            uint64_t hi = n - mid > width ? mid + width : n;\n");
-        String::append(&mut b, "            uint64_t l = lo, r = mid, k = lo;\n");
-        String::append(&mut b, "            while (l < mid && r < hi) {\n");
-        String::appendf(
-            &mut b,
-            "                if (cb_bytes_lt((const void *)x[r].%v, x[r].%v, (const void *)x[l].%v, x[l].%v)) y[k++] = x[r++]; else y[k++] = x[l++];\n",
-            pf,
-            nf,
-            pf,
-            nf
-        );
-        String::append(&mut b, "            }\n");
-        String::append(&mut b, "            while (l < mid) y[k++] = x[l++];\n");
-        String::append(&mut b, "            while (r < hi) y[k++] = x[r++];\n");
-        String::append(&mut b, "            lo = hi;\n");
-        String::append(&mut b, "        }\n");
-        String::appendf(&mut b, "        %s *t = x; x = y; y = t;\n", &elem_c);
-        String::append(&mut b, "    }\n");
         String::appendf(&mut b, "    cb_vec_drop_plain(v->ptr, n, %vu);\n", size);
         String::appendf(&mut b, "    cb_release((uint8_t *)v->ptr, n * %vu);\n", size);
-        String::appendf(&mut b, "    memcpy(v->ptr, x, n * sizeof(%s));\n", &elem_c);
-        String::append(&mut b, "    free(x);\n");
-        String::append(&mut b, "    free(y);\n");
+        String::appendf(&mut b, "    cb_sort_text(v->ptr, n, %vu);\n", kind);
         String::append(&mut b, "    cb_write(p_v.tok, NULL, 0, 0u, CB_NOLOC, 0);\n");
         return Some(b);
     }

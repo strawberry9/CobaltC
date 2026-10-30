@@ -470,7 +470,7 @@ pub(super) fn elide_implied_checks(out: &str) -> String {
     let mut seen: Vec<(String, Vec<String>, bool)> = Vec::new();
     let mut inited: HashSet<String> = HashSet::new();
     // `cb_stmt_push`/`cb_stmt_push_at` open a scope: no path's state changes.
-    const PURE: &[&str] = &["cb_read", "cb_borrow_unminted", "cb_borrow_check", "cb_at", "cb_fault", "cb_index_check", "cb_hash_bytes", "cb_bytes_eq", "cb_bytes_lt", "cb_load_ref", "cb_stmt_push", "cb_stmt_push_at"];
+    const PURE: &[&str] = &["cb_read", "cb_borrow_unminted", "cb_borrow_check", "cb_at", "cb_fault", "cb_index_check", "cb_hash_bytes", "cb_bytes_eq", "cb_bytes_lt", "cb_load_ref", "cb_stmt_push", "cb_stmt_push_at", "cb_fmt_space", "cb_fmt_u64", "cb_fmt_i64", "cb_fmt_hex", "cb_fmt_pad"];
     // `uint64_t tkN = <token>;` copies: a check through either names one path.
     let mut alias: HashMap<String, String> = HashMap::new();
     fn split_args(s: &str) -> Vec<String> {
@@ -734,6 +734,8 @@ pub(super) fn resolve_scopes_in(out: &str, decided: bool) -> String {
         "cb_fnbox",
         // Pure inline helpers (`cbrt.h`), and a query that records nothing.
         "cb_bytes_lt", "cb_bytes_cmp", "cb_find_bytes", "cb_char_boundary", "cb_popcount64", "cb_popcount128", "cb_clz", "cb_clz128", "cb_ctz", "cb_ctz128", "cb_rotl", "cb_rotl128", "cb_rotr", "cb_rotr128", "cb_rotl8", "cb_rotl16", "cb_rotl32", "cb_rotl64", "cb_rotr8", "cb_rotr16", "cb_rotr32", "cb_rotr64", "cb_fnv_more", "cb_live_at",
+        // D-0297: a literal format written in place.
+        "cb_fmt_space", "cb_fmt_u64", "cb_fmt_i64", "cb_fmt_hex", "cb_fmt_pad",
         "cb_read", "cb_write", "cb_write_quiet", "cb_borrow_unminted", "cb_borrow_range_unminted", "cb_borrow_unstamped", "cb_call_done", "cb_load_ref", "cb_store_ref", "cb_hold_ref", "cb_copy_datum", "cb_move_to", "cb_send", "cb_send_ref", "cb_send_datum", "cb_borrow_check", "cb_elem_access", "cb_elem_access_if", "cb_live_in",
         // A question about the value at an address (`owns`), recording nothing.
         "cb_owns",

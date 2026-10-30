@@ -180,13 +180,25 @@ code generation.
   decided lowering has brought it back to 125 M.
 - **`strings`** builds words with `sprintf` into a `Vec<String>`, counts
   them in a `HashMap<String, u32>`, sorts them and sums their lengths. No
-  push, map lookup or loop step checks a reference at run time; what
-  remains beyond Rust's work is chiefly the formatting, which
-  `sprintf` does through the runtime's general formatter.
+  push, map lookup or loop step checks a reference at run time. The
+  `sprintf` is written in place by the compiler (D-0297: the literal's
+  bytes and the number's digits, straight into the result, with no call
+  to the runtime's formatter), and `Vec::sort` of text is the library's
+  stable sort, as Rust's is: `cobc`'s code now executes slightly fewer
+  instructions than Rust's (236 M against 243 M; 282 M before D-0297).
+  What remains of the time is chiefly the allocator: one allocation per
+  word and per map key, freed at the end.
 - **`hashcount`** counts `sprintf`-built keys in a `HashMap<String, u32>`.
   The map's operations are native code and, the program being decided,
-  no lookup checks the map at run time: `cobc`'s code executes about as
-  many instructions as Rust's.
+  no lookup checks the map at run time; with the key written in place
+  (D-0297; the runtime's general formatter was 41% of the cycles before),
+  `cobc`'s code executes about half the instructions Rust's does (120 M
+  against 216 M) and finishes first.
+
+The timings of the 2026-10-31 run are about 10% slower across every
+column than the day before's, Rust's included, on the same code: the
+virtual machine's speed moved, not the programs. Compare columns within
+one run, and the instruction counts across runs.
 
 `impl/COBC-PLAN.md` §10 gives the argument for each check the compiler
 leaves out, and `impl/STATUS.md` what each change measured at the time.

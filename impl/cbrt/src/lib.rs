@@ -4121,55 +4121,62 @@ pub struct CbStr {
     n: u64,
 }
 
-thread_local! {
+// `cb_format`'s state, one per thread.
+struct FmtState {
     // The last `$fmt` text of this thread: valid until its next `$fmt`,
     // after `print` or `String::append` has taken it.
-    static FORMATTED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    // Parsed formats, most recent last (`cb_format`).
-    static FMT_CACHE: std::cell::RefCell<Vec<(Vec<u8>, Vec<fmt::Piece>)>> = const { std::cell::RefCell::new(Vec::new()) };
-    // `cb_format`'s arguments, copied out of the call: kept between calls,
-    // the list and each text argument's bytes reuse their storage.
-    static FMT_ARGS: std::cell::RefCell<Vec<fmt::Arg>> = const { std::cell::RefCell::new(Vec::new()) };
+    out: Vec<u8>,
+    // Parsed formats, most recent last.
+    cache: Vec<(Vec<u8>, Vec<fmt::Piece>)>,
+    // The arguments, copied out of the call: kept between calls, the list
+    // and each text argument's bytes reuse their storage.
+    args: Vec<fmt::Arg>,
+}
+
+thread_local! {
+    static FMT: std::cell::RefCell<FmtState> = const { std::cell::RefCell::new(FmtState { out: Vec::new(), cache: Vec::new(), args: Vec::new() }) };
+    // D-0297: the space a literal format's generated code writes its text
+    // into, apart from `out`, which one of its arguments may still be.
+    static FMT_SPACE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn cb_format(f: *const u8, fn_: u64, args: *const CbFmtArg, n: u64, out: *mut CbStr) {
     let fb = bytes(f, fn_);
     let cargs = args;
-    FMT_ARGS.with(|fa| {
-    let mut args = fa.borrow_mut();
-    let n = n as usize;
-    args.truncate(n);
-    for i in 0..n {
-        let a = &*cargs.add(i);
-        let v = match a.kind {
-            0 | 1 => fmt::Arg::Int { bits: ((a.hi as u128) << 64) | a.lo as u128, signed: a.kind == 1, width: a.width },
-            2 => fmt::Arg::Float(a.f, a.width == 32),
-            _ => {
-                // The bytes copied into the slot's own buffer when it has one.
-                if let Some(fmt::Arg::Text(t)) = args.get_mut(i) {
-                    t.clear();
-                    t.extend_from_slice(bytes(a.p, a.n));
-                    continue;
+    FMT.with(|st| {
+        let st = &mut *st.borrow_mut();
+        let args = &mut st.args;
+        let n = n as usize;
+        args.truncate(n);
+        for i in 0..n {
+            let a = &*cargs.add(i);
+            let v = match a.kind {
+                0 | 1 => fmt::Arg::Int { bits: ((a.hi as u128) << 64) | a.lo as u128, signed: a.kind == 1, width: a.width },
+                2 => fmt::Arg::Float(a.f, a.width == 32),
+                _ => {
+                    // The bytes copied into the slot's own buffer when it has one.
+                    if let Some(fmt::Arg::Text(t)) = args.get_mut(i) {
+                        t.clear();
+                        t.extend_from_slice(bytes(a.p, a.n));
+                        continue;
+                    }
+                    fmt::Arg::Text(bytes(a.p, a.n).to_vec())
                 }
-                fmt::Arg::Text(bytes(a.p, a.n).to_vec())
+            };
+            if i < args.len() {
+                args[i] = v;
+            } else {
+                args.push(v);
             }
-        };
-        if i < args.len() {
-            args[i] = v;
-        } else {
-            args.push(v);
         }
-    }
-    let args = &*args;
-    // The format's pieces, parsed once per distinct format (by its bytes:
-    // a format built at run time may reuse an address with other text),
-    // and the text rendered into this thread's buffer. The arguments were
-    // copied out above, so a text argument that was the previous result
-    // is not overwritten under them.
-    FMT_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        let i = match c.iter().position(|(k, _)| k.as_slice() == fb) {
+        // The format's pieces, parsed once per distinct format (by its bytes:
+        // a format built at run time may reuse an address with other text),
+        // the most recent first, and the text rendered into this thread's
+        // buffer. The arguments were copied out above, so a text argument
+        // that was the previous result is not overwritten under them.
+        let c = &mut st.cache;
+        let i = match c.iter().rposition(|(k, _)| k.as_slice() == fb) {
             Some(i) => i,
             None => {
                 if c.len() >= 64 {
@@ -4179,14 +4186,22 @@ pub unsafe extern "C" fn cb_format(f: *const u8, fn_: u64, args: *const CbFmtArg
                 c.len() - 1
             }
         };
-        FORMATTED.with(|b| {
-            let mut b = b.borrow_mut();
-            b.clear();
-            fmt::render_into(&c[i].1, args, &mut b);
-            *out = CbStr { p: b.as_ptr(), n: b.len() as u64 };
-        });
+        st.out.clear();
+        fmt::render_into(&c[i].1, &st.args, &mut st.out);
+        *out = CbStr { p: st.out.as_ptr(), n: st.out.len() as u64 };
     });
-    });
+}
+
+// D-0297: room for `n` bytes of a literal format's text, this thread's,
+// valid until its next call.
+#[no_mangle]
+pub unsafe extern "C" fn cb_fmt_space(n: u64) -> *mut u8 {
+    FMT_SPACE.with(|sp| {
+        let mut v = sp.borrow_mut();
+        v.clear();
+        v.reserve(n as usize);
+        v.as_mut_ptr()
+    })
 }
 
 // `std::file_read` / `std::file_write` (`rule.stdlib.file`): the file
@@ -4253,6 +4268,21 @@ pub unsafe extern "C" fn cb_sort_plain(p: *mut u8, n: u64, kind: u32) {
         264 => sort_as!(i64),
         272 => sort_as!(i128),
         _ => {}
+    }
+}
+
+// D-0297: `Vec::sort` of `String` (`kind` 0: its bytes' pointer, length
+// and capacity) or `str` (1: pointer and length) holding no reference,
+// stably in byte order: the order the prelude's merge leaves (a stable
+// sort's result is determined), by the library's sort, which takes the
+// runs and the repeated keys a merge of fixed widths does not.
+#[no_mangle]
+pub unsafe extern "C" fn cb_sort_text(p: *mut u8, n: u64, kind: u32) {
+    let n = n as usize;
+    if kind == 0 {
+        std::slice::from_raw_parts_mut(p as *mut [u64; 3], n).sort_by(|a, b| bytes(a[0] as *const u8, a[1]).cmp(bytes(b[0] as *const u8, b[1])));
+    } else {
+        std::slice::from_raw_parts_mut(p as *mut [u64; 2], n).sort_by(|a, b| bytes(a[0] as *const u8, a[1]).cmp(bytes(b[0] as *const u8, b[1])));
     }
 }
 

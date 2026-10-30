@@ -1261,6 +1261,9 @@ impl<'g, 'a> Fx<'g, 'a> {
                 let fv = self.lower_expr(&args[0], None)?;
                 let fv = self.into_temp(fv, line)?;
                 let mut inits = Vec::new();
+                // D-0297: each argument as a literal format written in place
+                // would take it (`None`: only `cb_format` takes it).
+                let mut pargs: Vec<Option<FmtArg>> = Vec::new();
                 for a in &args[1..] {
                     // `&s` of a `String` local that no other argument names
                     // (decided before any probe: an objectless local has no
@@ -1284,6 +1287,7 @@ impl<'g, 'a> Fx<'g, 'a> {
                             self.objectless_use(&b.c, a.line);
                         }
                         inits.push(format!("{{ 3u, 0u, 0, 0, 0.0, ({}).bytes.ptr, ({}).bytes.len }}", b.c, b.c));
+                        pargs.push(Some(FmtArg::Text(format!("({}).bytes.ptr", b.c), format!("({}).bytes.len", b.c))));
                         continue;
                     }
                     // A reference to a number, `bool` or `str` is formatted
@@ -1304,6 +1308,17 @@ impl<'g, 'a> Fx<'g, 'a> {
                     }
                     let v = self.into_temp(v, a.line)?;
                     let x = v.c.clone();
+                    pargs.push(match &v.ty {
+                        Type::Int(t) if t.bitwidth(64) <= 64 => Some(FmtArg::Int(t.signed(), t.bitwidth(64), x.clone())),
+                        Type::Str => Some(FmtArg::Text(format!("({}).p", x), format!("({}).n", x))),
+                        Type::Bool => Some(FmtArg::Text(format!("(const uint8_t *)(({}) ? \"true\" : \"false\")", x), format!("(({}) ? 4u : 5u)", x))),
+                        Type::Named(n, _) if n == "std::StringView" => Some(FmtArg::Text(format!("(const uint8_t *)({}).bytes.data", x), format!("({}).bytes.len", x))),
+                        Type::Ref(inner, _) if !matches!(&**inner, Type::Named(n, _) if self.g.items.enums.contains_key(n)) => {
+                            let sc = self.g.ctype(&Type::Named("std::String".into(), vec![]))?;
+                            Some(FmtArg::Text(format!("(({} *)({}).p)->bytes.ptr", sc, x), format!("(({} *)({}).p)->bytes.len", sc, x)))
+                        }
+                        _ => None,
+                    });
                     inits.push(match &v.ty {
                         Type::Int(t) => {
                             let wide = if t.signed() { format!("(cb_u128)(cb_i128)({})", x) } else { format!("(cb_u128)({})", x) };
@@ -1341,6 +1356,13 @@ impl<'g, 'a> Fx<'g, 'a> {
                         }
                         _ => return internal("a format argument of an unformattable type"),
                     });
+                }
+                let lit = match &strip_parens(&args[0]).kind {
+                    ExprKind::StrLit(f) => fmt_plan(f.as_bytes(), &pargs),
+                    _ => None,
+                };
+                if let Some(ops) = lit {
+                    return Ok(self.fmt_in_place(&fv.c, &ops, &pargs));
                 }
                 let arr = self.g.fresh("fa");
                 let out = self.g.fresh("fs");
@@ -1689,5 +1711,160 @@ impl<'g, 'a> Fx<'g, 'a> {
             let rv = self.into_temp(rv, r.line)?;
             Ok((Some(lv), Some(rv)))
         }
+    }
+}
+
+// D-0297: a `$fmt` argument as a literal format written in place takes it:
+// an integer of at most 64 bits (signed, its width, the C value), or text
+// (its bytes' pointer and length).
+pub(super) enum FmtArg {
+    Int(bool, u32, String),
+    Text(String, String),
+}
+
+// One piece of a literal format written in place: bytes of the format
+// itself (offset, length), or an argument's text: a decimal or hexadecimal
+// integer padded to a width (`how`: `cb_fmt_pad`'s), or text as it is.
+pub(super) enum FmtOp {
+    Lit(usize, usize),
+    Dec(usize, usize, u32),
+    Hex(usize, bool, usize, u32),
+    Text(usize),
+}
+
+// The pieces of the literal format `f` when each of its specifiers is one
+// written in place -- `%v`, `%d`, `%i` or `%u` of an integer and `%x` or
+// `%X`, with a width and the `-` and `0` flags, and `%v` or `%s` of text
+// with no width -- else `None` (`cb_format` renders it). The front end has
+// checked `f` against its arguments.
+pub(super) fn fmt_plan(f: &[u8], args: &[Option<FmtArg>]) -> Option<Vec<FmtOp>> {
+    let mut ops = Vec::new();
+    let mut k = 0;
+    let mut i = 0;
+    let mut start = 0;
+    while i < f.len() {
+        if f[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if i > start {
+            ops.push(FmtOp::Lit(start, i - start));
+        }
+        i += 1;
+        if f.get(i) == Some(&b'%') {
+            ops.push(FmtOp::Lit(i, 1));
+            i += 1;
+            start = i;
+            continue;
+        }
+        let (mut left, mut zero) = (false, false);
+        while let Some(&c) = f.get(i) {
+            match c {
+                b'-' => left = true,
+                b'0' => zero = true,
+                b'+' | b' ' | b'#' => return None,
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut w = 0;
+        while let Some(&c) = f.get(i).filter(|c| c.is_ascii_digit()) {
+            w = w * 10 + (c - b'0') as usize;
+            i += 1;
+        }
+        let conv = *f.get(i)?;
+        i += 1;
+        let how = if left { 1 } else if zero { 2 } else { 0 };
+        let op = match (conv, args.get(k)?.as_ref()?) {
+            (b'v' | b'd' | b'i' | b'u', FmtArg::Int(..)) => FmtOp::Dec(k, w, how),
+            (b'x' | b'X', FmtArg::Int(..)) => FmtOp::Hex(k, conv == b'X', w, how),
+            (b'v' | b's', FmtArg::Text(..)) if w == 0 => FmtOp::Text(k),
+            _ => return None,
+        };
+        ops.push(op);
+        k += 1;
+        start = i;
+    }
+    if i > start {
+        ops.push(FmtOp::Lit(start, i - start));
+    }
+    if k != args.len() {
+        return None;
+    }
+    Some(ops)
+}
+
+impl<'g, 'a> Fx<'g, 'a> {
+    // D-0297: the text of a literal format, written in place (`fmt_plan`'s
+    // pieces): into the frame when its length has a small bound, else into
+    // the runtime's space for its length; the same bytes `cb_format` makes.
+    pub(super) fn fmt_in_place(&mut self, f: &str, ops: &[FmtOp], args: &[Option<FmtArg>]) -> V {
+        if ops.is_empty() {
+            let out = self.g.fresh("fs");
+            self.emit(&format!("cb_str {} = {{ ({}).p, 0 }};", out, f));
+            return V { c: out, ty: Type::Str, obj: None };
+        }
+        if let [FmtOp::Lit(0, _)] = ops {
+            let out = self.g.fresh("fs");
+            self.emit(&format!("cb_str {} = {};", out, f));
+            return V { c: out, ty: Type::Str, obj: None };
+        }
+        let mut bound = 0;
+        let mut texts = Vec::new();
+        for op in ops {
+            match op {
+                FmtOp::Lit(_, n) => bound += n,
+                FmtOp::Dec(_, w, _) => bound += (*w).max(20),
+                FmtOp::Hex(_, _, w, _) => bound += (*w).max(16),
+                FmtOp::Text(k) => {
+                    if let Some(FmtArg::Text(_, n)) = &args[*k] {
+                        texts.push(n.clone());
+                    }
+                }
+            }
+        }
+        let fp = self.g.fresh("fp");
+        let fk = self.g.fresh("fk");
+        let out = self.g.fresh("fs");
+        if texts.is_empty() && bound <= 256 {
+            self.emit(&format!("uint8_t {}[{}];", fp, bound));
+        } else {
+            let mut total = format!("(uint64_t){}u", bound);
+            for n in &texts {
+                total.push_str(&format!(" + {}", n));
+            }
+            self.emit(&format!("uint8_t *{} = cb_fmt_space({});", fp, total));
+        }
+        self.emit(&format!("uint64_t {} = 0;", fk));
+        for op in ops {
+            let (k, render, w, how) = match op {
+                FmtOp::Lit(at, n) => {
+                    self.emit(&format!("memcpy({} + {}, ({}).p + {}u, {}u);", fp, fk, f, at, n));
+                    self.emit(&format!("{} += {}u;", fk, n));
+                    continue;
+                }
+                FmtOp::Text(k) => {
+                    let Some(FmtArg::Text(p, n)) = &args[*k] else { continue };
+                    self.emit(&format!("if ({} != 0) memcpy({} + {}, {}, {});", n, fp, fk, p, n));
+                    self.emit(&format!("{} += {};", fk, n));
+                    continue;
+                }
+                FmtOp::Dec(k, w, how) => (*k, None, *w, *how),
+                FmtOp::Hex(k, upper, w, how) => (*k, Some(*upper), *w, *how),
+            };
+            let Some(FmtArg::Int(signed, bits, x)) = &args[k] else { continue };
+            let r = match render {
+                None if *signed => format!("cb_fmt_i64({} + {}, (int64_t)({}))", fp, fk, x),
+                None => format!("cb_fmt_u64({} + {}, (uint64_t)({}))", fp, fk, x),
+                Some(upper) => format!("cb_fmt_hex({} + {}, (uint64_t)(uint{}_t)({}), {}u)", fp, fk, bits, x, upper as u32),
+            };
+            if w > 0 {
+                self.emit(&format!("{} += cb_fmt_pad({} + {}, {}, {}u, {}u);", fk, fp, fk, r, w, how));
+            } else {
+                self.emit(&format!("{} += {};", fk, r));
+            }
+        }
+        self.emit(&format!("cb_str {} = {{ {}, {} }};", out, fp, fk));
+        V { c: out, ty: Type::Str, obj: None }
     }
 }

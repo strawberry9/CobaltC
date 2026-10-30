@@ -647,6 +647,14 @@ fn real_main() -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
 
+    // `--run`'s directory goes when the run ends, and when the build stops
+    // short of a run for any reason but the C compiler's failure, whose C
+    // file it keeps for inspection.
+    fn drop_scratch(scratch: &Option<std::path::PathBuf>) {
+        if let Some(d) = scratch {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
     let scratch = if run {
         let d = std::env::temp_dir().join(format!("cobc-{}-{}", std::process::id(), unique()));
         std::fs::create_dir_all(&d).expect("temp dir");
@@ -720,6 +728,7 @@ fn real_main() -> ExitCode {
                 let also = if code.is_empty() { "" } else { " or the program's C code" };
                 eprintln!("unsupported: no C function `{}` in libc, libm{}", name, also);
                 let _ = std::fs::remove_file(&c_path);
+                drop_scratch(&scratch);
                 return ExitCode::from(3);
             }
         }
@@ -733,6 +742,7 @@ fn real_main() -> ExitCode {
                 let at = coby::locate(*line, &analysis.map).map(|(f, l)| format!("\n  at {}:{}", f, l)).unwrap_or_default();
                 eprintln!("cobc: extern \"{}\": the C compiler found no library `lib{}`{}", name, name, at);
                 let _ = std::fs::remove_file(&c_path);
+                drop_scratch(&scratch);
                 return ExitCode::from(2);
             }
         }
@@ -755,6 +765,7 @@ fn real_main() -> ExitCode {
             Some(r) => Some(r.split_whitespace().map(str::to_string).collect()),
             None => {
                 eprintln!("cobc: built {} for {}; running it here needs COBALTC_RUNNER, the program that runs it (such as `wine64`)", exe.display(), target.triple());
+                drop_scratch(&scratch);
                 return ExitCode::from(2);
             }
         }
@@ -763,9 +774,7 @@ fn real_main() -> ExitCode {
     };
     if let Some(n) = explore {
         let code = explore_runs(&exe, &prog_args, n, &file, runner.as_deref());
-        if let Some(d) = &scratch {
-            let _ = std::fs::remove_dir_all(d);
-        }
+        drop_scratch(&scratch);
         return code;
     }
     let code = if run {
@@ -790,9 +799,7 @@ fn real_main() -> ExitCode {
                 None => {}
             }
         }
-        if let Some(d) = &scratch {
-            let _ = std::fs::remove_dir_all(d);
-        }
+        drop_scratch(&scratch);
         st.code().unwrap_or(1)
     } else {
         0

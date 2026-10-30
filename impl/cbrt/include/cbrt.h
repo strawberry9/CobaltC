@@ -138,6 +138,45 @@ int64_t cb_parse_float(const void *p, uint64_t n, uint32_t is_f32, double *out);
 int64_t cb_parse_bool(const void *p, uint64_t n, uint8_t *out);                /* D-0181 */
 typedef struct { uint32_t kind; uint32_t width; uint64_t hi, lo; double f; const uint8_t *p; uint64_t n; } cb_fmt_arg;
 void cb_format(const uint8_t *f, uint64_t fn, const cb_fmt_arg *args, uint64_t n, cb_str *out);   /* `$fmt` (rule.stdlib.format) */
+/* D-0297: a literal format of the common specifiers, written in place by
+   the generated code: this thread's space for `n` bytes (not cb_format's
+   buffer, which an argument may still point into), and each number's
+   text as cb_format writes it. */
+uint8_t *cb_fmt_space(uint64_t n);
+static inline uint64_t cb_fmt_u64(uint8_t *out, uint64_t v)
+{
+    uint8_t t[20];
+    uint32_t i = 20;
+    do { t[--i] = (uint8_t)('0' + v % 10); v /= 10; } while (v != 0);
+    memcpy(out, t + i, 20 - i);
+    return 20 - i;
+}
+static inline uint64_t cb_fmt_i64(uint8_t *out, int64_t v)
+{
+    if (v < 0) { out[0] = '-'; return 1 + cb_fmt_u64(out + 1, (uint64_t)0 - (uint64_t)v); }
+    return cb_fmt_u64(out, (uint64_t)v);
+}
+static inline uint64_t cb_fmt_hex(uint8_t *out, uint64_t v, uint32_t upper)
+{
+    const char *d = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    uint8_t t[16];
+    uint32_t i = 16;
+    do { t[--i] = (uint8_t)d[v & 15]; v >>= 4; } while (v != 0);
+    memcpy(out, t + i, 16 - i);
+    return 16 - i;
+}
+/* The `n` bytes at `out` widened to `w`: `how` 0 spaces before, 1 spaces
+   after (`-`), 2 zeros after the sign (`0`). */
+static inline uint64_t cb_fmt_pad(uint8_t *out, uint64_t n, uint64_t w, uint32_t how)
+{
+    if (n >= w) return n;
+    uint64_t pad = w - n;
+    if (how == 1) { memset(out + n, ' ', pad); return w; }
+    uint64_t s = (how == 2 && out[0] == '-') ? 1 : 0;
+    memmove(out + s + pad, out + s, n - s);
+    memset(out + s, how == 2 ? '0' : ' ', pad);
+    return w;
+}
 int64_t cb_file_read(const void *path, uint64_t path_len, void *buf, uint64_t cap);   /* `read_file` (rule.stdlib.file) */
 int64_t cb_file_write(const void *path, uint64_t path_len, const void *buf, uint64_t len);
 int64_t cb_file_op(uint64_t op, uint64_t h, void *buf, uint64_t n);  /* `File` (rule.stdlib.file-handle) */
@@ -180,6 +219,7 @@ static inline uint8_t cb_bytes_lt(const void *a, uint64_t an, const void *b, uin
     return (uint8_t)(c < 0 || (c == 0 && an < bn));
 }
 void    cb_sort_plain(void *p, uint64_t n, uint32_t kind);   /* Vec::sort of integers or bools (D-0062) */
+void    cb_sort_text(void *p, uint64_t n, uint32_t kind);    /* Vec::sort of String (0) or str (1), stably by bytes (D-0297) */
 /* Inline so that `cc` sees the comparison and drops it where the
    program has already proven it (a loop guard `i < n`); the fault is
    cb_fault's, as it would be from inside the runtime. */
@@ -231,7 +271,7 @@ uint64_t cb_borrow(uint64_t base, const cb_proj *p, size_t n, uint32_t mode, uin
 uint64_t cb_borrow_range(uint64_t base, const void *cont, uint32_t cty, const cb_proj *p, size_t n, uint64_t lo, uint64_t hi, uint32_t mode, uint32_t file, uint32_t line);   /* a slice's range (D-0070) — [Slice-Form]: [Borrow] whose last step is the range lo..hi (D-0070) */
 void     cb_read(uint64_t base, const cb_proj *p, size_t n, uint32_t file, uint32_t line);   /* [Read]'s premises on the place: temporally valid, ¬clash(shared), [Thread-Affine]; the C reads the value itself */
 void     cb_write(uint64_t base, const cb_proj *p, size_t n, uint32_t target_resource, uint32_t file, uint32_t line);   /* [Write]'s premises: temporally valid, mode exclusive, ¬clash(exclusive), ¬live-resource-at when `target_resource`; the C stores the value itself */
-void     cb_point_check(const uint64_t *args, size_t nargs, uint64_t base, const cb_proj *p, size_t n, uint32_t exclusive, const uint8_t *msg, uint64_t msg_len, uint32_t file, uint32_t line);   /* D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call, the call's argument paths `args` counted as held */
+void     cb_point_check(const uint64_t *args, size_t nargs, uint64_t base, const cb_proj *p, size_t n, uint32_t exclusive, const uint8_t *msg, uint64_t msg_len, uint32_t file, uint32_t line);   /* D-0283: a call's point check: the access the callee's summary declares through `base`, checked at the call — [Read]'s ¬clash(shared), or [Write]'s ¬clash(exclusive) when `exclusive` — the call's argument paths `args` counted as held */
 void     cb_write_quiet(uint64_t base, const cb_proj *p, size_t n, void *addr, uint32_t ty, uint32_t file, uint32_t line); /* D-0194: a quiet place's old value destroyed by the write — [Write-Quiet-Replace] (D-0194): the old quiet value at `addr` is destroyed ([Destroy]) and the place written */
 uint32_t cb_owns(const void *addr, uint32_t ty);   /* D-0049: the value there owns a resource now — `owns(τ, v)` of [Write]'s live-resource-at (D-0049): whether the value at `addr` owns a resource now */
 

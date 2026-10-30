@@ -1,7 +1,7 @@
 # CobaltC Conformance Cases
 
 Status: normative artifact
-Version: 3.284.0
+Version: 3.285.0
 Conforms to: `spec/02-schema.md` (Kind: Conformance case, `conf.<name>`)
 Governed by: `CobaltC_Master_Instructions.md` §1, §19, §20
 
@@ -1044,6 +1044,7 @@ Rows added for case files that had none (CHG-0265):
 | `conf.sort-by-comparator-type` | `impl/conformance/21-standard-library-semantics/sort_by_comparator_type_rejected.cb` | ✗ `diag.type-mismatch` (static) | a comparison of `i64`s for a `Vec<i32>` |
 | `conf.sort-element-borrowed` | `impl/conformance/21-standard-library-semantics/sort_while_element_borrowed_rejected.cb` | ✗ `diag.aliasing-conflict` (static) | sorting borrows the Vec exclusively |
 | `conf.printf-output` | `impl/conformance/21-standard-library-semantics/printf_output_ok.cb` | ok | every conversion and flag, with C's text (`%#o` aside: `0o`); `String::appendf` into a `String` |
+| `conf.format-in-place` | `impl/conformance/21-standard-library-semantics/format_in_place_ok.cb` | ok | D-0297: the formats a compiler writes in place (integers up to 64 bits under `%v %d %i %u %x %X` with a width and `-`/`0`, text under `%v %s` with no width, `%%`) print the formatter's text: each width's extremes, a sign before zeros, `-` over `0`, a width past the frame's bound, every kind of text argument |
 | `conf.printf-arg-mismatch` | `printf("%s", 42);` | ✗ `diag.type-mismatch` (static) | `[Format-Arg-Mismatch]`: `%s` takes text, not an `i32` |
 | `conf.printf-count-mismatch` | `printf("%d %d", 1);` | ✗ `diag.type-mismatch` (static) | `[Format-Arg-Mismatch]`: two specifiers, one argument |
 | `conf.printf-format-invalid` | `printf("%q", 1);` | ✗ `diag.format-invalid` (static) | `[Format-Invalid]`: `q` is not a conversion |
@@ -2034,6 +2035,7 @@ Rows added for case files that had none (CHG-0265):
 
 ## Change Log
 
+- 3.285.0 — `CHG-0392` (D-0297): `conf.format-in-place`.
 - 3.284.0 — `CHG-0391` (D-0296): `conf.nested-match-arm-temporaries-end`.
 - 3.283.0 — `CHG-0387` (D-0292): `conf.light-ref-recorded-on-arrival`, `conf.light-ref-recorded-on-arrival-written`.
 - 3.282.0 — `CHG-0386` (D-0291): `conf.ref-lent-in-loop-handle-kept-written`, `conf.exclusive-ref-lent-to-shared-param`, `conf.wrapped-handle-lent`, `conf.wrapped-handle-maybe-lent`, `conf.slice-lent-copy-written`, `conf.lent-parts-written-after-loop`, `conf.slice-parts-lent-to-threads`, `conf.closure-captured-slice-source-read`, `conf.slice-reborrow-parent-element-written`, `conf.propagated-ref-holds-borrow`; `conf.vec-predicate-value-keeps-element`'s `fn` value lives in its own block, and the case faults `diag.stale-binding` at the read after the growing push (its first read is refuted before the run otherwise).

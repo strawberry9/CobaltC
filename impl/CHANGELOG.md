@@ -303,6 +303,7 @@ file was `impl/STATUS.md`; its text below is unchanged, so a section may describ
 - D-0294 — The objectless remainder: a decided program's values keep no object where no check could read it
 - D-0295 — Light element references: a decided function's element references carry no record in any program; phase 3 closed
 - D-0296 — The self-hosted toolchain ported to the current edition: `cbc` writes `cobc`'s C again, and D-0281 is complete
+- D-0297 — Formats written in place, and text sorted by the runtime
 
 ---
 
@@ -8451,6 +8452,23 @@ crossing to C by value.
   the callee resolved once per call and `holder_type`/`data_type`/`stores_refs` worked out once per type, 36 s
   (`coby --check`: 19.1 s against 18.5 s). Peak memory 467 MB against 367 MB, most of it from the facts literals
   and reads now hold.
+
+## CHG-0392: formats written in place, text sorted by the runtime, and `--run`'s directory removed (D-0297, 2026-10-30)
+
+- `cobc` (`lower/intrinsics.rs`) and `cbc` (`back/gen.cb`): `$fmt` of a string literal whose specifiers are all
+  `%v %d %i %u %x %X` of an integer up to 64 bits (with a width and `-`/`0`), `%v %s` of text with no width, and
+  `%%` is written as straight-line C — the literal's bytes, inline renderers (`cb_fmt_u64`, `cb_fmt_i64`,
+  `cb_fmt_hex`, `cb_fmt_pad`, new in `cbrt.h`), the texts' bytes — into a frame array when the bound is at most
+  256 bytes, else into `cb_fmt_space` (new); other formats call `cb_format` as before, which now keeps one
+  thread-local state. Both compilers' `FREE` and `PURE` name the new helpers.
+- `Vec::sort` of `String`/`str` (`native_vec_sort_keys`, both compilers): `cb_sort_text` (new, the library's stable
+  sort) after the elements' objects end and their cells are released; the C merge is gone.
+- `cobc --run`/`cbc --run` remove their directory on every early return but the C compiler's failure.
+- `cbrt.h`: `cb_point_check`'s contract names `[Read]`/`[Write]` (`runtime_contract.py --check` had failed since
+  D-0283); `spec/IMPLEMENTATION-NOTES.md` §6 regenerated. New case `conf.format-in-place` (3.285.0).
+- Measured: `hashcount` 210 M → 120 M instructions (Rust 216 M), `strings` 282 M → 236 M (Rust 243 M), `cbc` on
+  `anagrams.cb` 5.21 G → 5.11 G. Verified: `compare_c.sh` (1,164; 755 with `--all-checks`; 92 per form),
+  `fixpoint.sh`, the undecided sweep (8,825 decided, as before), the release suites.
 
 ## CHG-0391: the self-hosted toolchain ported to the current edition; an arm's nested `match` scopes its arms (D-0296, 2026-10-30)
 
