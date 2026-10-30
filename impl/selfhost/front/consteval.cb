@@ -1,0 +1,740 @@
+// `rule.module.static-assert` (D-0052): each `static_assert` the type
+// checker recorded, computed before the program runs. coby computes them
+// with its evaluator (lib.rs `check_static_asserts`); a constant
+// expression is literals, constants, their fields and elements, `sizeof`,
+// `alignof`, `min_value`, `max_value`, and `spec/06`'s checked arithmetic
+// over them (D-0036, D-0066), which this evaluates directly. A false
+// assertion is `diag.static-assert-failed` with its message; a checked
+// failure in the condition is that failure, at the assertion.
+
+import std;
+import ast;
+import items;
+import typecheck;
+
+struct IntVal
+{
+    i128 v;
+    // `None`: a literal whose type its context gives.
+    Option<IntTy> t;
+}
+
+struct FieldVal
+{
+    String name;
+    CVal v;
+}
+
+enum CVal
+{
+    VInt(IntVal),
+    VBool(bool),
+    VFloat(f64),
+    VStr(String),
+    VStruct(Vec<FieldVal>),
+    VArr(Vec<CVal>),
+}
+
+struct Ev
+{
+    HashMap<String, Type> subst;
+    u32 depth;
+}
+
+fn not_const() : Result<CVal, String>
+{
+    Err(String::from_str("diag.const-not-constant"))
+}
+
+fn fits(i128 v, IntTy t) : bool
+{
+    IntRange r = int_range(t);
+    v >= r.min && v <= r.max
+}
+
+fn typed(i128 v, Option<IntTy> t) : Result<CVal, String>
+{
+    match (t)
+    {
+        Some(k) :
+        {
+            if (!fits(v, k))
+            {
+                return Err(String::from_str("diag.arith-overflow"));
+            }
+        },
+        None    : {},
+    }
+    Ok(CVal::VInt(IntVal { .v = v, .t = t }))
+}
+
+struct SizeAlign
+{
+    u128 size;
+    u128 align;
+}
+
+fn round_up(u128 x, u128 a) : u128
+{
+    (x + a - 1) / a * a
+}
+
+// `sizeof` and `alignof` (spec/06 §4, spec/16 §1), as coby's layouts:
+// fields in order at their alignment; an enum's discriminant (4 bytes)
+// then its largest payload; `None` for a type this does not lay out.
+fn size_align(ref<Items, shared> it, ref<Type, shared> t) : Option<SizeAlign>
+{
+    match (t)
+    {
+        Type::TInt(k)    :
+        {
+            u128 n = widen<u128>(int_ty_bits(*k, 64) / 8);
+            Some(SizeAlign { .size = n, .align = n })
+        },
+        Type::TBool      : Some(SizeAlign { .size = 1, .align = 1 }),
+        Type::TF32       : Some(SizeAlign { .size = 4, .align = 4 }),
+        Type::TF64       : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::TStr       : Some(SizeAlign { .size = 16, .align = 8 }),
+        Type::TSlice(_)  : Some(SizeAlign { .size = 24, .align = 8 }),
+        Type::TRef(_)    : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::TRawptr(_) : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::TFn(_)     : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::THandle(_) : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::TGuard(_)  : Some(SizeAlign { .size = 8, .align = 8 }),
+        Type::TArray(ab) :
+        {
+            SizeAlign e = size_align(it, &Box::get(ab).inner)?;
+            Some(SizeAlign { .size = e.size * Box::get(ab).n, .align = e.align })
+        },
+        Type::TSimd(ab)  :
+        {
+            SizeAlign e = size_align(it, &Box::get(ab).inner)?;
+            u128 n = e.size * Box::get(ab).n;
+            Some(SizeAlign { .size = n, .align = max(n, 1) })
+        },
+        Type::TMutex(x)  :
+        {
+            SizeAlign e = size_align(it, Box::get(x))?;
+            u128 align = max(e.align, 8);
+            Some(SizeAlign { .size = round_up(round_up(e.size, 8) + 8, align), .align = align })
+        },
+        Type::TNamed(nb) :
+        {
+            ref<NamedTy, shared> n = Box::get(nb);
+            match (HashMap::get(&it.structs, &n.name))
+            {
+                Some(sd) :
+                {
+                    // D-0118: a bitstruct is its backing integer.
+                    match (sd.bits)
+                    {
+                        Some(k) :
+                        {
+                            u128 w = widen<u128>(int_ty_bits(k, 64) / 8);
+                            return Some(SizeAlign { .size = w, .align = min(w, 8) });
+                        },
+                        None    : {},
+                    }
+                    HashMap<String, Type> sub = zip_subst(&sd.type_params, &n.args);
+                    u128 off = 0;
+                    // D-0251: `align(N)` raises the alignment, never lowers it.
+                    u128 align = match (sd.align)
+                    {
+                        Some(a) : widen<u128>(a),
+                        None    : 1,
+                    };
+                    for (usize i = 0; i < Vec::len(&sd.fields); i += 1)
+                    {
+                        SizeAlign f = size_align(it, &apply_subst(&sd.fields[i].ty, &sub))?;
+                        align = max(align, f.align);
+                        off = round_up(off, f.align) + f.size;
+                    }
+                    return Some(SizeAlign { .size = round_up(off, align), .align = align });
+                },
+                None     : {},
+            }
+            match (HashMap::get(&it.enums, &n.name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = zip_subst(&ed.type_params, &n.args);
+                    u128 pa = 1;
+                    u128 ps = 0;
+                    for (usize i = 0; i < Vec::len(&ed.variants); i += 1)
+                    {
+                        match (&ed.variants[i].payload)
+                        {
+                            Some(p) :
+                            {
+                                SizeAlign f = size_align(it, &apply_subst(p, &sub))?;
+                                pa = max(pa, f.align);
+                                ps = max(ps, f.size);
+                            },
+                            None    : {},
+                        }
+                    }
+                    u128 align = max(pa, 4);
+                    return Some(SizeAlign { .size = round_up(round_up(4, pa) + ps, align), .align = align });
+                },
+                None     : {},
+            }
+            None
+        },
+        _                : None,
+    }
+}
+
+fn eval(ref<Ev, exclusive> ev, ref<Items, shared> it, ref<Expr, shared> e) : Result<CVal, String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(lb)         :
+        {
+            ref<IntLit, shared> l = Box::get(lb);
+            if (l.v > reinterpret<u128>(max_value<i128>()))
+            {
+                return not_const();
+            }
+            Option<IntTy> t = match (&l.sfx)
+            {
+                Some(s) : if (String::eq_str(s, "byte")) { Some(IntTy::U8) } else { int_ty_from(String::as_view(s)) },
+                None    : None,
+            };
+            typed(reinterpret<i128>(l.v), t)
+        },
+        ExprKind::EBool(v)         : Ok(CVal::VBool(*v)),
+        ExprKind::EFloat(fb)       : Ok(CVal::VFloat(Box::get(fb).v)),
+        ExprKind::EStr(s)          : Ok(CVal::VStr(String::clone(s))),
+        ExprKind::EParen(x)        : eval(ev, it, Box::get(x)),
+        ExprKind::EUnary(ub)       :
+        {
+            ref<UnaryExpr, shared> u = Box::get(ub);
+            // `-L` is the literal's negative, typed by its context.
+            CVal x = eval(ev, it, &u.e)?;
+            match (x)
+            {
+                CVal::VInt(iv)  :
+                {
+                    if (u.op == UnOp::Neg)
+                    {
+                        if (iv.v == min_value<i128>())
+                        {
+                            return Err(String::from_str("diag.arith-overflow"));
+                        }
+                        return typed(0 - iv.v, iv.t);
+                    }
+                    if (u.op == UnOp::BitNot)
+                    {
+                        IntTy k = Option::unwrap_or(iv.t, IntTy::I32);
+                        if (int_ty_signed(k))
+                        {
+                            return typed(-1 - iv.v, Some(k));
+                        }
+                        return typed(int_range(k).max - iv.v, Some(k));
+                    }
+                    not_const()
+                },
+                CVal::VBool(bv) : if (u.op == UnOp::Not) { Ok(CVal::VBool(!bv)) } else { not_const() },
+                CVal::VFloat(f) : if (u.op == UnOp::Neg) { Ok(CVal::VFloat(-f)) } else { not_const() },
+                _               : not_const(),
+            }
+        },
+        ExprKind::EBinary(bb)      : eval_binary(ev, it, Box::get(bb)),
+        ExprKind::EField(fb)       :
+        {
+            CVal x = eval(ev, it, &Box::get(fb).e)?;
+            match (x)
+            {
+                CVal::VStruct(fs) :
+                {
+                    for (usize i = 0; i < Vec::len(&fs); i += 1)
+                    {
+                        if (String::eq(&fs[i].name, &Box::get(fb).name))
+                        {
+                            return Ok(clone(&fs[i].v));
+                        }
+                    }
+                    not_const()
+                },
+                _                 : not_const(),
+            }
+        },
+        ExprKind::EIndex(pb)       :
+        {
+            CVal a = eval(ev, it, &Box::get(pb).a)?;
+            CVal k = eval(ev, it, &Box::get(pb).b)?;
+            match (a)
+            {
+                CVal::VArr(xs) : match (k)
+                {
+                    CVal::VInt(iv) :
+                    {
+                        if (iv.v < 0 || iv.v >= widen<i128>(Vec::len(&xs)))
+                        {
+                            return Err(String::from_str("diag.index-out-of-bounds"));
+                        }
+                        Ok(clone(&xs[narrow<usize>(iv.v)]))
+                    },
+                    _              : not_const(),
+                },
+                _ : not_const(),
+            }
+        },
+        ExprKind::EArrayLit(es)    :
+        {
+            Vec<CVal> xs = Vec::new();
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                Vec::push(&mut xs, eval(ev, it, &es[i])?);
+            }
+            Ok(CVal::VArr(xs))
+        },
+        ExprKind::EArrayRepeat(rb) :
+        {
+            CVal x = eval(ev, it, &Box::get(rb).value)?;
+            Vec<CVal> xs = Vec::new();
+            for (u128 i = 0; i < Box::get(rb).n; i += 1)
+            {
+                Vec::push(&mut xs, clone(&x));
+            }
+            Ok(CVal::VArr(xs))
+        },
+        ExprKind::EStructLit(sb)   :
+        {
+            ref<StructLitExpr, shared> sl = Box::get(sb);
+            Vec<FieldVal> fs = Vec::new();
+            for (usize i = 0; i < Vec::len(&sl.fields); i += 1)
+            {
+                Vec::push(
+                    &mut fs,
+                    FieldVal { .name = String::clone(&sl.fields[i].name), .v = eval(ev, it, &sl.fields[i].value)? },
+                );
+            }
+            Ok(CVal::VStruct(fs))
+        },
+        ExprKind::EBlock(blk)      :
+        {
+            if (Vec::len(&blk.stmts) != 0)
+            {
+                return not_const();
+            }
+            match (&blk.tail)
+            {
+                Some(t) : eval(ev, it, Box::get(t)),
+                None    : not_const(),
+            }
+        },
+        ExprKind::ECall(cb)        : eval_call(ev, it, Box::get(cb)),
+        _                          : not_const(),
+    }
+}
+
+fn eval_call(ref<Ev, exclusive> ev, ref<Items, shared> it, ref<CallExpr, shared> c) : Result<CVal, String>
+{
+    ref<PathExpr, shared> p = match (&c.callee.kind)
+    {
+        ExprKind::EPath(pb) : Box::get(pb),
+        _                   : return not_const(),
+    };
+    String name = String::join(&p.segs[0..$], "::");
+    // A constant item (`const τ K = e;` that did not fold to a literal).
+    match (HashMap::get(&it.fns, &name))
+    {
+        Some(f) :
+        {
+            if (f.is_const && Vec::len(&c.args) == 0)
+            {
+                if (ev.depth > 200)
+                {
+                    return not_const();
+                }
+                ev.depth += 1;
+                Result<CVal, String> r = eval_block(ev, it, &f.body);
+                ev.depth -= 1;
+                CVal v = r?;
+                // The constant's declared type types a literal.
+                return match (v)
+                {
+                    CVal::VInt(iv) : match (&f.ret)
+                    {
+                        Type::TInt(k) : typed(iv.v, Some(*k)),
+                        _             : Ok(CVal::VInt(iv)),
+                    },
+                    other : Ok(other),
+                };
+            }
+            return not_const();
+        },
+        None    : {},
+    }
+    Option<Type> ta = if (Vec::len(&p.targs) == 1) { Some(apply_subst_ce(&p.targs[0], &ev.subst)) } else { None };
+    if (String::eq_str(&name, "sizeof") || String::eq_str(&name, "alignof"))
+    {
+        match (&ta)
+        {
+            Some(t) : match (size_align(it, t))
+            {
+                Some(sa) : return typed(
+                    reinterpret<i128>(if (String::eq_str(&name, "sizeof")) { sa.size } else { sa.align }),
+                    Some(IntTy::Usize),
+                ),
+                None : return Err(String::from_str("diag.unsupported-in-selfhost")),
+            },
+            None : return not_const(),
+        }
+    }
+    if (String::eq_str(&name, "min_value") || String::eq_str(&name, "max_value"))
+    {
+        match (&ta)
+        {
+            Some(Type::TInt(k)) :
+            {
+                IntRange r = int_range(*k);
+                return typed(if (String::eq_str(&name, "min_value")) { r.min } else { r.max }, Some(*k));
+            },
+            _                   : return not_const(),
+        }
+    }
+    if ((String::eq_str(&name, "widen") || String::eq_str(&name, "narrow")) && Vec::len(&c.args) == 1)
+    {
+        CVal x = eval(ev, it, &c.args[0])?;
+        match (ta)
+        {
+            Some(Type::TInt(k)) : match (x)
+            {
+                CVal::VInt(iv) :
+                {
+                    if (!fits(iv.v, k))
+                    {
+                        return Err(String::from_str("diag.narrow-out-of-range"));
+                    }
+                    return typed(iv.v, Some(k));
+                },
+                _              : return not_const(),
+            },
+            _ : return not_const(),
+        }
+    }
+    // `$fmt(F, …)`: the message of a failed assertion (D-0068).
+    if (String::eq_str(&name, "$fmt") && Vec::len(&c.args) > 0)
+    {
+        String f = match (&c.args[0].kind)
+        {
+            ExprKind::EStr(s) : String::clone(s),
+            _                 : return not_const(),
+        };
+        Vec<CVal> vals = Vec::new();
+        for (usize i = 1; i < Vec::len(&c.args); i += 1)
+        {
+            Vec::push(&mut vals, eval(ev, it, &c.args[i])?);
+        }
+        return Ok(CVal::VStr(render(&f, &vals)?));
+    }
+    Err(String::from_str("diag.unsupported-in-selfhost"))
+}
+
+fn eval_block(ref<Ev, exclusive> ev, ref<Items, shared> it, ref<Block, shared> blk) : Result<CVal, String>
+{
+    if (Vec::len(&blk.stmts) != 0)
+    {
+        return Err(String::from_str("diag.unsupported-in-selfhost"));
+    }
+    match (&blk.tail)
+    {
+        Some(t) : eval(ev, it, Box::get(t)),
+        None    : not_const(),
+    }
+}
+
+fn apply_subst_ce(ref<Type, shared> t, ref<HashMap<String, Type>, shared> subst) : Type
+{
+    match (t)
+    {
+        Type::TNamed(nb) :
+        {
+            if (Vec::len(&Box::get(nb).args) == 0)
+            {
+                match (HashMap::get(subst, &Box::get(nb).name))
+                {
+                    Some(x) : return clone(x),
+                    None    : {},
+                }
+            }
+            clone(t)
+        },
+        _                : clone(t),
+    }
+}
+
+// Two integers' common type: a literal's is the other operand's.
+fn join_ty(Option<IntTy> a, Option<IntTy> b) : Option<IntTy>
+{
+    match (a)
+    {
+        Some(k) : Some(k),
+        None    : b,
+    }
+}
+
+fn eval_binary(ref<Ev, exclusive> ev, ref<Items, shared> it, ref<BinaryExpr, shared> x) : Result<CVal, String>
+{
+    BinOp op = x.op;
+    // `&&` and `||` evaluate their right operand only when it decides.
+    if (op == BinOp::And || op == BinOp::Or)
+    {
+        bool l = match (eval(ev, it, &x.a)?)
+        {
+            CVal::VBool(v) : v,
+            _              : return not_const(),
+        };
+        if ((op == BinOp::And && !l) || (op == BinOp::Or && l))
+        {
+            return Ok(CVal::VBool(l));
+        }
+        return match (eval(ev, it, &x.b)?)
+        {
+            CVal::VBool(v) : Ok(CVal::VBool(v)),
+            _              : not_const(),
+        };
+    }
+    CVal a = eval(ev, it, &x.a)?;
+    CVal b = eval(ev, it, &x.b)?;
+    bool cmp = op == BinOp::Eq || op == BinOp::Ne || op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge;
+    match (a)
+    {
+        CVal::VInt(p)   :
+        {
+            IntVal q = match (b)
+            {
+                CVal::VInt(q) : q,
+                _             : return not_const(),
+            };
+            Option<IntTy> t = join_ty(p.t, q.t);
+            if (cmp)
+            {
+                return Ok(CVal::VBool(holds(op, compare_i(p.v, q.v))));
+            }
+            // An operation of two literals is an `i32`'s.
+            Option<IntTy> tt = match (t)
+            {
+                Some(k) : Some(k),
+                None    : Some(IntTy::I32),
+            };
+            int_op(op, p.v, q.v, Option::unwrap_or(tt, IntTy::I32), if (Option::is_some(&p.t)) { p.t } else { tt })
+        },
+        CVal::VBool(p)  :
+        {
+            bool q = match (b)
+            {
+                CVal::VBool(q) : q,
+                _              : return not_const(),
+            };
+            if (op == BinOp::Eq)
+            {
+                return Ok(CVal::VBool(p == q));
+            }
+            if (op == BinOp::Ne)
+            {
+                return Ok(CVal::VBool(p != q));
+            }
+            not_const()
+        },
+        CVal::VFloat(p) :
+        {
+            f64 q = match (b)
+            {
+                CVal::VFloat(q) : q,
+                _               : return not_const(),
+            };
+            if (op == BinOp::Eq)
+            {
+                return Ok(CVal::VBool(p == q));
+            }
+            if (op == BinOp::Ne)
+            {
+                return Ok(CVal::VBool(p != q));
+            }
+            if (op == BinOp::Lt)
+            {
+                return Ok(CVal::VBool(p < q));
+            }
+            if (op == BinOp::Le)
+            {
+                return Ok(CVal::VBool(p <= q));
+            }
+            if (op == BinOp::Gt)
+            {
+                return Ok(CVal::VBool(p > q));
+            }
+            if (op == BinOp::Ge)
+            {
+                return Ok(CVal::VBool(p >= q));
+            }
+            Err(String::from_str("diag.unsupported-in-selfhost"))
+        },
+        _               : Err(String::from_str("diag.unsupported-in-selfhost")),
+    }
+}
+
+fn compare_i(i128 p, i128 q) : i32
+{
+    if (p < q) { -1 } else if (p > q) { 1 } else { 0 }
+}
+
+fn holds(BinOp op, i32 o) : bool
+{
+    match (op)
+    {
+        BinOp::Eq : o == 0,
+        BinOp::Ne : o != 0,
+        BinOp::Lt : o < 0,
+        BinOp::Le : o <= 0,
+        BinOp::Gt : o > 0,
+        _         : o >= 0,
+    }
+}
+
+// `spec/06`'s checked operation in type `k` (the result typed `rt`).
+fn int_op(BinOp op, i128 p, i128 q, IntTy k, Option<IntTy> rt) : Result<CVal, String>
+{
+    Option<i128> r = None;
+    if (op == BinOp::Add)
+    {
+        r = checked_add(p, q);
+    }
+    else if (op == BinOp::Sub)
+    {
+        r = checked_sub(p, q);
+    }
+    else if (op == BinOp::Mul)
+    {
+        r = checked_mul(p, q);
+    }
+    else if (op == BinOp::Div || op == BinOp::Rem)
+    {
+        if (q == 0)
+        {
+            return Err(String::from_str("diag.div-by-zero"));
+        }
+        if (int_ty_signed(k) && q == -1 && p == int_range(k).min)
+        {
+            return Err(String::from_str("diag.div-overflow"));
+        }
+        r = if (op == BinOp::Div) { checked_div(p, q) } else { checked_rem(p, q) };
+    }
+    else if (op == BinOp::BitAnd)
+    {
+        r = Some(p & q);
+    }
+    else if (op == BinOp::BitOr)
+    {
+        r = Some(p | q);
+    }
+    else if (op == BinOp::BitXor)
+    {
+        r = Some(p ^ q);
+    }
+    else
+    {
+        return Err(String::from_str("diag.unsupported-in-selfhost"));
+    }
+    match (r)
+    {
+        Some(v) : typed(v, Some(k)),
+        None    : Err(String::from_str("diag.arith-overflow")),
+    }
+}
+
+fn shown(ref<CVal, shared> v) : Result<String, String>
+{
+    match (v)
+    {
+        CVal::VInt(iv) : Ok(sprintf("%v", iv.v)),
+        CVal::VBool(b) : Ok(String::from_str(if (*b) { "true" } else { "false" })),
+        CVal::VStr(s)  : Ok(String::clone(s)),
+        _              : Err(String::from_str("diag.unsupported-in-selfhost")),
+    }
+}
+
+// The message: `%v`, `%d`, `%s` and `%%` (other specifiers are not met in
+// a static assertion's message yet).
+fn render(ref<String, shared> f, ref<Vec<CVal>, shared> vals) : Result<String, String>
+{
+    slice<u8, shared> b = &String::as_bytes(f)[0..$];
+    usize n = slice_len(b);
+    String out = String::new();
+    usize k = 0;
+    usize i = 0;
+    usize start = 0;
+    while (i < n)
+    {
+        if (b[i] != b'%')
+        {
+            i += 1;
+            continue;
+        }
+        String::append(&mut out, StringView::sub(String::as_view(f), start, i));
+        if (i + 1 < n && b[i + 1] == b'%')
+        {
+            String::append(&mut out, "%");
+            i += 2;
+            start = i;
+            continue;
+        }
+        if (i + 1 >= n || !(b[i + 1] == b'v' || b[i + 1] == b'd' || b[i + 1] == b's' || b[i + 1] == b'i' || b[i + 1] == b'u'))
+        {
+            return Err(String::from_str("diag.unsupported-in-selfhost"));
+        }
+        if (k >= Vec::len(vals))
+        {
+            return not_const_s();
+        }
+        String::append(&mut out, &shown(&vals[k])?);
+        k += 1;
+        i += 2;
+        start = i;
+    }
+    String::append(&mut out, StringView::sub(String::as_view(f), start, n));
+    Ok(out)
+}
+
+fn not_const_s() : Result<String, String>
+{
+    Err(String::from_str("diag.const-not-constant"))
+}
+
+// Each assertion in turn: the first false one, or the first whose
+// condition fails, is the program's error (at its line).
+export fn check_static_asserts(ref<Items, shared> it, ref<Vec<StaticAssert>, shared> asserts) : Result<void, String>
+{
+    for (usize i = 0; i < Vec::len(asserts); i += 1)
+    {
+        ref<StaticAssert, shared> a = &asserts[i];
+        Ev ev = Ev { .subst = clone(&a.subst), .depth = 0 };
+        match (eval(&mut ev, it, &a.cond))
+        {
+            Ok(CVal::VBool(true))  : {},
+            Ok(CVal::VBool(false)) :
+            {
+                Option<String> text = match (&a.message_fmt)
+                {
+                    Some(fe) : match (eval(&mut ev, it, fe))
+                    {
+                        Ok(CVal::VStr(t)) : Some(t),
+                        Ok(_)             : return Err(sprintf("diag.type-mismatch@%v", a.line)),
+                        Err(d)            : return Err(sprintf("%s@%v", &d, a.line)),
+                    },
+                    None : clone(&a.message),
+                };
+                return Err(match (text)
+                {
+                    Some(m) : sprintf("diag.static-assert-failed\u{1}%s@%v", &m, a.line),
+                    None    : sprintf("diag.static-assert-failed@%v", a.line),
+                });
+            },
+            Ok(_)                  : return Err(sprintf("diag.type-mismatch@%v", a.line)),
+            Err(d)                 : return Err(sprintf("%s@%v", &d, a.line)),
+        }
+    }
+    Ok(())
+}

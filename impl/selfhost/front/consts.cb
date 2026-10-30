@@ -1,0 +1,1922 @@
+// `const` items (D-0036, `spec/17` §1 `rule.module.const`) after name
+// resolution, as impl/src/consts.rs handles them, function for function:
+// `const auto`'s types (D-0068); no constant depending on itself
+// (`[Const-Cycle]`); a constant of integer, float, `bool` or `str`
+// arithmetic over literals and other such constants folded with the
+// checked arithmetic of `spec/06`, and each use rewritten to a literal of
+// its type. Any other constant keeps its call.
+
+import std;
+import ast;
+import modres;
+
+struct IntVal
+{
+    IntTy t;
+    // A signed value, or an unsigned one's bit pattern, of its type.
+    i128 v;
+}
+
+struct FloatVal
+{
+    f64 v;
+    bool f32_;
+}
+
+enum Val
+{
+    VInt(Box<IntVal>),
+    VFloat(Box<FloatVal>),
+    VBool(bool),
+    VStr(String),
+}
+
+struct Const
+{
+    Type ty;
+    Expr init;
+    usize line;
+}
+
+fn vint(IntTy t, i128 v) : Val
+{
+    Val::VInt(Box::new(IntVal { .t = t, .v = v }))
+}
+
+fn vfloat(f64 v, bool f32_) : Val
+{
+    Val::VFloat(Box::new(FloatVal { .v = v, .f32_ = f32_ }))
+}
+
+fn joined(ref<Vec<String>, shared> v) : String
+{
+    String::join(&v[0..$], "::")
+}
+
+// The folded constants' literals, kept for the functions of `std` parsed
+// later (`rewrite_more`, CHG-0355).
+export fn process(ref<Program, exclusive> program) : Result<HashMap<String, Expr>, String>
+{
+    resolve_auto(program)?;
+    HashMap<String, Const> consts = HashMap::new();
+    Vec<String> path = Vec::new();
+    collect(&program.items, &mut path, &mut consts);
+    HashMap<String, Expr> lits = HashMap::new();
+    if (HashMap::len(&consts) == 0)
+    {
+        return Ok(lits);
+    }
+    check_cycles(&consts)?;
+    HashMap<String, Option<Val>> folded = HashMap::new();
+    Vec<String> keys = sorted_keys(&consts);
+    for (usize i = 0; i < Vec::len(&keys); i += 1)
+    {
+        fold(&keys[i], &consts, &mut folded)?;
+    }
+    for (usize i = 0; i < HashMap::len(&folded); i += 1)
+    {
+        match (HashMap::value_at(&folded, i))
+        {
+            Some(v) :
+            {
+                HashMap::insert(&mut lits, String::clone(HashMap::key_at(&folded, i)), literal(v));
+            },
+            None    : {},
+        }
+    }
+    if (HashMap::len(&lits) > 0)
+    {
+        rewrite_items(&mut program.items, &lits);
+    }
+    Ok(lits)
+}
+
+// Every use of a folded constant in `items` rewritten, as `process` did.
+export fn rewrite_more(ref<Vec<Item>, exclusive> items, ref<HashMap<String, Expr>, shared> lits)
+{
+    if (HashMap::len(lits) > 0)
+    {
+        rewrite_items(items, lits);
+    }
+}
+
+fn sorted_keys(ref<HashMap<String, Const>, shared> m) : Vec<String>
+{
+    Vec<String> keys = Vec::new();
+    for (usize i = 0; i < HashMap::len(m); i += 1)
+    {
+        Vec::push(&mut keys, String::clone(HashMap::key_at(m, i)));
+    }
+    Vec::sort(&mut keys);
+    keys
+}
+
+fn collect(ref<Vec<Item>, shared> items, ref<Vec<String>, exclusive> path, ref<HashMap<String, Const>, exclusive> out)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                if (f.is_const)
+                {
+                    match (&f.body.tail)
+                    {
+                        Some(init) :
+                        {
+                            HashMap::insert(out, qualify(path, String::as_view(&f.name)), Const {
+                                .ty = clone(&f.ret),
+                                .init = clone(Box::get(init)),
+                                .line = f.line,
+                            });
+                        },
+                        None       : {},
+                    }
+                }
+            },
+            Item::IModule(b) :
+            {
+                ref<ModuleItem, shared> m = Box::get(b);
+                Vec::push(path, String::clone(&m.name));
+                collect(&m.items, path, out);
+                Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+// ---- `visit` ----
+
+// What a walk over every expression in `e` (closures' bodies included,
+// as `consts.rs`'s `visit` goes) finds: whether a float literal is among
+// them, and the constants called (`modres` made each use a call with no
+// arguments).
+struct Scan
+{
+    bool float;
+    Vec<String> uses;
+}
+
+fn scan(ref<Expr, shared> e, ref<HashMap<String, Const>, shared> consts, ref<Scan, exclusive> out)
+{
+    match (&e.kind)
+    {
+        ExprKind::EFloat(_) : out.float = true,
+        ExprKind::ECall(b)  :
+        {
+            ref<CallExpr, shared> c = Box::get(b);
+            if (Vec::len(&c.args) == 0)
+            {
+                match (&c.callee.kind)
+                {
+                    ExprKind::EPath(p) :
+                    {
+                        String k = joined(&Box::get(p).segs);
+                        if (HashMap::contains(consts, &k))
+                        {
+                            Vec::push(&mut out.uses, k);
+                        }
+                    },
+                    _                  : {},
+                }
+            }
+        },
+        _                   : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EUnary(b)       : scan(&Box::get(b).e, consts, out),
+        ExprKind::EBorrow(b)      : scan(&Box::get(b).e, consts, out),
+        ExprKind::EDeref(x)       : scan(Box::get(x), consts, out),
+        ExprKind::EField(b)       : scan(&Box::get(b).e, consts, out),
+        ExprKind::EPropagate(x)   : scan(Box::get(x), consts, out),
+        ExprKind::EParen(x)       : scan(Box::get(x), consts, out),
+        ExprKind::EBinary(b)      :
+        {
+            scan(&Box::get(b).a, consts, out);
+            scan(&Box::get(b).b, consts, out);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            scan(&Box::get(b).a, consts, out);
+            scan(&Box::get(b).b, consts, out);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            scan(&Box::get(b).a, consts, out);
+            scan(&Box::get(b).b, consts, out);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, shared> c = Box::get(b);
+            scan(&c.callee, consts, out);
+            for (usize i = 0; i < Vec::len(&c.args); i += 1)
+            {
+                scan(&c.args[i], consts, out);
+            }
+        },
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, shared> s = Box::get(b);
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                scan(&s.fields[i].value, consts, out);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                scan(&es[i], consts, out);
+            }
+        },
+        ExprKind::EArrayRepeat(b) : scan(&Box::get(b).value, consts, out),
+        ExprKind::EBlock(b)       : scan_block(b, consts, out),
+        ExprKind::EUnsafe(b)      : scan_block(b, consts, out),
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, shared> x = Box::get(b);
+            scan(&x.cond, consts, out);
+            scan_block(&x.then_, consts, out);
+            match (&x.else_)
+            {
+                Some(el) : scan(el, consts, out),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, shared> x = Box::get(b);
+            scan(&x.cond, consts, out);
+            scan_block(&x.body, consts, out);
+            match (&x.step)
+            {
+                Some(s) : scan(s, consts, out),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, shared> x = Box::get(b);
+            scan(&x.scrut, consts, out);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                scan(Box::get(&x.arms[i].body), consts, out);
+            }
+        },
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) : scan(Box::get(x), consts, out),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(b)     : scan_block(&Box::get(b).body, consts, out),
+        _                         : {},
+    }
+}
+
+fn scan_block(ref<Block, shared> b, ref<HashMap<String, Const>, shared> consts, ref<Scan, exclusive> out)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        match (&b.stmts[i])
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : scan(e, consts, out),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : scan(&Box::get(d).init, consts, out),
+            Stmt::SExpr(e)        : scan(Box::get(e), consts, out),
+            Stmt::SBlockLike(e)   : scan(Box::get(e), consts, out),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : scan(Box::get(t), consts, out),
+        None    : {},
+    }
+}
+
+fn scanned(ref<Expr, shared> e, ref<HashMap<String, Const>, shared> consts) : Scan
+{
+    Scan s = Scan { .float = false, .uses = Vec::new() };
+    scan(e, consts, &mut s);
+    s
+}
+
+// ---- `[Const-Cycle]` ----
+
+fn dfs(
+    ref<String, shared> k,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, u8>, exclusive> state,
+) : Result<void, String>
+{
+    match (HashMap::get(state, k))
+    {
+        Some(s) :
+        {
+            if (*s == 2)
+            {
+                return Ok(());
+            }
+            if (*s == 1)
+            {
+                return Err(sprintf(
+                    "diag.const-not-constant@%v",
+                    Option::expect(HashMap::get(consts, k), "a constant").line,
+                ));
+            }
+        },
+        None    : {},
+    }
+    HashMap::insert(state, String::clone(k), 1);
+    Scan s = scanned(&Option::expect(HashMap::get(consts, k), "a constant").init, consts);
+    for (usize i = 0; i < Vec::len(&s.uses); i += 1)
+    {
+        dfs(&s.uses[i], consts, state)?;
+    }
+    HashMap::insert(state, String::clone(k), 2);
+    Ok(())
+}
+
+fn check_cycles(ref<HashMap<String, Const>, shared> consts) : Result<void, String>
+{
+    // 0 = unseen, 1 = on the current path, 2 = done.
+    HashMap<String, u8> state = HashMap::new();
+    Vec<String> keys = sorted_keys(consts);
+    for (usize i = 0; i < Vec::len(&keys); i += 1)
+    {
+        dfs(&keys[i], consts, &mut state)?;
+    }
+    Ok(())
+}
+
+// ---- folding ----
+
+fn fold(
+    ref<String, shared> k,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, Option<Val>>, exclusive> folded,
+) : Result<Option<Val>, String>
+{
+    match (HashMap::get(folded, k))
+    {
+        Some(v) : return Ok(clone(v)),
+        None    : {},
+    }
+    ref<Const, shared> c = Option::expect(HashMap::get(consts, k), "a constant");
+    Option<Val> v = match (eval(&c.init, &c.ty, consts, folded))
+    {
+        Ok(v)  : v,
+        Err(d) : return Err(sprintf("%s@%v", &d, c.line)),
+    };
+    HashMap::insert(folded, String::clone(k), clone(&v));
+    Ok(v)
+}
+
+struct Range
+{
+    i128 min;
+    u128 max;
+}
+
+fn range(IntTy t) : Range
+{
+    u32 bw = int_ty_bits(t, 64);
+    i128 one = 1;
+    u128 uone = 1;
+    if (int_ty_signed(t))
+    {
+        if (bw >= 128)
+        {
+            return Range { .min = min_value<i128>(), .max = reinterpret<u128>(max_value<i128>()) };
+        }
+        return Range { .min = 0 - (one << (bw - 1)), .max = (uone << (bw - 1)) - 1 };
+    }
+    Range { .min = 0, .max = if (bw >= 128) { max_value<u128>() } else { (uone << bw) - 1 } }
+}
+
+fn unsigned_abs(i128 v) : u128
+{
+    if (v < 0)
+    {
+        return reinterpret<u128>(wrapping_sub(0, v));
+    }
+    reinterpret<u128>(v)
+}
+
+// An integer of type `t` from a mathematical value, if it is one.
+fn int_of(IntTy t, bool neg, u128 mag) : Option<Val>
+{
+    Range r = range(t);
+    if (neg)
+    {
+        if (mag == 0)
+        {
+            return Some(vint(t, 0));
+        }
+        u128 lo = unsigned_abs(r.min);
+        if (!int_ty_signed(t) || mag > lo)
+        {
+            return None;
+        }
+        return Some(vint(t, wrapping_sub(0, reinterpret<i128>(mag))));
+    }
+    if (mag > r.max)
+    {
+        return None;
+    }
+    Some(vint(t, reinterpret<i128>(mag)))
+}
+
+struct Parts
+{
+    bool neg;
+    u128 mag;
+}
+
+fn signed_parts(IntTy t, i128 v) : Parts
+{
+    if (int_ty_signed(t))
+    {
+        return Parts { .neg = v < 0, .mag = unsigned_abs(v) };
+    }
+    Parts { .neg = false, .mag = reinterpret<u128>(v) }
+}
+
+fn is_int_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_) : true,
+        _             : false,
+    }
+}
+
+fn is_float_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TF32 : true,
+        Type::TF64 : true,
+        _          : false,
+    }
+}
+
+fn is_compare_or_logic(BinOp op) : bool
+{
+    op == BinOp::Eq || op == BinOp::Ne || op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge || op == BinOp::And || op == BinOp::Or
+}
+
+fn is_shift(BinOp op) : bool
+{
+    op == BinOp::Shl || op == BinOp::Shr
+}
+
+// The type `e` has on its own, as `rule.type.typing` synthesizes it:
+// `None` for a bare unsuffixed literal, which takes its context's type.
+fn synth(ref<Expr, shared> e, ref<HashMap<String, Const>, shared> consts) : Option<Type>
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(b)    :
+        {
+            match (&Box::get(b).sfx)
+            {
+                // D-0102: a byte literal takes its type from its context.
+                Some(s) :
+                {
+                    if (String::eq_str(s, "byte"))
+                    {
+                        return None;
+                    }
+                    match (int_ty_from(String::as_view(s)))
+                    {
+                        Some(t) : Some(Type::TInt(t)),
+                        None    : None,
+                    }
+                },
+                None    : None,
+            }
+        },
+        ExprKind::EFloat(b)  :
+        {
+            match (&Box::get(b).sfx)
+            {
+                Some(s) : if (String::eq_str(s, "f32")) { Some(Type::TF32) } else { Some(Type::TF64) },
+                None    : None,
+            }
+        },
+        ExprKind::EBool(_)   : Some(Type::TBool),
+        ExprKind::EStr(_)    : Some(Type::TStr),
+        ExprKind::EParen(x)  : synth(Box::get(x), consts),
+        ExprKind::EUnary(b)  : synth(&Box::get(b).e, consts),
+        ExprKind::ECall(b)   :
+        {
+            ref<CallExpr, shared> c = Box::get(b);
+            if (Vec::len(&c.args) > 0)
+            {
+                return None;
+            }
+            match (&c.callee.kind)
+            {
+                ExprKind::EPath(p) : match (HashMap::get(consts, &joined(&Box::get(p).segs)))
+                {
+                    Some(k) : Some(clone(&k.ty)),
+                    None    : None,
+                },
+                _ : None,
+            }
+        },
+        ExprKind::EBinary(b) :
+        {
+            ref<BinaryExpr, shared> x = Box::get(b);
+            if (is_compare_or_logic(x.op))
+            {
+                return Some(Type::TBool);
+            }
+            // A literal expression takes its context's type (D-0037).
+            if (is_literal_expr(e))
+            {
+                return None;
+            }
+            Option<Type> t = operand_synth(&x.a, &x.b, x.op, consts);
+            match (t)
+            {
+                Some(t) : Some(t),
+                None    : Some(default_of(&x.a)),
+            }
+        },
+        _                    : None,
+    }
+}
+
+fn operand_synth(
+    ref<Expr, shared> a,
+    ref<Expr, shared> b,
+    BinOp op,
+    ref<HashMap<String, Const>, shared> consts,
+) : Option<Type>
+{
+    Option<Type> t = synth(a, consts);
+    if (is_shift(op) || Option::is_some(&t))
+    {
+        return t;
+    }
+    synth(b, consts)
+}
+
+// The type an unsuffixed literal operand defaults to with nothing to take
+// one from: `i32`, or `f64` for a float.
+fn default_of(ref<Expr, shared> e) : Type
+{
+    HashMap<String, Const> none = HashMap::new();
+    if (scanned(e, &none).float)
+    {
+        return Type::TF64;
+    }
+    Type::TInt(IntTy::I32)
+}
+
+fn round32(f64 v) : f64
+{
+    widen<f64>(to_float<f32>(v))
+}
+
+fn is_infinite(f64 v) : bool
+{
+    !is_finite(v) && !is_nan(v)
+}
+
+fn int_name_differs(ref<Option<String>, shared> sfx, IntTy t) : bool
+{
+    match (sfx)
+    {
+        Some(s) : !String::eq_str(s, int_ty_name(t)),
+        None    : false,
+    }
+}
+
+// `e`'s value when its context expects `ty` (a bare literal takes it), or
+// `None` when this pass does not compute it; `Err` for a checked failure.
+fn eval(
+    ref<Expr, shared> e,
+    ref<Type, shared> ty,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, Option<Val>>, exclusive> folded,
+) : Result<Option<Val>, String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)  : return eval(Box::get(x), ty, consts, folded),
+        ExprKind::EInt(b)    :
+        {
+            ref<IntLit, shared> lit = Box::get(b);
+            return match (ty)
+            {
+                Type::TInt(t) :
+                {
+                    if (int_name_differs(&lit.sfx, *t))
+                    {
+                        return Ok(None);
+                    }
+                    Ok(int_of(*t, false, lit.v))
+                },
+                _             : Ok(None),
+            };
+        },
+        ExprKind::EFloat(b)  :
+        {
+            if (!is_float_ty(ty))
+            {
+                return Ok(None);
+            }
+            ref<FloatLit, shared> lit = Box::get(b);
+            bool f32_ = match (ty)
+            {
+                Type::TF32 : true,
+                _          : false,
+            };
+            match (&lit.sfx)
+            {
+                Some(s) :
+                {
+                    if (!String::eq_str(s, if (f32_) { "f32" } else { "f64" }))
+                    {
+                        return Ok(None);
+                    }
+                },
+                None    : {},
+            }
+            f64 v = if (f32_) { round32(lit.v) } else { lit.v };
+            if (is_infinite(v))
+            {
+                return Ok(None);
+            }
+            return Ok(Some(vfloat(v, f32_)));
+        },
+        ExprKind::EBool(v)   :
+        {
+            return match (ty)
+            {
+                Type::TBool : Ok(Some(Val::VBool(*v))),
+                _           : Ok(None),
+            };
+        },
+        ExprKind::EStr(s)    :
+        {
+            return match (ty)
+            {
+                Type::TStr : Ok(Some(Val::VStr(String::clone(s)))),
+                _          : Ok(None),
+            };
+        },
+        ExprKind::ECall(b)   :
+        {
+            ref<CallExpr, shared> c = Box::get(b);
+            if (Vec::len(&c.args) > 0)
+            {
+                return Ok(None);
+            }
+            String k = match (&c.callee.kind)
+            {
+                ExprKind::EPath(p) : joined(&Box::get(p).segs),
+                _                  : return Ok(None),
+            };
+            bool same = match (HashMap::get(consts, &k))
+            {
+                Some(other) : type_eq(&other.ty, ty),
+                None        : false,
+            };
+            if (!same)
+            {
+                return Ok(None);
+            }
+            return fold(&k, consts, folded);
+        },
+        ExprKind::EUnary(b)  : return eval_unary(Box::get(b), ty, consts, folded),
+        ExprKind::EBinary(b) : return eval_binary(Box::get(b), ty, consts, folded),
+        _                    : {},
+    }
+    Ok(None)
+}
+
+fn eval_unary(
+    ref<UnaryExpr, shared> u,
+    ref<Type, shared> ty,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, Option<Val>>, exclusive> folded,
+) : Result<Option<Val>, String>
+{
+    if (u.op == UnOp::Neg)
+    {
+        match (ty)
+        {
+            Type::TInt(t) :
+            {
+                IntTy it = *t;
+                // `-L` is one literal (D-0025): `-128` is an `i8`.
+                match (&u.e.kind)
+                {
+                    ExprKind::EInt(lb) :
+                    {
+                        ref<IntLit, shared> lit = Box::get(lb);
+                        if (!int_name_differs(&lit.sfx, it))
+                        {
+                            return Ok(int_of(it, true, lit.v));
+                        }
+                    },
+                    _                  : {},
+                }
+                return match (eval(&u.e, ty, consts, folded)?)
+                {
+                    Some(Val::VInt(x)) :
+                    {
+                        if (!int_ty_signed(it))
+                        {
+                            return Ok(None);
+                        }
+                        Parts p = signed_parts(it, Box::get(&x).v);
+                        match (int_of(it, !p.neg, p.mag))
+                        {
+                            Some(v) : Ok(Some(v)),
+                            None    : Err(String::from_str("diag.arith-overflow")),
+                        }
+                    },
+                    _                  : Ok(None),
+                };
+            },
+            Type::TF32    : {},
+            Type::TF64    : {},
+            _             : return Ok(None),
+        }
+        return match (eval(&u.e, ty, consts, folded)?)
+        {
+            Some(Val::VFloat(x)) : Ok(Some(vfloat(-Box::get(&x).v, Box::get(&x).f32_))),
+            _                    : Ok(None),
+        };
+    }
+    if (u.op == UnOp::Not)
+    {
+        return match (ty)
+        {
+            Type::TBool : match (eval(&u.e, ty, consts, folded)?)
+            {
+                Some(Val::VBool(b)) : Ok(Some(Val::VBool(!b))),
+                _                   : Ok(None),
+            },
+            _ : Ok(None),
+        };
+    }
+    // `~x`.
+    match (ty)
+    {
+        Type::TInt(t) :
+        {
+            IntTy it = *t;
+            match (eval(&u.e, ty, consts, folded)?)
+            {
+                Some(Val::VInt(x)) :
+                {
+                    u32 bw = int_ty_bits(it, 64);
+                    u128 uone = 1;
+                    i128 one = 1;
+                    u128 mask = if (bw >= 128) { max_value<u128>() } else { (uone << bw) - 1 };
+                    u128 bits = ~reinterpret<u128>(Box::get(&x).v) & mask;
+                    if (int_ty_signed(it) && bw < 128 && ((bits >> (bw - 1)) & 1) == 1)
+                    {
+                        return Ok(Some(vint(it, reinterpret<i128>(bits) - (one << bw))));
+                    }
+                    Ok(Some(vint(it, reinterpret<i128>(bits))))
+                },
+                _                  : Ok(None),
+            }
+        },
+        _             : Ok(None),
+    }
+}
+
+// An operator's operands are typed as `rule.type.typing` types them: a
+// bare literal takes the other operand's type, or the context's number
+// type (D-0037), or the default.
+fn operand_ty(
+    ref<Expr, shared> a,
+    ref<Expr, shared> b,
+    BinOp op,
+    ref<Type, shared> ty,
+    ref<HashMap<String, Const>, shared> consts,
+) : Type
+{
+    match (operand_synth(a, b, op, consts))
+    {
+        Some(t) : t,
+        None    : if (is_int_ty(ty) || is_float_ty(ty)) { clone(ty) } else { default_of(a) },
+    }
+}
+
+fn eval_binary(
+    ref<BinaryExpr, shared> x,
+    ref<Type, shared> ty,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, Option<Val>>, exclusive> folded,
+) : Result<Option<Val>, String>
+{
+    match (ty)
+    {
+        Type::TBool   :
+        {
+            if (x.op != BinOp::And && x.op != BinOp::Or)
+            {
+                return Ok(None);
+            }
+            Option<Val> a = eval(&x.a, ty, consts, folded)?;
+            Option<Val> b = eval(&x.b, ty, consts, folded)?;
+            match (a)
+            {
+                Some(Val::VBool(p)) : match (b)
+                {
+                    Some(Val::VBool(q)) : Ok(Some(Val::VBool(if (x.op == BinOp::And) { p && q } else { p || q }))),
+                    _                   : Ok(None),
+                },
+                _ : Ok(None),
+            }
+        },
+        Type::TInt(t) :
+        {
+            IntTy it = *t;
+            if (!type_eq(&operand_ty(&x.a, &x.b, x.op, ty, consts), ty))
+            {
+                return Ok(None);
+            }
+            Type rty = if (is_shift(x.op)) { Type::TInt(IntTy::U32) } else { clone(ty) };
+            Option<Val> a = eval(&x.a, ty, consts, folded)?;
+            Option<Val> b = eval(&x.b, &rty, consts, folded)?;
+            match (a)
+            {
+                Some(Val::VInt(p)) : match (b)
+                {
+                    Some(Val::VInt(q)) : int_op(x.op, it, Box::get(&p).v, Box::get(&q).v),
+                    _                  : Ok(None),
+                },
+                _ : Ok(None),
+            }
+        },
+        Type::TF32    : eval_float(x, ty, consts, folded),
+        Type::TF64    : eval_float(x, ty, consts, folded),
+        _             : Ok(None),
+    }
+}
+
+fn eval_float(
+    ref<BinaryExpr, shared> x,
+    ref<Type, shared> ty,
+    ref<HashMap<String, Const>, shared> consts,
+    ref<HashMap<String, Option<Val>>, exclusive> folded,
+) : Result<Option<Val>, String>
+{
+    if (!type_eq(&operand_ty(&x.a, &x.b, x.op, ty, consts), ty))
+    {
+        return Ok(None);
+    }
+    Option<Val> a = eval(&x.a, ty, consts, folded)?;
+    Option<Val> b = eval(&x.b, ty, consts, folded)?;
+    f64 p = 0.0;
+    f64 q = 0.0;
+    bool f32_ = false;
+    match (a)
+    {
+        Some(Val::VFloat(v)) :
+        {
+            p = Box::get(&v).v;
+            f32_ = Box::get(&v).f32_;
+        },
+        _                    : return Ok(None),
+    }
+    match (b)
+    {
+        Some(Val::VFloat(v)) : q = Box::get(&v).v,
+        _                    : return Ok(None),
+    }
+    f64 r = if (x.op == BinOp::Add)
+    {
+        p + q
+    }
+    else if (x.op == BinOp::Sub)
+    {
+        p - q
+    }
+    else if (x.op == BinOp::Mul)
+    {
+        p * q
+    }
+    else if (x.op == BinOp::Div)
+    {
+        p / q
+    }
+    else
+    {
+        return Ok(None);
+    };
+    // Each operation rounds in its own type (spec/06).
+    if (f32_)
+    {
+        r = round32(r);
+    }
+    if (!is_finite(r))
+    {
+        return Ok(None);
+    }
+    Ok(Some(vfloat(r, f32_)))
+}
+
+fn overflow() : String
+{
+    String::from_str("diag.arith-overflow")
+}
+
+fn from_i(IntTy t, Option<i128> r) : Result<Option<Val>, String>
+{
+    match (r)
+    {
+        Some(v) : match (int_of(t, v < 0, unsigned_abs(v)))
+        {
+            Some(x) : Ok(Some(x)),
+            None    : Err(overflow()),
+        },
+        None : Err(overflow()),
+    }
+}
+
+fn from_u(IntTy t, Option<u128> r) : Result<Option<Val>, String>
+{
+    match (r)
+    {
+        Some(v) : match (int_of(t, false, v))
+        {
+            Some(x) : Ok(Some(x)),
+            None    : Err(overflow()),
+        },
+        None : Err(overflow()),
+    }
+}
+
+// `x op y` in `t`, checked as at run time (spec/06): `None` for an
+// operator this pass leaves alone.
+fn int_op(BinOp op, IntTy t, i128 x, i128 y) : Result<Option<Val>, String>
+{
+    u32 bw = int_ty_bits(t, 64);
+    bool signed = int_ty_signed(t);
+    Parts xp = signed_parts(t, x);
+    Parts yp = signed_parts(t, y);
+    if (op == BinOp::Add || op == BinOp::Sub || op == BinOp::Mul)
+    {
+        if (signed)
+        {
+            Option<i128> r = if (op == BinOp::Add)
+            {
+                checked_add(
+                    x,
+                    y,
+                )
+            }
+            else if (op == BinOp::Sub) { checked_sub(x, y) } else { checked_mul(x, y) };
+            return from_i(t, r);
+        }
+        Option<u128> r = if (op == BinOp::Add)
+        {
+            checked_add(
+                xp.mag,
+                yp.mag,
+            )
+        }
+        else if (op == BinOp::Sub) { checked_sub(xp.mag, yp.mag) } else { checked_mul(xp.mag, yp.mag) };
+        return from_u(t, r);
+    }
+    if (op == BinOp::Div || op == BinOp::Rem)
+    {
+        if (yp.mag == 0)
+        {
+            return Err(String::from_str("diag.div-by-zero"));
+        }
+        if (signed)
+        {
+            if (op == BinOp::Div && x == range(t).min && y == -1)
+            {
+                return Err(String::from_str("diag.div-overflow"));
+            }
+            // i128's `checked_rem` has no value for `MIN % -1`.
+            if (x == min_value<i128>() && y == -1)
+            {
+                return Err(overflow());
+            }
+            return from_i(t, if (op == BinOp::Div) { checked_div(x, y) } else { checked_rem(x, y) });
+        }
+        return from_u(t, if (op == BinOp::Div) { checked_div(xp.mag, yp.mag) } else { checked_rem(xp.mag, yp.mag) });
+    }
+    if (op == BinOp::BitAnd)
+    {
+        return Ok(Some(vint(t, x & y)));
+    }
+    if (op == BinOp::BitOr)
+    {
+        return Ok(Some(vint(t, x | y)));
+    }
+    if (op == BinOp::BitXor)
+    {
+        return Ok(Some(vint(t, x ^ y)));
+    }
+    if (is_shift(op))
+    {
+        if (yp.mag >= widen<u128>(bw) || yp.neg)
+        {
+            return Err(String::from_str("diag.shift-amount-out-of-range"));
+        }
+        u32 s = narrow<u32>(yp.mag);
+        u128 uone = 1;
+        i128 one = 1;
+        u128 mask = if (bw >= 128) { max_value<u128>() } else { (uone << bw) - 1 };
+        u128 bits = reinterpret<u128>(x) & mask;
+        u128 r = if (op == BinOp::Shl)
+        {
+            (bits << s) & mask
+        }
+        else if (signed && xp.neg)
+        {
+            reinterpret<u128>(x >> s) & mask
+        }
+        else
+        {
+            bits >> s
+        };
+        if (signed && bw < 128 && ((r >> (bw - 1)) & 1) == 1)
+        {
+            return Ok(Some(vint(t, reinterpret<i128>(r) - (one << bw))));
+        }
+        return Ok(Some(vint(t, reinterpret<i128>(r))));
+    }
+    Ok(None)
+}
+
+// A folded value as the literal that means it, typed by its suffix.
+fn literal(ref<Val, shared> v) : Expr
+{
+    match (v)
+    {
+        Val::VInt(b)   :
+        {
+            ref<IntVal, shared> x = Box::get(b);
+            Parts p = signed_parts(x.t, x.v);
+            Expr lit = mk(
+                ExprKind::EInt(Box::new(IntLit { .v = p.mag, .sfx = Some(String::from_str(int_ty_name(x.t))) })),
+                0,
+                0,
+            );
+            if (p.neg)
+            {
+                return mk(ExprKind::EUnary(Box::new(UnaryExpr { .op = UnOp::Neg, .e = lit })), 0, 0);
+            }
+            lit
+        },
+        Val::VFloat(b) :
+        {
+            ref<FloatVal, shared> x = Box::get(b);
+            bool negative = (reinterpret<u64>(x.v) >> 63) == 1;
+            f64 mag = if (negative) { -x.v } else { x.v };
+            Expr lit = mk(
+                ExprKind::EFloat(Box::new(FloatLit { .v = mag, .sfx = Some(String::from_str(if (x.f32_) { "f32" } else { "f64" })) })),
+                0,
+                0,
+            );
+            if (negative)
+            {
+                return mk(ExprKind::EUnary(Box::new(UnaryExpr { .op = UnOp::Neg, .e = lit })), 0, 0);
+            }
+            lit
+        },
+        Val::VBool(x)  : mk(ExprKind::EBool(*x), 0, 0),
+        Val::VStr(s)   : mk(ExprKind::EStr(String::clone(s)), 0, 0),
+    }
+}
+
+// ---- the rewrite ----
+
+fn rewrite_items(ref<Vec<Item>, exclusive> items, ref<HashMap<String, Expr>, shared> lits)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IFn(b)     : rewrite_block(&mut Box::get_mut(b).body, lits),
+            Item::IModule(b) : rewrite_items(&mut Box::get_mut(b).items, lits),
+            _                : {},
+        }
+    }
+}
+
+fn rewrite_block(ref<Block, exclusive> b, ref<HashMap<String, Expr>, shared> lits)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        match (&mut b.stmts[i])
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&mut Box::get_mut(l).init)
+                {
+                    Some(e) : rewrite(e, lits),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : rewrite(&mut Box::get_mut(d).init, lits),
+            Stmt::SExpr(e)        : rewrite(Box::get_mut(e), lits),
+            Stmt::SBlockLike(e)   : rewrite(Box::get_mut(e), lits),
+        }
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : rewrite(Box::get_mut(t), lits),
+        None    : {},
+    }
+}
+
+// The folded literal a call `NAME()` stands for.
+fn folded_call(ref<Expr, shared> e, ref<HashMap<String, Expr>, shared> lits) : Option<Expr>
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(b) :
+        {
+            ref<CallExpr, shared> c = Box::get(b);
+            if (Vec::len(&c.args) > 0)
+            {
+                return None;
+            }
+            match (&c.callee.kind)
+            {
+                ExprKind::EPath(p) : match (HashMap::get(lits, &joined(&Box::get(p).segs)))
+                {
+                    Some(l) : Some(clone(l)),
+                    None    : None,
+                },
+                _ : None,
+            }
+        },
+        _                  : None,
+    }
+}
+
+// Every use of a folded constant, `NAME()` after `modres`, becomes its
+// literal, keeping the use's line.
+fn rewrite(ref<Expr, exclusive> e, ref<HashMap<String, Expr>, shared> lits)
+{
+    match (folded_call(e, lits))
+    {
+        Some(l) :
+        {
+            usize line = e.line;
+            *e = l;
+            e.line = line;
+            match (&mut e.kind)
+            {
+                ExprKind::EUnary(u) : Box::get_mut(u).e.line = line,
+                _                   : {},
+            }
+            return;
+        },
+        None    : {},
+    }
+    match (&mut e.kind)
+    {
+        ExprKind::EBorrow(b)      :
+        {
+            // D-0258: `&K` wants the constant's address: the call stays.
+            ref<BorrowExpr, exclusive> x = Box::get_mut(b);
+            if (Option::is_none(&folded_call(&x.e, lits)))
+            {
+                rewrite(&mut x.e, lits);
+            }
+        },
+        ExprKind::EUnary(b)       : rewrite(&mut Box::get_mut(b).e, lits),
+        ExprKind::EDeref(x)       : rewrite(Box::get_mut(x), lits),
+        ExprKind::EField(b)       : rewrite(&mut Box::get_mut(b).e, lits),
+        ExprKind::EPropagate(x)   : rewrite(Box::get_mut(x), lits),
+        ExprKind::EParen(x)       : rewrite(Box::get_mut(x), lits),
+        ExprKind::EBinary(b)      :
+        {
+            rewrite(&mut Box::get_mut(b).a, lits);
+            rewrite(&mut Box::get_mut(b).b, lits);
+        },
+        ExprKind::EIndex(b)       :
+        {
+            rewrite(&mut Box::get_mut(b).a, lits);
+            rewrite(&mut Box::get_mut(b).b, lits);
+        },
+        ExprKind::EAssign(b)      :
+        {
+            rewrite(&mut Box::get_mut(b).a, lits);
+            rewrite(&mut Box::get_mut(b).b, lits);
+        },
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, exclusive> c = Box::get_mut(b);
+            rewrite(&mut c.callee, lits);
+            for (usize i = 0; i < Vec::len(&c.args); i += 1)
+            {
+                rewrite(&mut c.args[i], lits);
+            }
+        },
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, exclusive> s = Box::get_mut(b);
+            for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+            {
+                rewrite(&mut s.fields[i].value, lits);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            for (usize i = 0; i < Vec::len(es); i += 1)
+            {
+                rewrite(&mut es[i], lits);
+            }
+        },
+        ExprKind::EArrayRepeat(b) : rewrite(&mut Box::get_mut(b).value, lits),
+        ExprKind::EBlock(b)       : rewrite_block(b, lits),
+        ExprKind::EUnsafe(b)      : rewrite_block(b, lits),
+        ExprKind::EIf(b)          :
+        {
+            ref<IfExpr, exclusive> x = Box::get_mut(b);
+            rewrite(&mut x.cond, lits);
+            rewrite_block(&mut x.then_, lits);
+            match (&mut x.else_)
+            {
+                Some(el) : rewrite(el, lits),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(b)       :
+        {
+            ref<WhileExpr, exclusive> x = Box::get_mut(b);
+            rewrite(&mut x.cond, lits);
+            rewrite_block(&mut x.body, lits);
+            match (&mut x.step)
+            {
+                Some(s) : rewrite(s, lits),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(b)       :
+        {
+            ref<MatchExpr, exclusive> x = Box::get_mut(b);
+            rewrite(&mut x.scrut, lits);
+            for (usize i = 0; i < Vec::len(&x.arms); i += 1)
+            {
+                ref<Arm, exclusive> a = &mut x.arms[i];
+                // D-0058: a constant in a pattern, folded to its literal.
+                match (&mut a.lit)
+                {
+                    Some(l) : rewrite(Box::get_mut(l), lits),
+                    None    : {},
+                }
+                rewrite(Box::get_mut(&mut a.body), lits);
+            }
+        },
+        ExprKind::EReturn(opt)    :
+        {
+            match (opt)
+            {
+                Some(x) : rewrite(Box::get_mut(x), lits),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(b)     : rewrite_block(&mut Box::get_mut(b).body, lits),
+        _                         : {},
+    }
+}
+
+// ---- `const auto` (D-0068) ----
+
+// The declarations a constant expression can name, by qualified name.
+struct Decls
+{
+    HashMap<String, StructDecl> structs;
+    HashMap<String, EnumDecl> enums;
+    HashMap<String, FnDecl> fns;
+}
+
+fn gather(ref<Vec<Item>, shared> items, ref<Vec<String>, exclusive> path, ref<Decls, exclusive> d)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IStruct(b) :
+            {
+                HashMap::insert(&mut d.structs, qualify(path, String::as_view(&Box::get(b).name)), clone(Box::get(b)));
+            },
+            Item::IEnum(b)   :
+            {
+                HashMap::insert(&mut d.enums, qualify(path, String::as_view(&Box::get(b).name)), clone(Box::get(b)));
+            },
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, shared> f = Box::get(b);
+                String n = match (&f.assoc_type)
+                {
+                    Some(t) : sprintf("%s::%s", t, &f.name),
+                    None    : String::clone(&f.name),
+                };
+                HashMap::insert(&mut d.fns, qualify(path, String::as_view(&n)), clone(f));
+            },
+            Item::IModule(b) :
+            {
+                ref<ModuleItem, shared> m = Box::get(b);
+                Vec::push(path, String::clone(&m.name));
+                gather(&m.items, path, d);
+                Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+fn has_auto(ref<Vec<Item>, shared> items) : bool
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(b)     :
+            {
+                if (Box::get(b).is_const && Box::get(b).auto_type)
+                {
+                    return true;
+                }
+            },
+            Item::IModule(b) :
+            {
+                if (has_auto(&Box::get(b).items))
+                {
+                    return true;
+                }
+            },
+            _                : {},
+        }
+    }
+    false
+}
+
+// `const auto N = e;`: N's type is the type `auto x = e;` would give x,
+// synthesized from e alone; one e does not determine must be written
+// (`diag.type-mismatch`).
+fn resolve_auto(ref<Program, exclusive> program) : Result<void, String>
+{
+    if (!has_auto(&program.items))
+    {
+        return Ok(());
+    }
+    Decls d = Decls { .structs = HashMap::new(), .enums = HashMap::new(), .fns = HashMap::new() };
+    Vec<String> path = Vec::new();
+    gather(&program.items, &mut path, &mut d);
+    HashMap<String, Type> done = HashMap::new();
+    Vec<String> keys = Vec::new();
+    for (usize i = 0; i < HashMap::len(&d.fns); i += 1)
+    {
+        ref<FnDecl, shared> f = HashMap::value_at(&d.fns, i);
+        if (f.is_const && f.auto_type)
+        {
+            Vec::push(&mut keys, String::clone(HashMap::key_at(&d.fns, i)));
+        }
+    }
+    Vec::sort(&mut keys);
+    for (usize i = 0; i < Vec::len(&keys); i += 1)
+    {
+        Vec<String> active = Vec::new();
+        auto_type_of(&keys[i], &d, &mut done, &mut active)?;
+    }
+    Vec<String> p2 = Vec::new();
+    write_back(&mut program.items, &mut p2, &done);
+    Ok(())
+}
+
+// The type of the constant `k`: written, or synthesized (and memoized).
+fn auto_type_of(
+    ref<String, shared> k,
+    ref<Decls, shared> d,
+    ref<HashMap<String, Type>, exclusive> done,
+    ref<Vec<String>, exclusive> active,
+) : Result<Option<Type>, String>
+{
+    ref<FnDecl, shared> f = match (HashMap::get(&d.fns, k))
+    {
+        Some(f) : f,
+        None    : return Ok(None),
+    };
+    if (!f.auto_type)
+    {
+        return Ok(Some(clone(&f.ret)));
+    }
+    match (HashMap::get(done, k))
+    {
+        Some(t) : return Ok(Some(clone(t))),
+        None    : {},
+    }
+    if (Vec::contains(active, k))
+    {
+        // `[Const-Cycle]`.
+        return Err(sprintf("diag.const-not-constant@%v", f.line));
+    }
+    Vec::push(active, String::clone(k));
+    Option<Type> t = match (&f.body.tail)
+    {
+        Some(e) : infer(Box::get(e), d, done, active)?,
+        None    : None,
+    };
+    Vec::pop(active);
+    match (t)
+    {
+        Some(t) :
+        {
+            HashMap::insert(done, String::clone(k), clone(&t));
+            Ok(Some(t))
+        },
+        None    : Err(sprintf("diag.type-mismatch@%v", f.line)),
+    }
+}
+
+fn first_non_literal(
+    ref<Vec<Expr>, shared> es,
+    ref<Decls, shared> d,
+    ref<HashMap<String, Type>, exclusive> done,
+    ref<Vec<String>, exclusive> active,
+) : Result<Option<Type>, String>
+{
+    for (usize i = 0; i < Vec::len(es); i += 1)
+    {
+        if (!is_literal_expr(&es[i]))
+        {
+            return infer(&es[i], d, done, active);
+        }
+    }
+    Ok(None)
+}
+
+fn infer(
+    ref<Expr, shared> e,
+    ref<Decls, shared> d,
+    ref<HashMap<String, Type>, exclusive> done,
+    ref<Vec<String>, exclusive> active,
+) : Result<Option<Type>, String>
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(b)         :
+        {
+            match (&Box::get(b).sfx)
+            {
+                Some(s) :
+                {
+                    if (String::eq_str(s, "byte"))
+                    {
+                        return Ok(Some(Type::TInt(IntTy::U8)));
+                    }
+                    Ok(Some(Type::TInt(Option::unwrap_or(int_ty_from(String::as_view(s)), IntTy::I32))))
+                },
+                None    : Ok(Some(Type::TInt(IntTy::I32))),
+            }
+        },
+        ExprKind::EFloat(b)       :
+        {
+            match (&Box::get(b).sfx)
+            {
+                Some(s) : Ok(Some(if (String::eq_str(s, "f32")) { Type::TF32 } else { Type::TF64 })),
+                None    : Ok(Some(Type::TF64)),
+            }
+        },
+        ExprKind::EBool(_)        : Ok(Some(Type::TBool)),
+        ExprKind::EStr(_)         : Ok(Some(Type::TStr)),
+        ExprKind::EUnit           : Ok(Some(Type::TVoid)),
+        ExprKind::EParen(x)       : infer(Box::get(x), d, done, active),
+        ExprKind::EUnary(b)       :
+        {
+            if (Box::get(b).op == UnOp::Not)
+            {
+                return Ok(Some(Type::TBool));
+            }
+            infer(&Box::get(b).e, d, done, active)
+        },
+        ExprKind::EBinary(b)      :
+        {
+            ref<BinaryExpr, shared> x = Box::get(b);
+            if (is_compare_or_logic(x.op))
+            {
+                return Ok(Some(Type::TBool));
+            }
+            // A bare literal operand takes the other operand's type; two
+            // literals with no expected type take the default (D-0037).
+            Option<Type> ta = if (is_literal_expr(&x.a)) { None } else { infer(&x.a, d, done, active)? };
+            if (is_shift(x.op))
+            {
+                return match (ta)
+                {
+                    Some(t) : Ok(Some(t)),
+                    None    : Ok(Some(default_of(&x.a))),
+                };
+            }
+            Option<Type> tb = if (is_literal_expr(&x.b)) { None } else { infer(&x.b, d, done, active)? };
+            if (Option::is_some(&ta))
+            {
+                return Ok(ta);
+            }
+            match (tb)
+            {
+                Some(t) : Ok(Some(t)),
+                None    : Ok(Some(default_of(e))),
+            }
+        },
+        ExprKind::ECall(b)        : infer_call(Box::get(b), d, done, active),
+        ExprKind::EPath(b)        :
+        {
+            ref<PathExpr, shared> p = Box::get(b);
+            // A unit variant of a non-generic enum, or a function's name.
+            match (variant_enum(&p.segs, d))
+            {
+                Some(ve) :
+                {
+                    if (Vec::len(&Option::expect(HashMap::get(&d.enums, &ve.key), "an enum").type_params) == 0)
+                    {
+                        return Ok(Some(named(String::as_view(&ve.key), Vec::new())));
+                    }
+                    return Ok(None);
+                },
+                None     : {},
+            }
+            match (HashMap::get(&d.fns, &joined(&p.segs)))
+            {
+                Some(f) :
+                {
+                    if (!f.is_const && Vec::len(&f.type_params) == 0)
+                    {
+                        Vec<Type> ps = Vec::new();
+                        for (usize i = 0; i < Vec::len(&f.params); i += 1)
+                        {
+                            Vec::push(&mut ps, clone(&f.params[i].ty));
+                        }
+                        return Ok(Some(Type::TFn(Box::new(FnTy { .params = ps, .ret = clone(&f.ret) }))));
+                    }
+                    Ok(None)
+                },
+                None    : Ok(None),
+            }
+        },
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, shared> s = Box::get(b);
+            String k = joined(&s.segs);
+            match (HashMap::get(&d.structs, &k))
+            {
+                Some(sd) :
+                {
+                    if (Vec::len(&sd.type_params) == 0)
+                    {
+                        return Ok(Some(named(String::as_view(&k), Vec::new())));
+                    }
+                    if (Vec::len(&s.targs) == Vec::len(&sd.type_params))
+                    {
+                        return Ok(Some(named(String::as_view(&k), clone(&s.targs))));
+                    }
+                    Ok(None)
+                },
+                None     : Ok(None),
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            Option<Type> t = first_non_literal(es, d, done, active)?;
+            Type t2 = match (t)
+            {
+                Some(t) : t,
+                None    :
+                {
+                    if (Vec::len(es) == 0)
+                    {
+                        return Ok(None);
+                    }
+                    default_of(&es[0])
+                },
+            };
+            Ok(Some(Type::TArray(Box::new(SizedTy { .inner = t2, .n = widen<u128>(Vec::len(es)) }))))
+        },
+        ExprKind::EArrayRepeat(b) :
+        {
+            ref<RepeatExpr, shared> r = Box::get(b);
+            Option<Type> t = if (is_literal_expr(&r.value)) { Some(default_of(&r.value)) } else
+            {
+                infer(
+                    &r.value,
+                    d,
+                    done,
+                    active,
+                )?
+            };
+            match (t)
+            {
+                Some(t) : Ok(Some(Type::TArray(Box::new(SizedTy { .inner = t, .n = r.n })))),
+                None    : Ok(None),
+            }
+        },
+        ExprKind::EField(b)       :
+        {
+            ref<FieldExpr, shared> fe = Box::get(b);
+            match (infer(&fe.e, d, done, active)?)
+            {
+                Some(Type::TNamed(nt)) :
+                {
+                    ref<NamedTy, shared> n = Box::get(&nt);
+                    match (HashMap::get(&d.structs, &n.name))
+                    {
+                        Some(sd) :
+                        {
+                            for (usize i = 0; i < Vec::len(&sd.fields); i += 1)
+                            {
+                                if (String::eq(&sd.fields[i].name, &fe.name))
+                                {
+                                    return Ok(Some(subst_type(&sd.fields[i].ty, &sd.type_params, &n.args)));
+                                }
+                            }
+                            Ok(None)
+                        },
+                        None     : Ok(None),
+                    }
+                },
+                _                      : Ok(None),
+            }
+        },
+        ExprKind::EIndex(b)       :
+        {
+            match (infer(&Box::get(b).a, d, done, active)?)
+            {
+                Some(Type::TArray(s)) : Ok(Some(clone(&Box::get(&s).inner))),
+                _                     : Ok(None),
+            }
+        },
+        _                         : Ok(None),
+    }
+}
+
+fn infer_call(
+    ref<CallExpr, shared> c,
+    ref<Decls, shared> d,
+    ref<HashMap<String, Type>, exclusive> done,
+    ref<Vec<String>, exclusive> active,
+) : Result<Option<Type>, String>
+{
+    ref<PathExpr, shared> p = match (&c.callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return Ok(None),
+    };
+    String k = joined(&p.segs);
+    if (Vec::len(&c.args) == 0)
+    {
+        bool is_const = match (HashMap::get(&d.fns, &k))
+        {
+            Some(f) : f.is_const,
+            None    : false,
+        };
+        if (is_const)
+        {
+            return auto_type_of(&k, d, done, active);
+        }
+    }
+    StringView kv = String::as_view(&k);
+    if (StringView::eq_str(kv, "sizeof") || StringView::eq_str(kv, "alignof"))
+    {
+        return Ok(Some(Type::TInt(IntTy::Usize)));
+    }
+    foreach (conv in [
+        "min_value",
+        "max_value",
+        "widen",
+        "narrow",
+        "narrow_wrapping",
+        "reinterpret",
+        "to_float",
+        "to_int",
+    ])
+    {
+        if (StringView::eq_str(kv, conv))
+        {
+            if (Vec::len(&p.targs) == 0)
+            {
+                return Ok(None);
+            }
+            return Ok(Some(clone(&p.targs[0])));
+        }
+    }
+    foreach (alt in [
+        "wrapping_add",
+        "wrapping_sub",
+        "wrapping_mul",
+        "saturating_add",
+        "saturating_sub",
+        "saturating_mul",
+    ])
+    {
+        if (StringView::eq_str(kv, alt))
+        {
+            return match (first_non_literal(&c.args, d, done, active)?)
+            {
+                Some(t) : Ok(Some(t)),
+                None    : Ok(Some(if (Vec::len(&c.args) > 0) { default_of(&c.args[0]) } else { Type::TInt(IntTy::I32) })),
+            };
+        }
+    }
+    // An enum variant with a payload.
+    match (variant_enum(&p.segs, d))
+    {
+        Some(ve) :
+        {
+            ref<EnumDecl, shared> en = Option::expect(HashMap::get(&d.enums, &ve.key), "an enum");
+            if (Vec::len(&en.type_params) == 0)
+            {
+                return Ok(Some(named(String::as_view(&ve.key), Vec::new())));
+            }
+            bool own_param = Vec::len(&en.type_params) == 1 && match (&en.variants[ve.index].payload)
+            {
+                Some(Type::TNamed(pn)) : Vec::len(&Box::get(pn).args) == 0 && String::eq(
+                    &Box::get(pn).name,
+                    &en.type_params[0],
+                ),
+                _ : false,
+            };
+            if (own_param && Vec::len(&c.args) > 0)
+            {
+                return match (infer(&c.args[0], d, done, active)?)
+                {
+                    Some(t) :
+                    {
+                        Vec<Type> args = Vec::new();
+                        Vec::push(&mut args, t);
+                        Ok(Some(named(String::as_view(&ve.key), args)))
+                    },
+                    None    : Ok(None),
+                };
+            }
+            Ok(None)
+        },
+        None     : Ok(None),
+    }
+}
+
+struct VariantOf
+{
+    String key;
+    usize index;
+}
+
+fn variant_index(ref<EnumDecl, shared> en, ref<String, shared> name) : Option<usize>
+{
+    for (usize i = 0; i < Vec::len(&en.variants); i += 1)
+    {
+        if (String::eq(&en.variants[i].name, name))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// The enum a variant path names (`M::E::V`, or `V` alone when exactly one
+// enum has a variant of that name), and the variant.
+fn variant_enum(ref<Vec<String>, shared> segs, ref<Decls, shared> d) : Option<VariantOf>
+{
+    usize n = Vec::len(segs);
+    if (n == 0)
+    {
+        return None;
+    }
+    ref<String, shared> last = &segs[n - 1];
+    if (n >= 2)
+    {
+        Vec<String> head = Vec::new();
+        for (usize i = 0; i + 1 < n; i += 1)
+        {
+            Vec::push(&mut head, String::clone(&segs[i]));
+        }
+        String key = joined(&head);
+        ref<EnumDecl, shared> en = match (HashMap::get(&d.enums, &key))
+        {
+            Some(en) : en,
+            None     : return None,
+        };
+        return match (variant_index(en, last))
+        {
+            Some(i) : Some(VariantOf { .key = key, .index = i }),
+            None    : None,
+        };
+    }
+    Option<VariantOf> found = None;
+    for (usize i = 0; i < HashMap::len(&d.enums); i += 1)
+    {
+        match (variant_index(HashMap::value_at(&d.enums, i), last))
+        {
+            Some(vi) :
+            {
+                if (Option::is_some(&found))
+                {
+                    return None;
+                }
+                found = Some(VariantOf { .key = String::clone(HashMap::key_at(&d.enums, i)), .index = vi });
+            },
+            None     : {},
+        }
+    }
+    found
+}
+
+fn subst_type(ref<Type, shared> t, ref<Vec<String>, shared> params, ref<Vec<Type>, shared> args) : Type
+{
+    match (t)
+    {
+        Type::TNamed(b) :
+        {
+            ref<NamedTy, shared> n = Box::get(b);
+            if (Vec::len(&n.args) == 0)
+            {
+                for (usize i = 0; i < Vec::len(params) && i < Vec::len(args); i += 1)
+                {
+                    if (String::eq(&params[i], &n.name))
+                    {
+                        return clone(&args[i]);
+                    }
+                }
+            }
+            Vec<Type> out = Vec::new();
+            for (usize i = 0; i < Vec::len(&n.args); i += 1)
+            {
+                Vec::push(&mut out, subst_type(&n.args[i], params, args));
+            }
+            named(String::as_view(&n.name), out)
+        },
+        Type::TArray(b) : Type::TArray(Box::new(SizedTy { .inner = subst_type(
+            &Box::get(b).inner,
+            params,
+            args,
+        ), .n = Box::get(b).n })),
+        Type::TRef(b) : Type::TRef(Box::new(ModedTy { .inner = subst_type(
+            &Box::get(b).inner,
+            params,
+            args,
+        ), .mode = Box::get(b).mode })),
+        _               : clone(t),
+    }
+}
+
+fn write_back(
+    ref<Vec<Item>, exclusive> items,
+    ref<Vec<String>, exclusive> path,
+    ref<HashMap<String, Type>, shared> done,
+)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IFn(b)     :
+            {
+                ref<FnDecl, exclusive> f = Box::get_mut(b);
+                if (f.is_const && f.auto_type)
+                {
+                    match (HashMap::get(done, &qualify(path, String::as_view(&f.name))))
+                    {
+                        Some(t) :
+                        {
+                            f.ret = clone(t);
+                            f.auto_type = false;
+                        },
+                        None    : {},
+                    }
+                }
+            },
+            Item::IModule(b) :
+            {
+                ref<ModuleItem, exclusive> m = Box::get_mut(b);
+                Vec::push(path, String::clone(&m.name));
+                write_back(&mut m.items, path, done);
+                Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}

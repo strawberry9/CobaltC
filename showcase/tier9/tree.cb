@@ -1,0 +1,166 @@
+// A Directory Tree, with Sizes
+//
+// Shows: walking a directory, as `tree` and `du` do. `list_dir` gives a
+// directory's entry names already sorted by their bytes, so the output
+// is the same on every system and every run; `path_kind` tells a file —
+// `File(n)`, its size carried in the variant — from a directory (`Dir`)
+// and from anything else (`Other`). The walk builds a tree of `Node`s
+// first, each directory owning a `Vec` of its children, so a directory's
+// total is known before its line is printed; the whole tree is
+// destroyed, every `String` and `Vec` in it, when `main`'s block ends.
+// Sizes are `u64` and every sum is a `checked_add`.
+//
+//   coby tree.cb [-s] DIR
+//
+// -s  sort each directory's entries by size, largest first (ties keep
+//     list_dir's order: the sort is stable)
+
+import std;
+
+struct Node
+{
+    String name;
+    bool is_dir;
+    u64 size;               // a file's bytes, or everything under a directory
+    Vec<Node> children;     // empty for a file
+}
+
+// The tree at `path`, named `name`; an entry that cannot be read is
+// reported on standard error, left out, and counted in `skipped`.
+fn walk(ref<String, shared> path, String name, ref<usize, exclusive> skipped) : Result<Node, FileError>
+{
+    match (path_kind(&path[0..$])?)
+    {
+        File(n) : Ok(Node { .name = name, .is_dir = false, .size = n, .children = Vec::new() }),
+        Other   :
+        {
+            eprintf("tree: %s: not a file or a directory, skipped\n", path);
+            *skipped += 1;
+            Ok(Node { .name = name, .is_dir = false, .size = 0, .children = Vec::new() })
+        },
+        Dir     :
+        {
+            Vec<Node> children = Vec::new();
+            u64 total = 0;
+            foreach (entry in list_dir(&path[0..$])?)          // each name moves into its node
+            {
+                String child_path = sprintf("%s/%s", path, &entry);
+                match (walk(&child_path, entry, skipped))
+                {
+                    Ok(child) :
+                    {
+                        total = Option::expect(checked_add(total, child.size), "a tree larger than a u64 holds");
+                        Vec::push(&mut children, child);
+                    },
+                    Err(_)    :
+                    {
+                        eprintf("tree: %s: cannot be read, skipped\n", &child_path);
+                        *skipped += 1;
+                    },
+                }
+            }
+            Ok(Node { .name = name, .is_dir = true, .size = total, .children = children })
+        },
+    }
+}
+
+fn sort_by_size(ref<Node, exclusive> n)
+{
+    Vec::sort_by(&mut n.children, [](ref<Node, shared> a, ref<Node, shared> b) : bool { a.size > b.size });
+    foreach (c in &mut n.children)
+    {
+        sort_by_size(c);
+    }
+}
+
+// Prints the children of `n`, each line led by `prefix` and a branch.
+fn print_children(ref<Node, shared> n, ref<String, shared> prefix)
+{
+    usize count = Vec::len(&n.children);
+    foreach (i, c in &n.children)
+    {
+        bool last = i + 1 == count;
+        str branch = if (last) { "└── " } else { "├── " };
+        str slash = if (c.is_dir) { "/" } else { "" };
+        printf("%s%s%s%s  %v\n", prefix, branch, &c.name, slash, c.size);
+        if (c.is_dir)
+        {
+            String deeper = sprintf("%s%s", prefix, if (last) { "    " } else { "│   " });
+            print_children(c, &deeper);
+        }
+    }
+}
+
+// How many files and directories are below `n`.
+fn count(ref<Node, shared> n, ref<usize, exclusive> files, ref<usize, exclusive> dirs)
+{
+    foreach (c in &n.children)
+    {
+        if (c.is_dir)
+        {
+            *dirs += 1;
+            count(c, files, dirs);
+        }
+        else
+        {
+            *files += 1;
+        }
+    }
+}
+
+fn main() : u8
+{
+    bool by_size = false;
+    String root = String::new();
+    bool have_root = false;
+    foreach (i in 0..arg_count())
+    {
+        String a = Result::unwrap_or(arg(i), String::new());
+        if (&a[0..$] == "-s")
+        {
+            by_size = true;
+        }
+        else if (have_root || String::starts_with(&a, "-"))
+        {
+            eprintf("usage: tree [-s] DIR\n");
+            return 2;
+        }
+        else
+        {
+            overwrite(&mut root, a);
+            have_root = true;
+        }
+    }
+    if (!have_root)
+    {
+        eprintf("usage: tree [-s] DIR\n");
+        return 2;
+    }
+
+    usize skipped = 0;
+    Node top = match (walk(&root, String::clone(&root), &mut skipped))
+    {
+        Ok(n)         : n,
+        Err(NotFound) :
+        {
+            eprintf("tree: %s: no such file or directory\n", &root);
+            return 1;
+        },
+        Err(e)        :
+        {
+            eprintf("tree: %s: %s\n", &root, FileError::text(&e));
+            return 1;
+        },
+    };
+    if (by_size)
+    {
+        sort_by_size(&mut top);
+    }
+    printf("%s%s  %v\n", &top.name, if (top.is_dir) { "/" } else { "" }, top.size);
+    print_children(&top, &String::new());
+    usize files = 0;
+    usize dirs = 0;
+    count(&top, &mut files, &mut dirs);
+    printf("%v directories, %v files, %v bytes\n", dirs, files, top.size);
+    if (skipped > 0) { 1 } else { 0 }
+}

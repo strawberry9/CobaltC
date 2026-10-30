@@ -1,0 +1,1594 @@
+// `std::text` (spec/21 §2, §2a, §2d, §2f, §2h): `String`, `StringView`,
+// their errors and the ASCII functions. `sprintf` and
+// `String::appendf` are realized natively by both implementations.
+
+/// The error of bytes that are not well-formed UTF-8.
+///
+/// `offset` is the position of the first byte that does not fit: the start of a sequence that is malformed or
+/// cut short, or a byte where a continuation byte was expected.
+export struct Utf8Error
+{
+    export usize offset;
+}
+
+/// Why text did not parse as a number, or as hexadecimal, base64 or JSON.
+///
+/// - `Empty`: the text is empty (for JSON, it holds no value).
+/// - `Invalid(k)`: byte `k` is the first that cannot continue the text; `k` is the length when the text stops
+///   too early.
+/// - `OutOfRange`: the text is well-formed, but its value does not fit the type (for JSON, also nesting
+///   deeper than 512).
+export enum ParseError
+{
+    Empty,
+    Invalid(usize),
+    OutOfRange,
+}
+
+/// A short description of the error for messages: `"empty"`, `"not a number"` or `"out of range"`.
+export fn ParseError::text(ref<ParseError, shared> e) : str
+{
+    match (e)
+    {
+        Empty      : "empty",
+        Invalid(_) : "not a number",
+        OutOfRange : "out of range",
+    }
+}
+
+/// A short description of the error for messages: `"not UTF-8"`.
+export fn Utf8Error::text(ref<Utf8Error, shared> e) : str
+{
+    "not UTF-8"
+}
+
+/// Owned, growable text, always well-formed UTF-8.
+///
+/// Lengths, positions and ranges count bytes. A literal where a `String` is expected is made into one
+/// (`String s = "text";`), and `&s[lo .. hi]` is a `StringView` of part of it. `==`, `!=`, `<`, `<=`, `>` and
+/// `>=` compare the bytes; a `String` also compares equal or not with a `str` or a `StringView`. Dropping a
+/// `String` frees its bytes.
+export struct String
+{
+    Vec<u8> bytes;
+}
+
+// The offset of the first byte of `b` that is not well-formed UTF-8, or
+// its length when all of it is. `b` is the function's only reference,
+// read element by element: the compiler leaves those reads unchecked.
+fn utf8_error_at(slice<u8, shared> b) : usize
+{
+    usize n = slice_len(b);
+    usize i = 0;
+    while (i < n)
+    {
+        u8 c0 = b[i];
+        usize width =
+            if (c0 < 128)
+            {
+                1
+            }
+            else if ((c0 & 224) == 192 && c0 >= 194)
+            {
+                2
+            }
+            else if ((c0 & 240) == 224)
+            {
+                3
+            }
+            else if ((c0 & 248) == 240 && c0 <= 244)
+            {
+                4
+            }
+            else
+            {
+                return i;
+            };
+        if (i + width > n)
+        {
+            return i;
+        }
+        usize k = 1;
+        while (k < width)
+        {
+            u8 c = b[i + k];
+            if ((c & 192) != 128)
+            {
+                return i + k;
+            }
+            k = k + 1;
+        }
+        if (width == 3)
+        {
+            u8 c1 = b[i + 1];
+            if ((c0 == 224 && c1 < 160) || (c0 == 237 && c1 >= 160))
+            {
+                return i;
+            }
+        }
+        if (width == 4)
+        {
+            u8 c1 = b[i + 1];
+            if ((c0 == 240 && c1 < 144) || (c0 == 244 && c1 >= 144))
+            {
+                return i;
+            }
+        }
+        i = i + width;
+    }
+    n
+}
+
+/// Makes a `String` of `bytes` when they are well-formed UTF-8, without copying them.
+///
+/// `Err(e)` when they are not, with `e.offset` the position of the first byte that does not fit; the bytes
+/// are then dropped.
+export fn String::from_utf8(Vec<u8> bytes) : Result<String, Utf8Error>
+{
+    usize at = utf8_error_at(&bytes[0..$]);
+    if (at < Vec::len(&bytes))
+    {
+        return Err(Utf8Error { .offset = at });
+    }
+    Ok(String { .bytes = bytes })
+}
+
+/// The error names the first byte that is not UTF-8.
+unittest "String::from_utf8: the offset of the bad byte"
+{
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, b'o');
+    Vec::push(&mut b, b'k');
+    Vec::push(&mut b, 0xff: u8);
+    match (String::from_utf8(b))
+    {
+        Ok(_)  : assert(false),
+        Err(e) : assert(e.offset == 2),
+    }
+}
+
+// D-0205: `bytes` viewed as text, after the check `String::from_utf8`
+// makes; nothing is copied.
+/// Views `bytes` as text when they are well-formed UTF-8; nothing is copied.
+///
+/// `Err(e)` when they are not, with `e.offset` the position of the first byte that does not fit. The view
+/// borrows what `bytes` borrows.
+export fn StringView::from_utf8(slice<u8, shared> bytes) : Result<StringView, Utf8Error>
+{
+    usize at = utf8_error_at(bytes);
+    if (at < slice_len(bytes))
+    {
+        return Err(Utf8Error { .offset = at });
+    }
+    Ok(StringView { .bytes = bytes })
+}
+
+// D-0252: the other call of `std` written only inside `unsafe`.
+// trusted: [Rawptr-Read] through `Vec::from_c_bytes`, under the caller's assertion about `p`.
+/// A copy of C's text at `p`, up to and without its NUL, when it is UTF-8.
+///
+/// Called only inside `unsafe`: `p` must point at readable bytes ending in a NUL, as a C function's `char *`
+/// result does. A null `p` faults (`null_pointer`); test with `is_null` first when C may return `NULL`.
+/// `Err(e)` when the bytes are not UTF-8; `Vec::from_c_bytes` takes them as they are.
+export fn String::from_c(rawptr<u8> p) : Result<String, Utf8Error>
+{
+    Vec<u8> b = unsafe
+    {
+        Vec::from_c_bytes(p)
+    };
+    String::from_utf8(b)
+}
+
+/// The length of `s` in bytes.
+///
+/// `String::char_count` counts characters.
+export fn String::len(ref<String, shared> s) : usize
+{
+    Vec::len(&s.bytes)
+}
+
+/// The bytes of `s` as a `Vec<u8>`, without copying them.
+export fn String::into_bytes(String s) : Vec<u8>
+{
+    String { bytes } = s;
+    bytes
+}
+
+/// A new `String` holding a copy of the bytes of `s`.
+///
+/// What a literal becomes where a `String` is expected; programs usually write the literal (`String s =
+/// "text";`).
+export fn String::from_str(str s) : String
+{
+    Vec<u8> v = Vec::new();
+    usize n = str_len(s);
+    Vec::reserve(&mut v, n);
+    usize i = 0;
+    while (i < n)
+    {
+        Vec::push(&mut v, str_byte(s, i));
+        i = i + 1;
+    }
+    String { .bytes = v }
+}
+
+// Text conversions (`rule.stdlib.text`, spec/21 §2d, CHG-0041).
+/// A new, empty `String`.
+export fn String::new() : String
+{
+    String { .bytes = Vec::new() }
+}
+
+/// The bytes of `s`, as a shared reference to its byte vector.
+///
+/// `StringView::as_bytes(String::as_view(&s))` gives them as a slice.
+export fn String::as_bytes(ref<String, shared> s) : ref<Vec<u8>, shared>
+{
+    &s.bytes
+}
+
+// D-0129: room for `n` more bytes.
+/// Reserves room for `n` more bytes in `s`; the text is unchanged.
+export fn String::reserve(ref<String, exclusive> s, usize n)
+{
+    Vec::reserve(&mut s.bytes, n);
+}
+
+// A copy of s: a new String with the same bytes (D-0044).
+/// A new `String` with the same text as `s`.
+export fn String::clone(ref<String, shared> s) : String
+{
+    String c = String::new();
+    String::append_string(&mut c, s);
+    c
+}
+
+// D-0101: ASCII classification and case, on one byte. Bytes outside
+// ASCII are none of these and are left as they are, so a `String`'s
+// UTF-8 stays valid when every byte of it goes through `ascii_to_lower`.
+/// Whether `b` is an ASCII digit, `0` to `9`.
+export fn ascii_is_digit(u8 b) : bool
+{
+    b >= b'0' && b <= b'9'
+}
+
+/// Whether `b` is an ASCII upper-case letter, `A` to `Z`.
+export fn ascii_is_upper(u8 b) : bool
+{
+    b >= b'A' && b <= b'Z'
+}
+
+/// Whether `b` is an ASCII lower-case letter, `a` to `z`.
+export fn ascii_is_lower(u8 b) : bool
+{
+    b >= b'a' && b <= b'z'
+}
+
+/// Whether `b` is an ASCII letter.
+///
+/// A byte of 128 or more is never a letter: `std` has no character classes beyond ASCII.
+export fn ascii_is_alpha(u8 b) : bool
+{
+    ascii_is_upper(b) || ascii_is_lower(b)
+}
+
+/// Whether `b` is an ASCII letter or digit.
+export fn ascii_is_alnum(u8 b) : bool
+{
+    ascii_is_alpha(b) || ascii_is_digit(b)
+}
+
+// Space, tab, line feed, vertical tab, form feed, carriage return.
+/// Whether `b` is ASCII white space: space, tab, line feed, vertical tab, form feed or carriage return.
+export fn ascii_is_space(u8 b) : bool
+{
+    b == b' ' || (b >= 9: u8 && b <= 13: u8)
+}
+
+/// The lower-case form of `b` when it is an ASCII upper-case letter, else `b` unchanged.
+///
+/// A byte of 128 or more is returned as it is, so lowering every byte of UTF-8 text keeps it UTF-8.
+export fn ascii_to_lower(u8 b) : u8
+{
+    if (ascii_is_upper(b)) { b + 32 } else { b }
+}
+
+/// The upper-case form of `b` when it is an ASCII lower-case letter, else `b` unchanged.
+///
+/// A byte of 128 or more is returned as it is, so raising every byte of UTF-8 text keeps it UTF-8.
+export fn ascii_to_upper(u8 b) : u8
+{
+    if (ascii_is_lower(b)) { b - 32 } else { b }
+}
+
+// D-0101: a copy of s with its ASCII letters in lower (upper) case.
+/// A copy of `s` with its ASCII letters in lower case.
+///
+/// Other characters are unchanged: there is no case mapping beyond ASCII.
+export fn String::to_ascii_lower(ref<String, shared> s) : String
+{
+    String c = String::new();
+    foreach (b in &s.bytes)
+    {
+        Vec::push(&mut c.bytes, ascii_to_lower(*b));
+    }
+    c
+}
+
+/// Only ASCII letters change case.
+unittest "String::to_ascii_lower: only ASCII changes"
+{
+    String s = "Hello, World 1";
+    String l = String::to_ascii_lower(&s);
+    assert(l == "hello, world 1");
+    assert(ascii_to_upper(b'q') == b'Q');
+    assert(!ascii_is_alpha(0xc3: u8));
+}
+
+/// A copy of `s` with its ASCII letters in upper case.
+///
+/// Other characters are unchanged: there is no case mapping beyond ASCII.
+export fn String::to_ascii_upper(ref<String, shared> s) : String
+{
+    String c = String::new();
+    foreach (b in &s.bytes)
+    {
+        Vec::push(&mut c.bytes, ascii_to_upper(*b));
+    }
+    c
+}
+
+// D-0073: whether two texts are the same, byte for byte.
+/// Whether `a` and `b` hold the same text, byte for byte.
+///
+/// Programs usually write `a == b`.
+export fn String::eq(ref<String, shared> a, ref<String, shared> b) : bool
+{
+    String::view(a, 0, String::len(a)) == String::view(b, 0, String::len(b))
+}
+
+/// Whether `a` holds the same text as the `str` `t`.
+///
+/// What `a == t` becomes for a `String` and a `str`; programs write that.
+export fn String::eq_str(ref<String, shared> a, str t) : bool
+{
+    String::view(a, 0, String::len(a)) == t
+}
+
+// Adds one ASCII byte (below 128) to s; any other byte would not be
+// UTF-8 on its own, and faults (D-0044). Text of arbitrary bytes is
+// built in a Vec<u8> and checked by String::from_utf8.
+/// Appends the ASCII byte `b` to `s`.
+///
+/// Faults (`not_ascii`) when `b >= 128`, since such a byte alone is not UTF-8. `String::push_code_point`
+/// appends any character; bytes of any kind are built in a `Vec<u8>` and checked by `String::from_utf8`.
+export fn String::push_ascii(ref<String, exclusive> s, u8 b)
+{
+    if (b >= 128)
+    {
+        fault(not_ascii);
+    }
+    Vec::push(&mut s.bytes, b);
+}
+
+// Empties s, keeping its buffer (D-0044).
+/// Empties `s`, keeping its buffer for reuse.
+export fn String::clear(ref<String, exclusive> s)
+{
+    Vec::clear(&mut s.bytes);
+}
+
+// D-0076: the texts' order (`StringView::less`); fits `Vec::sort_by`.
+/// Whether `a` comes before `b` in byte order (for UTF-8, code point order), a prefix first.
+///
+/// It fits `Vec::sort_by`; `a < b` is the same comparison.
+export fn String::less(ref<String, shared> a, ref<String, shared> b) : bool
+{
+    StringView::less(String::view(a, 0, String::len(a)), String::view(b, 0, String::len(b)))
+}
+
+// D-0076: keeps the first `n` bytes; `n` must be at most the length and
+// on a character boundary.
+/// Shortens `s` to its first `n` bytes.
+///
+/// Faults (`index_out_of_bounds`) when `n` is more than the length, and (`not_char_boundary`) when byte `n`
+/// is inside a character.
+export fn String::truncate(ref<String, exclusive> s, usize n)
+{
+    if (n > Vec::len(&s.bytes))
+    {
+        fault(index_out_of_bounds);
+    }
+    if (!StringView::boundary(&s.bytes[0 .. $], n))
+    {
+        fault(not_char_boundary);
+    }
+    while (Vec::len(&s.bytes) > n)
+    {
+        drop(Vec::pop(&mut s.bytes));
+    }
+}
+
+/// The new length must fall between characters.
+unittest "String::truncate: at a character boundary"
+{
+    String s = "caf\u{e9}";
+    String::truncate(&mut s, 3);
+    assert(s == "caf");
+}
+
+// D-0053: a borrowed, read-only view of part of a `String`'s text, made
+// by `&s[lo .. hi]` (`String::view`) and re-sliced by `&v[lo .. hi]`
+// (`StringView::sub`). Its bounds fall on character boundaries, so its
+// bytes are UTF-8. The `String` stays borrowed while a view of it lives.
+/// A borrowed, read-only view of part of some text, without a copy.
+///
+/// Made by `&s[lo .. hi]` from a `String`, re-sliced by `&v[lo .. hi]`, and made from a `str` by
+/// `StringView::of` (a literal where a `StringView` is expected is one). Its bounds fall on character
+/// boundaries, so its bytes are UTF-8. A view is passed by value; while it lives, the `String` it views
+/// cannot be changed, and it cannot outlive that `String`. `==` and `!=` compare its bytes with another
+/// view's, a `str`'s or a `String`'s.
+export struct StringView
+{
+    slice<u8, shared> bytes;
+}
+
+/// A view of a `String` can be viewed again; positions are byte positions.
+unittest "StringView: views of views"
+{
+    String s = "hello world";
+    StringView w = &s[6 .. $];
+    assert(w == "world");
+    StringView o = &w[0 .. 1];
+    assert(o == "w");
+}
+
+// Whether byte position `i` of `b` starts a character (or is its end).
+fn StringView::boundary(slice<u8, shared> b, usize i) : bool
+{
+    i == 0 || i == slice_len(b) || (b[i] & 0xC0: u8) != 0x80: u8
+}
+
+// D-0134: a view of a `str`'s text. A `str` is a value that never ends,
+// so the view is valid for the rest of the program; a literal where a
+// `StringView` is expected is this call (`[Str-Literal-View]`).
+/// A view of the text of `s`, valid for the rest of the program.
+///
+/// A literal where a `StringView` is expected is this call, so programs usually write the literal.
+export fn StringView::of(str s) : StringView
+{
+    StringView { .bytes = str_slice(s) }
+}
+
+// The address of a view's first byte, for the file primitives; any
+// address when the view is empty (they then read none).
+fn StringView::ptr(StringView v) : rawptr<u8>
+{
+    if (slice_len(v.bytes) == 0)
+    {
+        return dangling<u8>();
+    }
+    rawptr_of(&v.bytes[0])
+}
+
+/// A view of bytes `lo` to `hi` of `s`, `hi` excluded.
+///
+/// What `&s[lo .. hi]` becomes; programs write that. Faults (`index_out_of_bounds`) when `lo > hi` or `hi` is
+/// beyond the length, and (`not_char_boundary`) when `lo` or `hi` is inside a character.
+export fn String::view(ref<String, shared> s, usize lo, usize hi) : StringView
+{
+    slice<u8, shared> all = &s.bytes[0..$];
+    if (lo > hi || hi > slice_len(all))
+    {
+        fault(index_out_of_bounds);
+    }
+    if (!StringView::boundary(all, lo) || !StringView::boundary(all, hi))
+    {
+        fault(not_char_boundary);
+    }
+    StringView { .bytes = &all[lo..hi] }
+}
+
+/// A view of bytes `lo` to `hi` of `v`, `hi` excluded.
+///
+/// What `&v[lo .. hi]` becomes for a view; programs write that. Faults (`index_out_of_bounds`) when `lo > hi`
+/// or `hi` is beyond the length, and (`not_char_boundary`) when `lo` or `hi` is inside a character.
+export fn StringView::sub(StringView v, usize lo, usize hi) : StringView
+{
+    if (lo > hi || hi > slice_len(v.bytes))
+    {
+        fault(index_out_of_bounds);
+    }
+    if (!StringView::boundary(v.bytes, lo) || !StringView::boundary(v.bytes, hi))
+    {
+        fault(not_char_boundary);
+    }
+    StringView { .bytes = &v.bytes[lo..hi] }
+}
+
+/// The length of `v` in bytes.
+///
+/// `StringView::char_count` counts characters.
+export fn StringView::len(StringView v) : usize
+{
+    slice_len(v.bytes)
+}
+
+// D-0076: whether `a` comes before `b`, byte by byte (for UTF-8 text,
+// code point order); a prefix comes first.
+/// Whether `a` comes before `b` in byte order (for UTF-8, code point order), a prefix first.
+export fn StringView::less(StringView a, StringView b) : bool
+{
+    usize n = slice_len(a.bytes);
+    usize m = slice_len(b.bytes);
+    usize i = 0;
+    while (i < n && i < m)
+    {
+        if (a.bytes[i] != b.bytes[i])
+        {
+            return a.bytes[i] < b.bytes[i];
+        }
+        i += 1;
+    }
+    n < m
+}
+
+/// A prefix comes first, and upper-case ASCII before lower-case.
+unittest "StringView::less: a prefix first"
+{
+    assert(StringView::less("ab", "abc"));
+    assert(StringView::less("B", "a"));
+    assert(!StringView::less("b", "b"));
+}
+
+/// Whether `a` and `b` hold the same bytes.
+///
+/// What `a == b` becomes for two views; programs write that.
+export fn StringView::eq(StringView a, StringView b) : bool
+{
+    usize n = slice_len(a.bytes);
+    if (n != slice_len(b.bytes))
+    {
+        return false;
+    }
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (a.bytes[i] != b.bytes[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// D-0163: the view's bytes, the same bytes, not a copy, for whatever
+// takes `slice<u8, shared>` (a hash, a MAC, a socket's write): valid as
+// long as the view is. A literal in a `StringView` position is a view, and
+// `String::as_view(&s)` a `String`'s, so every text type reaches it.
+/// The bytes of `v` as a slice, not a copy, valid as long as `v` is.
+///
+/// For what takes `slice<u8, shared>`: a hash, a MAC, a socket's write. A literal in its place is a view, and
+/// `String::as_view(&s)` gives a `String`'s.
+export fn StringView::as_bytes(StringView v) : slice<u8, shared>
+{
+    v.bytes
+}
+
+// D-0164: whether a `String` holds the same text as a `StringView`, as
+// `s == v` writes it.
+/// Whether `a` holds the same text as the view `v`.
+///
+/// What `a == v` becomes for a `String` and a `StringView`; programs write that.
+export fn String::eq_view(ref<String, shared> a, StringView v) : bool
+{
+    StringView::eq(String::as_view(a), v)
+}
+
+/// Whether `a` holds the same text as the `str` `t`.
+///
+/// What `a == t` becomes for a view and a `str`; programs write that.
+export fn StringView::eq_str(StringView a, str t) : bool
+{
+    usize n = slice_len(a.bytes);
+    if (n != str_len(t))
+    {
+        return false;
+    }
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (a.bytes[i] != str_byte(t, i))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether `t` occurs in `v` at byte position `at`.
+fn StringView::at(StringView v, usize at, StringView t) : bool
+{
+    usize m = slice_len(t.bytes);
+    if (at + m > slice_len(v.bytes))
+    {
+        return false;
+    }
+    for (usize j = 0; j < m; j += 1)
+    {
+        if (v.bytes[at + j] != t.bytes[j])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The byte position of the first occurrence of `t` in `v`.
+/// The byte position of the first occurrence of `t` in `v`, or `None` when it does not occur.
+///
+/// The empty text occurs at position 0.
+export fn StringView::find(StringView v, StringView t) : Option<usize>
+{
+    usize n = slice_len(v.bytes);
+    usize m = slice_len(t.bytes);
+    if (m > n)
+    {
+        return None;
+    }
+    for (usize i = 0; i <= n - m; i += 1)
+    {
+        if (StringView::at(v, i, t))
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Positions count bytes; the empty text is in every text.
+unittest "StringView::find: positions and the empty text"
+{
+    assert(StringView::contains("abc", ""));
+    assert(StringView::find("abcabc", "c") == Some(2: usize));
+    assert(StringView::find("abc", "d") == None);
+}
+
+/// Whether `v` begins with `t`.
+export fn StringView::starts_with(StringView v, StringView t) : bool
+{
+    StringView::at(v, 0, t)
+}
+
+/// Whether `v` ends with `t`.
+export fn StringView::ends_with(StringView v, StringView t) : bool
+{
+    usize n = slice_len(v.bytes);
+    usize m = slice_len(t.bytes);
+    m <= n && StringView::at(v, n - m, t)
+}
+
+// Whether the text of `t` occurs in `v`.
+/// Whether `t` occurs in `v`.
+///
+/// The empty text is in every text.
+export fn StringView::contains(StringView v, StringView t) : bool
+{
+    StringView::find(v, t) != None
+}
+
+// ASCII white space: space, tab, line feed, vertical tab, form feed, return.
+fn StringView::space(u8 b) : bool
+{
+    b == b' ' || (b >= 9: u8 && b <= 13: u8)
+}
+
+/// The view `v` without the ASCII white space at its start.
+///
+/// White space is what `ascii_is_space` accepts.
+export fn StringView::trim_start(StringView v) : StringView
+{
+    usize n = slice_len(v.bytes);
+    usize i = 0;
+    while (i < n && StringView::space(v.bytes[i]))
+    {
+        i += 1;
+    }
+    StringView::sub(v, i, n)
+}
+
+/// The view `v` without the ASCII white space at its end.
+///
+/// White space is what `ascii_is_space` accepts.
+export fn StringView::trim_end(StringView v) : StringView
+{
+    usize n = slice_len(v.bytes);
+    while (n > 0 && StringView::space(v.bytes[n - 1]))
+    {
+        n -= 1;
+    }
+    StringView::sub(v, 0, n)
+}
+
+/// The view `v` without the ASCII white space at either end.
+///
+/// White space is what `ascii_is_space` accepts; there is no Unicode white space.
+export fn StringView::trim(StringView v) : StringView
+{
+    // `trim_end(trim_start(v))`: the same range, taken once.
+    usize n = slice_len(v.bytes);
+    usize i = 0;
+    while (i < n && StringView::space(v.bytes[i]))
+    {
+        i += 1;
+    }
+    while (n > i && StringView::space(v.bytes[n - 1]))
+    {
+        n -= 1;
+    }
+    StringView::sub(v, i, n)
+}
+
+// The parts of `v` between occurrences of `sep`, each a view of the same
+// `String`; an empty `sep` gives `v` whole.
+/// The parts of `v` between occurrences of `sep`, in order, each a view of the same text.
+///
+/// Empty parts are kept: `"a,,b"` gives three parts, and empty text one empty part. An empty `sep` gives `v`
+/// whole. `sep` is a `str`, not a view, because the parts may borrow only `v`. `StringView::split_whitespace`
+/// gives words without empty parts.
+export fn StringView::split(StringView v, str sep) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = slice_len(v.bytes);
+    usize m = str_len(sep);
+    if (m == 0)
+    {
+        Vec::push(&mut out, v);
+        return out;
+    }
+    StringView sv = StringView::of(sep);
+    usize start = 0;
+    usize i = 0;
+    while (i + m <= n)
+    {
+        if (StringView::at(v, i, sv))
+        {
+            Vec::push(&mut out, StringView::sub(v, start, i));
+            i += m;
+            start = i;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+    Vec::push(&mut out, StringView::sub(v, start, n));
+    out
+}
+
+/// Splitting on a separator keeps the empty fields.
+unittest "StringView::split: empty fields"
+{
+    StringView line = "a,,b";
+    Vec<StringView> parts = StringView::split(line, ",");
+    assert(Vec::len(&parts) == 3);
+    assert(parts[1] == "");
+    assert(parts[2] == "b");
+}
+
+// D-0193: how many characters (code points) `v` holds; `len` counts bytes.
+// Each character starts with a byte that is not a continuation byte
+// (`10xxxxxx`), the view's bytes being UTF-8 (`[View-Form]`).
+/// The number of characters (code points) in `v`.
+///
+/// `StringView::len` counts bytes; a character is one to four bytes. A character is a Unicode scalar value,
+/// so `"e\u{301}"` is two. Nothing is allocated.
+export fn StringView::char_count(StringView v) : usize
+{
+    usize n = 0;
+    for (usize i = 0; i < slice_len(v.bytes); i += 1)
+    {
+        if ((v.bytes[i] & 0xc0) != 0x80)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// D-0128: the characters of `v`, in order, each a view of that one
+// character's bytes (one to four): a character starts at every byte that
+// is not a UTF-8 continuation byte (0b10xxxxxx). Empty text gives no
+// views. The `Vec` is new; the views borrow what `v` borrows.
+/// The characters of `v`, in order, each a view of that character's one to four bytes.
+///
+/// Empty text gives an empty `Vec`. The `Vec` is new (one allocation); the views borrow what `v` borrows.
+/// `StringView::code_point` reads a character's code point, and `StringView::char_count` counts without the
+/// `Vec`.
+export fn StringView::chars(StringView v) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = slice_len(v.bytes);
+    usize start = 0;
+    foreach (i in 1..n + 1)
+    {
+        if (StringView::boundary(v.bytes, i))
+        {
+            Vec::push(&mut out, StringView { .bytes = &v.bytes[start..i] });
+            start = i;
+        }
+    }
+    out
+}
+
+// A new `String`: `v` with every occurrence of `from` replaced by `to`.
+// Occurrences are found left to right and do not overlap (`"aaa"` with
+// `"aa"` replaced is one replacement and an `a`); an empty `from`
+// occurs nowhere, so the result is a copy of `v`.
+/// A new `String` holding `v` with every occurrence of `from` replaced by `to`.
+///
+/// Occurrences are found left to right and do not overlap; an empty `from` occurs nowhere, so the result is
+/// then a copy of `v`.
+export fn StringView::replace(StringView v, StringView from, StringView to) : String
+{
+    usize n = slice_len(v.bytes);
+    usize m = slice_len(from.bytes);
+    if (m == 0)
+    {
+        return String::from_view(v);
+    }
+    String out = String::new();
+    usize start = 0;
+    usize i = 0;
+    while (i + m <= n)
+    {
+        if (StringView::at(v, i, from))
+        {
+            String::append_view(&mut out, StringView { .bytes = &v.bytes[start..i] });
+            String::append_view(&mut out, to);
+            i += m;
+            start = i;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+    String::append_view(&mut out, StringView { .bytes = &v.bytes[start..n] });
+    out
+}
+
+/// Occurrences do not overlap, and an empty `from` replaces nothing.
+unittest "StringView::replace: no overlaps"
+{
+    String r = StringView::replace("aaa", "aa", "b");
+    assert(r == "ba");
+    String same = StringView::replace("abc", "", "x");
+    assert(same == "abc");
+}
+
+// The texts of `parts`, in order, with `sep` between each two, in a new
+// `String`; no parts give an empty `String`.
+/// The texts of `parts`, in order, with `sep` between each two, in a new `String`.
+///
+/// No parts give an empty `String`. `String::join` joins a slice of `String`s.
+export fn StringView::join(slice<StringView, shared> parts, StringView sep) : String
+{
+    String out = String::new();
+    foreach (i, p in parts)
+    {
+        if (i > 0)
+        {
+            String::append_view(&mut out, sep);
+        }
+        String::append_view(&mut out, *p);
+    }
+    out
+}
+
+/// The separator goes between the parts only.
+unittest "StringView::join: separators between"
+{
+    Vec<StringView> parts = Vec::new();
+    Vec::push(&mut parts, StringView::of("a"));
+    Vec::push(&mut parts, StringView::of("b"));
+    Vec::push(&mut parts, StringView::of("c"));
+    String j = StringView::join(&parts[0..$], ", ");
+    assert(j == "a, b, c");
+}
+
+// `StringView::join` for `String`s: the texts of `parts` joined by `sep`.
+/// The texts of the `String`s in `parts`, in order, with `sep` between each two, in a new `String`.
+///
+/// No parts give an empty `String`. `StringView::join` joins a slice of views.
+export fn String::join(slice<String, shared> parts, StringView sep) : String
+{
+    String out = String::new();
+    foreach (i, p in parts)
+    {
+        if (i > 0)
+        {
+            String::append_view(&mut out, sep);
+        }
+        String::append_string(&mut out, p);
+    }
+    out
+}
+
+// A new `String` holding a copy of the view's text.
+/// A new `String` holding a copy of the text of `v`.
+export fn String::from_view(StringView v) : String
+{
+    String { .bytes = Vec::from_slice(v.bytes) }
+}
+
+// D-0113: the searching and splitting functions straight from a
+// `String`: each is the `StringView::` function applied to `&s[0..$]`.
+/// A view of the whole text of `s`, as `&s[0 .. $]` is.
+export fn String::as_view(ref<String, shared> s) : StringView
+{
+    &(*s)[0..$]
+}
+
+/// The byte position of the first occurrence of `t` in `s`, or `None` when it does not occur.
+///
+/// As `StringView::find` on the whole text.
+export fn String::find(ref<String, shared> s, StringView t) : Option<usize>
+{
+    StringView::find(&(*s)[0..$], t)
+}
+
+/// Whether `s` begins with `t`.
+export fn String::starts_with(ref<String, shared> s, StringView t) : bool
+{
+    StringView::starts_with(&(*s)[0..$], t)
+}
+
+/// Whether `s` ends with `t`.
+export fn String::ends_with(ref<String, shared> s, StringView t) : bool
+{
+    StringView::ends_with(&(*s)[0..$], t)
+}
+
+/// A view of `s` without the ASCII white space at either end.
+///
+/// As `StringView::trim` on the whole text.
+export fn String::trim(ref<String, shared> s) : StringView
+{
+    StringView::trim(&(*s)[0..$])
+}
+
+/// A view of `s` without the ASCII white space at its start.
+///
+/// As `StringView::trim_start` on the whole text.
+export fn String::trim_start(ref<String, shared> s) : StringView
+{
+    StringView::trim_start(&(*s)[0..$])
+}
+
+/// A view of `s` without the ASCII white space at its end.
+///
+/// As `StringView::trim_end` on the whole text.
+export fn String::trim_end(ref<String, shared> s) : StringView
+{
+    StringView::trim_end(&(*s)[0..$])
+}
+
+/// The parts of `s` between occurrences of `sep`, in order, each a view of `s`.
+///
+/// As `StringView::split` on the whole text: empty parts are kept.
+export fn String::split(ref<String, shared> s, str sep) : Vec<StringView>
+{
+    StringView::split(&(*s)[0..$], sep)
+}
+
+/// The number of characters (code points) in `s`.
+///
+/// `String::len` counts bytes.
+export fn String::char_count(ref<String, shared> s) : usize
+{
+    StringView::char_count(&(*s)[0..$])
+}
+
+/// The characters of `s`, in order, each a view of that character's bytes.
+///
+/// As `StringView::chars` on the whole text.
+export fn String::chars(ref<String, shared> s) : Vec<StringView>
+{
+    StringView::chars(&(*s)[0..$])
+}
+
+/// A character can be several bytes.
+unittest "String::chars: bytes and characters"
+{
+    String s = "h\u{e9}!";
+    assert(String::len(&s) == 4);
+    assert(String::char_count(&s) == 3);
+    Vec<StringView> cs = String::chars(&s);
+    assert(StringView::len(cs[1]) == 2);
+    assert(StringView::code_point(cs[1]) == Some(0xe9: u32));
+}
+
+/// Whether `t` occurs in `s`.
+///
+/// The empty text is in every text.
+export fn String::contains(ref<String, shared> s, StringView t) : bool
+{
+    StringView::contains(&(*s)[0..$], t)
+}
+
+/// A new `String` holding the text of `s` with every occurrence of `from` replaced by `to`.
+///
+/// As `StringView::replace`: left to right, without overlaps; an empty `from` occurs nowhere.
+export fn String::replace(ref<String, shared> s, StringView from, StringView to) : String
+{
+    StringView::replace(&(*s)[0..$], from, to)
+}
+
+// ---- D-0181: prefixes and suffixes, lines, words, code points ----
+
+// `v` without `t` at its start: `Some(the rest)` when `v` begins with
+// `t`, else `None`. The idiom of `--name=value`: `strip_prefix(a,
+// "--name=")` gives the value or says the argument is another.
+/// The rest of `v` after `t` when `v` begins with `t`, else `None`.
+///
+/// It reads an option's value: `StringView::strip_prefix(a, "--name=")` gives the value, or `None` for
+/// another argument.
+export fn StringView::strip_prefix(StringView v, StringView t) : Option<StringView>
+{
+    if (StringView::starts_with(v, t))
+    {
+        return Some(StringView::sub(v, StringView::len(t), StringView::len(v)));
+    }
+    None
+}
+
+/// The prefix is removed only when it is there.
+unittest "StringView::strip_prefix: an option's value"
+{
+    StringView a = "--name=value";
+    assert(Option::unwrap(StringView::strip_prefix(a, "--name=")) == "value");
+    assert(Option::is_none(&StringView::strip_prefix(a, "--other=")));
+}
+
+// `v` without `t` at its end: `Some(the rest)` when `v` ends with `t`.
+/// The part of `v` before `t` when `v` ends with `t`, else `None`.
+export fn StringView::strip_suffix(StringView v, StringView t) : Option<StringView>
+{
+    if (StringView::ends_with(v, t))
+    {
+        return Some(StringView::sub(v, 0, StringView::len(v) - StringView::len(t)));
+    }
+    None
+}
+
+// The lines of `v`: the parts between `\n`s, each without a `\r` just
+// before its `\n` (D-0092), and no empty line after a final `\n`, so
+// `"a\nb\n"` and `"a\nb"` both give `a` and `b`; empty text gives none.
+/// The lines of `v`: the parts between `\n` bytes, each without a `\r` just before its `\n`.
+///
+/// There is no empty line after a final `\n`, so `"a\nb\n"` and `"a\nb"` both give `a` and `b`; `"\n\n"`
+/// gives two empty lines, and empty text none. A `\r` not followed by `\n` stays in its line.
+export fn StringView::lines(StringView v) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = slice_len(v.bytes);
+    usize start = 0;
+    while (true)
+    {
+        usize i = byte_index_from(v.bytes, start, b'\n');
+        if (i >= n)
+        {
+            break;
+        }
+        usize end = if (i > start && v.bytes[i - 1] == b'\r') { i - 1 } else { i };
+        Vec::push(&mut out, StringView::sub(v, start, end));
+        start = i + 1;
+    }
+    if (start < n)
+    {
+        Vec::push(&mut out, StringView::sub(v, start, n));
+    }
+    out
+}
+
+/// Windows and Unix line endings read the same, and a final line ending adds no line.
+unittest "StringView::lines: line endings"
+{
+    StringView text = "one\r\ntwo\n\nthree\n";
+    Vec<StringView> ls = StringView::lines(text);
+    assert(Vec::len(&ls) == 4);
+    assert(ls[0] == "one");
+    assert(ls[2] == "");
+    assert(ls[3] == "three");
+}
+
+// Scans over the bytes from `at`, their slice each function's only
+// reference (read unchecked): the first `c` (the length when none), and
+// the end of a run of ASCII white space (`space`) or of other bytes.
+fn byte_index_from(slice<u8, shared> b, usize at, u8 c) : usize
+{
+    usize i = at;
+    while (i < slice_len(b) && b[i] != c)
+    {
+        i += 1;
+    }
+    i
+}
+
+fn space_run_end(slice<u8, shared> b, usize at, bool space) : usize
+{
+    usize i = at;
+    while (i < slice_len(b) && ascii_is_space(b[i]) == space)
+    {
+        i += 1;
+    }
+    i
+}
+
+// The words of `v`: the runs of bytes that are not ASCII whitespace
+// (`ascii_is_space`), in order; no part is empty, so leading, trailing
+// and repeated whitespace make no difference.
+/// The words of `v`: the runs of bytes that are not ASCII white space, in order.
+///
+/// No word is empty, so leading, trailing and repeated white space make no difference. White space is what
+/// `ascii_is_space` accepts.
+export fn StringView::split_whitespace(StringView v) : Vec<StringView>
+{
+    Vec<StringView> out = Vec::new();
+    usize n = slice_len(v.bytes);
+    usize i = 0;
+    while (i < n)
+    {
+        i = space_run_end(v.bytes, i, true);
+        usize start = i;
+        i = space_run_end(v.bytes, i, false);
+        if (i > start)
+        {
+            Vec::push(&mut out, StringView::sub(v, start, i));
+        }
+    }
+    out
+}
+
+/// Runs of white space of any kind separate words.
+unittest "StringView::split_whitespace: runs of spaces"
+{
+    Vec<StringView> w = StringView::split_whitespace("  to  be\tor ");
+    assert(Vec::len(&w) == 3);
+    assert(w[0] == "to");
+    assert(w[2] == "or");
+}
+
+// The code point of `v`'s first character (U+0000 to U+10FFFF); `None`
+// when `v` is empty. With `chars`, every character of a text in turn.
+/// The code point of the first character of `v`, or `None` when `v` is empty.
+///
+/// With `StringView::chars`, it reads every character of a text in turn.
+export fn StringView::code_point(StringView v) : Option<u32>
+{
+    usize n = slice_len(v.bytes);
+    if (n == 0)
+    {
+        return None;
+    }
+    u8 b = v.bytes[0];
+    if (b < 0x80)
+    {
+        return Some(widen<u32>(b));
+    }
+    // The view's bytes are UTF-8 (`[View-Form]`), so a lead byte's
+    // continuation bytes are there.
+    if ((b & 0xE0) == 0xC0)
+    {
+        return Some((widen<u32>(b & 0x1F) << 6) | widen<u32>(v.bytes[1] & 0x3F));
+    }
+    if ((b & 0xF0) == 0xE0)
+    {
+        return Some((widen<u32>(b & 0x0F) << 12) | (widen<u32>(v.bytes[1] & 0x3F) << 6) | widen<u32>(v.bytes[2] & 0x3F));
+    }
+    Some((widen<u32>(b & 0x07) << 18) | (widen<u32>(v.bytes[1] & 0x3F) << 12) | (widen<u32>(v.bytes[2] & 0x3F) << 6) | widen<u32>(v.bytes[3] & 0x3F))
+}
+
+// Appends the character with code point `cp` as UTF-8 (one to four
+// bytes). A value that is no character (a surrogate, D800 to DFFF, or
+// above 10FFFF) appends U+FFFD, the replacement character, as decoders
+// do, so the `String` stays valid UTF-8.
+/// Appends the character with code point `cp` to `s`, as one to four UTF-8 bytes.
+///
+/// A value that is no character (a surrogate, `0xD800` to `0xDFFF`, or above `0x10FFFF`) appends U+FFFD, the
+/// replacement character, so `s` stays UTF-8.
+export fn String::push_code_point(ref<String, exclusive> s, u32 cp)
+{
+    u32 c = if ((cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) { 0xFFFD } else { cp };
+    if (c < 0x80)
+    {
+        Vec::push(&mut s.bytes, narrow<u8>(c));
+    }
+    else if (c < 0x800)
+    {
+        Vec::push(&mut s.bytes, 0xC0 | narrow<u8>(c >> 6));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>(c & 0x3F));
+    }
+    else if (c < 0x10000)
+    {
+        Vec::push(&mut s.bytes, 0xE0 | narrow<u8>(c >> 12));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>((c >> 6) & 0x3F));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>(c & 0x3F));
+    }
+    else
+    {
+        Vec::push(&mut s.bytes, 0xF0 | narrow<u8>(c >> 18));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>((c >> 12) & 0x3F));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>((c >> 6) & 0x3F));
+        Vec::push(&mut s.bytes, 0x80 | narrow<u8>(c & 0x3F));
+    }
+}
+
+/// A surrogate is not a character and becomes U+FFFD.
+unittest "String::push_code_point: a surrogate"
+{
+    String s = String::new();
+    String::push_code_point(&mut s, 0x41);
+    String::push_code_point(&mut s, 0xD800);
+    assert(s == "A\u{fffd}");
+}
+
+/// The rest of `s` after `t` when `s` begins with `t`, else `None`.
+///
+/// As `StringView::strip_prefix` on the whole text.
+export fn String::strip_prefix(ref<String, shared> s, StringView t) : Option<StringView>
+{
+    StringView::strip_prefix(&(*s)[0..$], t)
+}
+
+/// The part of `s` before `t` when `s` ends with `t`, else `None`.
+///
+/// As `StringView::strip_suffix` on the whole text.
+export fn String::strip_suffix(ref<String, shared> s, StringView t) : Option<StringView>
+{
+    StringView::strip_suffix(&(*s)[0..$], t)
+}
+
+/// The lines of `s`, each without its line ending.
+///
+/// As `StringView::lines` on the whole text: a `\r` before a `\n` is dropped, and a final `\n` adds no empty
+/// line.
+export fn String::lines(ref<String, shared> s) : Vec<StringView>
+{
+    StringView::lines(&(*s)[0..$])
+}
+
+/// The words of `s`: the runs of bytes that are not ASCII white space, in order.
+///
+/// As `StringView::split_whitespace` on the whole text.
+export fn String::split_whitespace(ref<String, shared> s) : Vec<StringView>
+{
+    StringView::split_whitespace(&(*s)[0..$])
+}
+
+// D-0287: what `foreach (x in StringView::lines(v))` holds instead of the
+// `Vec` (and so for `split`, `split_whitespace`, `chars` and their `String`
+// forms; `rule.control.foreach-parts`, spec/14): the view, where the next
+// part starts, the part last found (`lo`, `hi`), how many parts it has
+// given and whether one is left. Each part is found when the loop takes
+// it, so the loop keeps no `Vec`, and each part is a view of `v`'s text as
+// the `Vec`'s would be. The loop passes it by value, a view and a few
+// numbers, so it is never borrowed; the static pass holds it as it holds a
+// view (one text, borrowed shared): the parts are tier S. `kind`: 0
+// `split` on `sep`, 1 `lines`, 2 `split_whitespace`, 3 `chars`. The parts
+// are the `Vec`'s, in its order.
+struct Parts
+{
+    StringView v;
+    str sep;
+    usize at;
+    usize lo;
+    usize hi;
+    usize taken;
+    u8 kind;
+    bool done;
+}
+
+fn Parts::split(StringView v, str sep) : Parts
+{
+    Parts { .v = v, .sep = sep, .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 0, .done = false }
+}
+
+fn Parts::lines(StringView v) : Parts
+{
+    Parts { .v = v, .sep = "", .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 1, .done = slice_len(v.bytes) == 0 }
+}
+
+fn Parts::words(StringView v) : Parts
+{
+    usize at = space_run_end(v.bytes, 0, true);
+    Parts { .v = v, .sep = "", .at = at, .lo = 0, .hi = 0, .taken = 0, .kind = 2, .done = at >= slice_len(v.bytes) }
+}
+
+fn Parts::chars(StringView v) : Parts
+{
+    Parts { .v = v, .sep = "", .at = 0, .lo = 0, .hi = 0, .taken = 0, .kind = 3, .done = slice_len(v.bytes) == 0 }
+}
+
+fn Parts::string_split(ref<String, shared> s, str sep) : Parts
+{
+    Parts::split(&(*s)[0..$], sep)
+}
+
+fn Parts::string_lines(ref<String, shared> s) : Parts
+{
+    Parts::lines(&(*s)[0..$])
+}
+
+fn Parts::string_words(ref<String, shared> s) : Parts
+{
+    Parts::words(&(*s)[0..$])
+}
+
+fn Parts::string_chars(ref<String, shared> s) : Parts
+{
+    Parts::chars(&(*s)[0..$])
+}
+
+// The loop's bound: one past the parts given while one is left, so that
+// `$i < bound` holds exactly until the last part is taken.
+fn Parts::bound(Parts p) : usize
+{
+    if (p.done) { p.taken } else { p.taken + 1 }
+}
+
+// `p` with its next part found, the view `StringView::sub(p.v, p.lo,
+// p.hi)`, and where the one after it starts.
+fn Parts::next(Parts p) : Parts
+{
+    usize n = slice_len(p.v.bytes);
+    usize lo = p.at;
+    usize hi = n;
+    p.taken = p.taken + 1;
+    if (p.kind == 0)
+    {
+        usize m = str_len(p.sep);
+        match (if (m == 0) { None } else { StringView::find(StringView::sub(p.v, lo, n), StringView::of(p.sep)) })
+        {
+            Some(i) :
+            {
+                hi = lo + i;
+                p.at = hi + m;
+            },
+            None    : p.done = true,
+        }
+    }
+    else if (p.kind == 1)
+    {
+        usize i = byte_index_from(p.v.bytes, lo, b'\n');
+        if (i >= n)
+        {
+            p.done = true;
+        }
+        else
+        {
+            hi = if (i > lo && p.v.bytes[i - 1] == b'\r') { i - 1 } else { i };
+            p.at = i + 1;
+            p.done = p.at >= n;
+        }
+    }
+    else if (p.kind == 2)
+    {
+        hi = space_run_end(p.v.bytes, lo, false);
+        p.at = space_run_end(p.v.bytes, hi, true);
+        p.done = p.at >= n;
+    }
+    else
+    {
+        hi = lo + 1;
+        while (!StringView::boundary(p.v.bytes, hi))
+        {
+            hi += 1;
+        }
+        p.at = hi;
+        p.done = hi >= n;
+    }
+    p.lo = lo;
+    p.hi = hi;
+    p
+}
+
+/// A `foreach` over the parts finds each when it takes it; the parts are the `Vec`'s.
+unittest "StringView::lines: a foreach takes the parts as it goes"
+{
+    StringView text = "one\r\ntwo\n\nthree\n";
+    Vec<StringView> ls = StringView::lines(text);
+    usize n = 0;
+    foreach (i, l in StringView::lines(text))
+    {
+        assert(l == ls[i]);
+        n += 1;
+    }
+    assert(n == 4);
+    n = 0;
+    foreach (w in StringView::split_whitespace("  to  be\tor "))
+    {
+        n += StringView::len(w);
+    }
+    assert(n == 6);
+    n = 0;
+    foreach (f in StringView::split("a,,b", ","))
+    {
+        n += 1;
+    }
+    assert(n == 3);
+}
+
+/// The code point of the first character of `s`, or `None` when `s` is empty.
+export fn String::code_point(ref<String, shared> s) : Option<u32>
+{
+    StringView::code_point(&(*s)[0..$])
+}
+
+// D-0193: parsed in place, as `String::parse` parses a `String`'s bytes
+// (it was a copy into a new `String` first).
+/// The number the text of `v` holds, as a `T`: an integer type, `f32` or `f64`.
+///
+/// Parsed in place, by the rules and with the errors of `String::parse`: the whole text or nothing, so white
+/// space around the number must be trimmed first.
+export fn StringView::parse<T>(StringView v) : Result<T, ParseError>
+{
+    parse_bytes<T>(StringView::ptr(v), StringView::len(v))
+}
+
+/// The whole text must be the number.
+unittest "StringView::parse: no white space"
+{
+    StringView v = " 42 ";
+    assert(StringView::parse<u32>(v) == Err(Invalid(0)));
+    assert(StringView::parse<u32>(StringView::trim(v)) == Ok(42));
+}
+
+fn String::append_view(ref<String, exclusive> s, StringView v)
+{
+    foreach (x in v.bytes)
+    {
+        Vec::push(&mut s.bytes, *x);
+    }
+}
+
+// `String::append<T>` is realized natively, as `print<T>` is: the
+// std-only intrinsic `append_native` sends a `str` to `append_str`, a
+// `ref<String, shared>` to `append_string`, a `StringView` to
+// `append_view` (D-0053), and a number or `bool` to
+// `append_text`, which has `text_write` format it into a buffer. The
+// front end checks `T` at the call.
+/// Appends `x` to `s` as text: the bytes `printf("%v", x)` would write.
+///
+/// `x` is a `str`, a `StringView`, a `ref<String, shared>`, an integer, `f32`, `f64` or `bool`; another type
+/// is rejected at the call. A float is written in the shortest digits that read back as the same value
+/// (`1.0`, `0.1`). `String::appendf` appends formatted text.
+export fn String::append<T>(ref<String, exclusive> s, T x)
+{
+    append_native(s, x);
+}
+
+/// Numbers are appended as `printf` writes them.
+unittest "String::append: numbers as printf writes them"
+{
+    String s = "x = ";
+    String::append(&mut s, 1.0);
+    String::append(&mut s, ", n = ");
+    String::append(&mut s, 42: u8);
+    assert(s == "x = 1.0, n = 42");
+}
+
+fn String::append_str(ref<String, exclusive> s, str t)
+{
+    usize n = str_len(t);
+    usize i = 0;
+    while (i < n)
+    {
+        Vec::push(&mut s.bytes, str_byte(t, i));
+        i = i + 1;
+    }
+}
+
+// trusted: [Rawptr-Read] of t's bytes below len, live for the call through the shared reference.
+fn String::append_string(ref<String, exclusive> s, ref<String, shared> t)
+{
+    usize n = t.bytes.len;
+    Vec::reserve(&mut s.bytes, n);
+    usize i = 0;
+    while (i < n)
+    {
+        u8 b = unsafe
+        {
+            *(reinterpret_ptr<u8>(t.bytes.ptr) + reinterpret<isize>(i))
+        };
+        Vec::push(&mut s.bytes, b);
+        i = i + 1;
+    }
+}
+
+// trusted: [Extern-Call] text_write writes at most 64 bytes at p, the allocation made just above; [Rawptr-Read] of the n it wrote; [Deallocate] of that allocation.
+fn String::append_text<T>(ref<String, exclusive> s, T x)
+{
+    rawptr<u8> p = match (allocate(64, 1))
+    {
+        Ok(p)  : p,
+        Err(_) : fault(alloc_failure),
+    };
+    usize n = unsafe
+    {
+        text_write(x, p)
+    };
+    usize i = 0;
+    while (i < n)
+    {
+        u8 b = unsafe
+        {
+            *(p + reinterpret<isize>(i))
+        };
+        Vec::push(&mut s.bytes, b);
+        i = i + 1;
+    }
+    unsafe
+    {
+        deallocate(p, 64, 1);
+    }
+}
+
+// `String::parse<T>` is realized natively: the std-only intrinsics `parse_check`
+// (-1 for a number, -2 empty, -3 out of range, else the invalid offset)
+// and `parse_value` read the bytes (src/numtext.rs). The front end
+// checks `T` at the call.
+/// The number the text of `s` holds, as a `T`: an integer type, `f32` or `f64`.
+///
+/// The whole text must be the number: no white space, `_`, other base, or `.5` and `5.` forms. Leading zeros
+/// are allowed; `+` is allowed, and `-` is invalid for an unsigned `T`, even in `-0`. A float may also be
+/// `inf` or `NaN`, and is correctly rounded in `T` itself.
+///
+/// - `Err(Empty)` for empty text.
+/// - `Err(Invalid(k))` at the first byte that cannot continue a number, or the length when the text stops too
+///   early: `"12x4"` gives `Invalid(2)` and `"1e"` `Invalid(2)`. An invalid byte is reported even when the
+///   digits before it are already out of range.
+/// - `Err(OutOfRange)` when the value does not fit `T`.
+export fn String::parse<T>(ref<String, shared> s) : Result<T, ParseError>
+{
+    parse_bytes<T>(reinterpret_ptr<u8>(s.bytes.ptr), s.bytes.len)
+}
+
+/// Each error, and a success.
+unittest "String::parse: the three errors"
+{
+    String a = "12x4";
+    assert(String::parse<i32>(&a) == Err(Invalid(2)));
+    String b = "300";
+    assert(String::parse<u8>(&b) == Err(OutOfRange));
+    String c = "";
+    assert(String::parse<i32>(&c) == Err(Empty));
+    String d = "-17";
+    assert(String::parse<i32>(&d) == Ok(-17));
+}
+
+// The `n` bytes at `p`, which stay put and unchanged for the call, as a `T`.
+// trusted: [Extern-Call] parse_check and parse_value read [p, p + n), bytes the caller keeps live.
+fn parse_bytes<T>(rawptr<u8> p, usize n) : Result<T, ParseError>
+{
+    isize code = unsafe
+    {
+        parse_check<T>(p, n)
+    };
+    if (code == -1)
+    {
+        auto v = unsafe
+        {
+            parse_value<T>(p, n)
+        };
+        return Ok(v);
+    }
+    if (code == -2)
+    {
+        return Err(Empty);
+    }
+    if (code == -3)
+    {
+        return Err(OutOfRange);
+    }
+    Err(Invalid(reinterpret<usize>(code)))
+}

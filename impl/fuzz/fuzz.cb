@@ -1,0 +1,1320 @@
+// The std fuzzer (WI-7, CHG-0266): every parser in std fed mutated
+// inputs, from the hostile-input round of D-0211. Each input runs in its
+// own thread, so a fault is counted, not fatal; the expected outcome of
+// every input is Ok or Err -- never a fault, and under a sanitizer never
+// a report. Usage: fuzz PARSER COUNT [SEED], where PARSER is inflate,
+// json, der, pem, text, http-server, http-client, pg or tls. Prints a
+// tally; exit status 1 when a fault was seen. impl/fuzz/run.py runs every
+// parser to a time budget under each C compiler and a sanitizer; see
+// impl/fuzz/README.md for how to add a seed input.
+
+import std;
+
+const str KEY = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIG/xpX/23qwZ8iDRpzBtyYErXB+yw1ePRPCeOrMbHv6h\n-----END PRIVATE KEY-----\n";
+const str CRT = "-----BEGIN CERTIFICATE-----\nMIIBfzCCATGgAwIBAgIUT5+4C2nK5/ckjqCAbHutlwq/fFowBQYDK2VwMBQxEjAQ\nBgNVBAMMCWxvY2FsaG9zdDAgFw0yNjEwMDcwNTE1MDFaGA8yMTAwMDkwOTA1MTUw\nMVowFDESMBAGA1UEAwwJbG9jYWxob3N0MCowBQYDK2VwAyEAegP8qkgXtxseLdoQ\nVA0JHXycpuJ8Pngy7dgQ3xsz552jgZIwgY8wHQYDVR0OBBYEFDSsOJwWBXtwFB5F\nALP2IghQZGKuMB8GA1UdIwQYMBaAFDSsOJwWBXtwFB5FALP2IghQZGKuMA8GA1Ud\nEwEB/wQFMAMBAf8wCwYDVR0PBAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoG\nA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAFBgMrZXADQQBo4o2RWAyOEsn05+06\n9J3Dk9EvdsEp2cq67rhtYhNMNEEOvAUQ3bY3x/ykp+tcRbGW/RKox3FHoJUKTkw8\ng2AG\n-----END CERTIFICATE-----\n";
+
+struct Tally
+{
+    usize ok;
+    usize err;
+    usize fault;
+    usize skipped;
+}
+
+fn tally_new() : Tally
+{
+    Tally { .ok = 0, .err = 0, .fault = 0, .skipped = 0 }
+}
+
+fn show(str parser, ref<Tally, shared> t)
+{
+    printf("%v: ok %v, err %v, fault %v, skipped %v\n", parser, t.ok, t.err, t.fault, t.skipped);
+}
+
+fn below(ref<Rng, exclusive> g, usize n) : usize
+{
+    narrow<usize>(Rng::below(g, widen<u64>(n)))
+}
+
+fn note_fault(ref<Tally, exclusive> t, ref<ThreadFailure, shared> f, slice<u8, shared> input, str parser, usize i)
+{
+    t.fault += 1;
+    if (t.fault <= 5)
+    {
+        printf("FAULT %v #%v: %v\n", parser, i, &ThreadFailure::diagnostic(f));
+        String path = String::from_str("fault_");
+        String::append(&mut path, parser);
+        String::append(&mut path, "_");
+        String::append(&mut path, i);
+        String::append(&mut path, ".hex");
+        _ = write_file(String::as_view(&path), String::as_view(&to_hex(input)));
+    }
+}
+
+// ---- mutations ----
+
+fn rand_byte(ref<Rng, exclusive> g) : u8
+{
+    narrow<u8>(Rng::below(g, 256))
+}
+
+// One to three edits: a bit flip, a byte set to 0 or 255, a truncation, an
+// insertion, a deletion, a 2- or 4-byte field zeroed or saturated, a run
+// of 0xFF, a region duplicated.
+fn mutate(ref<Rng, exclusive> g, ref<Vec<u8>, exclusive> v)
+{
+    usize edits = 1 + below(g, 3);
+    for (usize k = 0; k < edits; k += 1)
+    {
+        if (Vec::len(v) == 0)
+        {
+            Vec::push(v, rand_byte(g));
+            continue;
+        }
+        usize at = below(g, Vec::len(v));
+        match (below(g, 9))
+        {
+            0 : v[at] = v[at] ^ narrow<u8>(1 << narrow<u32>(below(g, 8))),
+            1 : v[at] = 0,
+            2 : v[at] = 255,
+            3 : Vec::truncate(v, at),
+            4 : Vec::insert(v, at, rand_byte(g)),
+            5 : { _ = Vec::remove(v, at); },
+            6 :
+            {
+                usize w = if (below(g, 2) == 0) { 2 } else { 4 };
+                u8 fill = if (below(g, 2) == 0) { 0 } else { 255 };
+                for (usize j = 0; j < w && at + j < Vec::len(v); j += 1)
+                {
+                    v[at + j] = fill;
+                }
+            },
+            7 :
+            {
+                usize n = 1 + below(g, 64);
+                for (usize j = 0; j < n && at + j < Vec::len(v); j += 1)
+                {
+                    v[at + j] = 255;
+                }
+            },
+            _ :
+            {
+                usize n = 1 + below(g, 32);
+                if (at + n > Vec::len(v))
+                {
+                    n = Vec::len(v) - at;
+                }
+                Vec<u8> copy = Vec::from_slice(&v[at..at + n]);
+                usize to = below(g, Vec::len(v) + 1);
+                for (usize j = 0; j < n; j += 1)
+                {
+                    Vec::insert(v, to + j, copy[j]);
+                }
+            },
+        }
+    }
+}
+
+const str TEXT_ALPHABET = "{}[]\":,\\0123456789.-+eEunltrfas \n\t/x";
+
+// Edits for text parsers: replacements from the parser's own alphabet,
+// so the text stays UTF-8 and the edits land on structure, not encoding.
+fn mutate_text(ref<Rng, exclusive> g, ref<Vec<u8>, exclusive> v)
+{
+    usize edits = 1 + below(g, 3);
+    for (usize k = 0; k < edits; k += 1)
+    {
+        if (Vec::len(v) == 0)
+        {
+            Vec::push(v, 123);
+            continue;
+        }
+        usize at = below(g, Vec::len(v));
+        u8 c = str_byte(TEXT_ALPHABET, below(g, str_len(TEXT_ALPHABET)));
+        match (below(g, 6))
+        {
+            0 : v[at] = c,
+            1 : Vec::insert(v, at, c),
+            2 : { _ = Vec::remove(v, at); },
+            3 : Vec::truncate(v, at),
+            4 :
+            {
+                // a valid multi-byte character: é (c3 a9) or 😀 (f0 9f 98 80)
+                if (below(g, 2) == 0)
+                {
+                    Vec::insert(v, at, 0xa9);
+                    Vec::insert(v, at, 0xc3);
+                }
+                else
+                {
+                    Vec::insert(v, at, 0x80);
+                    Vec::insert(v, at, 0x98);
+                    Vec::insert(v, at, 0x9f);
+                    Vec::insert(v, at, 0xf0);
+                }
+            },
+            _ :
+            {
+                usize n = 1 + below(g, 16);
+                if (at + n > Vec::len(v))
+                {
+                    n = Vec::len(v) - at;
+                }
+                Vec<u8> copy = Vec::from_slice(&v[at..at + n]);
+                usize to = below(g, Vec::len(v) + 1);
+                for (usize j = 0; j < n; j += 1)
+                {
+                    Vec::insert(v, to + j, copy[j]);
+                }
+            },
+        }
+    }
+}
+
+fn bytes_of(str s) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    for (usize i = 0; i < str_len(s); i += 1)
+    {
+        Vec::push(&mut v, str_byte(s, i));
+    }
+    v
+}
+
+fn repeat_bytes(str s, usize times) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    for (usize k = 0; k < times; k += 1)
+    {
+        for (usize i = 0; i < str_len(s); i += 1)
+        {
+            Vec::push(&mut v, str_byte(s, i));
+        }
+    }
+    v
+}
+
+// ---- inflate / zlib / gzip ----
+
+fn run_inflate(Vec<u8> input, usize max, usize which) : u8
+{
+    match (which)
+    {
+        0 : match (inflate(&input[0..$], max)) { Ok(_) : 0, Err(_) : 1 },
+        1 : match (zlib_inflate(&input[0..$], max)) { Ok(_) : 0, Err(_) : 1 },
+        _ : match (gunzip(&input[0..$], max)) { Ok(_) : 0, Err(_) : 1 },
+    }
+}
+
+fn round_inflate(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    Vec<Vec<u8>> plain = Vec::new();
+    Vec::push(&mut plain, repeat_bytes("hello, hello, hello! ", 200));
+    Vec::push(&mut plain, repeat_bytes("a", 5000));
+    Vec<u8> noise = Vec::new();
+    for (usize i = 0; i < 3000; i += 1)
+    {
+        Vec::push(&mut noise, rand_byte(&mut g));
+    }
+    Vec::push(&mut plain, noise);
+    Vec::push(&mut plain, bytes_of("The quick brown fox jumps over the lazy dog. 0123456789 ~~~~ ####"));
+    Vec::push(&mut plain, Vec::new());
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec<usize> kinds = Vec::new();
+    foreach (p in &plain)
+    {
+        Vec::push(&mut bases, deflate(&(*p)[0..$]));
+        Vec::push(&mut kinds, 0);
+        Vec::push(&mut bases, zlib_deflate(&(*p)[0..$]));
+        Vec::push(&mut kinds, 1);
+        Vec::push(&mut bases, gzip(&(*p)[0..$]));
+        Vec::push(&mut kinds, 2);
+    }
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        usize b = below(&mut g, Vec::len(&bases));
+        Vec<u8> input = Vec::clone(&bases[b]);
+        if (below(&mut g, 20) != 0)
+        {
+            mutate(&mut g, &mut input);
+        }
+        usize which = if (below(&mut g, 10) == 0) { below(&mut g, 3) } else { kinds[b] };
+        usize max = if (below(&mut g, 10) == 0) { 1 + below(&mut g, 100) } else { 1048576 };
+        auto h = spawn(run_inflate, Vec::clone(&input), max, which);
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(_) : t.err += 1,
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "inflate", i),
+        }
+    }
+    t
+}
+
+// ---- JSON ----
+
+fn run_json(Vec<u8> input) : u8
+{
+    match (StringView::from_utf8(&input[0..$]))
+    {
+        Ok(v) : match (Json::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+        Err(_) : 2,
+    }
+}
+
+fn round_json(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec::push(&mut bases, bytes_of("{\"a\": [1, 2.5e3, -0, true, false, null, \"x\\n\\u00e9\\ud83d\\ude00\"], \"b\": {\"c\": {}}, \"d\": []}"));
+    Vec::push(&mut bases, bytes_of("[[[[[[[[[[\"deep\"]]]]]]]]]]"));
+    Vec::push(&mut bases, bytes_of("  {\"n\": 12345678901234567890, \"f\": 1e400, \"s\": \"\\\"quoted\\\" \\\\ \\/ \\b\\f\\r\\t\"}  "));
+    Vec::push(&mut bases, bytes_of("\"just a string with \\u0000 and \\uD800 lone surrogate\""));
+    Vec::push(&mut bases, bytes_of("[1,2,3,{\"k\":\"v\",\"k\":\"dup\"},[],{},\"\",0,-1,1.0,1E+2]"));
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        Vec<u8> input;
+        if (below(&mut g, 50) == 0)
+        {
+            // nesting at, past and far past the limit, open or closed
+            usize depth = match (below(&mut g, 4)) { 0 : 511, 1 : 512, 2 : 513, _ : 3000 };
+            input = Vec::new();
+            u8 open = if (below(&mut g, 2) == 0) { 91 } else { 123 };
+            for (usize d = 0; d < depth; d += 1)
+            {
+                Vec::push(&mut input, open);
+                if (open == 123)
+                {
+                    Vec::push(&mut input, 34);
+                    Vec::push(&mut input, 107);
+                    Vec::push(&mut input, 34);
+                    Vec::push(&mut input, 58);
+                }
+            }
+            if (below(&mut g, 2) == 0)
+            {
+                Vec::push(&mut input, 49);
+                for (usize d = 0; d < depth; d += 1)
+                {
+                    Vec::push(&mut input, open + 2);
+                }
+            }
+        }
+        else
+        {
+            input = Vec::clone(&bases[below(&mut g, Vec::len(&bases))]);
+            if (below(&mut g, 20) != 0)
+            {
+                mutate_text(&mut g, &mut input);
+            }
+        }
+        auto h = spawn(run_json, Vec::clone(&input));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(1) : t.err += 1,
+            Ok(_) : t.skipped += 1,
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "json", i),
+        }
+    }
+    t
+}
+
+// ---- DER and PEM ----
+
+fn run_der(Vec<u8> input) : u8
+{
+    u8 r = 1;
+    if (Ok(_) = Certificate::parse(&input[0..$]))
+    {
+        r = 0;
+    }
+    if (Ok(_) = CertKey::from_der(&input[0..$]))
+    {
+        r = 0;
+    }
+    if (Ok(_) = PrivateKey::from_der(&input[0..$]))
+    {
+        r = 0;
+    }
+    _ = der_read(&input[0..$], 0);
+    r
+}
+
+fn round_der(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    Vec<Certificate> certs = certificates_from_pem(CRT);
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(KEY));
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec::push(&mut bases, Vec::clone(&certs[0].der));
+    Vec::push(&mut bases, PrivateKey::to_der(&key));
+    Vec::push(&mut bases, Option::unwrap(CertKey::to_der(&PrivateKey::public_key(&key))));
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        Vec<u8> input = Vec::clone(&bases[below(&mut g, Vec::len(&bases))]);
+        if (below(&mut g, 20) != 0)
+        {
+            mutate(&mut g, &mut input);
+        }
+        auto h = spawn(run_der, Vec::clone(&input));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(_) : t.err += 1,
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "der", i),
+        }
+    }
+    t
+}
+
+fn run_pem(Vec<u8> input) : u8
+{
+    match (StringView::from_utf8(&input[0..$]))
+    {
+        Ok(v) :
+        {
+            u8 r = 1;
+            if (Vec::len(&certificates_from_pem(v)) > 0)
+            {
+                r = 0;
+            }
+            if (Ok(_) = PrivateKey::from_pem(v))
+            {
+                r = 0;
+            }
+            if (Ok(_) = CertKey::from_pem(v))
+            {
+                r = 0;
+            }
+            r
+        },
+        Err(_) : 2,
+    }
+}
+
+fn round_pem(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec::push(&mut bases, bytes_of(CRT));
+    Vec::push(&mut bases, bytes_of(KEY));
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(KEY));
+    Vec::push(&mut bases, Vec::from_slice(StringView::as_bytes(String::as_view(&Option::unwrap(CertKey::to_pem(&PrivateKey::public_key(&key)))))));
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        Vec<u8> input = Vec::clone(&bases[below(&mut g, Vec::len(&bases))]);
+        if (below(&mut g, 20) != 0)
+        {
+            if (below(&mut g, 2) == 0)
+            {
+                mutate_text(&mut g, &mut input);
+            }
+            else
+            {
+                mutate(&mut g, &mut input);
+            }
+        }
+        auto h = spawn(run_pem, Vec::clone(&input));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(1) : t.err += 1,
+            Ok(_) : t.skipped += 1,
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "pem", i),
+        }
+    }
+    t
+}
+
+// ---- text parsers ----
+
+fn run_text(Vec<u8> input, usize which) : u8
+{
+    match (StringView::from_utf8(&input[0..$]))
+    {
+        Ok(v) : match (which)
+        {
+            0  : match (base64_decode(v)) { Ok(_) : 0, Err(_) : 1 },
+            1  : match (from_hex(v)) { Ok(_) : 0, Err(_) : 1 },
+            2  : match (BigUint::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+            3  : match (StringView::parse<i64>(v)) { Ok(_) : 0, Err(_) : 1 },
+            4  : match (StringView::parse<u8>(v)) { Ok(_) : 0, Err(_) : 1 },
+            5  : match (StringView::parse<f64>(v)) { Ok(_) : 0, Err(_) : 1 },
+            6  : match (DateTime::from_iso(v)) { Ok(_) : 0, Err(_) : 1 },
+            7  : match (Url::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+            8  : match (IpAddr::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+            9  : match (SocketAddr::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+            10 : match (PgUrl::parse(v)) { Ok(_) : 0, Err(_) : 1 },
+            _  : match (StringView::parse<f32>(v)) { Ok(_) : 0, Err(_) : 1 },
+        },
+        Err(_) : 2,
+    }
+}
+
+fn round_text(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec<usize> kinds = Vec::new();
+    Vec::push(&mut bases, bytes_of("aGVsbG8sIHdvcmxkIQ=="));
+    Vec::push(&mut kinds, 0);
+    Vec::push(&mut bases, bytes_of("0123456789abcdefABCDEF00ff"));
+    Vec::push(&mut kinds, 1);
+    Vec::push(&mut bases, bytes_of("123456789012345678901234567890123456789012345678901234567890"));
+    Vec::push(&mut kinds, 2);
+    Vec::push(&mut bases, bytes_of("-9223372036854775808"));
+    Vec::push(&mut kinds, 3);
+    Vec::push(&mut bases, bytes_of("255"));
+    Vec::push(&mut kinds, 4);
+    Vec::push(&mut bases, bytes_of("-1.7976931348623157e308"));
+    Vec::push(&mut kinds, 5);
+    Vec::push(&mut bases, bytes_of("2026-10-13T12:34:56Z"));
+    Vec::push(&mut kinds, 6);
+    Vec::push(&mut bases, bytes_of("https://user@example.com:8443/a/b%20c?x=1&y=%41#frag"));
+    Vec::push(&mut kinds, 7);
+    Vec::push(&mut bases, bytes_of("2001:db8::ff00:42:8329"));
+    Vec::push(&mut kinds, 8);
+    Vec::push(&mut bases, bytes_of("[::1]:5432"));
+    Vec::push(&mut kinds, 9);
+    Vec::push(&mut bases, bytes_of("postgres://user:p%40ss@db.example:5433/name?sslmode=verify-full&connect_timeout=5"));
+    Vec::push(&mut kinds, 10);
+    Vec::push(&mut bases, bytes_of("3.4028235e38"));
+    Vec::push(&mut kinds, 11);
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        usize b = below(&mut g, Vec::len(&bases));
+        Vec<u8> input = Vec::clone(&bases[b]);
+        if (below(&mut g, 20) != 0)
+        {
+            if (below(&mut g, 2) == 0)
+            {
+                mutate_text(&mut g, &mut input);
+            }
+            else
+            {
+                mutate(&mut g, &mut input);
+            }
+        }
+        // Mostly the parser the input was made for, sometimes another.
+        usize which = if (below(&mut g, 8) == 0) { below(&mut g, 12) } else { kinds[b] };
+        auto h = spawn(run_text, Vec::clone(&input), which);
+        match (try_join(h))
+        {
+            Ok(0)  : t.ok += 1,
+            Ok(1)  : t.err += 1,
+            Ok(_)  : t.skipped += 1,
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "text", i),
+        }
+    }
+    t
+}
+
+// ---- HTTP: the server's request parser ----
+
+fn serve_http(HttpServer s) : usize
+{
+    usize parsed = 0;
+    Vec<Header> none = Vec::new();
+    while (true)
+    {
+        HttpConnection c = match (HttpServer::accept(&mut s))
+        {
+            Ok(c) : c,
+            Err(_) : return parsed,
+        };
+        match (HttpConnection::request(&mut c))
+        {
+            Ok(Some(r)) :
+            {
+                parsed += 1;
+                if (r.url == "/quit")
+                {
+                    return parsed;
+                }
+                _ = HttpConnection::respond(&mut c, 200, &none[0..$], &r.body[0..$]);
+            },
+            Ok(None) : {},
+            Err(_) : {},
+        }
+        HttpConnection::close(&mut c);
+    }
+    parsed
+}
+
+// Sends `input` to `addr` and drains the reply: 0 when something came
+// back, 1 when the server closed without answering.
+fn poke(SocketAddr addr, Vec<u8> input) : u8
+{
+    TcpStream c = match (TcpStream::connect(addr))
+    {
+        Ok(c) : c,
+        Err(_) : return 3,
+    };
+    TcpStream::set_read_timeout_ms(&mut c, 3000);
+    TcpStream::set_write_timeout_ms(&mut c, 3000);
+    _ = TcpStream::write(&mut c, &input[0..$]);
+    _ = TcpStream::shutdown_write(&mut c);
+    Vec<u8> reply = Vec::new();
+    usize got = 0;
+    while (true)
+    {
+        match (TcpStream::read(&mut c, &mut reply, 65536))
+        {
+            Ok(0) : break,
+            Ok(n) : got += n,
+            Err(TimedOut) : return 4,
+            Err(_) : break,
+        }
+        if (got > 1048576)
+        {
+            break;
+        }
+    }
+    if (got > 0) { 0 } else { 1 }
+}
+
+fn round_http_server(usize count, u64 seed) : Tally
+{
+    Rng g = Rng::new(seed);
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr addr = HttpServer::local_addr(&s);
+    auto server = spawn(serve_http, s);
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec::push(&mut bases, bytes_of("GET /index.html?q=1 HTTP/1.1\r\nHost: localhost\r\nUser-Agent: hostile\r\nAccept: */*\r\n\r\n"));
+    Vec::push(&mut bases, bytes_of("POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello"));
+    Vec::push(&mut bases, bytes_of("POST /c HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n0\r\nTrailer: t\r\n\r\n"));
+    Vec::push(&mut bases, bytes_of("HEAD /h HTTP/1.0\r\n\r\n"));
+    Vec::push(&mut bases, bytes_of("PUT /u HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4294967296\r\n\r\nxxxx"));
+    Tally t = tally_new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        Vec<u8> input;
+        if (below(&mut g, 100) == 0)
+        {
+            // a head past the 64 KiB limit, or a huge chunk size
+            input = bytes_of("GET / HTTP/1.1\r\nX-Long: ");
+            usize n = 60000 + below(&mut g, 20000);
+            for (usize k = 0; k < n; k += 1)
+            {
+                Vec::push(&mut input, 97);
+            }
+            Vec::append(&mut input, bytes_of("\r\n\r\n"));
+        }
+        else
+        {
+            input = Vec::clone(&bases[below(&mut g, Vec::len(&bases))]);
+            if (below(&mut g, 20) != 0)
+            {
+                if (below(&mut g, 2) == 0)
+                {
+                    mutate_text(&mut g, &mut input);
+                }
+                else
+                {
+                    mutate(&mut g, &mut input);
+                }
+            }
+        }
+        auto h = spawn(poke, addr, Vec::clone(&input));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(1) : t.err += 1,
+            Ok(3) :
+            {
+                printf("http-server: the server is gone at #%v\n", i);
+                t.fault += 1;
+                break;
+            },
+            Ok(_) :
+            {
+                printf("HANG http-server #%v\n", i);
+                _ = write_file("hang_http-server.hex", String::as_view(&to_hex(&input[0..$])));
+                t.fault += 1;
+            },
+            Err(f) : note_fault(&mut t, &f, &input[0..$], "http-server", i),
+        }
+    }
+    _ = poke(addr, bytes_of("GET /quit HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    match (try_join(server))
+    {
+        Ok(n) : printf("http-server: the server parsed %v requests\n", n),
+        Err(f) : { printf("FAULT http-server (server thread): %v\n", &ThreadFailure::diagnostic(&f)); t.fault += 1; },
+    }
+    t
+}
+
+// ---- HTTP: the client's response parser, against a fake server ----
+
+fn fake_http(TcpListener l, u64 seed) : usize
+{
+    Rng g = Rng::new(seed);
+    Vec<Vec<u8>> bases = Vec::new();
+    Vec::push(&mut bases, bytes_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello"));
+    Vec::push(&mut bases, bytes_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=y\r\nhello\r\n6\r\n world\r\n0\r\nT: v\r\n\r\n"));
+    Vec<u8> body = repeat_bytes("hello world ", 50);
+    Vec<u8> gz = gzip(&body[0..$]);
+    Vec<u8> gzr = bytes_of("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ");
+    Vec::append(&mut gzr, bytes_of_string(&len_text(Vec::len(&gz))));
+    Vec::append(&mut gzr, bytes_of("\r\n\r\n"));
+    Vec::append(&mut gzr, gz);
+    Vec::push(&mut bases, gzr);
+    Vec::push(&mut bases, bytes_of("HTTP/1.1 301 Moved Permanently\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n"));
+    Vec::push(&mut bases, bytes_of("HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html>until close</html>"));
+    Vec::push(&mut bases, bytes_of("HTTP/1.1 204 No Content\r\n\r\n"));
+    Vec::push(&mut bases, bytes_of("HTTP/1.1 200 OK\r\nContent-Length: 4294967296\r\n\r\nxxxx"));
+    usize served = 0;
+    while (true)
+    {
+        TcpStream c = match (TcpListener::accept(&mut l))
+        {
+            Ok(c) : c,
+            Err(_) : return served,
+        };
+        TcpStream::set_read_timeout_ms(&mut c, 2000);
+        TcpStream::set_write_timeout_ms(&mut c, 2000);
+        Vec<u8> head = Vec::new();
+        bool quit = false;
+        while (true)
+        {
+            match (TcpStream::read(&mut c, &mut head, 4096))
+            {
+                Ok(0) : break,
+                Ok(_) : {},
+                Err(_) : break,
+            }
+            if (Option::is_some(&find_bytes(&head[0..$], "\r\n\r\n")))
+            {
+                break;
+            }
+            if (Vec::len(&head) > 1048576)
+            {
+                break;
+            }
+        }
+        if (Option::is_some(&find_bytes(&head[0..$], "/quit")))
+        {
+            return served;
+        }
+        Vec<u8> reply = Vec::clone(&bases[below(&mut g, Vec::len(&bases))]);
+        if (below(&mut g, 20) != 0)
+        {
+            if (below(&mut g, 2) == 0)
+            {
+                mutate_text(&mut g, &mut reply);
+            }
+            else
+            {
+                mutate(&mut g, &mut reply);
+            }
+        }
+        _ = TcpStream::write(&mut c, &reply[0..$]);
+        served += 1;
+    }
+    served
+}
+
+fn len_text(usize n) : String
+{
+    String s = String::new();
+    String::append(&mut s, n);
+    s
+}
+
+fn bytes_of_string(ref<String, shared> s) : Vec<u8>
+{
+    Vec::from_slice(StringView::as_bytes(String::as_view(s)))
+}
+
+fn find_bytes(slice<u8, shared> hay, str needle) : Option<usize>
+{
+    usize n = str_len(needle);
+    if (slice_len(hay) < n)
+    {
+        return None;
+    }
+    for (usize i = 0; i + n <= slice_len(hay); i += 1)
+    {
+        bool same = true;
+        for (usize j = 0; j < n; j += 1)
+        {
+            if (hay[i + j] != str_byte(needle, j))
+            {
+                same = false;
+                break;
+            }
+        }
+        if (same)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn fetch(String url) : u8
+{
+    match (http_get(String::as_view(&url)))
+    {
+        Ok(_) : 0,
+        Err(_) : 1,
+    }
+}
+
+fn round_http_client(usize count, u64 seed) : Tally
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr addr = TcpListener::local_addr(&l);
+    auto server = spawn(fake_http, l, seed);
+    String url = String::from_str("http://");
+    String::append(&mut url, &SocketAddr::text(&addr));
+    String::append(&mut url, "/path?x=1");
+    Tally t = tally_new();
+    Vec<u8> no_input = Vec::new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        auto h = spawn(fetch, String::clone(&url));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(_) : t.err += 1,
+            Err(f) : note_fault(&mut t, &f, &no_input[0..$], "http-client", i),
+        }
+    }
+    String quit = String::from_str("http://");
+    String::append(&mut quit, &SocketAddr::text(&addr));
+    String::append(&mut quit, "/quit");
+    _ = fetch(quit);
+    match (try_join(server))
+    {
+        Ok(n) : printf("http-client: the fake server served %v responses\n", n),
+        Err(f) : { printf("FAULT http-client (fake server): %v\n", &ThreadFailure::diagnostic(&f)); t.fault += 1; },
+    }
+    t
+}
+
+// ---- PostgreSQL: framing and SCRAM, against a fake server ----
+
+fn be32(ref<Vec<u8>, exclusive> v, u32 x)
+{
+    Vec::push(v, narrow<u8>(x >> 24));
+    Vec::push(v, narrow<u8>((x >> 16) & 255));
+    Vec::push(v, narrow<u8>((x >> 8) & 255));
+    Vec::push(v, narrow<u8>(x & 255));
+}
+
+fn be16(ref<Vec<u8>, exclusive> v, u16 x)
+{
+    Vec::push(v, narrow<u8>(x >> 8));
+    Vec::push(v, narrow<u8>(x & 255));
+}
+
+fn pg_msg(u8 kind, slice<u8, shared> payload) : Vec<u8>
+{
+    Vec<u8> m = Vec::new();
+    Vec::push(&mut m, kind);
+    be32(&mut m, narrow<u32>(slice_len(payload) + 4));
+    Vec::extend_from(&mut m, payload);
+    m
+}
+
+fn cstr(ref<Vec<u8>, exclusive> v, str s)
+{
+    Vec::append(v, bytes_of(s));
+    Vec::push(v, 0);
+}
+
+// Reads one length-prefixed message (with its kind byte when `kinded`),
+// returning its payload, or None at close, timeout or an absurd length.
+fn pg_read_msg(ref<TcpStream, exclusive> c, bool kinded) : Option<Vec<u8>>
+{
+    Vec<u8> head = Vec::new();
+    usize hn = if (kinded) { 5 } else { 4 };
+    if (Err(_) = TcpStream::read_exact(c, &mut head, hn))
+    {
+        return None;
+    }
+    usize off = if (kinded) { 1 } else { 0 };
+    usize len = widen<usize>(head[off]) << 24 | widen<usize>(head[off + 1]) << 16 | widen<usize>(head[off + 2]) << 8 | widen<usize>(head[off + 3]);
+    if (len < 4 || len > 1048576)
+    {
+        return None;
+    }
+    Vec<u8> body = Vec::new();
+    if (Err(_) = TcpStream::read_exact(c, &mut body, len - 4))
+    {
+        return None;
+    }
+    Some(body)
+}
+
+fn take_until(slice<u8, shared> s, usize from, u8 stop) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    for (usize i = from; i < slice_len(s) && s[i] != stop; i += 1)
+    {
+        Vec::push(&mut out, s[i]);
+    }
+    out
+}
+
+// One connection of the fake server: phase `bad` (0 to 4) is mutated,
+// 5 means a correct conversation.
+fn fake_pg_one(ref<TcpStream, exclusive> c, ref<Rng, exclusive> g, usize bad)
+{
+    Vec<u8> startup = match (pg_read_msg(c, false)) { Some(m) : m, None : return };
+    if (Vec::len(&startup) == 4 && startup[0] == 4 && startup[1] == 0xd2 && startup[2] == 0x16 && startup[3] == 0x2f)
+    {
+        // SSLRequest: no TLS here
+        Vec<u8> no = Vec::new();
+        Vec::push(&mut no, 78);
+        _ = TcpStream::write(c, &no[0..$]);
+        startup = match (pg_read_msg(c, false)) { Some(m) : m, None : return };
+    }
+    // phase 0: the SASL request
+    Vec<u8> p0 = Vec::new();
+    be32(&mut p0, 10);
+    cstr(&mut p0, "SCRAM-SHA-256");
+    Vec::push(&mut p0, 0);
+    Vec<u8> m0 = pg_msg(82, &p0[0..$]);
+    if (bad == 0) { mutate(g, &mut m0); }
+    if (Err(_) = TcpStream::write(c, &m0[0..$])) { return; }
+    // the client's first message
+    Vec<u8> ci = match (pg_read_msg(c, true)) { Some(m) : m, None : return };
+    // "SCRAM-SHA-256\0" + be32 n + "n,,n=user,r=nonce"
+    usize at = 0;
+    while (at < Vec::len(&ci) && ci[at] != 0) { at += 1; }
+    at += 5;
+    if (at > Vec::len(&ci)) { return; }
+    Vec<u8> client_first = Vec::from_slice(&ci[at..$]);
+    // client-first-bare: after "n,,"
+    if (Vec::len(&client_first) < 3) { return; }
+    Vec<u8> cfb = Vec::from_slice(&client_first[3..$]);
+    Option<usize> rpos = find_bytes(&cfb[0..$], "r=");
+    usize rp = match (rpos) { Some(p) : p + 2, None : return };
+    Vec<u8> nonce = take_until(&cfb[0..$], rp, 44);
+    // phase 1: server-first
+    Vec<u8> salt = bytes_of("0123456789abcdef");
+    Vec<u8> sf = bytes_of("r=");
+    Vec::extend_from(&mut sf, &nonce[0..$]);
+    Vec::append(&mut sf, bytes_of("srvNONCE42"));
+    Vec::append(&mut sf, bytes_of(",s="));
+    Vec::append(&mut sf, bytes_of_string(&base64_encode(&salt[0..$])));
+    Vec::append(&mut sf, bytes_of(",i=4096"));
+    Vec<u8> p1 = Vec::new();
+    be32(&mut p1, 11);
+    Vec::extend_from(&mut p1, &sf[0..$]);
+    Vec<u8> m1 = pg_msg(82, &p1[0..$]);
+    if (bad == 1) { mutate(g, &mut m1); }
+    if (Err(_) = TcpStream::write(c, &m1[0..$])) { return; }
+    // the client's final message: "c=biws,r=...,p=proof"
+    Vec<u8> cf = match (pg_read_msg(c, true)) { Some(m) : m, None : return };
+    usize pp = match (find_bytes(&cf[0..$], ",p=")) { Some(p) : p, None : Vec::len(&cf) };
+    Vec<u8> cfwp = Vec::from_slice(&cf[0..pp]);
+    // the server signature
+    Vec<u8> auth = Vec::clone(&cfb);
+    Vec::push(&mut auth, 44);
+    Vec::extend_from(&mut auth, &sf[0..$]);
+    Vec::push(&mut auth, 44);
+    Vec::extend_from(&mut auth, &cfwp[0..$]);
+    Vec<u8> salted = pbkdf2(Sha2_256, StringView::as_bytes("pw"), &salt[0..$], 4096, 32);
+    array<u8, 32> server_key = hmac_sha256(&salted[0..$], StringView::as_bytes("Server Key"));
+    array<u8, 32> sig = hmac_sha256(&server_key[0..$], &auth[0..$]);
+    // phase 2: server-final, AuthenticationOk, parameters, ready
+    Vec<u8> p2 = Vec::new();
+    be32(&mut p2, 12);
+    Vec::append(&mut p2, bytes_of("v="));
+    Vec::append(&mut p2, bytes_of_string(&base64_encode(&sig[0..$])));
+    Vec<u8> m2 = pg_msg(82, &p2[0..$]);
+    Vec<u8> ok = Vec::new();
+    be32(&mut ok, 0);
+    Vec::append(&mut m2, pg_msg(82, &ok[0..$]));
+    Vec<u8> ps = Vec::new();
+    cstr(&mut ps, "server_version");
+    cstr(&mut ps, "16.0");
+    Vec::append(&mut m2, pg_msg(83, &ps[0..$]));
+    Vec<u8> kd = Vec::new();
+    be32(&mut kd, 4242);
+    be32(&mut kd, 99);
+    Vec::append(&mut m2, pg_msg(75, &kd[0..$]));
+    Vec<u8> rq = Vec::new();
+    Vec::push(&mut rq, 73);
+    Vec::append(&mut m2, pg_msg(90, &rq[0..$]));
+    if (bad == 2) { mutate(g, &mut m2); }
+    if (Err(_) = TcpStream::write(c, &m2[0..$])) { return; }
+    // the query
+    Vec<u8> q = match (pg_read_msg(c, true)) { Some(m) : m, None : return };
+    _ = q;
+    // phase 3: row description, a row, completion, ready
+    Vec<u8> rd = Vec::new();
+    be16(&mut rd, 2);
+    cstr(&mut rd, "x");
+    be32(&mut rd, 0);
+    be16(&mut rd, 0);
+    be32(&mut rd, 23);
+    be16(&mut rd, 4);
+    be32(&mut rd, 4294967295);
+    be16(&mut rd, 0);
+    cstr(&mut rd, "name");
+    be32(&mut rd, 0);
+    be16(&mut rd, 0);
+    be32(&mut rd, 25);
+    be16(&mut rd, 65535);
+    be32(&mut rd, 4294967295);
+    be16(&mut rd, 0);
+    Vec<u8> m3 = pg_msg(84, &rd[0..$]);
+    Vec<u8> row = Vec::new();
+    be16(&mut row, 2);
+    be32(&mut row, 1);
+    Vec::push(&mut row, 49);
+    be32(&mut row, 4294967295);
+    Vec::append(&mut m3, pg_msg(68, &row[0..$]));
+    Vec<u8> done = Vec::new();
+    cstr(&mut done, "SELECT 1");
+    Vec::append(&mut m3, pg_msg(67, &done[0..$]));
+    Vec::append(&mut m3, pg_msg(90, &rq[0..$]));
+    if (bad == 3) { mutate(g, &mut m3); }
+    if (bad == 4)
+    {
+        // an error response with a bad length, or a notice storm
+        Vec<u8> e = Vec::new();
+        Vec::push(&mut e, 83);
+        cstr(&mut e, "ERROR");
+        Vec::push(&mut e, 67);
+        cstr(&mut e, "42P01");
+        Vec::push(&mut e, 77);
+        cstr(&mut e, "no such table");
+        Vec::push(&mut e, 0);
+        Vec<u8> em = pg_msg(69, &e[0..$]);
+        mutate(g, &mut em);
+        Vec::append(&mut em, pg_msg(90, &rq[0..$]));
+        m3 = em;
+    }
+    _ = TcpStream::write(c, &m3[0..$]);
+    // the client's Terminate, or its close
+    _ = pg_read_msg(c, true);
+}
+
+fn fake_pg(TcpListener l, u64 seed, usize count) : usize
+{
+    Rng g = Rng::new(seed);
+    usize served = 0;
+    while (served < count)
+    {
+        TcpStream c = match (TcpListener::accept(&mut l))
+        {
+            Ok(c) : c,
+            Err(_) : return served,
+        };
+        TcpStream::set_read_timeout_ms(&mut c, 600);
+        TcpStream::set_write_timeout_ms(&mut c, 600);
+        usize bad = if (below(&mut g, 10) == 0) { 5 } else { below(&mut g, 5) };
+        fake_pg_one(&mut c, &mut g, bad);
+        served += 1;
+    }
+    served
+}
+
+fn pg_once(String url) : u8
+{
+    TrustStore roots = TrustStore::new();
+    PgConnection c = match (PgConnection::connect_with(String::as_view(&url), &roots, 600))
+    {
+        Ok(c) : c,
+        Err(_) : return 1,
+    };
+    Vec<PgValue> none = Vec::new();
+    u8 r = match (PgConnection::query(&mut c, "select 1 as x, 'n' as name", &none[0..$]))
+    {
+        Ok(_) : 0,
+        Err(_) : 1,
+    };
+    PgConnection::close(&mut c);
+    r
+}
+
+fn round_pg(usize count, u64 seed) : Tally
+{
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr addr = TcpListener::local_addr(&l);
+    auto server = spawn(fake_pg, l, seed, count);
+    String url = String::from_str("postgres://u:pw@");
+    String::append(&mut url, &SocketAddr::text(&addr));
+    String::append(&mut url, "/db?sslmode=disable");
+    Tally t = tally_new();
+    Vec<u8> no_input = Vec::new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        auto h = spawn(pg_once, String::clone(&url));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(_) : t.err += 1,
+            Err(f) : note_fault(&mut t, &f, &no_input[0..$], "pg", i),
+        }
+    }
+    match (try_join(server))
+    {
+        Ok(n) : printf("pg: the fake server served %v connections\n", n),
+        Err(f) : { printf("FAULT pg (fake server): %v\n", &ThreadFailure::diagnostic(&f)); t.fault += 1; },
+    }
+    t
+}
+
+// ---- TLS: the client's record and handshake parsers, through a
+// mutating proxy in front of our own server ----
+
+fn tls_server(TcpListener l, PrivateKey key, Vec<Certificate> chain) : usize
+{
+    usize served = 0;
+    while (true)
+    {
+        TcpStream tcp = match (TcpListener::accept(&mut l))
+        {
+            Ok(c) : c,
+            Err(_) : return served,
+        };
+        TcpStream::set_read_timeout_ms(&mut tcp, 1000);
+        TcpStream::set_write_timeout_ms(&mut tcp, 1000);
+        TlsStream s = match (TlsStream::server(tcp, &key, &chain[0..$]))
+        {
+            Ok(s) : s,
+            Err(_) : { served += 1; continue; },
+        };
+        match (TlsStream::read_line(&mut s))
+        {
+            Ok(Some(line)) :
+            {
+                if (line == "quit")
+                {
+                    return served;
+                }
+                _ = TlsStream::write_text(&mut s, "echo ");
+                _ = TlsStream::write_text(&mut s, String::as_view(&line));
+                _ = TlsStream::write_text(&mut s, "\n");
+            },
+            _ : {},
+        }
+        _ = TlsStream::close(&mut s);
+        served += 1;
+    }
+    served
+}
+
+// Copies bytes one way until the source closes or stalls.
+fn pump(TcpStream from, TcpStream to)
+{
+    Vec<u8> buf = Vec::new();
+    while (true)
+    {
+        Vec::clear(&mut buf);
+        match (TcpStream::read(&mut from, &mut buf, 65536))
+        {
+            Ok(0) : break,
+            Ok(_) : {},
+            Err(_) : break,
+        }
+        if (Err(_) = TcpStream::write(&mut to, &buf[0..$]))
+        {
+            break;
+        }
+    }
+    _ = TcpStream::shutdown_write(&mut to);
+}
+
+// The server's bytes to the client, the first chunk mutated.
+fn pump_mutating(TcpStream from, TcpStream to, u64 seed)
+{
+    Rng g = Rng::new(seed);
+    Vec<u8> buf = Vec::new();
+    bool first = true;
+    while (true)
+    {
+        Vec::clear(&mut buf);
+        match (TcpStream::read(&mut from, &mut buf, 65536))
+        {
+            Ok(0) : break,
+            Ok(_) : {},
+            Err(_) : break,
+        }
+        if (first)
+        {
+            first = false;
+            match (below(&mut g, 4))
+            {
+                0 :
+                {
+                    // the ServerHello region: one bit
+                    usize at = below(&mut g, min(Vec::len(&buf), 160));
+                    buf[at] = buf[at] ^ narrow<u8>(1 << narrow<u32>(below(&mut g, 8)));
+                },
+                1 :
+                {
+                    // a record length: zero, the limit, past it, or huge
+                    if (Vec::len(&buf) >= 5)
+                    {
+                        match (below(&mut g, 4))
+                        {
+                            0 : { buf[3] = 0; buf[4] = 0; },
+                            1 : { buf[3] = 0x41; buf[4] = 0; },
+                            2 : { buf[3] = 0x41; buf[4] = 1; },
+                            _ : { buf[3] = 255; buf[4] = 255; },
+                        }
+                    }
+                },
+                2 : mutate(&mut g, &mut buf),
+                _ : {},
+            }
+        }
+        if (Err(_) = TcpStream::write(&mut to, &buf[0..$]))
+        {
+            break;
+        }
+    }
+    _ = TcpStream::shutdown_write(&mut to);
+}
+
+fn proxy_one(TcpStream client, SocketAddr upstream, u64 seed)
+{
+    TcpStream s = match (TcpStream::connect(upstream))
+    {
+        Ok(s) : s,
+        Err(_) : return,
+    };
+    TcpStream::set_read_timeout_ms(&mut s, 1000);
+    TcpStream c2 = match (TcpStream::try_clone(&client)) { Ok(c) : c, Err(_) : return };
+    TcpStream s2 = match (TcpStream::try_clone(&s)) { Ok(c) : c, Err(_) : return };
+    auto up = spawn(pump, client, s2);
+    pump_mutating(s, c2, seed);
+    _ = try_join(up);
+}
+
+fn proxy(TcpListener l, SocketAddr upstream, u64 seed, usize count) : usize
+{
+    usize served = 0;
+    while (served < count)
+    {
+        TcpStream c = match (TcpListener::accept(&mut l))
+        {
+            Ok(c) : c,
+            Err(_) : return served,
+        };
+        TcpStream::set_read_timeout_ms(&mut c, 1000);
+        auto h = spawn(proxy_one, c, upstream, seed + widen<u64>(served));
+        _ = try_join(h);
+        served += 1;
+    }
+    served
+}
+
+fn tls_once(SocketAddr addr, Vec<Certificate> chain) : u8
+{
+    TrustStore roots = TrustStore::new();
+    TrustStore::add(&mut roots, Certificate::clone(&chain[0]));
+    TcpStream tcp = match (TcpStream::connect(addr))
+    {
+        Ok(c) : c,
+        Err(_) : return 3,
+    };
+    TcpStream::set_read_timeout_ms(&mut tcp, 1000);
+    TcpStream::set_write_timeout_ms(&mut tcp, 1000);
+    TlsStream s = match (TlsStream::client(tcp, "localhost", &roots))
+    {
+        Ok(s) : s,
+        Err(_) : return 1,
+    };
+    _ = TlsStream::write_text(&mut s, "ping\n");
+    u8 r = match (TlsStream::read_line(&mut s))
+    {
+        Ok(Some(_)) : 0,
+        _ : 1,
+    };
+    _ = TlsStream::close(&mut s);
+    r
+}
+
+fn round_tls(usize count, u64 seed) : Tally
+{
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(KEY));
+    Vec<Certificate> chain = certificates_from_pem(CRT);
+    TcpListener sl = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr saddr = TcpListener::local_addr(&sl);
+    auto server = spawn(tls_server, sl, key, Vec::clone(&chain));
+    TcpListener pl = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr paddr = TcpListener::local_addr(&pl);
+    auto px = spawn(proxy, pl, saddr, seed, count);
+    Tally t = tally_new();
+    Vec<u8> no_input = Vec::new();
+    for (usize i = 0; i < count; i += 1)
+    {
+        auto h = spawn(tls_once, paddr, Vec::clone(&chain));
+        match (try_join(h))
+        {
+            Ok(0) : t.ok += 1,
+            Ok(1) : t.err += 1,
+            Ok(_) :
+            {
+                printf("tls: the proxy is gone at #%v\n", i);
+                t.fault += 1;
+                break;
+            },
+            Err(f) : note_fault(&mut t, &f, &no_input[0..$], "tls", i),
+        }
+    }
+    match (try_join(px))
+    {
+        Ok(n) : printf("tls: the proxy relayed %v connections\n", n),
+        Err(f) : { printf("FAULT tls (proxy): %v\n", &ThreadFailure::diagnostic(&f)); t.fault += 1; },
+    }
+    // stop the server with a direct, unmutated "quit"
+    TrustStore roots = TrustStore::new();
+    TrustStore::add(&mut roots, Certificate::clone(&chain[0]));
+    if (Ok(s) = TlsStream::connect(saddr, "localhost", &roots))
+    {
+        TlsStream q = s;
+        _ = TlsStream::write_text(&mut q, "quit\n");
+        _ = TlsStream::close(&mut q);
+    }
+    match (try_join(server))
+    {
+        Ok(n) : printf("tls: the server saw %v connections\n", n),
+        Err(f) : { printf("FAULT tls (server): %v\n", &ThreadFailure::diagnostic(&f)); t.fault += 1; },
+    }
+    t
+}
+
+fn main() : u8
+{
+    if (arg_count() < 2)
+    {
+        eprintf("usage: fuzz PARSER COUNT [SEED]\n");
+        return 2;
+    }
+    String parser = Result::unwrap(arg(0));
+    usize count = Result::unwrap(StringView::parse<usize>(String::as_view(&Result::unwrap(arg(1)))));
+    u64 seed = if (arg_count() > 2) { Result::unwrap(StringView::parse<u64>(String::as_view(&Result::unwrap(arg(2))))) } else { 20261011 };
+    Tally t;
+    if (parser == "inflate") { t = round_inflate(count, seed); }
+    else if (parser == "json") { t = round_json(count, seed); }
+    else if (parser == "der") { t = round_der(count, seed); }
+    else if (parser == "pem") { t = round_pem(count, seed); }
+    else if (parser == "text") { t = round_text(count, seed); }
+    else if (parser == "http-server") { t = round_http_server(count, seed); }
+    else if (parser == "http-client") { t = round_http_client(count, seed); }
+    else if (parser == "pg") { t = round_pg(count, seed); }
+    else if (parser == "tls") { t = round_tls(count, seed); }
+    else
+    {
+        eprintf("unknown parser\n");
+        return 2;
+    }
+    show("tally", &t);
+    if (t.fault > 0) { 1 } else { 0 }
+}

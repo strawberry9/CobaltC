@@ -1,0 +1,1237 @@
+// D-0282 (`rule.control.frame-references`, spec/14 §6): access summaries,
+// as impl/src/tier.rs computes them, function for function.
+//
+// Each function has an *access summary*: for each of its reference
+// parameters, the projections of the referent it may read and may write,
+// directly or through the functions it calls, computed over the whole
+// program to a fixed point. A projection is a field path from the
+// parameter's referent, cut at the first index; the empty path is the
+// whole referent. The summary over-approximates: a form the walk does not
+// follow counts as reading, and for an exclusive parameter writing, the
+// whole of what it reaches.
+//
+// The types (`ParamAccess`, `Summaries`, `PointCheck`) are items.cb's, as
+// the code generator reads them there.
+
+import std;
+import ast;
+import items;
+
+// The order of Rust's `BTreeSet<Vec<String>>`: lexicographic, a prefix
+// first.
+fn proj_less(ref<Vec<String>, shared> a, ref<Vec<String>, shared> b) : bool
+{
+    for (usize i = 0; i < Vec::len(a) && i < Vec::len(b); i += 1)
+    {
+        if (String::less(&a[i], &b[i]))
+        {
+            return true;
+        }
+        if (String::less(&b[i], &a[i]))
+        {
+            return false;
+        }
+    }
+    Vec::len(a) < Vec::len(b)
+}
+
+// Whether `p` starts with `q`.
+export fn proj_starts_with(ref<Vec<String>, shared> p, ref<Vec<String>, shared> q) : bool
+{
+    if (Vec::len(q) > Vec::len(p))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(q); i += 1)
+    {
+        if (!String::eq(&p[i], &q[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// `ParamAccess::add`: a path below one already present adds nothing; one
+// added removes those below it. The set stays in `BTreeSet` order.
+fn access_add(ref<Vec<Vec<String>>, exclusive> set, Vec<String> p) : bool
+{
+    for (usize i = 0; i < Vec::len(set); i += 1)
+    {
+        if (proj_starts_with(&p, &set[i]))
+        {
+            return false;
+        }
+    }
+    Vec<Vec<String>> kept = Vec::new();
+    bool placed = false;
+    while (true)
+    {
+        Vec<String> q = match (Vec::pop(set))
+        {
+            Some(q) : q,
+            None    : break,
+        };
+        if (!proj_starts_with(&q, &p))
+        {
+            Vec::push(&mut kept, q);
+        }
+    }
+    // `kept` holds the survivors last to first.
+    Vec::reverse(&mut kept);
+    for (usize i = 0; i < Vec::len(&kept); i += 1)
+    {
+        if (!placed && proj_less(&p, &kept[i]))
+        {
+            Vec::push(set, clone(&p));
+            placed = true;
+        }
+        Vec::push(set, clone(&kept[i]));
+    }
+    if (!placed)
+    {
+        Vec::push(set, p);
+    }
+    true
+}
+
+export fn access_read(ref<ParamAccess, exclusive> a, Vec<String> p) : bool
+{
+    access_add(&mut a.reads, p)
+}
+
+export fn access_write(ref<ParamAccess, exclusive> a, Vec<String> p) : bool
+{
+    access_add(&mut a.writes, p)
+}
+
+fn empty_access() : ParamAccess
+{
+    ParamAccess { .reads = Vec::new(), .writes = Vec::new() }
+}
+
+// `Summaries::param`: the summary of `key`'s parameter `i`, or `None`
+// when the function has none (no body: the caller assumes the parameter's
+// mode reaches all).
+export fn summary_param(ref<Summaries, shared> s, ref<String, shared> key, usize i) : Option<ref<ParamAccess, shared>>
+{
+    ref<Vec<ParamAccess>, shared> v = HashMap::get(&s.by_fn, key)?;
+    if (i < Vec::len(v)) { Some(&v[i]) } else { None }
+}
+
+// `summary_param`, noting that the walk depends on `key`'s summary.
+fn summary_param_dep(
+    ref<Walk, exclusive> w,
+    ref<Summaries, shared> s,
+    ref<String, shared> key,
+    usize i,
+) : Option<ref<ParamAccess, shared>>
+{
+    if (!HashSet::contains(&w.deps, key))
+    {
+        HashSet::insert(&mut w.deps, String::clone(key));
+    }
+    summary_param(s, key, i)
+}
+
+fn is_ref_param(ref<Type, shared> t) : Option<Mode>
+{
+    match (t)
+    {
+        Type::TRef(b)   : Some(Box::get(b).mode),
+        Type::TSlice(b) : Some(Box::get(b).mode),
+        Type::TNamed(b) :
+        {
+            ref<NamedTy, shared> n = Box::get(b);
+            if (String::eq_str(
+                &n.name,
+                "std::StringView",
+            ) && Vec::len(&n.args) == 0) { Some(Mode::Shared) } else { None }
+        },
+        _               : None,
+    }
+}
+
+fn is_std_option(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(b) : String::eq_str(&Box::get(b).name, "std::Option"),
+        _               : false,
+    }
+}
+
+// The summary of a function the walk does not follow (`std`'s, whose
+// types' fields are its own; one with trusted code): each reference
+// parameter whole, in its declared mode.
+fn opaque_summary(ref<FnDecl, shared> f) : Vec<ParamAccess>
+{
+    Vec<ParamAccess> out = Vec::new();
+    for (usize i = 0; i < Vec::len(&f.params); i += 1)
+    {
+        ParamAccess b = empty_access();
+        match (is_ref_param(&f.params[i].ty))
+        {
+            Some(Mode::Exclusive) :
+            {
+                access_read(&mut b, Vec::new());
+                access_write(&mut b, Vec::new());
+            },
+            Some(Mode::Shared)    :
+            {
+                access_read(&mut b, Vec::new());
+            },
+            None                  : {},
+        }
+        Vec::push(&mut out, b);
+    }
+    out
+}
+
+// The program's summaries (`tier::compute`). A `std` function's summary
+// does not depend on its body (`opaque`), so its body need not be parsed
+// for it (CHG-0355: `std` bodies are parsed on reach).
+export fn compute(ref<Items, shared> it) : Summaries
+{
+    Vec<String> keys = Vec::new();
+    for (usize i = 0; i < HashMap::len(&it.fns); i += 1)
+    {
+        Vec::push(&mut keys, String::clone(HashMap::key_at(&it.fns, i)));
+    }
+    Vec::sort(&mut keys);
+    Summaries s = Summaries { .by_fn = HashMap::new() };
+    Vec<String> walked = Vec::new();
+    for (usize k = 0; k < Vec::len(&keys); k += 1)
+    {
+        ref<FnDecl, shared> f = Option::expect(HashMap::get(&it.fns, &keys[k]), "a function");
+        // A `std` type's fields are its own: a `std` function's access to a
+        // parameter is to the whole of it. So is one with trusted code
+        // (`unsafe`), which reaches storage through raw pointers the walk
+        // does not follow. Both take their parameters' declared modes.
+        if (String::starts_with(&keys[k], "std::") || has_unsafe(&f.body))
+        {
+            HashMap::insert(&mut s.by_fn, String::clone(&keys[k]), opaque_summary(f));
+        }
+        else
+        {
+            Vec<ParamAccess> empty = Vec::new();
+            for (usize i = 0; i < Vec::len(&f.params); i += 1)
+            {
+                Vec::push(&mut empty, empty_access());
+            }
+            HashMap::insert(&mut s.by_fn, String::clone(&keys[k]), empty);
+            Vec::push(&mut walked, String::clone(&keys[k]));
+        }
+    }
+    HashMap<usize, String> callee_keys = HashMap::new();
+    // Monotone: each walk can only add projections, and the sets are
+    // bounded by the program's field paths, so this ends. coby walks every
+    // function again until a round changes nothing; a function's walk
+    // depends only on the summaries of the functions it calls (its
+    // `deps`), so here a round walks again only the callers of those whose
+    // summary changed: the same least fixed point.
+    HashMap<String, Vec<usize>> callers = HashMap::new();
+    Vec<usize> todo = Vec::new();
+    for (usize k = 0; k < Vec::len(&walked); k += 1)
+    {
+        Vec::push(&mut todo, k);
+    }
+    bool first = true;
+    while (Vec::len(&todo) > 0)
+    {
+        HashSet<String> changed_keys = HashSet::new();
+        for (usize t = 0; t < Vec::len(&todo); t += 1)
+        {
+            usize k = todo[t];
+            ref<FnDecl, shared> f = Option::expect(HashMap::get(&it.fns, &walked[k]), "a function");
+            Walk w = Walk {
+                .env = HashMap::new(),
+                .out = Vec::new(),
+                .shared_ = HashSet::new(),
+                .keys = replace(&mut callee_keys, HashMap::new()),
+                .deps = HashSet::new(),
+            };
+            for (usize i = 0; i < Vec::len(&f.params); i += 1)
+            {
+                Vec::push(&mut w.out, empty_access());
+                match (is_ref_param(&f.params[i].ty))
+                {
+                    Some(m) :
+                    {
+                        if (m == Mode::Shared)
+                        {
+                            HashSet::insert(&mut w.shared_, String::clone(&f.params[i].name));
+                        }
+                        Vec<Root> roots = Vec::new();
+                        Vec::push(&mut roots, Root { .i = i, .p = Vec::new(), .cut = false });
+                        HashMap::insert(&mut w.env, String::clone(&f.params[i].name), roots);
+                    },
+                    None    : {},
+                }
+            }
+            w_block(&mut w, it, &s, &f.body);
+            Vec<ParamAccess> out = replace(&mut w.out, Vec::new());
+            callee_keys = replace(&mut w.keys, HashMap::new());
+            if (first)
+            {
+                for (usize d = 0; d < HashSet::len(&w.deps); d += 1)
+                {
+                    Vec::push(HashMap::entry(&mut callers, String::clone(HashSet::key_at(&w.deps, d)), Vec::new()), k);
+                }
+            }
+            bool changed = false;
+            ref<Vec<ParamAccess>, exclusive> cur = Option::expect(
+                HashMap::get_mut(&mut s.by_fn, &walked[k]),
+                "a summary",
+            );
+            for (usize i = 0; i < Vec::len(&out) && i < Vec::len(cur); i += 1)
+            {
+                ParamAccess { reads, writes } = clone(&out[i]);
+                while (true)
+                {
+                    match (Vec::pop(&mut reads))
+                    {
+                        Some(r) :
+                        {
+                            if (access_read(&mut cur[i], r))
+                            {
+                                changed = true;
+                            }
+                        },
+                        None    : break,
+                    }
+                }
+                while (true)
+                {
+                    match (Vec::pop(&mut writes))
+                    {
+                        Some(x) :
+                        {
+                            if (access_write(&mut cur[i], x))
+                            {
+                                changed = true;
+                            }
+                        },
+                        None    : break,
+                    }
+                }
+            }
+            if (changed)
+            {
+                HashSet::insert(&mut changed_keys, String::clone(&walked[k]));
+            }
+        }
+        first = false;
+        // The next round: every caller of a changed summary, in key order.
+        Vec<bool> again = Vec::filled(Vec::len(&walked), false);
+        for (usize c = 0; c < HashSet::len(&changed_keys); c += 1)
+        {
+            match (HashMap::get(&callers, HashSet::key_at(&changed_keys, c)))
+            {
+                Some(v) :
+                {
+                    for (usize i = 0; i < Vec::len(v); i += 1)
+                    {
+                        again[v[i]] = true;
+                    }
+                },
+                None    : {},
+            }
+        }
+        Vec::clear(&mut todo);
+        for (usize k = 0; k < Vec::len(&walked); k += 1)
+        {
+            if (again[k])
+            {
+                Vec::push(&mut todo, k);
+            }
+        }
+    }
+    s
+}
+
+// A root: (parameter index, projection, cut). `cut` once the path crossed
+// an index: further fields add nothing.
+struct Root
+{
+    usize i;
+    Vec<String> p;
+    bool cut;
+}
+
+struct Walk
+{
+    // Local reference bindings rooted in a parameter's referent.
+    HashMap<String, Vec<Root>> env;
+    Vec<ParamAccess> out;
+    // Local reference bindings known to be shared: what is passed through
+    // one is only read.
+    HashSet<String> shared_;
+    // A callee path's key by the callee's id, joined once (kept across
+    // the rounds).
+    HashMap<usize, String> keys;
+    // The functions whose summaries this walk consulted.
+    HashSet<String> deps;
+}
+
+fn extend(Vec<Root> roots, Option<StringView> field) : Vec<Root>
+{
+    Vec<Root> out = Vec::new();
+    while (true)
+    {
+        Root { i, p, cut } = match (Vec::pop(&mut roots))
+        {
+            Some(r) : r,
+            None    : break,
+        };
+        match (field)
+        {
+            Some(f) :
+            {
+                if (!cut)
+                {
+                    Vec::push(&mut p, String::from_view(f));
+                    Vec::push(&mut out, Root { .i = i, .p = p, .cut = false });
+                }
+                else
+                {
+                    Vec::push(&mut out, Root { .i = i, .p = p, .cut = true });
+                }
+            },
+            None    : Vec::push(&mut out, Root { .i = i, .p = p, .cut = true }),
+        }
+    }
+    Vec::reverse(&mut out);
+    out
+}
+
+fn env_get(ref<Walk, shared> w, ref<String, shared> name) : Vec<Root>
+{
+    match (HashMap::get(&w.env, name))
+    {
+        Some(v) : clone(v),
+        None    : Vec::new(),
+    }
+}
+
+fn w_read(ref<Walk, exclusive> w, ref<Vec<Root>, shared> roots)
+{
+    for (usize k = 0; k < Vec::len(roots); k += 1)
+    {
+        usize i = roots[k].i;
+        if (i < Vec::len(&w.out))
+        {
+            access_read(&mut w.out[i], clone(&roots[k].p));
+        }
+    }
+}
+
+fn w_write(ref<Walk, exclusive> w, ref<Vec<Root>, shared> roots)
+{
+    for (usize k = 0; k < Vec::len(roots); k += 1)
+    {
+        usize i = roots[k].i;
+        if (i < Vec::len(&w.out))
+        {
+            access_write(&mut w.out[i], clone(&roots[k].p));
+        }
+    }
+}
+
+fn single_seg(ref<Expr, shared> e) : Option<ref<String, shared>>
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            ref<Vec<String>, shared> segs = &Box::get(p).segs;
+            if (Vec::len(segs) == 1) { Some(&segs[0]) } else { None }
+        },
+        _                  : None,
+    }
+}
+
+// The parameter-rooted places a place expression denotes.
+fn w_place(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Expr, shared> e) : Vec<Root>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)   : w_place(w, it, Box::get(x)),
+        // A reference binding used as a place (auto-deref in `r.f`, `*r`):
+        // its referent.
+        ExprKind::EPath(_) : match (single_seg(e))
+        {
+            Some(n) : env_get(w, n),
+            None    : Vec::new(),
+        },
+        ExprKind::EDeref(x)   : w_reference(w, it, Box::get(x)),
+        ExprKind::EField(fb)  : extend(w_place(w, it, &Box::get(fb).e), Some(String::as_view(&Box::get(fb).name))),
+        ExprKind::EIndex(ib)  : extend(w_place(w, it, &Box::get(ib).a), None),
+        ExprKind::ESliceOf(s) : extend(w_place(w, it, &Box::get(s).base), None),
+        ExprKind::ECall(_)    : extend(w_reference(w, it, e), None),
+        _                     : Vec::new(),
+    }
+}
+
+// The parameter-rooted places a reference-valued expression reaches.
+fn w_reference(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Expr, shared> e) : Vec<Root>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)   : w_reference(w, it, Box::get(x)),
+        ExprKind::EPath(_) : match (single_seg(e))
+        {
+            Some(n) : env_get(w, n),
+            None    : Vec::new(),
+        },
+        ExprKind::EBorrow(b)  : w_place(w, it, &Box::get(b).e),
+        ExprKind::ESliceOf(s) : extend(w_place(w, it, &Box::get(s).base), None),
+        // A call returning a reference with one reference parameter
+        // (D-0011) reaches inside what that argument reaches.
+        ExprKind::ECall(cb)   :
+        {
+            ref<CallExpr, shared> c = Box::get(cb);
+            String key = callee_key(w, &c.callee);
+            ref<FnDecl, shared> f = match (HashMap::get(&it.fns, &key))
+            {
+                Some(f) : f,
+                None    : return Vec::new(),
+            };
+            if (Option::is_none(&is_ref_param(&f.ret)) && !is_std_option(&f.ret))
+            {
+                return Vec::new();
+            }
+            Vec<Root> out = Vec::new();
+            for (usize i = 0; i < Vec::len(&f.params) && i < Vec::len(&c.args); i += 1)
+            {
+                if (Option::is_some(&is_ref_param(&f.params[i].ty)))
+                {
+                    Vec::append(&mut out, extend(w_reference(w, it, &c.args[i]), None));
+                }
+            }
+            out
+        },
+        ExprKind::EIf(ib)     :
+        {
+            ref<IfExpr, shared> x = Box::get(ib);
+            Vec<Root> out = match (&x.then_.tail)
+            {
+                Some(t) : w_reference(w, it, Box::get(t)),
+                None    : Vec::new(),
+            };
+            match (&x.else_)
+            {
+                Some(e2) : Vec::append(&mut out, w_reference(w, it, e2)),
+                None     : {},
+            }
+            out
+        },
+        ExprKind::EBlock(blk) : match (&blk.tail)
+        {
+            Some(t) : w_reference(w, it, Box::get(t)),
+            None    : Vec::new(),
+        },
+        ExprKind::EMatch(mb)  :
+        {
+            ref<MatchExpr, shared> m = Box::get(mb);
+            Vec<Root> out = Vec::new();
+            for (usize i = 0; i < Vec::len(&m.arms); i += 1)
+            {
+                Vec::append(&mut out, w_reference(w, it, Box::get(&m.arms[i].body)));
+            }
+            out
+        },
+        _                     : Vec::new(),
+    }
+}
+
+// A callee's path joined (`segs.join("::")`), or empty for one that is no
+// path.
+fn callee_key(ref<Walk, exclusive> w, ref<Expr, shared> c) : String
+{
+    if (c.id != 0)
+    {
+        match (HashMap::get(&w.keys, &c.id))
+        {
+            Some(k) : return String::clone(k),
+            None    : {},
+        }
+    }
+    String k = match (&c.kind)
+    {
+        ExprKind::EPath(p) : String::join(&Box::get(p).segs[0..$], "::"),
+        _                  : String::new(),
+    };
+    if (c.id != 0)
+    {
+        HashMap::insert(&mut w.keys, c.id, String::clone(&k));
+    }
+    k
+}
+
+fn w_block(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Summaries, shared> s, ref<Block, shared> b)
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        w_stmt(w, it, s, &b.stmts[i]);
+    }
+    match (&b.tail)
+    {
+        Some(t) : w_expr(w, it, s, Box::get(t)),
+        None    : {},
+    }
+}
+
+fn is_shared_borrow(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(b)  : Box::get(b).mode == Mode::Shared,
+        ExprKind::ESliceOf(x) : Box::get(x).mode == Mode::Shared,
+        _                     : false,
+    }
+}
+
+fn is_excl_borrow(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(b)  : Box::get(b).mode == Mode::Exclusive,
+        ExprKind::ESliceOf(x) : Box::get(x).mode == Mode::Exclusive,
+        _                     : false,
+    }
+}
+
+fn w_stmt(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Summaries, shared> s, ref<Stmt, shared> st)
+{
+    match (st)
+    {
+        Stmt::SLet(lb)         :
+        {
+            ref<LetStmt, shared> l = Box::get(lb);
+            match (&l.init)
+            {
+                Some(e) :
+                {
+                    w_expr(w, it, s, e);
+                    Vec<Root> r = w_reference(w, it, e);
+                    bool is_ref = match (&l.ty)
+                    {
+                        Some(t) : Option::is_some(&is_ref_param(t)) || is_std_option(t),
+                        None    : true,
+                    };
+                    if (Vec::len(&r) > 0 && is_ref)
+                    {
+                        HashMap::insert(&mut w.env, String::clone(&l.name), r);
+                    }
+                    else
+                    {
+                        HashMap::remove(&mut w.env, &l.name);
+                    }
+                    bool shared_ty = match (&l.ty)
+                    {
+                        Some(t) : match (is_ref_param(t))
+                        {
+                            Some(m) : m == Mode::Shared,
+                            None    : false,
+                        },
+                        None : false,
+                    };
+                    bool shared_init = is_shared_borrow(e);
+                    if (shared_ty || (Option::is_none(&l.ty) && shared_init))
+                    {
+                        HashSet::insert(&mut w.shared_, String::clone(&l.name));
+                    }
+                    else
+                    {
+                        HashSet::remove(&mut w.shared_, &l.name);
+                    }
+                },
+                None    :
+                {
+                    HashMap::remove(&mut w.env, &l.name);
+                },
+            }
+        },
+        Stmt::SDestructure(db) :
+        {
+            ref<DestructureStmt, shared> d = Box::get(db);
+            w_expr(w, it, s, &d.init);
+            for (usize i = 0; i < Vec::len(&d.names); i += 1)
+            {
+                HashMap::remove(&mut w.env, &d.names[i]);
+            }
+        },
+        Stmt::SExpr(e)         : w_expr(w, it, s, Box::get(e)),
+        Stmt::SBlockLike(e)    : w_expr(w, it, s, Box::get(e)),
+    }
+}
+
+fn w_expr(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Summaries, shared> s, ref<Expr, shared> e)
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)        : w_expr(w, it, s, Box::get(x)),
+        ExprKind::EUnary(u)        : w_expr(w, it, s, &Box::get(u).e),
+        ExprKind::EPropagate(x)    : w_expr(w, it, s, Box::get(x)),
+        ExprKind::EBinary(bb)      :
+        {
+            w_expr(w, it, s, &Box::get(bb).a);
+            w_expr(w, it, s, &Box::get(bb).b);
+        },
+        ExprKind::EAssign(pb)      :
+        {
+            ref<PairExpr, shared> p = Box::get(pb);
+            w_expr(w, it, s, &p.b);
+            w_subexprs_of_place(w, it, s, &p.a);
+            Vec<Root> wr = w_place(w, it, &p.a);
+            w_write(w, &wr);
+            // `r = e` for a reference binding `r` rebinds it.
+            match (single_seg(&p.a))
+            {
+                Some(n) :
+                {
+                    if (HashMap::contains(&w.env, n))
+                    {
+                        Vec<Root> nr = w_reference(w, it, &p.b);
+                        ref<Vec<Root>, exclusive> entry = HashMap::entry(&mut w.env, String::clone(n), Vec::new());
+                        for (usize i = 0; i < Vec::len(&nr); i += 1)
+                        {
+                            bool present = false;
+                            for (usize k = 0; k < Vec::len(entry) && !present; k += 1)
+                            {
+                                present = root_eq(&entry[k], &nr[i]);
+                            }
+                            if (!present)
+                            {
+                                Vec::push(entry, clone(&nr[i]));
+                            }
+                        }
+                    }
+                },
+                None    : {},
+            }
+        },
+        ExprKind::EBorrow(bb)      :
+        {
+            ref<BorrowExpr, shared> b = Box::get(bb);
+            w_subexprs_of_place(w, it, s, &b.e);
+            Vec<Root> p = w_place(w, it, &b.e);
+            if (b.mode == Mode::Exclusive) { w_write(w, &p); } else { w_read(w, &p); }
+        },
+        ExprKind::ESliceOf(sb)     :
+        {
+            ref<SliceExpr, shared> x = Box::get(sb);
+            w_expr(w, it, s, &x.lo);
+            w_expr(w, it, s, &x.hi);
+            w_subexprs_of_place(w, it, s, &x.base);
+            Vec<Root> p = extend(w_place(w, it, &x.base), None);
+            if (x.mode == Mode::Exclusive) { w_write(w, &p); } else { w_read(w, &p); }
+        },
+        ExprKind::EField(_)        :
+        {
+            w_subexprs_of_place(w, it, s, e);
+            Vec<Root> p = w_place(w, it, e);
+            w_read(w, &p);
+        },
+        ExprKind::EIndex(_)        :
+        {
+            w_subexprs_of_place(w, it, s, e);
+            Vec<Root> p = w_place(w, it, e);
+            w_read(w, &p);
+        },
+        ExprKind::EDeref(_)        :
+        {
+            w_subexprs_of_place(w, it, s, e);
+            Vec<Root> p = w_place(w, it, e);
+            w_read(w, &p);
+        },
+        ExprKind::EPath(_) : match (single_seg(e))
+        {
+            // A reference binding read whole (passed on, copied): what it
+            // reaches is read; a call's own rule refines that.
+            Some(n) :
+            {
+                Vec<Root> p = env_get(w, n);
+                w_read(w, &p);
+            },
+            None    : {},
+        },
+        ExprKind::ECall(cb)        : w_call(w, it, s, &Box::get(cb).callee, &Box::get(cb).args),
+        ExprKind::EStructLit(sl)   :
+        {
+            ref<Vec<FieldInit>, shared> fs = &Box::get(sl).fields;
+            for (usize i = 0; i < Vec::len(fs); i += 1)
+            {
+                w_expr(w, it, s, &fs[i].value);
+            }
+        },
+        ExprKind::EArrayLit(xs)    :
+        {
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                w_expr(w, it, s, &xs[i]);
+            }
+        },
+        ExprKind::EArrayRepeat(rb) : w_expr(w, it, s, &Box::get(rb).value),
+        ExprKind::EBlock(blk)      : w_block(w, it, s, blk),
+        ExprKind::EUnsafe(blk)     : w_block(w, it, s, blk),
+        ExprKind::EIf(ib)          :
+        {
+            ref<IfExpr, shared> x = Box::get(ib);
+            w_expr(w, it, s, &x.cond);
+            w_block(w, it, s, &x.then_);
+            match (&x.else_)
+            {
+                Some(e2) : w_expr(w, it, s, e2),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(wb)       :
+        {
+            ref<WhileExpr, shared> x = Box::get(wb);
+            // Twice, so a rebinding in the body reaches its start.
+            for (usize round = 0; round < 2; round += 1)
+            {
+                w_expr(w, it, s, &x.cond);
+                w_block(w, it, s, &x.body);
+                match (&x.step)
+                {
+                    Some(st) : w_expr(w, it, s, st),
+                    None     : {},
+                }
+            }
+        },
+        ExprKind::EMatch(mb)       :
+        {
+            ref<MatchExpr, shared> m = Box::get(mb);
+            w_expr(w, it, s, &m.scrut);
+            Vec<Root> r0 = w_reference(w, it, &m.scrut);
+            Vec<Root> r = if (Vec::len(&r0) == 0) { extend(w_place(w, it, &m.scrut), None) } else { extend(r0, None) };
+            ref<Expr, shared> sc = strip(&m.scrut);
+            bool excl_scrut = is_excl_borrow(sc) || match (single_seg(sc))
+            {
+                Some(n) : HashMap::contains(&w.env, n) && !HashSet::contains(&w.shared_, n),
+                None    : false,
+            };
+            for (usize i = 0; i < Vec::len(&m.arms); i += 1)
+            {
+                ref<Arm, shared> a = &m.arms[i];
+                Option<Vec<Root>> saved = None;
+                bool was_shared = false;
+                match (&a.binder)
+                {
+                    Some(bn) :
+                    {
+                        saved = match (HashMap::get(&w.env, bn))
+                        {
+                            Some(v) : Some(clone(v)),
+                            None    : None,
+                        };
+                        was_shared = HashSet::contains(&w.shared_, bn);
+                        if (Vec::len(&r) == 0)
+                        {
+                            HashMap::remove(&mut w.env, bn);
+                        }
+                        else
+                        {
+                            HashMap::insert(&mut w.env, String::clone(bn), clone(&r));
+                        }
+                        // Only a match on an exclusive borrow binds an
+                        // exclusive reference; any other binder is read
+                        // through (or is a copy).
+                        if (excl_scrut)
+                        {
+                            HashSet::remove(&mut w.shared_, bn);
+                        }
+                        else
+                        {
+                            HashSet::insert(&mut w.shared_, String::clone(bn));
+                        }
+                    },
+                    None     : {},
+                }
+                w_expr(w, it, s, Box::get(&a.body));
+                match (&a.binder)
+                {
+                    Some(bn) :
+                    {
+                        if (was_shared)
+                        {
+                            HashSet::insert(&mut w.shared_, String::clone(bn));
+                        }
+                        else
+                        {
+                            HashSet::remove(&mut w.shared_, bn);
+                        }
+                        match (saved)
+                        {
+                            Some(o) :
+                            {
+                                HashMap::insert(&mut w.env, String::clone(bn), o);
+                            },
+                            None    :
+                            {
+                                HashMap::remove(&mut w.env, bn);
+                            },
+                        }
+                    },
+                    None     : {},
+                }
+            }
+        },
+        ExprKind::EReturn(v) : match (v)
+        {
+            Some(x) : w_expr(w, it, s, Box::get(x)),
+            None    : {},
+        },
+        ExprKind::EClosure(cb)     :
+        {
+            ref<ClosureExpr, shared> c = Box::get(cb);
+            // A closure that captures a reference rooted in a parameter
+            // may do anything through it.
+            for (usize i = 0; i < Vec::len(&c.captures); i += 1)
+            {
+                match (HashMap::get(&w.env, &c.captures[i]))
+                {
+                    Some(p0) :
+                    {
+                        Vec<Root> p = clone(p0);
+                        w_write(w, &p);
+                        w_read(w, &p);
+                    },
+                    None     : {},
+                }
+            }
+            HashMap<String, Vec<Root>> saved = replace(&mut w.env, HashMap::new());
+            w_block(w, it, s, &c.body);
+            w.env = saved;
+        },
+        _                          : {},
+    }
+}
+
+fn root_eq(ref<Root, shared> a, ref<Root, shared> b) : bool
+{
+    if (a.i != b.i || a.cut != b.cut || Vec::len(&a.p) != Vec::len(&b.p))
+    {
+        return false;
+    }
+    for (usize k = 0; k < Vec::len(&a.p); k += 1)
+    {
+        if (!String::eq(&a.p[k], &b.p[k]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The index and argument expressions inside a place, evaluated.
+fn w_subexprs_of_place(ref<Walk, exclusive> w, ref<Items, shared> it, ref<Summaries, shared> s, ref<Expr, shared> e)
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)   : w_subexprs_of_place(w, it, s, Box::get(x)),
+        ExprKind::EDeref(x)   : w_subexprs_of_place(w, it, s, Box::get(x)),
+        ExprKind::EField(fb)  : w_subexprs_of_place(w, it, s, &Box::get(fb).e),
+        ExprKind::EIndex(ib)  :
+        {
+            w_subexprs_of_place(w, it, s, &Box::get(ib).a);
+            w_expr(w, it, s, &Box::get(ib).b);
+        },
+        ExprKind::ESliceOf(x) :
+        {
+            ref<SliceExpr, shared> sl = Box::get(x);
+            w_subexprs_of_place(w, it, s, &sl.base);
+            w_expr(w, it, s, &sl.lo);
+            w_expr(w, it, s, &sl.hi);
+        },
+        ExprKind::ECall(_)    : w_expr(w, it, s, e),
+        _                     : {},
+    }
+}
+
+// Whether the type parameter's argument is a bare type parameter (a
+// `Named` with no arguments) -- what the Rust tests with `Some(Type::Named(_,
+// a)) if a.is_empty()`.
+fn bare_named(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(b) : Vec::len(&Box::get(b).args) == 0,
+        _               : false,
+    }
+}
+
+fn w_call(
+    ref<Walk, exclusive> w,
+    ref<Items, shared> it,
+    ref<Summaries, shared> s,
+    ref<Expr, shared> c,
+    ref<Vec<Expr>, shared> args,
+)
+{
+    String key = callee_key(w, c);
+    Option<ref<FnDecl, shared>> f = match (&c.kind)
+    {
+        ExprKind::EPath(_) : HashMap::get(&it.fns, &key),
+        _                  : None,
+    };
+    for (usize j = 0; j < Vec::len(args); j += 1)
+    {
+        ref<Expr, shared> a = &args[j];
+        Option<Mode> pmode = match (f)
+        {
+            Some(fd) : if (j < Vec::len(&fd.params)) { is_ref_param(&fd.params[j].ty) } else { None },
+            None     : None,
+        };
+        match (pmode)
+        {
+            Some(m) :
+            {
+                // The argument's own subexpressions, then what the callee
+                // does through the reference it is given.
+                match (&a.kind)
+                {
+                    ExprKind::EBorrow(bb)  : w_subexprs_of_place(w, it, s, &Box::get(bb).e),
+                    ExprKind::ESliceOf(sb) :
+                    {
+                        ref<SliceExpr, shared> sl = Box::get(sb);
+                        w_subexprs_of_place(w, it, s, &sl.base);
+                        w_expr(w, it, s, &sl.lo);
+                        w_expr(w, it, s, &sl.hi);
+                    },
+                    ExprKind::EPath(_)     : {},
+                    _                      : w_expr(w, it, s, a),
+                }
+                Vec<Root> roots = w_reference(w, it, a);
+                if (Vec::len(&roots) == 0)
+                {
+                    continue;
+                }
+                // A function with a body, an empty one included, by its
+                // summary; `std`'s are whole by their declared modes.
+                Option<ParamAccess> acc = match (f)
+                {
+                    Some(_) : match (summary_param_dep(w, s, &key, j))
+                    {
+                        Some(x) : Some(clone(x)),
+                        None    : None,
+                    },
+                    None : None,
+                };
+                match (acc)
+                {
+                    Some(ac) :
+                    {
+                        for (usize k = 0; k < Vec::len(&roots); k += 1)
+                        {
+                            usize i = roots[k].i;
+                            for (usize r = 0; r < Vec::len(&ac.reads); r += 1)
+                            {
+                                Vec<String> p = clone(&roots[k].p);
+                                if (!roots[k].cut)
+                                {
+                                    Vec::append(&mut p, clone(&ac.reads[r]));
+                                }
+                                if (i < Vec::len(&w.out))
+                                {
+                                    access_read(&mut w.out[i], p);
+                                }
+                            }
+                            for (usize x = 0; x < Vec::len(&ac.writes); x += 1)
+                            {
+                                Vec<String> p = clone(&roots[k].p);
+                                if (!roots[k].cut)
+                                {
+                                    Vec::append(&mut p, clone(&ac.writes[x]));
+                                }
+                                if (i < Vec::len(&w.out))
+                                {
+                                    access_write(&mut w.out[i], p);
+                                }
+                            }
+                        }
+                    },
+                    None     :
+                    {
+                        w_read(w, &roots);
+                        if (m == Mode::Exclusive)
+                        {
+                            w_write(w, &roots);
+                        }
+                    },
+                }
+            },
+            None    :
+            {
+                w_expr(w, it, s, a);
+                // An argument to an unknown callee (a `fn` value) or a type
+                // parameter: a reference passed may be used whole.
+                bool unknown = Option::is_none(&f);
+                bool generic = match (f)
+                {
+                    Some(fd) : j < Vec::len(&fd.params) && bare_named(&fd.params[j].ty),
+                    None     : false,
+                };
+                if (unknown || generic)
+                {
+                    Vec<Root> roots = w_reference(w, it, a);
+                    w_read(w, &roots);
+                    // A shared borrow handed to an unknown callee (`foreach`'s
+                    // helpers, a `fn` value) can only be read through.
+                    bool shared = is_shared_borrow(a) || match (single_seg(a))
+                    {
+                        Some(n) : HashSet::contains(&w.shared_, n),
+                        None    : false,
+                    };
+                    if (unknown && !shared)
+                    {
+                        w_write(w, &roots);
+                    }
+                }
+            },
+        }
+    }
+    if (Option::is_none(&f))
+    {
+        w_expr(w, it, s, c);
+    }
+}
+
+export fn has_unsafe(ref<Block, shared> b) : bool
+{
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        bool found = match (&b.stmts[i])
+        {
+            Stmt::SLet(l) : match (&Box::get(l).init)
+            {
+                Some(x) : hu_e(x),
+                None    : false,
+            },
+            Stmt::SDestructure(d) : hu_e(&Box::get(d).init),
+            Stmt::SExpr(x)        : hu_e(Box::get(x)),
+            Stmt::SBlockLike(x)   : hu_e(Box::get(x)),
+        };
+        if (found)
+        {
+            return true;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(x) : hu_e(Box::get(x)),
+        None    : false,
+    }
+}
+
+fn hu_e(ref<Expr, shared> x) : bool
+{
+    match (&x.kind)
+    {
+        ExprKind::EUnsafe(_)      : true,
+        ExprKind::EParen(a)       : hu_e(Box::get(a)),
+        ExprKind::EUnary(u)       : hu_e(&Box::get(u).e),
+        ExprKind::EPropagate(a)   : hu_e(Box::get(a)),
+        ExprKind::EDeref(a)       : hu_e(Box::get(a)),
+        ExprKind::EBorrow(b)      : hu_e(&Box::get(b).e),
+        ExprKind::EField(f)       : hu_e(&Box::get(f).e),
+        ExprKind::EArrayRepeat(r) : hu_e(&Box::get(r).value),
+        ExprKind::EBinary(b)      : hu_e(&Box::get(b).a) || hu_e(&Box::get(b).b),
+        ExprKind::EIndex(p)       : hu_e(&Box::get(p).a) || hu_e(&Box::get(p).b),
+        ExprKind::EAssign(p)      : hu_e(&Box::get(p).a) || hu_e(&Box::get(p).b),
+        ExprKind::ESliceOf(s)     : hu_e(&Box::get(s).base) || hu_e(&Box::get(s).lo) || hu_e(&Box::get(s).hi),
+        ExprKind::ECall(c)        :
+        {
+            if (hu_e(&Box::get(c).callee))
+            {
+                return true;
+            }
+            ref<Vec<Expr>, shared> xs = &Box::get(c).args;
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                if (hu_e(&xs[i]))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EStructLit(sl)  :
+        {
+            ref<Vec<FieldInit>, shared> fs = &Box::get(sl).fields;
+            for (usize i = 0; i < Vec::len(fs); i += 1)
+            {
+                if (hu_e(&fs[i].value))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayLit(xs)   :
+        {
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                if (hu_e(&xs[i]))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EBlock(b)       : has_unsafe(b),
+        ExprKind::EIf(ib)         :
+        {
+            ref<IfExpr, shared> i = Box::get(ib);
+            hu_e(&i.cond) || has_unsafe(&i.then_) || match (&i.else_)
+            {
+                Some(e) : hu_e(e),
+                None    : false,
+            }
+        },
+        ExprKind::EWhile(wb)      :
+        {
+            ref<WhileExpr, shared> wh = Box::get(wb);
+            hu_e(&wh.cond) || has_unsafe(&wh.body) || match (&wh.step)
+            {
+                Some(e) : hu_e(e),
+                None    : false,
+            }
+        },
+        ExprKind::EMatch(mb)      :
+        {
+            ref<MatchExpr, shared> m = Box::get(mb);
+            if (hu_e(&m.scrut))
+            {
+                return true;
+            }
+            for (usize i = 0; i < Vec::len(&m.arms); i += 1)
+            {
+                if (hu_e(Box::get(&m.arms[i].body)))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EReturn(v) : match (v)
+        {
+            Some(a) : hu_e(Box::get(a)),
+            None    : false,
+        },
+        ExprKind::EClosure(cb)    : has_unsafe(&Box::get(cb).body),
+        _                         : false,
+    }
+}
+
+fn strip(ref<Expr, shared> e) : ref<Expr, shared>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x) : strip(Box::get(x)),
+        _                   : e,
+    }
+}
