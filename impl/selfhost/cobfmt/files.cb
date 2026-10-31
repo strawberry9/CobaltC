@@ -1,0 +1,158 @@
+// Finding files, keeping backups, writing safely
+// (`private/cobfmt-proposal.md` §5, §6), as impl/cobfmt/src/files.rs and
+// `coby::check::collect` do it.
+
+import std;
+
+// The `.cb` files under `dir`, sorted; hidden directories and `target/`
+// skipped.
+export fn collect(StringView dir, ref<Vec<String>, exclusive> out)
+{
+    Vec<String> names = match (list_dir(dir))
+    {
+        Ok(v)  : v,
+        Err(_) : return,
+    };
+    foreach (name in &names)
+    {
+        String p = path_join(dir, String::as_view(name));
+        bool is_dir = match (path_kind(String::as_view(&p)))
+        {
+            Ok(Dir) : true,
+            _       : false,
+        };
+        if (is_dir)
+        {
+            if (String::starts_with(name, ".") || *name == "target")
+            {
+                continue;
+            }
+            collect(String::as_view(&p), out);
+        }
+        else if (String::ends_with(name, ".cb"))
+        {
+            Vec::push(out, p);
+        }
+    }
+}
+
+export fn exists(StringView p) : bool
+{
+    Result::is_ok(&path_kind(p))
+}
+
+export fn is_dir(StringView p) : bool
+{
+    match (path_kind(p))
+    {
+        Ok(Dir) : true,
+        _       : false,
+    }
+}
+
+// `name` in `dir`, or `name` alone when `dir` is empty.
+fn in_dir(StringView dir, StringView name) : String
+{
+    if (StringView::len(dir) == 0)
+    {
+        return String::from_view(name);
+    }
+    path_join(dir, name)
+}
+
+fn dir_of(StringView path) : String
+{
+    Option::unwrap_or(path_parent(path), String::new())
+}
+
+fn name_of(StringView path) : String
+{
+    Option::unwrap_or(path_file_name(path), String::new())
+}
+
+// The first free backup name beside `path`: `NAME.cb.format.bak`, then
+// `NAME.cb.format.bak.1`, `.2`, … — an existing one is never overwritten.
+export fn backup_name(StringView path) : String
+{
+    String base = name_of(path);
+    String::append(&mut base, ".format.bak");
+    String dir = dir_of(path);
+    String first = in_dir(String::as_view(&dir), String::as_view(&base));
+    if (!exists(String::as_view(&first)))
+    {
+        return first;
+    }
+    u32 k = 1;
+    while (true)
+    {
+        String p = in_dir(String::as_view(&dir), String::as_view(&sprintf("%s.%v", &base, k)));
+        if (!exists(String::as_view(&p)))
+        {
+            return p;
+        }
+        k += 1;
+    }
+    String::new()
+}
+
+// Writes `contents` to a new file at `p` and makes it durable.
+fn write_new(File f, StringView contents) : Result<void, FileError>
+{
+    File::write_text(&mut f, contents)?;
+    File::flush(&mut f)?;
+    File::close(f)
+}
+
+// Writes the backup and makes sure it is on disk before the file changes;
+// its name, or why it could not be written.
+export fn backup(StringView path, StringView contents) : Result<String, String>
+{
+    String b = backup_name(path);
+    File f = match (File::create_new(String::as_view(&b)))
+    {
+        Ok(Some(f)) : f,
+        Ok(None)    : return Err(sprintf("%s exists", &b)),
+        Err(e)      : return Err(String::from_str(FileError::text(&e))),
+    };
+    match (write_new(f, contents))
+    {
+        Ok(_)  : Ok(b),
+        Err(e) : Err(String::from_str(FileError::text(&e))),
+    }
+}
+
+// Replaces `path`'s contents atomically: a temporary file in the same
+// directory, given the original's permissions (D-0272), renamed over it.
+// An interrupted run leaves the old file or the new one, never half of
+// each.
+export fn replace_file(StringView path, StringView contents) : Result<void, String>
+{
+    String d = dir_of(path);
+    String dir = if (String::len(&d) == 0) { String::from_str(".") } else { d };
+    String name = name_of(path);
+    String tmp = path_join(String::as_view(&dir), String::as_view(&sprintf(".%s.cobfmt-%v.tmp", &name, process_id())));
+    File f = match (File::create(String::as_view(&tmp)))
+    {
+        Ok(f)  : f,
+        Err(e) : return Err(String::from_str(FileError::text(&e))),
+    };
+    match (write_new(f, contents))
+    {
+        Ok(_)  : {},
+        Err(e) :
+        {
+            _ = remove_file(String::as_view(&tmp));
+            return Err(String::from_str(FileError::text(&e)));
+        },
+    }
+    _ = copy_permissions(path, String::as_view(&tmp));
+    match (rename(String::as_view(&tmp), path))
+    {
+        Ok(_)  : Ok(()),
+        Err(e) :
+        {
+            _ = remove_file(String::as_view(&tmp));
+            Err(String::from_str(FileError::text(&e)))
+        },
+    }
+}

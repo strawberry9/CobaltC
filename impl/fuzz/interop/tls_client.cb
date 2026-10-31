@@ -1,0 +1,60 @@
+// Interop (WI-7): std::tls's client against another server. Usage:
+// tls_client PORT CAFILE NAME. Connects to 127.0.0.1:PORT, trusting the
+// roots in CAFILE and asking for the certificate of NAME, sends an HTTP/1.0
+// request (`openssl s_server -www` answers one), and prints the first line
+// of the answer as `OK <line>`, or `ERR <the failure's text>`.
+import std;
+
+fn main() : u8
+{
+    u16 port = Result::unwrap(StringView::parse<u16>(String::as_view(&Result::unwrap(arg(0)))));
+    String cafile = Result::unwrap(arg(1));
+    String name = Result::unwrap(arg(2));
+    TrustStore roots = match (TrustStore::from_pem_file(String::as_view(&cafile)))
+    {
+        Ok(t)  : t,
+        Err(_) :
+        {
+            printf("ERR cannot read %v\n", &cafile);
+            return 2;
+        },
+    };
+    SocketAddr at = SocketAddr::new(IpAddr::localhost_v4(), port);
+    TlsStream s = match (TlsStream::connect(at, String::as_view(&name), &roots))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            printf("ERR %v\n", TlsError::text(&e));
+            return 1;
+        },
+    };
+    match (TlsStream::write_text(&mut s, "GET / HTTP/1.0\r\n\r\n"))
+    {
+        Ok(_)  : {},
+        Err(e) :
+        {
+            printf("ERR %v\n", TlsError::text(&e));
+            return 1;
+        },
+    }
+    match (TlsStream::read_line(&mut s))
+    {
+        Ok(Some(line)) :
+        {
+            printf("OK %v\n", StringView::trim(String::as_view(&line)));
+            _ = TlsStream::close(&mut s);
+            0
+        },
+        Ok(None)       :
+        {
+            printf("ERR closed before answering\n");
+            1
+        },
+        Err(e)         :
+        {
+            printf("ERR %v\n", TlsError::text(&e));
+            1
+        },
+    }
+}

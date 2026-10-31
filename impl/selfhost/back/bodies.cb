@@ -1,0 +1,1489 @@
+// cobc's function body forms of D-0274 stage 1 (functions.rs): the dual body
+// (`lower_fn_dual`, D-0188), the field dual body (`lower_fn_field_dual`,
+// D-0189), the frozen body (`lower_fn_frozen`, CHG-0237) and the direct body
+// (`lower_fn_direct`, D-0209), each with its dispatcher and `__arrive` twin
+// (D-0219). None of them exists under `--all-checks`.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+import passes;
+import stage1a;
+import gen;
+
+// The longest fast half, in lines of C, a dual body is emitted with; the
+// longest frozen or direct body kept (cobc's `DUAL_LINES`, `FROZEN_LINES`).
+const usize DUAL_LINES = 600;
+const usize FROZEN_LINES = 3000;
+
+// The rest of the signature from its `(`.
+fn sig_tail(ref<String, shared> sig) : String
+{
+    usize open = Option::expect(StringView::find(String::as_view(sig), StringView::of("(")), "a signature");
+    String::from_view(StringView::sub(String::as_view(sig), open, String::len(sig)))
+}
+
+fn call_text(ref<String, shared> n, ref<Vec<String>, shared> args) : String
+{
+    sprintf("%s(%s)", n, &String::join(&args[0..$], ", "))
+}
+
+fn param_args(ref<FnDecl, shared> f) : Vec<String>
+{
+    Vec<String> args = Vec::new();
+    foreach (p in &f.params)
+    {
+        Vec::push(&mut args, sprintf("p_%s", &san(String::as_view(&p.name))));
+    }
+    args
+}
+
+// The dispatcher's two last lines: the fast body when `test` holds, else the
+// checked one.
+fn dispatch_tail(
+    ref<String, exclusive> b,
+    ref<String, shared> ret_c,
+    ref<String, shared> test,
+    ref<String, shared> fast,
+    ref<String, shared> slow,
+    ref<Vec<String>, shared> args,
+)
+{
+    if (String::eq_str(ret_c, "void"))
+    {
+        String::appendf(b, "    if (%s) { %s; return; }\n", test, &call_text(fast, args));
+        String::appendf(b, "    %s;\n", &call_text(slow, args));
+    }
+    else
+    {
+        String::appendf(b, "    if (%s) return %s;\n", test, &call_text(fast, args));
+        String::appendf(b, "    return %s;\n", &call_text(slow, args));
+    }
+}
+
+// cobc's `lower_fn` past the native bodies: a dual, field dual, frozen or
+// direct body where one applies; false when the plain body is to be emitted.
+export fn lower_fn_bodies(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<Type, shared> ret,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> ret_c,
+) : bool
+{
+    match (dual_eligible(g, f, subst))
+    {
+        Some(dual) :
+        {
+            lower_fn_dual(g, name, f, subst, ret, cname, sig, ret_c, &dual);
+            return true;
+        },
+        None       : {},
+    }
+    match (field_dual_eligible(g, f, subst))
+    {
+        Some(fd) :
+        {
+            lower_fn_field_dual(g, name, f, subst, ret, cname, sig, ret_c, &fd);
+            return true;
+        },
+        None     : {},
+    }
+    // CHG-0237: frozen shared reference parameters: a frozen body and a
+    // checked one, chosen at entry.
+    HashSet<String> direct0 = direct_ref_params(g, f, subst);
+    HashSet<String> unstored = unstored_ref_params(g, f, subst, &direct0);
+    Vec<String> frozen = Vec::new();
+    foreach (p in &f.params)
+    {
+        Type at_shared_ref = apply(&p.ty, subst);
+        bool shared_ref = match (&at_shared_ref)
+        {
+            Type::TRef(m) : Box::get(m).mode == Mode::Shared,
+            _             : false,
+        };
+        if (HashSet::contains(&unstored, &p.name) && shared_ref)
+        {
+            Vec::push(&mut frozen, String::clone(&p.name));
+        }
+    }
+    // (cobc collects the set in hash order; the order is only read as a set.)
+    if (Vec::len(&frozen) > 0 && !all_checks(g))
+    {
+        lower_fn_frozen(g, name, f, subst, ret, cname, sig, ret_c, &frozen, false);
+        // D-0196's `__raw` form, frozen-dual the same way.
+        if (Vec::len(targs) == 0 && raw_ret_ok(g, name))
+        {
+            String raw_name = sprintf("%s__raw", cname);
+            String raw_sig = sprintf("%s %s%s", ret_c, &raw_name, &sig_tail(sig));
+            String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+            g.uid = 0;
+            lower_fn_frozen(g, name, f, subst, ret, &raw_name, &raw_sig, ret_c, &frozen, true);
+        }
+        return true;
+    }
+    // D-0209: a function with direct reference parameters runs their reads
+    // unchecked only when its entry can vouch for them.
+    if (!all_checks(g))
+    {
+        HashSet<String> dset = direct_ref_params(g, f, subst);
+        if (HashSet::len(&dset) > 0)
+        {
+            lower_fn_direct(g, name, f, subst, ret, cname, sig, ret_c, &dset, false);
+            if (Vec::len(targs) == 0 && raw_ret_ok(g, name))
+            {
+                String raw_name = sprintf("%s__raw", cname);
+                String raw_sig = sprintf("%s %s%s", ret_c, &raw_name, &sig_tail(sig));
+                String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+                g.uid = 0;
+                lower_fn_direct(g, name, f, subst, ret, &raw_name, &raw_sig, ret_c, &dset, true);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+// A function with several reference parameters, one at least exclusive, all
+// direct in their uses, none handed on, every other parameter a plain value
+// (cobc's `dual_eligible`).
+export fn dual_eligible(
+    ref<Gen, exclusive> g,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+) : Option<Vec<String>>
+{
+    if (all_checks(g))
+    {
+        return None;
+    }
+    Vec<String> dual = match (dual_direct_params(g, &f.params, &f.body, subst))
+    {
+        Some(d) : d,
+        None    : return None,
+    };
+    CalleeTest never = CalleeTest::Never;
+    foreach (p in &f.params)
+    {
+        Type t = apply(&p.ty, subst);
+        bool in_dual = false;
+        foreach (d in &dual)
+        {
+            in_dual = in_dual || String::eq(d, &p.name);
+        }
+        if (in_dual)
+        {
+            if (!direct_uses(g, &f.body, &p.name, &never))
+            {
+                return None;
+            }
+        }
+        else if (!plain_data(g, &t) || has_refs(g, &t) || holds_fn(g, &t))
+        {
+            return None;
+        }
+    }
+    Some(dual)
+}
+
+// The dual body: `NAME__fast`, its reference parameters direct, `NAME__slow`
+// as any body, `NAME__bare` for calls whose arguments the call site proves
+// disjoint, and the dispatcher `NAME` (cobc's `lower_fn_dual`).
+fn lower_fn_dual(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<Type, shared> ret,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> ret_c,
+    ref<Vec<String>, shared> dual,
+)
+{
+    String fast = sprintf("%s__fast", cname);
+    String slow = sprintf("%s__slow", cname);
+    String tail = sig_tail(sig);
+    String fast_sig = sprintf("%s %s%s", ret_c, &fast, &tail);
+    String slow_sig = sprintf("%s %s%s", ret_c, &slow, &tail);
+    HashSet<String> set = HashSet::new();
+    foreach (d in dual)
+    {
+        HashSet::insert(&mut set, String::clone(d));
+    }
+    usize start = String::len(&g.fns);
+    // D-0219: entered only through its dispatcher's test.
+    g.pending_tested = true;
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &fast_sig, &fast, 0, Some(&set));
+    // D-0192: the bare form, for calls whose arguments the call site proves
+    // disjoint: the fast half, its slices pure direct, its own element test.
+    String bare_name = sprintf("%s__bare", cname);
+    String bare_sig = sprintf("%s %s%s", ret_c, &bare_name, &tail);
+    if (code_lines(&String::from_view(String::view(&g.fns, start, String::len(&g.fns)))) > DUAL_LINES)
+    {
+        String::truncate(&mut g.fns, start);
+        g.uid = 0;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, None);
+        String::appendf(&mut g.protos, "%s;\n", &bare_sig);
+        g.uid = 0;
+        g.pending_bare = true;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, &bare_sig, &bare_name, 0, Some(&set));
+        return;
+    }
+    String::appendf(&mut g.protos, "%s;\n", &bare_sig);
+    g.uid = 0;
+    g.pending_bare = true;
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &bare_sig, &bare_name, 0, Some(&set));
+    String::appendf(&mut g.protos, "%s;\n", &fast_sig);
+    String::appendf(&mut g.protos, "%s;\n", &slow_sig);
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &slow_sig, &slow, 0, None);
+    // The dispatcher peeks at the slices' data in flight.
+    usize n_slices = 0;
+    foreach (p in &f.params)
+    {
+        Type at_is_slice = apply(&p.ty, subst);
+        bool is_slice = match (&at_is_slice)
+        {
+            Type::TSlice(_) : true,
+            _               : false,
+        };
+        if (HashSet::contains(&set, &p.name) && is_slice)
+        {
+            n_slices += 1;
+        }
+    }
+    String b = String::new();
+    String::appendf(&mut b, "    uint64_t toks[%v];\n", Vec::len(dual));
+    String::appendf(&mut b, "    uint8_t excl[%v];\n", Vec::len(dual));
+    usize k = 0;
+    usize i = 0;
+    Vec<String> args = Vec::new();
+    Vec<String> live = Vec::new();
+    foreach (p in &f.params)
+    {
+        String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
+        Vec::push(&mut args, String::clone(&pc));
+        Type t = apply(&p.ty, subst);
+        u32 ex = match (&t)
+        {
+            Type::TRef(m)   : if (Box::get(m).mode == Mode::Exclusive) { 1 } else { 0 },
+            Type::TSlice(m) : if (Box::get(m).mode == Mode::Exclusive) { 1 } else { 0 },
+            _               : 0,
+        };
+        if (!HashSet::contains(&set, &p.name))
+        {
+            continue;
+        }
+        match (&t)
+        {
+            Type::TRef(_)   :
+            {
+                String::appendf(&mut b, "    toks[%v] = %s.tok; excl[%v] = %v;\n", i, &pc, i, ex);
+                i += 1;
+            },
+            Type::TSlice(m) :
+            {
+                String::appendf(
+                    &mut b,
+                    "    toks[%v] = cb_peek_datum_tok(%v, %v); excl[%v] = %v;\n",
+                    i,
+                    k,
+                    n_slices,
+                    i,
+                    ex,
+                );
+                // A slice over cells another live object lies over: its reads
+                // meet that object's paths, which no entry test sees.
+                u64 size = size_align(g, &Box::get(m).inner).size;
+                Vec::push(&mut live, sprintf("cb_live_in(%s.data, %s.len * %vu)", &pc, &pc, size));
+                k += 1;
+                i += 1;
+            },
+            _               : {},
+        }
+    }
+    String pre = String::clone(&b);
+    dispatch_tail(&mut b, ret_c, &dual_test("cb_paths_disjoint", Vec::len(dual), &live), &fast, &slow, &args);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, &b);
+    String b2 = pre;
+    dispatch_tail(&mut b2, ret_c, &dual_test("cb_paths_arrive", Vec::len(dual), &live), &fast, &slow, &args);
+    emit_arrive_twin(g, cname, sig, &b2, false);
+}
+
+fn dual_test(str fname, usize n, ref<Vec<String>, shared> live) : String
+{
+    String t = sprintf("%s(%v, toks, excl)", fname, n);
+    foreach (l in live)
+    {
+        String::appendf(&mut t, " && !%s", l);
+    }
+    t
+}
+
+// D-0219: `NAME__arrive`, the dispatcher `NAME` with the arrival test its
+// call sites ask for when an argument is an existing reference passed on
+// (cobc's `emit_arrive_twin`).
+export fn emit_arrive_twin(
+    ref<Gen, exclusive> g,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> body,
+    bool inline,
+)
+{
+    String twin = sprintf("%s__arrive", cname);
+    String tsig = replace_first(sig, &sprintf("%s(", cname), &sprintf("%s(", &twin));
+    String::appendf(&mut g.protos, "%s;\n", &tsig);
+    if (inline)
+    {
+        HashSet::insert(&mut g.inline_sigs, String::clone(&tsig));
+    }
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &tsig, body);
+    HashSet::insert(&mut g.arrive_twins, String::clone(cname));
+}
+
+// `s` with the first `a` replaced by `b` (Rust's `replacen(a, b, 1)`).
+fn replace_first(ref<String, shared> s, ref<String, shared> a, ref<String, shared> b) : String
+{
+    match (StringView::find(String::as_view(s), String::as_view(a)))
+    {
+        Some(k) :
+        {
+            String out = String::from_view(StringView::sub(String::as_view(s), 0, k));
+            String::append(&mut out, b);
+            String::append(
+                &mut out,
+                &String::from_view(StringView::sub(String::as_view(s), k + String::len(a), String::len(s))),
+            );
+            out
+        },
+        None    : String::clone(s),
+    }
+}
+
+// D-0209: `NAME__dir`, its direct parameters' reads unchecked, and
+// `NAME__chk`, every access checked; `NAME` runs the first when this thread
+// is alone or `cb_direct_ok` finds each direct path valid over fresh storage
+// (cobc's `lower_fn_direct`).
+fn lower_fn_direct(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<Type, shared> ret,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> ret_c,
+    ref<HashSet<String>, shared> dset,
+    bool raw,
+)
+{
+    String dir = sprintf("%s__dir", cname);
+    String chk = sprintf("%s__chk", cname);
+    String tail = sig_tail(sig);
+    String dir_sig = sprintf("%s %s%s", ret_c, &dir, &tail);
+    String chk_sig = sprintf("%s %s%s", ret_c, &chk, &tail);
+    HashSet<String> none = HashSet::new();
+    usize start = String::len(&g.fns);
+    g.pending_raw_ret = raw;
+    g.pending_tested = true;
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &dir_sig, &dir, 0, None);
+    if (code_lines(&String::from_view(String::view(&g.fns, start, String::len(&g.fns)))) > FROZEN_LINES)
+    {
+        String::truncate(&mut g.fns, start);
+        g.uid = 0;
+        g.pending_raw_ret = raw;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, Some(&none));
+        // `NAME__dir` exists all the same, for a call site that vouches for
+        // its arguments itself: the checked body, forwarded.
+        Vec<String> args = param_args(f);
+        String::appendf(&mut g.protos, "%s;\n", &dir_sig);
+        String fwd = if (String::eq_str(
+            ret_c,
+            "void",
+        ))
+        {
+            sprintf(
+                "    %s;\n",
+                &call_text(cname, &args),
+            )
+        }
+        else { sprintf("    return %s;\n", &call_text(cname, &args)) };
+        String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &dir_sig, &fwd);
+        return;
+    }
+    String::appendf(&mut g.protos, "%s;\n", &dir_sig);
+    String::appendf(&mut g.protos, "%s;\n", &chk_sig);
+    g.uid = 0;
+    g.pending_raw_ret = raw;
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &chk_sig, &chk, 0, Some(&none));
+    String b = String::new();
+    Vec<String> toks = Vec::new();
+    Vec<String> args = Vec::new();
+    foreach (p in &f.params)
+    {
+        String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
+        Vec::push(&mut args, String::clone(&pc));
+        Type at_is_ref = apply(&p.ty, subst);
+        bool is_ref = match (&at_is_ref)
+        {
+            Type::TRef(_) : true,
+            _             : false,
+        };
+        if (HashSet::contains(dset, &p.name) && is_ref)
+        {
+            Vec::push(&mut toks, sprintf("%s.tok", &pc));
+        }
+    }
+    // The plain dispatcher asks only while other threads run; its `__arrive`
+    // twin always asks (D-0219).
+    String test = String::from_str("1");
+    String test_arrive = String::from_str("1");
+    if (Vec::len(&toks) > 0)
+    {
+        String::appendf(&mut b, "    uint64_t toks[%v] = { %s };\n", Vec::len(&toks), &String::join(&toks[0..$], ", "));
+        // Tokens all 0 (paths their callers vouched for) pass `cb_direct_ok`
+        // whatever else holds: tested inline, so a reference passed on with
+        // no record costs no runtime call.
+        String zero = zero_tokens_test(&toks);
+        test = sprintf(
+            "__atomic_load_n(&cb_live_threads, __ATOMIC_ACQUIRE) == 1 || (%s) || cb_direct_ok(%v, toks)",
+            &zero,
+            Vec::len(&toks),
+        );
+        test_arrive = sprintf("(%s) || cb_direct_ok(%v, toks)", &zero, Vec::len(&toks));
+    }
+    String pre = String::clone(&b);
+    dispatch_tail(&mut b, ret_c, &test, &dir, &chk, &args);
+    String b2 = pre;
+    dispatch_tail(&mut b2, ret_c, &test_arrive, &dir, &chk, &args);
+    // A program function's dispatcher is inlined at every call (`localize`).
+    HashSet::insert(&mut g.inline_sigs, String::clone(sig));
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, &b);
+    emit_arrive_twin(g, cname, sig, &b2, true);
+}
+
+// `t == 0 && …` over the token expressions `toks`.
+fn zero_tokens_test(ref<Vec<String>, shared> toks) : String
+{
+    Vec<String> parts = Vec::new();
+    foreach (t in toks)
+    {
+        Vec::push(&mut parts, sprintf("%s == 0", t));
+    }
+    String::join(&parts[0..$], " && ")
+}
+
+// CHG-0237: `NAME__frz`, its frozen parameters' reads unchecked, and
+// `NAME__chk`; `NAME` tests each frozen parameter at entry (`cb_frozen_ok`)
+// and runs the first when all pass (cobc's `lower_fn_frozen`).
+fn lower_fn_frozen(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<Type, shared> ret,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> ret_c,
+    ref<Vec<String>, shared> frozen,
+    bool raw,
+)
+{
+    String frz = sprintf("%s__frz", cname);
+    String chk = sprintf("%s__chk", cname);
+    String tail = sig_tail(sig);
+    String frz_sig = sprintf("%s %s%s", ret_c, &frz, &tail);
+    String chk_sig = sprintf("%s %s%s", ret_c, &chk, &tail);
+    // D-0294: in a decided program the entry test is the constant 1
+    // (`cb_frozen_ok` under `CB_PATHLESS`): the frozen body is the function,
+    // with no twin and no dispatcher.
+    if (g.decided)
+    {
+        g.frozen_mode = true;
+        g.pending_raw_ret = raw;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, None);
+        g.frozen_mode = false;
+        return;
+    }
+    usize start = String::len(&g.fns);
+    g.frozen_mode = true;
+    g.pending_raw_ret = raw;
+    // D-0219: entered only through its dispatcher's test.
+    g.pending_tested = true;
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &frz_sig, &frz, 0, None);
+    g.frozen_mode = false;
+    if (code_lines(&String::from_view(String::view(&g.fns, start, String::len(&g.fns)))) > FROZEN_LINES)
+    {
+        String::truncate(&mut g.fns, start);
+        g.uid = 0;
+        g.pending_raw_ret = raw;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, None);
+        return;
+    }
+    String::appendf(&mut g.protos, "%s;\n", &frz_sig);
+    String::appendf(&mut g.protos, "%s;\n", &chk_sig);
+    g.uid = 0;
+    g.pending_raw_ret = raw;
+    HashSet<String> none = HashSet::new();
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &chk_sig, &chk, 0, Some(&none));
+    Vec<String> tests = Vec::new();
+    Vec<String> args = Vec::new();
+    foreach (p in &f.params)
+    {
+        String pc = sprintf("p_%s", &san(String::as_view(&p.name)));
+        Vec::push(&mut args, String::clone(&pc));
+        bool is_frozen = false;
+        foreach (fz in frozen)
+        {
+            is_frozen = is_frozen || String::eq(fz, &p.name);
+        }
+        if (!is_frozen)
+        {
+            continue;
+        }
+        Type t = apply(&p.ty, subst);
+        Type inner = match (&t)
+        {
+            Type::TRef(m) : clone(&Box::get(m).inner),
+            _             : continue,
+        };
+        Option<Type> vec_elem = match (&inner)
+        {
+            Type::TNamed(n) : if (String::eq_str(
+                &Box::get(n).name,
+                "std::Vec",
+            ) && Vec::len(&Box::get(n).args) == 1) { Some(clone(&Box::get(n).args[0])) } else { None },
+            _ : None,
+        };
+        bool sized = match (&vec_elem)
+        {
+            Some(el) : size_align(g, el).size > 0,
+            None     : false,
+        };
+        if (sized)
+        {
+            Type el = Option::expect(vec_elem, "an element type");
+            String vc = ctype(g, &inner);
+            u64 size = size_align(g, &el).size;
+            Vec::push(
+                &mut tests,
+                sprintf(
+                    "cb_frozen_ok(%s.tok, (const void *)((%s *)%s.p)->ptr, (size_t)((%s *)%s.p)->len * %vu)",
+                    &pc,
+                    &vc,
+                    &pc,
+                    &vc,
+                    &pc,
+                    size,
+                ),
+            );
+        }
+        else
+        {
+            Vec::push(&mut tests, sprintf("cb_frozen_ok(%s.tok, NULL, 0)", &pc));
+        }
+    }
+    // D-0209: a direct parameter beside the frozen ones is tested as
+    // `lower_fn_direct` tests it.
+    HashSet<String> dset = direct_ref_params(g, f, subst);
+    Vec<String> dtoks = Vec::new();
+    foreach (p in &f.params)
+    {
+        Type at_is_ref = apply(&p.ty, subst);
+        bool is_ref = match (&at_is_ref)
+        {
+            Type::TRef(_) : true,
+            _             : false,
+        };
+        if (HashSet::contains(&dset, &p.name) && is_ref)
+        {
+            Vec::push(&mut dtoks, sprintf("p_%s.tok", &san(String::as_view(&p.name))));
+        }
+    }
+    String b = String::new();
+    Vec<String> tests_arrive = clone(&tests);
+    if (Vec::len(&dtoks) > 0)
+    {
+        String::appendf(
+            &mut b,
+            "    uint64_t dtoks[%v] = { %s };\n",
+            Vec::len(&dtoks),
+            &String::join(&dtoks[0..$], ", "),
+        );
+        String zero = zero_tokens_test(&dtoks);
+        Vec::push(
+            &mut tests,
+            sprintf(
+                "(__atomic_load_n(&cb_live_threads, __ATOMIC_ACQUIRE) == 1 || (%s) || cb_direct_ok(%v, dtoks))",
+                &zero,
+                Vec::len(&dtoks),
+            ),
+        );
+        Vec::push(&mut tests_arrive, sprintf("((%s) || cb_direct_ok(%v, dtoks))", &zero, Vec::len(&dtoks)));
+    }
+    String pre = String::clone(&b);
+    dispatch_tail(&mut b, ret_c, &String::join(&tests[0..$], " && "), &frz, &chk, &args);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, &b);
+    if (Vec::len(&dtoks) > 0)
+    {
+        String b2 = pre;
+        dispatch_tail(&mut b2, ret_c, &String::join(&tests_arrive[0..$], " && "), &frz, &chk, &args);
+        emit_arrive_twin(g, cname, sig, &b2, false);
+    }
+}
+
+// D-0189: a function whose one reference parameter `b` is to a struct with
+// `Vec` fields of plain, non-zero-sized elements, its other parameters plain
+// values, whose body loops and uses each such field only as a confined vector
+// is used (`field_confined_uses`): the fields so used, with their element
+// types (cobc's `field_dual_eligible`).
+export struct FieldDual
+{
+    export String b;
+    export Vec<String> names;
+    export Vec<Type> elems;
+    export bool direct_b;
+}
+
+export fn field_dual_eligible(
+    ref<Gen, exclusive> g,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+) : Option<FieldDual>
+{
+    if (all_checks(g))
+    {
+        return None;
+    }
+    Option<usize> refp = None;
+    Type rt = Type::TVoid;
+    for (usize k = 0; k < Vec::len(&f.params); k += 1)
+    {
+        Type t = apply(&f.params[k].ty, subst);
+        if (has_refs(g, &t) || holds_fn(g, &t))
+        {
+            if (Option::is_some(&refp))
+            {
+                return None;
+            }
+            refp = Some(k);
+            rt = t;
+        }
+        else if (!plain_data(g, &t))
+        {
+            return None;
+        }
+    }
+    usize pk = match (refp)
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    Type inner = match (&rt)
+    {
+        Type::TRef(r) : clone(&Box::get(r).inner),
+        _             : return None,
+    };
+    ref<NamedTy, shared> st = match (&inner)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return None,
+    };
+    StructDecl sd = match (struct_decl(g, &st.name))
+    {
+        Some(d) : d,
+        None    : return None,
+    };
+    HashMap<String, Type> sub = subst_of(&sd.type_params, &st.args);
+    Vec<String> vnames = Vec::new();
+    Vec<Type> velems = Vec::new();
+    foreach (fd in &sd.fields)
+    {
+        Type ft = apply(&fd.ty, &sub);
+        match (&ft)
+        {
+            Type::TNamed(vn) :
+            {
+                ref<NamedTy, shared> v = Box::get(vn);
+                if (String::eq_str(
+                    &v.name,
+                    "std::Vec",
+                ) && Vec::len(&v.args) == 1 && plain_data(g, &v.args[0]) && size_align(g, &v.args[0]).size > 0)
+                {
+                    Vec::push(&mut vnames, String::clone(&fd.name));
+                    Vec::push(&mut velems, clone(&v.args[0]));
+                }
+            },
+            _                : {},
+        }
+    }
+    if (Vec::len(&vnames) == 0 || !has_loop(&f.body))
+    {
+        return None;
+    }
+    ref<String, shared> pname = &f.params[pk].name;
+    FieldUses fu = match (field_confined_uses(&f.body, pname, &vnames))
+    {
+        Some(u) : u,
+        None    : return None,
+    };
+    // `b` itself unchecked in the fast half too: nothing under it is
+    // borrowed, and every field it has that is not plain is a confined vector.
+    bool plain_rest = true;
+    foreach (fd in &sd.fields)
+    {
+        Type t = apply(&fd.ty, &sub);
+        plain_rest = plain_rest && (HashSet::contains(
+            &fu.used,
+            &fd.name,
+        ) || (plain_data(g, &t) && !has_refs(g, &t) && !holds_fn(g, &t)));
+    }
+    FieldDual out = FieldDual { .b = String::clone(pname), .names = Vec::new(), .elems = Vec::new(), .direct_b = fu.unborrowed && plain_rest };
+    for (usize k = 0; k < Vec::len(&vnames); k += 1)
+    {
+        if (HashSet::contains(&fu.used, &vnames[k]))
+        {
+            Vec::push(&mut out.names, String::clone(&vnames[k]));
+            Vec::push(&mut out.elems, clone(&velems[k]));
+        }
+    }
+    if (Vec::len(&out.names) == 0)
+    {
+        return None;
+    }
+    Some(out)
+}
+
+// D-0189's dual body, as D-0188's: `NAME__fast`, the fields confined, and
+// `NAME__slow`, as any body; the dispatcher runs the first when `b`'s path is
+// valid and no element of the fields has a live object (cobc's
+// `lower_fn_field_dual`).
+fn lower_fn_field_dual(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<Type, shared> ret,
+    ref<String, shared> cname,
+    ref<String, shared> sig,
+    ref<String, shared> ret_c,
+    ref<FieldDual, shared> fd,
+)
+{
+    String fast = sprintf("%s__fast", cname);
+    String slow = sprintf("%s__slow", cname);
+    String tail = sig_tail(sig);
+    String fast_sig = sprintf("%s %s%s", ret_c, &fast, &tail);
+    String slow_sig = sprintf("%s %s%s", ret_c, &slow, &tail);
+    Type bt = Type::TVoid;
+    foreach (p in &f.params)
+    {
+        if (String::eq(&p.name, &fd.b))
+        {
+            bt = apply(&p.ty, subst);
+        }
+    }
+    ref<ModedTy, shared> bm = match (&bt)
+    {
+        Type::TRef(r) : Box::get(r),
+        _             :
+        {
+            assert(false, "cobc: a field dual body without a reference");
+            return;
+        },
+    };
+    String sc = ctype(g, &bm.inner);
+    u32 excl = if (bm.mode == Mode::Exclusive) { 1 } else { 0 };
+    String pc = sprintf("p_%s", &san(String::as_view(&fd.b)));
+    HashMap<String, FieldConf> fc = HashMap::new();
+    Vec<String> live = Vec::new();
+    for (usize k = 0; k < Vec::len(&fd.names); k += 1)
+    {
+        String vc = sprintf("(*(%s *)%s.p).%s", &sc, &pc, &san(String::as_view(&fd.names[k])));
+        u64 size = size_align(g, &fd.elems[k]).size;
+        Vec::push(&mut live, sprintf("!cb_live_in((void *)(%s).ptr, (%s).len * %vu)", &vc, &vc, size));
+        HashMap::insert(
+            &mut fc,
+            sprintf("%s.%s", &fd.b, &fd.names[k]),
+            FieldConf { .c = vc, .elem = clone(&fd.elems[k]) },
+        );
+    }
+    usize start = String::len(&g.fns);
+    g.pending_field_confined = Some(fc);
+    // `b`'s other fields, all plain and never borrowed, unchecked too.
+    HashSet<String> direct = HashSet::new();
+    if (fd.direct_b)
+    {
+        HashSet::insert(&mut direct, String::clone(&fd.b));
+    }
+    // D-0219: entered only through its dispatcher's test.
+    g.pending_tested = true;
+    if (fd.direct_b)
+    {
+        emit_fn_body(g, String::as_view(name), f, subst, ret, &fast_sig, &fast, 0, Some(&direct));
+    }
+    else
+    {
+        emit_fn_body(g, String::as_view(name), f, subst, ret, &fast_sig, &fast, 0, None);
+    }
+    g.pending_field_confined = None;
+    if (code_lines(&String::from_view(String::view(&g.fns, start, String::len(&g.fns)))) > DUAL_LINES)
+    {
+        String::truncate(&mut g.fns, start);
+        g.uid = 0;
+        emit_fn_body(g, String::as_view(name), f, subst, ret, sig, cname, 0, None);
+        return;
+    }
+    String::appendf(&mut g.protos, "%s;\n", &fast_sig);
+    String::appendf(&mut g.protos, "%s;\n", &slow_sig);
+    emit_fn_body(g, String::as_view(name), f, subst, ret, &slow_sig, &slow, 0, None);
+    Vec<String> args = param_args(f);
+    String d = String::new();
+    String::appendf(&mut d, "    uint64_t toks[1] = { %s.tok };\n", &pc);
+    String::appendf(&mut d, "    uint8_t excl[1] = { %v };\n", excl);
+    String pre = String::clone(&d);
+    String lj = String::join(&live[0..$], " && ");
+    dispatch_tail(&mut d, ret_c, &sprintf("cb_paths_disjoint(1, toks, excl) && %s", &lj), &fast, &slow, &args);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", sig, &d);
+    String d2 = pre;
+    dispatch_tail(&mut d2, ret_c, &sprintf("cb_paths_arrive(1, toks, excl) && %s", &lj), &fast, &slow, &args);
+    emit_arrive_twin(g, cname, sig, &d2, false);
+}
+
+// ---- call sites (cobc's vec_calls.rs, frames.rs, uses.rs) ----
+
+// Whether `f` returns a borrow it formed: its result a reference or slice,
+// no `return` anywhere, and every tail a borrow or slice made there (cobc's
+// `returns_fresh_borrow`).
+export fn returns_fresh_borrow(ref<FnDecl, shared> f) : bool
+{
+    bool rr = match (&f.ret)
+    {
+        Type::TRef(_)   : true,
+        Type::TSlice(_) : true,
+        _               : false,
+    };
+    if (!rr || block_has_return(&f.body))
+    {
+        return false;
+    }
+    tail_fresh(&f.body)
+}
+
+fn tail_fresh(ref<Block, shared> b) : bool
+{
+    match (&b.tail)
+    {
+        Some(t) : expr_fresh(Box::get(t)),
+        None    : false,
+    }
+}
+
+fn expr_fresh(ref<Expr, shared> e) : bool
+{
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::EBorrow(_)  : true,
+        ExprKind::ESliceOf(_) : true,
+        ExprKind::EBlock(b)   : tail_fresh(b),
+        ExprKind::EUnsafe(b)  : tail_fresh(b),
+        ExprKind::EIf(i) : match (&Box::get(i).else_)
+        {
+            Some(e2) : tail_fresh(&Box::get(i).then_) && expr_fresh(e2),
+            None     : false,
+        },
+        _                     : false,
+    }
+}
+
+// A `return` anywhere in `b`, closures' bodies included (cobc's
+// `visit_exprs`).
+fn block_has_return(ref<Block, shared> b) : bool
+{
+    foreach (st in &b.stmts)
+    {
+        bool hit = match (st)
+        {
+            Stmt::SLet(l) : match (&Box::get(l).init)
+            {
+                Some(e) : has_return(e),
+                None    : false,
+            },
+            Stmt::SDestructure(d) : has_return(&Box::get(d).init),
+            Stmt::SExpr(e)        : has_return(Box::get(e)),
+            Stmt::SBlockLike(e)   : has_return(Box::get(e)),
+        };
+        if (hit)
+        {
+            return true;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : has_return(Box::get(t)),
+        None    : false,
+    }
+}
+
+fn has_return(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EReturn(_)      : true,
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (fi in &Box::get(s).fields)
+            {
+                if (has_return(&fi.value))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                if (has_return(a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayRepeat(r) : has_return(&Box::get(r).value),
+        ExprKind::EUnary(u)       : has_return(&Box::get(u).e),
+        ExprKind::EBinary(b)      : has_return(&Box::get(b).a) || has_return(&Box::get(b).b),
+        ExprKind::EBorrow(b)      : has_return(&Box::get(b).e),
+        ExprKind::ESliceOf(s)     : has_return(&Box::get(s).base) || has_return(&Box::get(s).lo) || has_return(&Box::get(s).hi),
+        ExprKind::EDeref(a)       : has_return(Box::get(a)),
+        ExprKind::EField(f)       : has_return(&Box::get(f).e),
+        ExprKind::EIndex(p)       : has_return(&Box::get(p).a) || has_return(&Box::get(p).b),
+        ExprKind::ECall(c)        :
+        {
+            if (has_return(&Box::get(c).callee))
+            {
+                return true;
+            }
+            foreach (a in &Box::get(c).args)
+            {
+                if (has_return(a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EAssign(p)      : has_return(&Box::get(p).a) || has_return(&Box::get(p).b),
+        ExprKind::EPropagate(a)   : has_return(Box::get(a)),
+        ExprKind::EBlock(b)       : block_has_return(b),
+        ExprKind::EUnsafe(b)      : block_has_return(b),
+        ExprKind::EIf(i)          :
+        {
+            if (has_return(&Box::get(i).cond) || block_has_return(&Box::get(i).then_))
+            {
+                return true;
+            }
+            match (&Box::get(i).else_)
+            {
+                Some(e2) : has_return(e2),
+                None     : false,
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            if (has_return(&Box::get(w).cond) || block_has_return(&Box::get(w).body))
+            {
+                return true;
+            }
+            match (&Box::get(w).step)
+            {
+                Some(s) : has_return(s),
+                None    : false,
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            if (has_return(&Box::get(m).scrut))
+            {
+                return true;
+            }
+            foreach (a in &Box::get(m).arms)
+            {
+                if (has_return(Box::get(&a.body)))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EClosure(c)     : block_has_return(&Box::get(c).body),
+        ExprKind::EParen(a)       : has_return(Box::get(a)),
+        _                         : false,
+    }
+}
+
+// D-0219: whether a call's reference arguments need no arrival test: at most
+// one argument is a reference or slice, and it is one whose path can have no
+// live descendant (cobc's `vouched_args`).
+export fn vouched_args(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> inst,
+    ref<Vec<Expr>, shared> args,
+) : bool
+{
+    HashMap<String, Type> sub = subst_of(&f.type_params, inst);
+    Vec<usize> refs = Vec::new();
+    for (usize k = 0; k < Vec::len(args) && k < Vec::len(&f.params); k += 1)
+    {
+        Type pt = apply(&f.params[k].ty, &sub);
+        bool r = match (&pt)
+        {
+            Type::TRef(_)   : true,
+            Type::TSlice(_) : true,
+            _               : false,
+        };
+        if (r)
+        {
+            Vec::push(&mut refs, k);
+        }
+    }
+    if (Vec::len(&refs) == 0)
+    {
+        return true;
+    }
+    if (Vec::len(&refs) == 1)
+    {
+        // A reference formed before a later argument is computed is fresh at
+        // the call only if that argument cannot act on what it reaches first
+        // (`set(&mut v[0], grow(&mut v))` moves the element): one with a
+        // call, a block or an assignment may.
+        usize i = refs[0];
+        if (!fresh_ref_arg(g, x, &args[i]))
+        {
+            return false;
+        }
+        for (usize k = i + 1; k < Vec::len(args); k += 1)
+        {
+            if (arg_has_call(&args[k]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Whether `e` contains a call, whose evaluation may have an effect
+// (coby's `parser::has_call`).
+fn arg_has_call(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(_)      : true,
+        ExprKind::EUnary(b)     : arg_has_call(&Box::get(b).e),
+        ExprKind::EBorrow(b)    : arg_has_call(&Box::get(b).e),
+        ExprKind::EDeref(x)     : arg_has_call(Box::get(x)),
+        ExprKind::EField(b)     : arg_has_call(&Box::get(b).e),
+        ExprKind::EPropagate(x) : arg_has_call(Box::get(x)),
+        ExprKind::EParen(x)     : arg_has_call(Box::get(x)),
+        ExprKind::EBinary(b)    : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EIndex(b)     : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EAssign(b)    : arg_has_call(&Box::get(b).a) || arg_has_call(&Box::get(b).b),
+        ExprKind::EPath(_)      : false,
+        ExprKind::EInt(_)       : false,
+        ExprKind::EFloat(_)     : false,
+        ExprKind::EStr(_)       : false,
+        ExprKind::EBool(_)      : false,
+        ExprKind::EUnit         : false,
+        _                       : true,
+    }
+}
+
+export fn fresh_ref_arg(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> a) : bool
+{
+    match (&strip_parens(a).kind)
+    {
+        ExprKind::EBorrow(_)  : true,
+        ExprKind::ESliceOf(_) : true,
+        ExprKind::EPath(pe)   :
+        {
+            if (Vec::len(&Box::get(pe).segs) != 1)
+            {
+                return false;
+            }
+            ref<String, shared> n = &Box::get(pe).segs[0];
+            x.entry_tested && HashSet::contains(&x.direct_params, n) && match (lookup(x, String::as_view(n)))
+            {
+                Some(b) : String::eq(&b.c, &sprintf("p_%s", &san(String::as_view(n)))),
+                None    : false,
+            }
+        },
+        ExprKind::ECall(c) : match (&strip_parens(&Box::get(c).callee).kind)
+        {
+            ExprKind::EPath(cp) : match (HashMap::get(&g.prog.table.fns, &String::join(&Box::get(cp).segs[0..$], "::")))
+            {
+                Some(fd) : returns_fresh_borrow(fd),
+                None     : false,
+            },
+            _ : false,
+        },
+        _                     : false,
+    }
+}
+
+// The direct parameters of a callee whose plain dispatcher is
+// `lower_fn_direct`'s (`cb_live_threads == 1 || cb_direct_ok(toks)`), None
+// for any other callee (cobc's `direct_dispatched`).
+fn direct_dispatched(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> inst,
+    u64 mask,
+    usize nargs,
+) : Option<HashSet<String>>
+{
+    if (all_checks(g) || mask != 0 || Vec::len(inst) > 0 || Vec::len(&f.type_params) > 0 || in_prelude(
+        name,
+        f,
+    ) || StringView::eq_str(name, "main") || nargs != Vec::len(&f.params) || Option::is_some(&x.raw_call))
+    {
+        return None;
+    }
+    HashMap<String, Type> subst = HashMap::new();
+    if (Option::is_some(&dual_eligible(g, f, &subst)) || Option::is_some(&field_dual_eligible(g, f, &subst)))
+    {
+        return None;
+    }
+    HashSet<String> direct = direct_ref_params(g, f, &subst);
+    if (HashSet::len(&direct) == 0)
+    {
+        return None;
+    }
+    HashSet<String> unstored = unstored_ref_params(g, f, &subst, &direct);
+    foreach (p in &f.params)
+    {
+        bool shared_ref = match (&p.ty)
+        {
+            Type::TRef(m) : Box::get(m).mode == Mode::Shared,
+            _             : false,
+        };
+        if (shared_ref && HashSet::contains(&unstored, &p.name))
+        {
+            return None;
+        }
+    }
+    Some(direct)
+}
+
+// A call whose every direct reference argument carries the token 0
+// (`((cb_ref){ adN, 0 })`, a path its caller vouched for): both
+// dispatchers' tests pass it (`cb_direct_ok` passes a 0 token), so the
+// direct twin is called itself, with no `toks` array (its address taken,
+// it costs every level a stack-protector canary) and no test (cobc's
+// `zero_token_call`).
+export fn zero_token_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> inst,
+    u64 mask,
+    ref<Vec<V>, shared> argv,
+) : bool
+{
+    HashSet<String> direct = match (direct_dispatched(g, x, name, f, inst, mask, Vec::len(argv)))
+    {
+        Some(d) : d,
+        None    : return false,
+    };
+    for (usize k = 0; k < Vec::len(argv); k += 1)
+    {
+        ref<ParamDecl, shared> p = &f.params[k];
+        bool is_ref = match (&p.ty)
+        {
+            Type::TRef(_) : true,
+            _             : false,
+        };
+        if (is_ref && HashSet::contains(&direct, &p.name) && !zero_token_ref(&argv[k].c))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// `((cb_ref){ NAME, 0 })` with NAME a C identifier.
+fn zero_token_ref(ref<String, shared> c) : bool
+{
+    StringView s = String::as_view(c);
+    StringView pre = StringView::of("((cb_ref){ ");
+    StringView post = StringView::of(", 0 })");
+    usize n = StringView::len(s);
+    usize a = StringView::len(pre);
+    usize z = StringView::len(post);
+    if (n <= a + z || !StringView::starts_with(s, pre) || !StringView::ends_with(s, post))
+    {
+        return false;
+    }
+    foreach (ch in StringView::as_bytes(StringView::sub(s, a, n - z)))
+    {
+        if (!(*ch == b'_' || ascii_is_alnum(*ch)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// D-0209: the direct twin itself (`NAME__dir`) where every direct argument is
+// a borrow of the caller's own local and no other argument names its root
+// (cobc's `direct_local_call`).
+export fn direct_local_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    StringView name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> inst,
+    u64 mask,
+    ref<Vec<Expr>, shared> args,
+) : bool
+{
+    HashSet<String> direct = match (direct_dispatched(g, x, name, f, inst, mask, Vec::len(args)))
+    {
+        Some(d) : d,
+        None    : return false,
+    };
+    Vec<String> roots = Vec::new();
+    for (usize k = 0; k < Vec::len(args); k += 1)
+    {
+        ref<ParamDecl, shared> p = &f.params[k];
+        Mode pm = match (&p.ty)
+        {
+            Type::TRef(m) : Box::get(m).mode,
+            _             : continue,
+        };
+        if (!HashSet::contains(&direct, &p.name))
+        {
+            continue;
+        }
+        ref<BorrowExpr, shared> bb = match (&strip_parens(&args[k]).kind)
+        {
+            ExprKind::EBorrow(b) : Box::get(b),
+            _                    : return false,
+        };
+        if (bb.mode != pm || !owned_local_root(g, x, &bb.e))
+        {
+            return false;
+        }
+        match (local_root_name(&bb.e))
+        {
+            Some(r) : Vec::push(&mut roots, r),
+            None    : return false,
+        }
+    }
+    // CHG-0342: no other argument may name a direct root.
+    for (usize k = 0; k < Vec::len(args); k += 1)
+    {
+        ref<ParamDecl, shared> p = &f.params[k];
+        Option<String> own = None;
+        if (is_ref_type(&p.ty) && HashSet::contains(&direct, &p.name))
+        {
+            match (&strip_parens(&args[k]).kind)
+            {
+                ExprKind::EBorrow(b) : own = local_root_name(&Box::get(b).e),
+                _                    : {},
+            }
+        }
+        foreach (r in &roots)
+        {
+            bool is_own = match (&own)
+            {
+                Some(o) : String::eq(o, r),
+                None    : false,
+            };
+            if (!is_own && mentions(&args[k], r))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// The local `x` at the root of `x`, `x.f`, `x[i]`, … (cobc's
+// `local_root_name`).
+export fn local_root_name(ref<Expr, shared> e) : Option<String>
+{
+    ref<Expr, shared> at_e = strip_parens(e);
+    while (true)
+    {
+        match (&at_e.kind)
+        {
+            ExprKind::EField(fe) : at_e = strip_parens(&Box::get(fe).e),
+            ExprKind::EIndex(ie) : at_e = strip_parens(&Box::get(ie).a),
+            ExprKind::EPath(pe)  :
+            {
+                if (Vec::len(&Box::get(pe).segs) == 1 && Vec::len(&Box::get(pe).targs) == 0)
+                {
+                    return Some(String::clone(&Box::get(pe).segs[0]));
+                }
+                return None;
+            },
+            _                    : return None,
+        }
+    }
+    None
+}
+
+// Whether `e` is `x`, or fields and indexes (of a `Vec` or an array) of it,
+// for `x` an owned local that is neither a reference nor a slice (cobc's
+// `owned_local_root`).
+export fn owned_local_root(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : bool
+{
+    ref<Expr, shared> at_e = strip_parens(e);
+    while (true)
+    {
+        match (&at_e.kind)
+        {
+            ExprKind::EField(fe) :
+            {
+                Type t = probe_type(g, x, strip_parens(&Box::get(fe).e), None);
+                bool ok = match (&t)
+                {
+                    Type::TNamed(_) : true,
+                    Type::TArray(_) : true,
+                    _               : false,
+                };
+                if (!ok)
+                {
+                    return false;
+                }
+                at_e = strip_parens(&Box::get(fe).e);
+            },
+            ExprKind::EIndex(ie) :
+            {
+                Type t = probe_type(g, x, strip_parens(&Box::get(ie).a), None);
+                bool ok = match (&t)
+                {
+                    Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::Vec"),
+                    Type::TArray(_) : true,
+                    _               : false,
+                };
+                if (!ok)
+                {
+                    return false;
+                }
+                at_e = strip_parens(&Box::get(ie).a);
+            },
+            ExprKind::EPath(pe)  :
+            {
+                if (Vec::len(&Box::get(pe).segs) != 1 || Vec::len(&Box::get(pe).targs) != 0)
+                {
+                    return false;
+                }
+                return match (lookup(x, String::as_view(&Box::get(pe).segs[0])))
+                {
+                    Some(b) : match (&b.kind)
+                    {
+                        BindKind::Local : !is_ref_type(&b.ty) && match (&b.ty)
+                        {
+                            Type::TSlice(_) : false,
+                            _               : true,
+                        },
+                        _ : false,
+                    },
+                    None : false,
+                };
+            },
+            _                    : return false,
+        }
+    }
+    false
+}
+
+// CHG-0237: `&x` of a local (or of fields of one, through a dereference of a
+// local at most) `Vec` of plain, non-zero-sized elements, no other argument
+// naming `x`: a borrow formed here for a confining shared parameter (cobc's
+// `fresh_shared_vec_arg`).
+export fn fresh_shared_vec_arg(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> a,
+    usize j,
+    ref<Vec<Expr>, shared> args,
+) : bool
+{
+    ref<BorrowExpr, shared> bb = match (&a.kind)
+    {
+        ExprKind::EBorrow(b) : Box::get(b),
+        _                    : return false,
+    };
+    if (bb.mode != Mode::Shared)
+    {
+        return false;
+    }
+    ref<Expr, shared> root = &bb.e;
+    while (true)
+    {
+        match (&root.kind)
+        {
+            ExprKind::EField(fe) : root = &Box::get(fe).e,
+            ExprKind::EParen(pe) : root = Box::get(pe),
+            _                    : break,
+        }
+    }
+    match (&root.kind)
+    {
+        ExprKind::EDeref(d) : root = strip_parens(Box::get(d)),
+        _                   : {},
+    }
+    ref<PathExpr, shared> pe = match (&root.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return false,
+    };
+    if (Vec::len(&pe.segs) != 1 || Vec::len(&pe.targs) != 0 || Option::is_none(&lookup(
+        x,
+        String::as_view(&pe.segs[0]),
+    )))
+    {
+        return false;
+    }
+    for (usize k = 0; k < Vec::len(args); k += 1)
+    {
+        if (k != j && mentions(&args[k], &pe.segs[0]))
+        {
+            return false;
+        }
+    }
+    Type ty = probe_type(g, x, &bb.e, None);
+    match (&ty)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            String::eq_str(
+                &nt.name,
+                "std::Vec",
+            ) && Vec::len(&nt.args) == 1 && plain_data(g, &nt.args[0]) && size_align(g, &nt.args[0]).size != 0
+        },
+        _               : false,
+    }
+}

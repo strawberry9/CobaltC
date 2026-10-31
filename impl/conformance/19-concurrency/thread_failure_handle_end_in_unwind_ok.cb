@@ -1,0 +1,50 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.thread-failure-handle-end-in-unwind; rule.conc.fault-contain [Fault-Contain], rule.conc.handle-destructor [Handle-Destructor], [Join-Failed] (D-0204, D-0210, CHG-0248)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 706172656e743a20646961672e696e6465782d6f75742d6f662d626f756e64730a656e640a
+//
+// A contained fault unwinds a frame that owns a handle: the unwind
+// cancels the waiter (blocked in a channel receive), the handle's
+// destructor waits for it, and the waiter's own failure --
+// diag.thread-cancelled -- is discarded. The parent's result is its own
+// fault, diag.index-out-of-bounds, which try_join returns to main; main
+// goes on. The index is bound through a function so that the static
+// analysis does not refute the access.
+
+import std;
+
+fn waiter(ref<Channel<i32>, shared> ch) : i32
+{
+    match (Channel::recv(ch))
+    {
+        Some(v) : v,
+        None    : 0,
+    }
+}
+
+fn parent(ref<Channel<i32>, shared> ch) : i32
+{
+    auto h = spawn(waiter, ch);
+    array<i32, 2> a = [1, 2];
+    usize i = five();
+    a[i]
+}
+
+fn main()
+{
+    Channel<i32> ch = Channel::new(1);
+    auto p = spawn(parent, &ch);
+    match (try_join(p))
+    {
+        Ok(v)  : printf("ok %v\n", v),
+        Err(f) : printf("parent: %v\n", &ThreadFailure::diagnostic(&f)),
+    }
+    printf("end\n");
+}
+
+fn five() : usize
+{
+    5
+}

@@ -1,0 +1,586 @@
+// The front end as cobc's driver uses it, over the front end written in
+// CobaltC (impl/selfhost/front): `analyze` (impl/src/lib.rs's, with
+// `--unittest`'s runner, impl/src/unittest.rs), `--check` (impl/src/check.rs's
+// `run`, with cobc's `extern` check) and `--check-syntax` (`run_syntax`).
+
+import std;
+import ast;
+import parser;
+import loader;
+import check;
+import diags;
+import link;
+import target;
+import driverbase;
+import certificate;
+
+// `--unittest`'s choices (impl/src/unittest.rs's `Mode`).
+export struct UnitMode
+{
+    // `--unittest-filter TEXT`: only the tests whose name contains TEXT.
+    export Option<String> filter;
+    // `--unittest-std`: `std`'s own tests, in place of the program's.
+    export bool std_tests;
+}
+
+// A test's place, as the report names it: `file.cb:LINE`. (cobc names a
+// test of `std` `<std>/FILE:LINE`; the front end written in CobaltC parses
+// the program's own tests only, so none is `std`'s here.)
+fn place(ref<UnitTest, shared> t, ref<Expansion, shared> ex, bool std_test) : String
+{
+    if (std_test)
+    {
+        return match (std_location(t.line))
+        {
+            Some(o) : sprintf("<std>/%s:%v", &o.file, o.line),
+            None    : sprintf("line %v", t.line),
+        };
+    }
+    match (resolve_line(ex, t.line))
+    {
+        Some(o) : sprintf("%s:%v", &o.file, o.line),
+        None    : sprintf("line %v", t.line),
+    }
+}
+
+fn hex_lower(u32 v) : String
+{
+    str digits = "0123456789abcdef";
+    String s = String::new();
+    bool started = false;
+    for (u32 i = 0; i < 8; i += 1)
+    {
+        u32 d = (v >> (28 - 4 * i)) & 15;
+        if (d != 0 || started || i == 7)
+        {
+            started = true;
+            String::push_ascii(&mut s, StringView::as_bytes(StringView::of(digits))[widen<usize>(d)]);
+        }
+    }
+    s
+}
+
+// A text as a CobaltC `str` literal.
+fn literal(StringView s) : String
+{
+    String out = String::from_str("\"");
+    Vec<StringView> cs = StringView::chars(s);
+    foreach (cp in &cs)
+    {
+        StringView c = *cp;
+        u8 b = StringView::as_bytes(c)[0];
+        if (StringView::eq_str(c, "\\"))
+        {
+            String::append(&mut out, "\\\\");
+        }
+        else if (StringView::eq_str(c, "\""))
+        {
+            String::append(&mut out, "\\\"");
+        }
+        else if (StringView::eq_str(c, "\n"))
+        {
+            String::append(&mut out, "\\n");
+        }
+        else if (StringView::eq_str(c, "\t"))
+        {
+            String::append(&mut out, "\\t");
+        }
+        else if (StringView::eq_str(c, "\r"))
+        {
+            String::append(&mut out, "\\r");
+        }
+        else if (StringView::len(c) == 1 && (b < 0x20 || b == 0x7f))
+        {
+            String::appendf(&mut out, "\\u{%s}", &hex_lower(widen<u32>(b)));
+        }
+        else
+        {
+            String::append(&mut out, c);
+        }
+    }
+    String::push_ascii(&mut out, b'"');
+    out
+}
+
+// The runner's source (impl/src/unittest.rs's `runner`): a `main` that runs
+// the selected tests in order, each as `try_join(spawn(test))`, and reports
+//
+//     test FILE:LINE NAME ... ok
+//     test FILE:LINE ... FAILED
+//     <the fault's report, as the program would have printed it>
+//     N tests: P passed, F failed[, K filtered out]
+//
+// on standard output; its exit status is 1 when a test failed.
+export fn runner(
+    ref<Vec<UnitTest>, shared> prog_tests,
+    ref<UnitMode, shared> mode,
+    ref<Expansion, shared> ex,
+) : Result<String, String>
+{
+    // `--unittest-std`: the prelude's tests (its declarations make them) in
+    // place of the program's.
+    Vec<UnitTest> std_tests = if (mode.std_tests) { parse_prelude().tests } else { Vec::new() };
+    ref<Vec<UnitTest>, shared> tests = if (mode.std_tests) { &std_tests } else { prog_tests };
+    Vec<usize> mine = Vec::new();
+    for (usize i = 0; i < Vec::len(tests); i += 1)
+    {
+        Vec::push(&mut mine, i);
+    }
+    Vec<usize> chosen = Vec::new();
+    match (&mode.filter)
+    {
+        Some(f) :
+        {
+            foreach (i in &mine)
+            {
+                match (&tests[*i].name)
+                {
+                    Some(n) :
+                    {
+                        if (String::contains(n, String::as_view(f)))
+                        {
+                            Vec::push(&mut chosen, *i);
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            if (Vec::len(&chosen) == 0)
+            {
+                return Err(sprintf(
+                    "%vno test's name contains %s (%v test%v in all)",
+                    REFUSAL,
+                    &debug_str(String::as_view(f)),
+                    Vec::len(&mine),
+                    if (Vec::len(&mine) == 1) { "" } else { "s" },
+                ));
+            }
+        },
+        None    : chosen = Vec::clone(&mine),
+    }
+    String s = String::from_str("fn main() : u8\n{\n    usize passed = 0;\n    usize failed = 0;\n");
+    foreach (i in &chosen)
+    {
+        ref<UnitTest, shared> t = &tests[*i];
+        String label = match (&t.name)
+        {
+            Some(n) : sprintf("test %s %s ... ", &place(t, ex, mode.std_tests), n),
+            None    : sprintf("test %s ... ", &place(t, ex, mode.std_tests)),
+        };
+        String path = if (Vec::len(&t.module_) == 0) { String::clone(&t.fn_name) } else
+        {
+            sprintf(
+                "%s::%s",
+                &String::join(&t.module_[0..$], "::"),
+                &t.fn_name,
+            )
+        };
+        String::appendf(&mut s, "    std::printf(\"%%v\", %s);\n", &literal(String::as_view(&label)));
+        String::appendf(&mut s, "    match (std::try_join(spawn(%s)))\n    {\n", &path);
+        String::append(&mut s, "        Ok(_)  : { std::printf(\"ok\\n\"); passed += 1; },\n");
+        String::append(
+            &mut s,
+            "        Err(f) : { std::printf(\"FAILED\\n%v\", &std::ThreadFailure::text(&f)); failed += 1; },\n",
+        );
+        String::append(&mut s, "    }\n");
+    }
+    String filtered = match (&mode.filter)
+    {
+        Some(_) : sprintf(", %v filtered out", Vec::len(&mine) - Vec::len(&chosen)),
+        None    : String::new(),
+    };
+    String::appendf(
+        &mut s,
+        "    std::printf(\"%%v test%%v: %%v passed, %%v failed%%v\\n\", passed + failed, %s, passed, failed, %s);\n",
+        &literal(if (Vec::len(&chosen) == 1) { "" } else { "s" }),
+        &literal(String::as_view(&filtered)),
+    );
+    String::append(&mut s, "    if (failed > 0) { 1 } else { 0 }\n}\n");
+    Ok(s)
+}
+
+// Rust's `{:?}` of a string: quoted, `"` and `\` escaped, a control
+// character as `\n`, `\t`, `\r`, `\0` or `\u{…}`.
+fn debug_str(StringView s) : String
+{
+    String out = String::from_str("\"");
+    Vec<StringView> cs = StringView::chars(s);
+    foreach (cp in &cs)
+    {
+        StringView c = *cp;
+        u8 b = StringView::as_bytes(c)[0];
+        if (StringView::eq_str(c, "\\"))
+        {
+            String::append(&mut out, "\\\\");
+        }
+        else if (StringView::eq_str(c, "\""))
+        {
+            String::append(&mut out, "\\\"");
+        }
+        else if (StringView::eq_str(c, "\n"))
+        {
+            String::append(&mut out, "\\n");
+        }
+        else if (StringView::eq_str(c, "\t"))
+        {
+            String::append(&mut out, "\\t");
+        }
+        else if (StringView::eq_str(c, "\r"))
+        {
+            String::append(&mut out, "\\r");
+        }
+        else if (b == 0)
+        {
+            String::append(&mut out, "\\0");
+        }
+        else if (StringView::len(c) == 1 && (b < 0x20 || b == 0x7f))
+        {
+            String::appendf(&mut out, "\\u{%s}", &hex_lower(widen<u32>(b)));
+        }
+        else
+        {
+            String::append(&mut out, c);
+        }
+    }
+    String::push_ascii(&mut out, b'"');
+    out
+}
+
+// The front end's verdict on a program (impl/src/lib.rs's `analyze`): the
+// checked program, or the static diagnostic that rejected it with the
+// expansion that places it. D-0230: under `--unittest` (`mode`), the runner
+// is the program's `main`; the program's own `main` is kept, checked and
+// renamed `__unittest_main`, and not run.
+export fn analyze(
+    StringView src,
+    StringView origin,
+    ref<Option<UnitMode>, shared> mode,
+    Option<String> certificate,
+) : Result<Checked, Rejected>
+{
+    Parsed parsed = parse_user(src, origin)?;
+    match (mode)
+    {
+        Some(m) :
+        {
+            Parsed { user, ex } = parsed;
+            String run = match (runner(&user.tests, m, &ex))
+            {
+                Ok(r)  : r,
+                Err(e) : return Err(Rejected { .raw = e, .ex = ex, .loading = false }),
+            };
+            usize last = Vec::len(&String::lines(&ex.text));
+            String text = sprintf("%s\n%s", &ex.text, &run);
+            Program again = match (parse_text(&text))
+            {
+                Ok(p)  : p,
+                Err(e) : return Err(Rejected { .raw = e, .ex = ex, .loading = false }),
+            };
+            for (usize i = 0; i < Vec::len(&again.items); i += 1)
+            {
+                match (&mut again.items[i])
+                {
+                    Item::IFn(b) :
+                    {
+                        ref<FnDecl, exclusive> f = Box::get_mut(b);
+                        if (f.name == "main" && Option::is_none(&f.assoc_type) && f.line <= last)
+                        {
+                            f.name = String::from_str("__unittest_main");
+                        }
+                    },
+                    _            : {},
+                }
+            }
+            parsed = Parsed { .user = again, .ex = ex };
+        },
+        None    : {},
+    }
+    check_parsed(parsed, env_flag("COBALTC_WARN_SHADOW"), certificate)
+}
+
+// D-0299: `--certificate CERT --check FILE`: the static pass alone on one
+// program, as `run_check` does it, the certificate written after it
+// (`certificate::check_one`). The exit status is `run_check`'s: 0 accepted,
+// 1 rejected, 2 unreadable, or two programs or a directory named.
+export fn check_one(ref<Vec<String>, shared> paths, StringView tool, ref<String, shared> cert) : u8
+{
+    if (Vec::len(paths) != 1 || is_dir(String::as_view(&paths[0])))
+    {
+        eprintf("usage: %v --certificate FILE --check FILE.cb (one program)\n", tool);
+        return 2;
+    }
+    ref<String, shared> file = &paths[0];
+    String src = match (read_file(String::as_view(file)))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("%v: error reading %s: %s\n", tool, file, io_text(&e));
+            return 2;
+        },
+    };
+    Option<UnitMode> no_tests = None;
+    match (analyze(String::as_view(&src), String::as_view(file), &no_tests, Some(String::clone(cert))))
+    {
+        Err(r) :
+        {
+            eprintf("%s", &for_stderr(String::as_view(&render_located(String::as_view(&r.raw), "static", &r.ex))));
+            _ = cert_finish_rejected(
+                String::as_view(cert),
+                &r.ex,
+                "cobc",
+                String::as_view(file),
+                String::as_view(&r.raw),
+            );
+            1
+        },
+        Ok(c)  :
+        {
+            _ = cert_finish(String::as_view(cert), &c.ex, "cobc", String::as_view(file), None);
+            match (link::resolve(&c.table.extern_code, &c.ex))
+            {
+                Ok(_)  : 0,
+                Err(e) :
+                {
+                    eprintf("%v: %s\n", tool, &e);
+                    2
+                },
+            }
+        },
+    }
+}
+
+// ---- `--check` (impl/src/check.rs) ----
+
+// The `.cb` files under `dir`, sorted; hidden directories and `target/`
+// skipped.
+export fn collect(StringView dir, ref<Vec<String>, exclusive> out)
+{
+    Vec<String> names = match (list_dir(dir))
+    {
+        Ok(v)  : v,
+        Err(_) : return,
+    };
+    foreach (name in &names)
+    {
+        String p = pjoin(dir, String::as_view(name));
+        if (is_dir(String::as_view(&p)))
+        {
+            if (String::starts_with(name, ".") || *name == "target")
+            {
+                continue;
+            }
+            collect(String::as_view(&p), out);
+        }
+        else if (String::ends_with(name, ".cb"))
+        {
+            Vec::push(out, p);
+        }
+    }
+}
+
+struct Found
+{
+    String path;
+    bool found;
+}
+
+// Checks `paths`; `tool` names the command in its own messages, and each
+// accepted program is checked further: the files its `extern "…";`
+// declarations name (cobc's `extra`), its error printed as `TOOL: error`.
+// The exit status: 0 every program accepted; 1 one was rejected statically;
+// 2 a path that does not exist, a file that cannot be read, or the `extern`
+// check failed. Every file is checked whatever an earlier one gave.
+export fn run_check(ref<Vec<String>, shared> paths, StringView tool) : u8
+{
+    u8 worst = 0;
+    // Each file, and whether a directory search found it.
+    Vec<Found> files = Vec::new();
+    foreach (p in paths)
+    {
+        if (is_dir(String::as_view(p)))
+        {
+            Vec<String> found = Vec::new();
+            collect(String::as_view(p), &mut found);
+            foreach (f in &found)
+            {
+                Vec::push(&mut files, Found { .path = String::clone(f), .found = true });
+            }
+        }
+        else if (exists(String::as_view(p)))
+        {
+            Vec::push(&mut files, Found { .path = String::clone(p), .found = false });
+        }
+        else
+        {
+            eprintf("%v: %s: no such file or directory\n", tool, p);
+            worst = 2;
+        }
+    }
+    // A file named twice (or found twice) is checked once.
+    Vec<String> seen = Vec::new();
+    Vec<Found> kept = Vec::new();
+    foreach (f in &files)
+    {
+        String canon = Option::unwrap_or(canonical(String::as_view(&f.path)), String::clone(&f.path));
+        bool fresh = !Vec::contains(&seen, &canon);
+        Vec::push(&mut seen, canon);
+        if (fresh)
+        {
+            Vec::push(&mut kept, clone(f));
+        }
+    }
+    // Read every file once; the module files the found ones load (the
+    // loader alone: no program is checked yet).
+    Vec<Result<String, String>> sources = Vec::new();
+    foreach (f in &kept)
+    {
+        Vec::push(&mut sources, match (read_file(String::as_view(&f.path)))
+        {
+            Ok(s)  : Ok(s),
+            Err(e) : Err(String::from_str(io_text(&e))),
+        });
+    }
+    Vec<String> modules = Vec::new();
+    for (usize i = 0; i < Vec::len(&kept); i += 1)
+    {
+        match (&sources[i])
+        {
+            Ok(src) :
+            {
+                Expansion ex = expand(String::as_view(src), String::as_view(&kept[i].path));
+                Vec::append(&mut modules, replace(&mut ex.loaded, Vec::new()));
+            },
+            Err(_)  : {},
+        }
+    }
+    bool many = Vec::len(&kept) > 1;
+    Option<UnitMode> no_tests = None;
+    for (usize i = 0; i < Vec::len(&kept); i += 1)
+    {
+        ref<Found, shared> f = &kept[i];
+        if (f.found)
+        {
+            match (canonical(String::as_view(&f.path)))
+            {
+                Some(c) :
+                {
+                    if (Vec::contains(&modules, &c))
+                    {
+                        continue;
+                    }
+                },
+                None    : {},
+            }
+        }
+        ref<String, shared> src = match (&sources[i])
+        {
+            Ok(s)  : s,
+            Err(e) :
+            {
+                eprintf("%v: error reading %s: %s\n", tool, &f.path, e);
+                worst = 2;
+                continue;
+            },
+        };
+        match (analyze(String::as_view(src), String::as_view(&f.path), &no_tests, None))
+        {
+            Err(r) :
+            {
+                if (many)
+                {
+                    eprintf("%s: rejected\n", &f.path);
+                }
+                eprintf("%s", &for_stderr(String::as_view(&render_located(String::as_view(&r.raw), "static", &r.ex))));
+                if (worst < 1)
+                {
+                    worst = 1;
+                }
+            },
+            Ok(c)  :
+            {
+                match (link::resolve(&c.table.extern_code, &c.ex))
+                {
+                    Ok(_)  : {},
+                    Err(e) :
+                    {
+                        eprintf("%v: %s\n", tool, &e);
+                        worst = 2;
+                    },
+                }
+            },
+        }
+    }
+    worst
+}
+
+// `--check-syntax` (`args` after the option): `[--origin PATH] FILE` or
+// `[--origin PATH] -`, the text read from FILE or standard input, its
+// modules found relative to PATH (by default FILE; none for standard input).
+// Whether it parses decides: exit 0 it does; 1 it does not, the error on
+// standard error; 2 a usage error or text that cannot be read.
+export fn run_syntax(ref<Vec<String>, shared> args, StringView tool) : u8
+{
+    Option<String> origin = None;
+    usize at = 0;
+    if (Vec::len(args) >= 2 && args[0] == "--origin")
+    {
+        origin = Some(String::clone(&args[1]));
+        at = 2;
+    }
+    if (Vec::len(args) != at + 1)
+    {
+        eprintf("usage: %v --check-syntax [--origin PATH] (FILE | -)\n", tool);
+        return 2;
+    }
+    ref<String, shared> file = &args[at];
+    String src = if (*file == "-")
+    {
+        match (read_all())
+        {
+            Ok(s)  : s,
+            Err(_) :
+            {
+                eprintf("%v: standard input is not readable UTF-8 text\n", tool);
+                return 2;
+            },
+        }
+    }
+    else
+    {
+        match (read_bytes(String::as_view(file)))
+        {
+            Ok(b)  :
+            {
+                match (String::from_utf8(b))
+                {
+                    Ok(s)  : s,
+                    Err(_) :
+                    {
+                        eprintf("%v: %s: not UTF-8 (a CobaltC source file is UTF-8)\n", tool, file);
+                        return 2;
+                    },
+                }
+            },
+            Err(e) :
+            {
+                eprintf("%v: %s: cannot read: %v\n", tool, file, io_text(&e));
+                return 2;
+            },
+        }
+    };
+    String o = match (origin)
+    {
+        Some(p) : p,
+        None    : if (*file == "-") { String::new() } else { String::clone(file) },
+    };
+    match (syntax(String::as_view(&src), String::as_view(&o)))
+    {
+        None    : 0,
+        Some(e) :
+        {
+            eprintf("%s\n", &e);
+            1
+        },
+    }
+}

@@ -1,0 +1,77 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.tls (`TlsStream::client`, `read`, `read_exact`, `write`, `local_addr`, `peer_addr`); rule.stdlib.x509 (`TrustStore::from_pem_file`, `TrustStore::system`) (CHG-0265); conf.tls-stream-bytes
+// kind: positive
+// expect: ok
+// slow: TLS handshakes under the interpreter take over a minute
+// args: $TMP
+// expect-stdout-hex: 6d697373696e673a204e6f74466f756e640a6164647265737365733a206c6f63616c20747275652c207065657220747275650a616e737765723a206f6c6c65680a73657276657220726561642065786163746c7920666976653a20747275650a
+//
+// Hermetic: the client trusts a root it reads from a PEM file it wrote
+// (`TrustStore::from_pem_file`; a missing file is `NotFound`), opens TLS
+// over a TCP stream of its own (`TlsStream::client`), writes bytes, and
+// reads the server's answer with `read`; the server reads exactly five
+// bytes and answers them reversed. The stream's addresses are the TCP
+// stream's. `TrustStore::system` is called (whether the machine has a
+// store is not printed).
+import std;
+
+const str KEY = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIG/xpX/23qwZ8iDRpzBtyYErXB+yw1ePRPCeOrMbHv6h\n-----END PRIVATE KEY-----\n";
+
+const str CRT = "-----BEGIN CERTIFICATE-----\nMIIBfzCCATGgAwIBAgIUT5+4C2nK5/ckjqCAbHutlwq/fFowBQYDK2VwMBQxEjAQ\nBgNVBAMMCWxvY2FsaG9zdDAgFw0yNjEwMDcwNTE1MDFaGA8yMTAwMDkwOTA1MTUw\nMVowFDESMBAGA1UEAwwJbG9jYWxob3N0MCowBQYDK2VwAyEAegP8qkgXtxseLdoQ\nVA0JHXycpuJ8Pngy7dgQ3xsz552jgZIwgY8wHQYDVR0OBBYEFDSsOJwWBXtwFB5F\nALP2IghQZGKuMB8GA1UdIwQYMBaAFDSsOJwWBXtwFB5FALP2IghQZGKuMA8GA1Ud\nEwEB/wQFMAMBAf8wCwYDVR0PBAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoG\nA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAFBgMrZXADQQBo4o2RWAyOEsn05+06\n9J3Dk9EvdsEp2cq67rhtYhNMNEEOvAUQ3bY3x/ykp+tcRbGW/RKox3FHoJUKTkw8\ng2AG\n-----END CERTIFICATE-----\n";
+
+fn serve(TcpListener l, PrivateKey key, Vec<Certificate> chain) : bool
+{
+    TcpStream tcp = Result::unwrap(TcpListener::accept(&mut l));
+    TlsStream s = Result::unwrap(TlsStream::server(tcp, &key, &chain[0..$]));
+    Vec<u8> got = Vec::new();
+    bool ok = Result::is_ok(&TlsStream::read_exact(&mut s, &mut got, 5));
+    Vec<u8> back = Vec::new();
+    for (usize i = Vec::len(&got); i > 0; i -= 1)
+    {
+        Vec::push(&mut back, got[i - 1]);
+    }
+    _ = TlsStream::write(&mut s, &back[0..$]);
+    _ = TlsStream::close(&mut s);
+    ok
+}
+
+fn main()
+{
+    String dir = Result::unwrap_or(arg(0), String::new());
+    String file = path_join(String::as_view(&dir), "roots.pem");
+    _ = write_file(String::as_view(&file), CRT);
+    match (TrustStore::from_pem_file(String::as_view(&path_join(String::as_view(&dir), "missing.pem"))))
+    {
+        Err(NotFound) : printf("missing: NotFound\n"),
+        _             : printf("missing: something else\n"),
+    }
+    TrustStore roots = Result::unwrap(TrustStore::from_pem_file(String::as_view(&file)));
+    _ = TrustStore::system();
+    PrivateKey key = Result::unwrap(PrivateKey::from_pem(KEY));
+    Vec<Certificate> chain = certificates_from_pem(CRT);
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr addr = TcpListener::local_addr(&l);
+    auto server = spawn(serve, l, key, chain);
+    TcpStream tcp = Result::unwrap(TcpStream::connect(addr));
+    u16 local = TcpStream::local_addr(&tcp).port;
+    TlsStream c = Result::unwrap(TlsStream::client(tcp, "localhost", &roots));
+    printf(
+        "addresses: local %v, peer %v\n",
+        TlsStream::local_addr(&c).port == local,
+        TlsStream::peer_addr(&c).port == addr.port,
+    );
+    _ = TlsStream::write(&mut c, &b"hello"[0..$]);
+    Vec<u8> answer = Vec::new();
+    while (Vec::len(&answer) < 5)
+    {
+        match (TlsStream::read(&mut c, &mut answer, 5 - Vec::len(&answer)))
+        {
+            Ok(0)  : break,
+            Ok(_)  : {},
+            Err(_) : break,
+        }
+    }
+    printf("answer: %v\n", &Result::unwrap(String::from_utf8(answer)));
+    printf("server read exactly five: %v\n", join(server));
+}

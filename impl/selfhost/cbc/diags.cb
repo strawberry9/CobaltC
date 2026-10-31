@@ -1,0 +1,958 @@
+// A `diag.*` id rendered as `coby` and cobc print it (impl/src/diagnostics.rs),
+// from spec/registry/diagnostics.md itself (`build_info::REGISTRY_SRC`, as
+// cobc's `include_str!`), and `render_located`, `resolve_user_location` and
+// `locate` (impl/src/lib.rs) over the front end's expansion. The front end
+// written in CobaltC numbers a diagnostic's line in the expanded program's own
+// line space (coby's in the prelude's and the program's combined text, less
+// the prelude's lines), so a line maps to its file through the expansion
+// directly.
+
+import std;
+import loader;
+import build_info;
+import driverbase;
+import host;
+import prelude;
+import typecheck;
+
+export struct DiagInfo
+{
+    export Vec<String> ids;
+    export Option<String> summary;
+    export Option<String> phase;
+    export Option<String> rule;
+    export Option<String> invariant;
+    export Option<String> required;
+    export Option<String> observed;
+    export Option<String> provenance;
+    export Option<String> repair;
+    export Option<String> related;
+    export Option<String> location;
+}
+
+fn field_labels() : Vec<str>
+{
+    Vec<str> v = Vec::new();
+    foreach (l in [
+        "Summary: ",
+        "Phase: ",
+        "Rule: ",
+        "Invariant: ",
+        "Required: ",
+        "Observed: ",
+        "Provenance: ",
+        "Repair: ",
+        "Related: ",
+        "Location: ",
+    ])
+    {
+        Vec::push(&mut v, l);
+    }
+    v
+}
+
+fn extract_diag_ids(StringView names_part) : Vec<String>
+{
+    Vec<String> ids = Vec::new();
+    StringView rest = names_part;
+    while (true)
+    {
+        usize start = match (StringView::find(rest, "`"))
+        {
+            Some(k) : k,
+            None    : break,
+        };
+        StringView after = StringView::sub(rest, start + 1, StringView::len(rest));
+        usize end = match (StringView::find(after, "`"))
+        {
+            Some(k) : k,
+            None    : break,
+        };
+        StringView candidate = StringView::sub(after, 0, end);
+        if (StringView::starts_with(candidate, "diag."))
+        {
+            Vec::push(&mut ids, String::from_view(candidate));
+        }
+        rest = StringView::sub(after, end + 1, StringView::len(after));
+    }
+    ids
+}
+
+struct LabelAt
+{
+    usize pos;
+    str label;
+}
+
+// Each known label's value: from its label to the next label found (or
+// the end), so a value may hold periods; trailing periods and spaces off.
+fn parse_fields(StringView fields_part) : HashMap<String, String>
+{
+    Vec<LabelAt> positions = Vec::new();
+    Vec<str> labels = field_labels();
+    foreach (label in &labels)
+    {
+        match (StringView::find(fields_part, StringView::of(*label)))
+        {
+            Some(p) : Vec::push(&mut positions, LabelAt { .pos = p, .label = *label }),
+            None    : {},
+        }
+    }
+    // Sorted by position (a stable insertion sort: labels never share one).
+    for (usize i = 1; i < Vec::len(&positions); i += 1)
+    {
+        usize j = i;
+        while (j > 0 && positions[j - 1].pos > positions[j].pos)
+        {
+            Vec::swap(&mut positions, j - 1, j);
+            j -= 1;
+        }
+    }
+    HashMap<String, String> out = HashMap::new();
+    for (usize i = 0; i < Vec::len(&positions); i += 1)
+    {
+        StringView label = StringView::of(positions[i].label);
+        usize value_start = positions[i].pos + StringView::len(label);
+        usize value_end = if (i + 1 < Vec::len(&positions)) { positions[i + 1].pos } else { StringView::len(fields_part) };
+        StringView value = StringView::trim(StringView::sub(fields_part, value_start, value_end));
+        while (StringView::ends_with(value, "."))
+        {
+            value = StringView::sub(value, 0, StringView::len(value) - 1);
+        }
+        while (StringView::ends_with(value, " "))
+        {
+            value = StringView::sub(value, 0, StringView::len(value) - 1);
+        }
+        StringView key = Option::unwrap_or(StringView::strip_suffix(label, ": "), label);
+        HashMap::insert(&mut out, String::from_view(key), String::from_view(value));
+    }
+    out
+}
+
+fn get_field(ref<HashMap<String, String>, shared> fields, str key) : Option<String>
+{
+    match (HashMap::get(fields, &String::from_str(key)))
+    {
+        Some(v) : Some(String::clone(v)),
+        None    : None,
+    }
+}
+
+// The registry's bullet list: one bullet may name several ids sharing one
+// description, each its own entry.
+export fn parse_registry(StringView text) : HashMap<String, DiagInfo>
+{
+    HashMap<String, DiagInfo> map = HashMap::new();
+    Vec<StringView> rows = StringView::lines(text);
+    foreach (raw in &rows)
+    {
+        StringView line = StringView::trim(*raw);
+        if (!StringView::starts_with(line, "- `diag."))
+        {
+            continue;
+        }
+        StringView rest = StringView::sub(line, 2, StringView::len(line));
+        usize sep = match (StringView::find(rest, " \u{2014} "))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        StringView names_part = StringView::sub(rest, 0, sep);
+        StringView fields_part = StringView::sub(rest, sep + StringView::len(" \u{2014} "), StringView::len(rest));
+        Vec<String> ids = extract_diag_ids(names_part);
+        if (Vec::len(&ids) == 0)
+        {
+            continue;
+        }
+        HashMap<String, String> fields = parse_fields(fields_part);
+        DiagInfo info = DiagInfo {
+            .ids = Vec::clone(&ids),
+            .summary = get_field(&fields, "Summary"),
+            .phase = get_field(&fields, "Phase"),
+            .rule = get_field(&fields, "Rule"),
+            .invariant = get_field(&fields, "Invariant"),
+            .required = get_field(&fields, "Required"),
+            .observed = get_field(&fields, "Observed"),
+            .provenance = get_field(&fields, "Provenance"),
+            .repair = get_field(&fields, "Repair"),
+            .related = get_field(&fields, "Related"),
+            .location = get_field(&fields, "Location"),
+        };
+        foreach (id in &ids)
+        {
+            HashMap::insert(&mut map, String::clone(id), clone(&info));
+        }
+    }
+    map
+}
+
+export fn registry() : HashMap<String, DiagInfo>
+{
+    parse_registry(REGISTRY_SRC)
+}
+
+// A raw diagnostic (`diag.x@42`, `diag.x@42:7`, `diag.x\u{1}message@42`)
+// in its parts: the bare id, the line and the column (0 for none).
+export struct Located
+{
+    export String id;
+    export Option<usize> line;
+    export usize col;
+}
+
+export struct LineCol
+{
+    export usize line;
+    export usize col;
+}
+
+// `42` or `42:7`.
+fn parse_at(StringView s) : Option<LineCol>
+{
+    match (StringView::find(s, ":"))
+    {
+        Some(k) :
+        {
+            match (StringView::parse<usize>(StringView::sub(s, 0, k)))
+            {
+                Ok(l)  :
+                {
+                    match (StringView::parse<usize>(StringView::sub(s, k + 1, StringView::len(s))))
+                    {
+                        Ok(c)  : Some(LineCol { .line = l, .col = c }),
+                        Err(_) : None,
+                    }
+                },
+                Err(_) : None,
+            }
+        },
+        None    :
+        {
+            match (StringView::parse<usize>(s))
+            {
+                Ok(l)  : Some(LineCol { .line = l, .col = 0 }),
+                Err(_) : None,
+            }
+        },
+    }
+}
+
+fn last_at(StringView s) : Option<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    usize k = StringView::len(s);
+    while (k > 0)
+    {
+        k -= 1;
+        if (b[k] == b'@')
+        {
+            return Some(k);
+        }
+    }
+    None
+}
+
+export fn split_location_col(StringView raw) : Located
+{
+    StringView id = raw;
+    Option<usize> line = None;
+    usize col = 0;
+    match (last_at(raw))
+    {
+        Some(k) :
+        {
+            match (parse_at(StringView::sub(raw, k + 1, StringView::len(raw))))
+            {
+                Some(lc) :
+                {
+                    id = StringView::sub(raw, 0, k);
+                    line = Some(lc.line);
+                    col = lc.col;
+                },
+                None     : {},
+            }
+        },
+        None    : {},
+    }
+    // A program-supplied detail is not part of the id.
+    match (StringView::find(id, "\u{1}"))
+    {
+        Some(k) : id = StringView::sub(id, 0, k),
+        None    : {},
+    }
+    Located { .id = String::from_view(id), .line = line, .col = col }
+}
+
+export fn split_location(StringView raw) : Located
+{
+    split_location_col(raw)
+}
+
+// Whether a raw diagnostic already ends in its location.
+export fn has_location(StringView raw) : bool
+{
+    match (last_at(raw))
+    {
+        Some(k) : Option::is_some(&parse_at(StringView::sub(raw, k + 1, StringView::len(raw)))),
+        None    : false,
+    }
+}
+
+// The program-supplied message of a raw diagnostic, if it carries one.
+export fn detail(StringView raw) : Option<String>
+{
+    usize k = match (StringView::find(raw, "\u{1}"))
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    StringView rest = StringView::sub(raw, k + 1, StringView::len(raw));
+    match (last_at(rest))
+    {
+        Some(a) :
+        {
+            if (Option::is_some(&parse_at(StringView::sub(rest, a + 1, StringView::len(rest)))))
+            {
+                return Some(String::from_view(StringView::sub(rest, 0, a)));
+            }
+        },
+        None    : {},
+    }
+    Some(String::from_view(rest))
+}
+
+// Whether a diagnostic is shown with its full registry entry (`--explain`,
+// or `COBALTC_EXPLAIN` set to anything but empty or `0`).
+export fn explain() : bool
+{
+    env_flag("COBALTC_EXPLAIN")
+}
+
+// Whether diagnostics written to stderr are colored: only on a terminal,
+// never when `NO_COLOR` is set, and on Windows only once the console
+// accepts ANSI sequences.
+export fn stderr_color() : bool
+{
+    bool no_color = match (env_var("NO_COLOR"))
+    {
+        Ok(Some(v)) : String::len(&v) > 0,
+        _           : false,
+    };
+    !no_color && is_terminal(2) && enable_ansi()
+}
+
+// A rendered diagnostic as it goes to stderr.
+export fn for_stderr(StringView out) : String
+{
+    if (stderr_color()) { paint(out) } else { String::from_view(out) }
+}
+
+fn spaces(usize n) : String
+{
+    String s = String::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        String::push_ascii(&mut s, b' ');
+    }
+    s
+}
+
+fn repeat_caret(usize n) : String
+{
+    String s = String::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        String::push_ascii(&mut s, b'^');
+    }
+    s
+}
+
+fn leading_spaces(StringView s) : usize
+{
+    usize k = 0;
+    slice<u8, shared> b = StringView::as_bytes(s);
+    while (k < StringView::len(s) && b[k] == b' ')
+    {
+        k += 1;
+    }
+    k
+}
+
+fn all_digits(StringView s) : bool
+{
+    foreach (b in StringView::as_bytes(s))
+    {
+        if (*b < b'0' || *b > b'9')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// Colors a rendered diagnostic as rustc colors its own: `error`/`fault`
+// bold red and the rest of its first line bold, the `-->` location and the
+// excerpt's gutter bold blue, the caret bold red, `= repair:` bold cyan.
+export fn paint(StringView out) : String
+{
+    str reset = "\u{1b}[0m";
+    String s = String::new();
+    Option<usize> width = None;
+    usize i = 0;
+    usize n = StringView::len(out);
+    usize start = 0;
+    while (start < n)
+    {
+        usize end = match (StringView::find(StringView::sub(out, start, n), "\n"))
+        {
+            Some(k) : start + k + 1,
+            None    : n,
+        };
+        StringView line = StringView::sub(out, start, end);
+        start = end;
+        StringView body = line;
+        StringView nl = "";
+        match (StringView::strip_suffix(line, "\n"))
+        {
+            Some(b) :
+            {
+                body = b;
+                nl = StringView::of("\n");
+            },
+            None    : {},
+        }
+        usize lead = leading_spaces(body);
+        String styled = String::new();
+        if (i == 0 && (StringView::starts_with(body, "error[") || StringView::starts_with(body, "fault[")))
+        {
+            styled = sprintf(
+                "\u{1b}[1;31m%v%v\u{1b}[1m%v%v",
+                StringView::sub(body, 0, 5),
+                reset,
+                StringView::sub(body, 5, StringView::len(body)),
+                reset,
+            );
+        }
+        else if (Option::is_none(&width) && StringView::starts_with(
+            StringView::sub(body, lead, StringView::len(body)),
+            "--> ",
+        ))
+        {
+            width = Some(lead);
+            styled = sprintf(
+                "%v\u{1b}[1;34m-->%v%v",
+                StringView::sub(body, 0, lead),
+                reset,
+                StringView::sub(body, lead + 3, StringView::len(body)),
+            );
+        }
+        else
+        {
+            match (width)
+            {
+                Some(w) :
+                {
+                    String gut = spaces(w + 1);
+                    String bar = sprintf("%s|", &gut);
+                    String rep = sprintf("%s= repair: ", &gut);
+                    String exc = sprintf("%s| ", &gut);
+                    if (StringView::eq(body, String::as_view(&bar)))
+                    {
+                        styled = sprintf("\u{1b}[1;34m%v%v", body, reset);
+                    }
+                    else if (StringView::starts_with(body, String::as_view(&rep)))
+                    {
+                        StringView rest = StringView::sub(body, String::len(&rep), StringView::len(body));
+                        styled = sprintf("%s\u{1b}[1;36m= repair:%v %v", &gut, reset, rest);
+                    }
+                    else if (StringView::starts_with(body, String::as_view(&exc)))
+                    {
+                        StringView rest = StringView::sub(body, String::len(&exc), StringView::len(body));
+                        usize carets = 0;
+                        slice<u8, shared> rb = StringView::as_bytes(rest);
+                        while (carets < StringView::len(rest) && rb[StringView::len(rest) - 1 - carets] == b'^')
+                        {
+                            carets += 1;
+                        }
+                        usize cut = StringView::len(rest) - carets;
+                        styled = sprintf(
+                            "\u{1b}[1;34m%s|%v %v\u{1b}[1;31m%v%v",
+                            &gut,
+                            reset,
+                            StringView::sub(rest, 0, cut),
+                            StringView::sub(rest, cut, StringView::len(rest)),
+                            reset,
+                        );
+                    }
+                    else if (StringView::len(body) > w + 2 && all_digits(StringView::sub(body, 0, w))
+                        && StringView::starts_with(StringView::sub(body, w, StringView::len(body)), " | "))
+                    {
+                        styled = sprintf(
+                            "\u{1b}[1;34m%v%v%v",
+                            StringView::sub(body, 0, w + 2),
+                            reset,
+                            StringView::sub(body, w + 2, StringView::len(body)),
+                        );
+                    }
+                    else
+                    {
+                        styled = String::from_view(body);
+                    }
+                },
+                None    : styled = String::from_view(body),
+            }
+        }
+        String::append(&mut s, &styled);
+        String::append(&mut s, nl);
+        i += 1;
+    }
+    s
+}
+
+// The text of line `line` (1-based) of `file`, read now; None for a file
+// that cannot be read (or `std`'s).
+export fn source_line(StringView file, usize line) : Option<String>
+{
+    if (StringView::starts_with(file, "<std>/") || line == 0)
+    {
+        return None;
+    }
+    Vec<u8> bytes = match (read_bytes(file))
+    {
+        Ok(b)  : b,
+        Err(_) : return None,
+    };
+    String text = lossy(&bytes[0..$]);
+    Vec<StringView> rows = String::split(&text, "\n");
+    if (line - 1 >= Vec::len(&rows))
+    {
+        return None;
+    }
+    StringView l = rows[line - 1];
+    Some(String::from_view(Option::unwrap_or(StringView::strip_suffix(l, "\r"), l)))
+}
+
+struct Caret
+{
+    String pad;
+    usize chars;
+    usize len;
+}
+
+fn word_byte(u8 c) : bool
+{
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+}
+
+// Where on `src` the caret goes and how far it reaches, for the byte column
+// `col` (1-based; 0 puts it at the line's first token).
+fn caret(StringView src, usize col) : Option<Caret>
+{
+    slice<u8, shared> b = StringView::as_bytes(src);
+    usize n = StringView::len(src);
+    usize k = 0;
+    if (col == 0)
+    {
+        bool found = false;
+        while (k < n)
+        {
+            if (b[k] != b' ' && b[k] != b'\t')
+            {
+                found = true;
+                break;
+            }
+            k += 1;
+        }
+        if (!found)
+        {
+            return None;
+        }
+    }
+    else
+    {
+        k = col - 1;
+    }
+    if (k > n)
+    {
+        k = n;
+    }
+    while (k < n && k > 0 && (b[k] & 0xC0) == 0x80)
+    {
+        k -= 1;
+    }
+    String pad = String::new();
+    usize chars = 1;
+    for (usize j = 0; j < k; j += 1)
+    {
+        if ((b[j] & 0xC0) != 0x80)
+        {
+            String::push_ascii(&mut pad, if (b[j] == b'\t') { b'\t' } else { b' ' });
+            chars += 1;
+        }
+    }
+    usize len = 1;
+    if (k < n)
+    {
+        if (word_byte(b[k]))
+        {
+            len = 0;
+            usize j = k;
+            while (j < n && word_byte(b[j]))
+            {
+                len += 1;
+                j += 1;
+            }
+        }
+        else if (b[k] == b'"')
+        {
+            len = 1;
+            bool esc = false;
+            usize j = k + 1;
+            while (j < n)
+            {
+                u8 c = b[j];
+                j += 1;
+                if ((c & 0xC0) == 0x80)
+                {
+                    continue;
+                }
+                len += 1;
+                if (esc)
+                {
+                    esc = false;
+                }
+                else if (c == b'\\')
+                {
+                    esc = true;
+                }
+                else if (c == b'"')
+                {
+                    break;
+                }
+            }
+        }
+    }
+    Some(Caret { .pad = pad, .chars = chars, .len = len })
+}
+
+// A resolved place: the file, the line, the byte column (0 when unknown).
+export struct At
+{
+    export String file;
+    export usize line;
+    export usize col;
+}
+
+// Renders a diagnostic: `phase_actual` `static` (an `error`) or `dynamic` (a
+// `fault`), `at` its place, `message` what the program or the rule said, or
+// else the registry's summary. The short form: the first line, the location,
+// the source line with a caret, the repair; under `explain()` the registry's
+// rule, invariant, required, observed and provenance follow.
+export fn render(StringView id, StringView phase_actual, Option<At> at_in, Option<String> message) : String
+{
+    HashMap<String, DiagInfo> reg = registry();
+    String key = String::from_view(id);
+    Option<ref<DiagInfo, shared>> info = HashMap::get(&reg, &key);
+    str kind = if (StringView::eq_str(phase_actual, "dynamic")) { "fault" } else { "error" };
+    String text = match (message)
+    {
+        Some(m) : m,
+        None : match (info)
+        {
+            Some(i) : match (&i.summary)
+            {
+                Some(s) : String::clone(s),
+                None    : String::from_str("(no summary)"),
+            },
+            None : String::from_str("(no summary)"),
+        },
+    };
+    String out = sprintf("%v[%v]: %s\n", kind, id, &text);
+    // A dynamic diagnostic is located by its line alone (D-0228).
+    Option<At> at = match (at_in)
+    {
+        Some(a) :
+        {
+            At { file, line, col } = a;
+            Some(At { .file = file, .line = line, .col = if (StringView::eq_str(
+                phase_actual,
+                "dynamic",
+            )) { 0 } else { col } })
+        },
+        None    : None,
+    };
+    usize width = match (&at)
+    {
+        Some(a) : String::len(&sprintf("%v", a.line)),
+        None    : 1,
+    };
+    String gut = spaces(width + 1);
+    String lead = spaces(width);
+    match (&at)
+    {
+        Some(a) :
+        {
+            match (source_line(String::as_view(&a.file), a.line))
+            {
+                Some(src) :
+                {
+                    match (caret(String::as_view(&src), a.col))
+                    {
+                        Some(c) :
+                        {
+                            String::appendf(&mut out, "%s--> %s:%v:%v\n", &lead, &a.file, a.line, c.chars);
+                            String::appendf(&mut out, "%s|\n", &gut);
+                            String::appendf(&mut out, "%v | %s\n", a.line, &src);
+                            String::appendf(&mut out, "%s| %s%s\n", &gut, &c.pad, &repeat_caret(c.len));
+                        },
+                        None    : String::appendf(&mut out, "%s--> %s:%v\n", &lead, &a.file, a.line),
+                    }
+                },
+                None      :
+                {
+                    if (a.col == 0)
+                    {
+                        String::appendf(&mut out, "%s--> %s:%v\n", &lead, &a.file, a.line);
+                    }
+                    else
+                    {
+                        String::appendf(&mut out, "%s--> %s:%v:%v\n", &lead, &a.file, a.line, a.col);
+                    }
+                },
+            }
+        },
+        None    : String::appendf(&mut out, "%s--> unknown location\n", &lead),
+    }
+    ref<DiagInfo, shared> i = match (info)
+    {
+        Some(i) : i,
+        None    :
+        {
+            String::appendf(
+                &mut out,
+                "%s= note: no entry for `%v` in spec/registry/diagnostics.md -- a gap in the registry or in this tool's diag id, not a fabricated explanation\n",
+                &gut,
+                id,
+            );
+            return out;
+        },
+    };
+    match (&i.repair)
+    {
+        Some(r) : String::appendf(&mut out, "%s= repair: %s\n", &gut, r),
+        None    : {},
+    }
+    if (!explain())
+    {
+        return out;
+    }
+    String::append(&mut out, "\n");
+    match (&i.rule)
+    {
+        Some(v) : String::appendf(&mut out, "  rule:      %s\n", v),
+        None    : {},
+    }
+    match (&i.invariant)
+    {
+        Some(v) : String::appendf(&mut out, "  invariant: %s\n", v),
+        None    : {},
+    }
+    match (&i.required)
+    {
+        Some(v) : String::appendf(&mut out, "  required:  %s\n", v),
+        None    : {},
+    }
+    match (&i.observed)
+    {
+        Some(v) : String::appendf(&mut out, "  observed:  %s\n", v),
+        None    : {},
+    }
+    match (&i.provenance)
+    {
+        Some(v) : String::appendf(&mut out, "  provenance: %s\n", v),
+        None    : {},
+    }
+    match (&i.related)
+    {
+        Some(v) :
+        {
+            String::appendf(&mut out, "\n  see: spec/examples.md -> %s\n", v);
+            String::append(&mut out, "       spec/registry/diagnostics.md\n");
+        },
+        None    : String::append(&mut out, "\n  see: spec/registry/diagnostics.md\n"),
+    }
+    out
+}
+
+// ---- impl/src/lib.rs: placing a diagnostic ----
+
+// The prefix of a refusal `--unittest`'s runner makes before anything runs.
+export const str REFUSAL = "unittest: ";
+
+// `resolve_user_location_col`: the bare id, and the file, line and column
+// the raw diagnostic names, through the expansion.
+export struct Resolved
+{
+    export String id;
+    export Option<At> at;
+}
+
+export fn resolve_user_location_col(StringView raw, ref<Expansion, shared> ex) : Resolved
+{
+    Located l = split_location_col(raw);
+    Option<At> at = match (l.line)
+    {
+        Some(n) : match (resolve_line(ex, n))
+        {
+            Some(o) :
+            {
+                Origin { file, line } = o;
+                Some(At { .file = file, .line = line, .col = l.col })
+            },
+            // A diagnostic inside `std` itself: its file and line there,
+            // marked as `std`'s (`prelude::std_location`).
+            None : match (std_location(if (n >= STD_LINE) { n - STD_LINE } else { n }))
+            {
+                Some(o) :
+                {
+                    Origin { file, line } = o;
+                    Some(At { .file = sprintf("<std>/%s", &file), .line = line, .col = l.col })
+                },
+                None    : None,
+            },
+        },
+        None : None,
+    };
+    Located { id, .. } = l;
+    Resolved { .id = id, .at = at }
+}
+
+// The `std` file and line a prelude line came from (`PRELUDE_STD_ORIGINS`).
+export fn std_location(usize line) : Option<Origin>
+{
+    StringView rest = StringView::of(PRELUDE_STD_ORIGINS);
+    while (StringView::len(rest) > 0)
+    {
+        StringView rec = rest;
+        match (StringView::find(rest, "\n"))
+        {
+            Some(i) :
+            {
+                rec = StringView::sub(rest, 0, i);
+                rest = StringView::sub(rest, i + 1, StringView::len(rest));
+            },
+            None    : rest = StringView::sub(rest, 0, 0),
+        }
+        Vec<StringView> f = StringView::split(rec, " ");
+        if (Vec::len(&f) != 4)
+        {
+            continue;
+        }
+        usize first = Result::unwrap_or(StringView::parse<usize>(f[0]), 0);
+        usize at = Result::unwrap_or(StringView::parse<usize>(f[2]), 0);
+        usize count = Result::unwrap_or(StringView::parse<usize>(f[3]), 0);
+        if (line >= first && line < first + count)
+        {
+            return Some(Origin { .file = String::from_view(f[1]), .line = at + (line - first) });
+        }
+    }
+    None
+}
+
+export struct Place
+{
+    export String file;
+    export usize line;
+}
+
+// The file and line a declaration's `line` came from (`coby::locate`).
+export fn locate(usize line, ref<Expansion, shared> ex) : Option<Place>
+{
+    match (resolve_line(ex, line))
+    {
+        Some(o) :
+        {
+            Origin { file, line } = o;
+            Some(Place { .file = file, .line = line })
+        },
+        None    : None,
+    }
+}
+
+// The file and line a combined-text line came from, the program's or
+// `std`'s (`<std>/FILE`), as `coby::locate` maps it (D-0299).
+export fn locate_any(usize line, ref<Expansion, shared> ex) : Option<Place>
+{
+    match (locate(line, ex))
+    {
+        Some(p) : return Some(p),
+        None    : {},
+    }
+    match (std_location(if (line >= STD_LINE) { line - STD_LINE } else { line }))
+    {
+        Some(o) :
+        {
+            Origin { file, line } = o;
+            Some(Place { .file = sprintf("<std>/%s", &file), .line = line })
+        },
+        None    : None,
+    }
+}
+
+// A static or dynamic outcome's diagnostic the way `coby` prints it: a
+// syntax error as `diag.syntax-error` at its file, line and column, anything
+// else through the registry at its `file:line`.
+export fn render_located(StringView d, StringView phase, ref<Expansion, shared> ex) : String
+{
+    if (StringView::starts_with(d, REFUSAL))
+    {
+        return sprintf("%v\n", d);
+    }
+    foreach (kind in ["parse error at ", "lex error at "])
+    {
+        StringView rest = match (StringView::strip_prefix(d, StringView::of(kind)))
+        {
+            Some(r) : r,
+            None    : continue,
+        };
+        usize sep = match (StringView::find(rest, ": "))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        StringView loc = StringView::sub(rest, 0, sep);
+        StringView msg = StringView::sub(rest, sep + 2, StringView::len(rest));
+        // `line:col` in the expansion's lines.
+        Option<At> at = None;
+        match (StringView::find(loc, ":"))
+        {
+            Some(m) :
+            {
+                usize col = Result::unwrap_or(
+                    StringView::parse<usize>(StringView::sub(loc, m + 1, StringView::len(loc))),
+                    0,
+                );
+                match (StringView::parse<usize>(StringView::sub(loc, 0, m)))
+                {
+                    Ok(l)  :
+                    {
+                        match (resolve_line(ex, l))
+                        {
+                            Some(o) :
+                            {
+                                Origin { file, line } = o;
+                                at = Some(At { .file = file, .line = line, .col = col });
+                            },
+                            None    : {},
+                        }
+                    },
+                    Err(_) : {},
+                }
+            },
+            None    : {},
+        }
+        return render("diag.syntax-error", "static", at, Some(String::from_view(msg)));
+    }
+    Resolved { id, at } = resolve_user_location_col(d, ex);
+    render(String::as_view(&id), phase, at, detail(d))
+}

@@ -1,0 +1,290 @@
+// cbc: the code generator written in CobaltC (D-0274), the self-hosting
+// compiler's back end over the front end of impl/selfhost/front. It writes
+// the C that `cobc --bootstrap-form` writes for the program, byte for byte:
+//
+//   cbc --emit-c [--c-name NAME] [-o OUT] FILE
+//
+// writes the C to OUT, or prints it on standard output without `-o` or with
+// `-o -`; NAME is the C file's name, which its `#line` directives name
+// (default OUT, else a.c). A program the static pass rejects gets the
+// diagnostic `coby` gives, and status 1, and OUT is not written.
+//
+// With any other command line cbc is cobc (impl/cobc/src/main.rs): the same
+// options, messages, exit statuses, files and commands (`driver.cb`).
+
+import std;
+
+module lexer "../front/lexer.cb";
+module ast "../front/ast.cb";
+module prelude "../front/prelude.cb";
+module parser "../front/parser.cb";
+module dump "../front/dump.cb";
+module loader "../front/loader.cb";
+module derive "../front/derive.cb";
+module modres "../front/modres.cb";
+module consts "../front/consts.cb";
+module views "../front/views.cb";
+module items "../front/items.cb";
+module each "../front/each.cb";
+module fmtcheck "../front/fmtcheck.cb";
+module typecheck "../front/typecheck.cb";
+module consteval "../front/consteval.cb";
+module check "../front/check.cb";
+module header "../back/header.cb";
+module passes "../back/passes.cb";
+module cnames "../back/cnames.cb";
+module uses "../back/uses.cb";
+module typeops "../back/typeops.cb";
+module state "../back/state.cb";
+module layout "../back/layout.cb";
+module direct "../back/direct.cb";
+module vec_scan "../back/vec_scan.cb";
+module strings4 "../back/strings4.cb";
+module std_values "../back/std_values.cb";
+module refs4 "../back/refs4.cb";
+module analyses "../back/analyses.cb";
+module stage1a "../back/stage1a.cb";
+module bodies "../back/bodies.cb";
+module natives "../back/natives.cb";
+module fresh3 "../back/fresh3.cb";
+module literals "../back/literals.cb";
+module vec3 "../back/vec3.cb";
+module native_vec "../back/native_vec.cb";
+module native_misc "../back/native_misc.cb";
+module native_text "../back/native_text.cb";
+module native_map "../back/native_map.cb";
+module native_io "../back/native_io.cb";
+module flights "../back/flights.cb";
+module program "../back/program.cb";
+module points "../back/points.cb";
+module gen "../back/gen.cb";
+module libheader "../back/libheader.cb";
+module build_info "./build_info.cb";
+module driverbase "./driverbase.cb";
+module host "./host.cb";
+module target "./target.cb";
+module diags "./diags.cb";
+module link "./link.cb";
+module cc "./cc.cb";
+module report "./report.cb";
+module certificate "./certificate.cb";
+module frontend "./frontend.cb";
+module driver "./driver.cb";
+
+import check;
+import state;
+import gen;
+import loader;
+import certificate;
+import driver;
+
+fn usage() : u8
+{
+    eprintf("usage: cobc --emit-c [--c-name NAME] [-o OUT] FILE\n");
+    2
+}
+
+fn main() : u8
+{
+    // Anything but `--emit-c` first (after `--certificate FILE`, D-0299) is
+    // cobc's command line (`driver.cb`).
+    bool emit = false;
+    bool certified = false;
+    if (arg_count() > 0)
+    {
+        match (arg(0))
+        {
+            Ok(a)  : emit = a == "--emit-c",
+            Err(_) : {},
+        }
+    }
+    if (!emit && arg_count() > 2)
+    {
+        match (arg(0))
+        {
+            Ok(a)  :
+            {
+                if (a == "--certificate")
+                {
+                    match (arg(2))
+                    {
+                        Ok(b)  :
+                        {
+                            emit = b == "--emit-c";
+                            certified = emit;
+                        },
+                        Err(_) : {},
+                    }
+                }
+            },
+            Err(_) : {},
+        }
+    }
+    if (!emit)
+    {
+        return driver_main();
+    }
+    Vec<String> args = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(a)  : Vec::push(&mut args, a),
+            Err(_) : return usage(),
+        }
+    }
+    Option<String> certificate = None;
+    if (certified)
+    {
+        String p = String::clone(&args[1]);
+        match (cert_begin(String::as_view(&p)))
+        {
+            Ok(_)  : {},
+            Err(e) :
+            {
+                eprintf("cobc: cannot write %s: %s\n", &p, FileError::text(&e));
+                return 2;
+            },
+        }
+        certificate = Some(p);
+        _ = Vec::remove(&mut args, 0);
+        _ = Vec::remove(&mut args, 0);
+    }
+    if (Vec::len(&args) < 2 || args[0] != "--emit-c")
+    {
+        return usage();
+    }
+    // `--emit-c [--c-name NAME] [-o OUT] FILE`, in any order, each once
+    // (cobc's `real_main`).
+    Option<String> name = None;
+    Option<String> to = None;
+    Option<String> file_arg = None;
+    usize i = 1;
+    while (i < Vec::len(&args))
+    {
+        ref<String, shared> a = &args[i];
+        if (String::eq_str(a, "--c-name") && Option::is_none(&name) && i + 1 < Vec::len(&args))
+        {
+            name = Some(String::clone(&args[i + 1]));
+            i += 2;
+        }
+        else if (String::eq_str(a, "-o") && Option::is_none(&to) && i + 1 < Vec::len(&args))
+        {
+            to = Some(String::clone(&args[i + 1]));
+            i += 2;
+        }
+        else if (Option::is_none(&file_arg) && !String::starts_with(a, "-"))
+        {
+            file_arg = Some(String::clone(a));
+            i += 1;
+        }
+        else
+        {
+            file_arg = None;
+            break;
+        }
+    }
+    String file_s = match (file_arg)
+    {
+        Some(f) : f,
+        None    : return usage(),
+    };
+    Option<String> out = match (to)
+    {
+        Some(o) : if (String::eq_str(&o, "-")) { None } else { Some(o) },
+        None    : None,
+    };
+    String c_name = match (name)
+    {
+        Some(n) : n,
+        None : match (&out)
+        {
+            Some(o) : String::clone(o),
+            None    : String::from_str("a.c"),
+        },
+    };
+    StringView file = String::as_view(&file_s);
+    String src = match (read_file(file))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("cbc: %v: cannot read: %s\n", file, FileError::text(&e));
+            return 2;
+        },
+    };
+    match (check_text_certified(String::as_view(&src), file, clone(&certificate)))
+    {
+        Ok(prog) :
+        {
+            Expansion ex = clone(&prog.ex);
+            // D-0284/D-0285: lowered once, and again decided where it can be
+            // (`generate_program`), as the driver lowers.
+            Lowered lowered = generate_program(prog, false, bootstrap_level(), false, true);
+            match (&lowered.unsupported)
+            {
+                Some(what) :
+                {
+                    eprintf("unsupported: %s\n", what);
+                    return 3;
+                },
+                None       : {},
+            }
+            match (&certificate)
+            {
+                Some(cp) :
+                {
+                    String verdict = match (&lowered.gen.kept)
+                    {
+                        None      : String::from_str("decided"),
+                        Some(why) : sprintf("paths kept: %s", why),
+                    };
+                    match (cert_finish(String::as_view(cp), &ex, "cobc", file, Some(verdict)))
+                    {
+                        Ok(_)  : {},
+                        Err(e) :
+                        {
+                            eprintf("cobc: cannot write %s: %s\n", cp, FileError::text(&e));
+                            return 2;
+                        },
+                    }
+                },
+                None     : {},
+            }
+            String c = combined(&lowered.gen, String::as_view(&c_name));
+            match (&out)
+            {
+                Some(o) :
+                {
+                    match (write_file(String::as_view(o), String::as_view(&c)))
+                    {
+                        Ok(_)  : 0,
+                        Err(e) :
+                        {
+                            eprintf("cobc: cannot write %s: %s\n", o, FileError::text(&e));
+                            1
+                        },
+                    }
+                },
+                None    :
+                {
+                    printf("%s", &c);
+                    0
+                },
+            }
+        },
+        Err(r)   :
+        {
+            eprintf("%s\n", &rejection_text(&r));
+            match (&certificate)
+            {
+                Some(cp) :
+                {
+                    _ = cert_finish_rejected(String::as_view(cp), &r.ex, "cobc", file, String::as_view(&r.raw));
+                },
+                None     : {},
+            }
+            1
+        },
+    }
+}

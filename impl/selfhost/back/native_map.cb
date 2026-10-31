@@ -1,0 +1,968 @@
+// cobc's lower/native_map.rs, written in CobaltC (D-0274 stage 5): the
+// native C bodies for std's HashMap, HashSet, Queue and PriorityQueue.
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import cnames;
+import direct;
+import natives;
+import native_vec;
+import gen;
+
+// ---- types the bodies name ----
+
+fn nm0(str name) : Type
+{
+    named(StringView::of(name), Vec::new())
+}
+
+fn nm1(str name, ref<Type, shared> a) : Type
+{
+    Vec<Type> args = Vec::new();
+    Vec::push(&mut args, clone(a));
+    named(StringView::of(name), args)
+}
+
+fn nm2(str name, ref<Type, shared> a, ref<Type, shared> b) : Type
+{
+    Vec<Type> args = Vec::new();
+    Vec::push(&mut args, clone(a));
+    Vec::push(&mut args, clone(b));
+    named(StringView::of(name), args)
+}
+
+fn ref_ty(ref<Type, shared> t, Mode mode) : Type
+{
+    Type::TRef(Box::new(ModedTy { .inner = clone(t), .mode = mode }))
+}
+
+fn one_ty(ref<Type, shared> t) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, clone(t));
+    v
+}
+
+fn two_ty(ref<Type, shared> a, ref<Type, shared> b) : Vec<Type>
+{
+    Vec<Type> v = Vec::new();
+    Vec::push(&mut v, clone(a));
+    Vec::push(&mut v, clone(b));
+    v
+}
+
+// `Type::Named(n, a) if n == "std::String"` (and, with `bare`, `a` empty).
+fn is_string_ty(ref<Type, shared> t, bool bare) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(
+            &Box::get(n).name,
+            "std::String",
+        ) && (!bare || Vec::len(&Box::get(n).args) == 0),
+        _ : false,
+    }
+}
+
+fn is_int_or_bool(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_) : true,
+        Type::TBool   : true,
+        _             : false,
+    }
+}
+
+// Rust's `str::replacen(pat, to, 1)`.
+fn replace_once(ref<String, shared> s, StringView pat, StringView to) : String
+{
+    match (String::find(s, pat))
+    {
+        Some(i) : sprintf(
+            "%v%v%v",
+            String::view(s, 0, i),
+            to,
+            String::view(s, i + StringView::len(pat), String::len(s)),
+        ),
+        None : String::clone(s),
+    }
+}
+
+// The lines of `b` (each ended by a newline) but those containing `x` or `y`.
+fn lines_without(ref<String, shared> b, StringView x, StringView y) : String
+{
+    String out = String::new();
+    foreach (l in StringView::lines(String::as_view(b)))
+    {
+        if (!StringView::contains(l, x) && !StringView::contains(l, y))
+        {
+            String::appendf(&mut out, "%v\n", l);
+        }
+    }
+    out
+}
+
+// The `_raw` form of the native body being made (`native_ctx`'s signature
+// with `_raw` after the name), its body `raw`.
+fn emit_raw_form(ref<Gen, exclusive> g, ref<String, shared> raw)
+{
+    if (Option::is_none(&g.native_ctx))
+    {
+        return;
+    }
+    String sig = match (&g.native_ctx)
+    {
+        Some(c) : String::clone(&c.sig),
+        None    : String::new(),
+    };
+    usize open = Option::expect(String::find(&sig, "("), "a signature");
+    String raw_sig = sprintf("%v_raw%v", String::view(&sig, 0, open), String::view(&sig, open, String::len(&sig)));
+    String::appendf(&mut g.protos, "%s;\n", &raw_sig);
+    String::appendf(&mut g.fns, "%s\n{\n%s}\n\n", &raw_sig, raw);
+}
+
+// ---- HashMap::find ----
+
+// `HashMap::find` with `String` keys (`spec/21` §4, D-0041): the probe
+// loop over `m.slots` comparing keys with `key_eq`. Natively: the
+// body's checked reads of `m.slots` (once: the same path, and nothing
+// in the loop writes) and of `k` (`key_hash`'s, then `key_eq`'s, which
+// cannot fail after it), `len - 1`'s overflow, each slot's element
+// access, and for each candidate key the read of `m.keys` (on the
+// first), its bounds fault, and the element access `key_eq`'s read of
+// it makes (`cb_elem_access`: checked where an object lies over the
+// key, and otherwise unobservable, as for a plain element, D-0023).
+export fn native_map_find_string(ref<Gen, exclusive> g, ref<Type, shared> v) : String
+{
+    Type st = nm0("std::String");
+    String sc = ctype(g, &st);
+    String mc = ctype(g, &nm2("std::HashMap", &st, v));
+    u32 sty = type_id(g, &st);
+    u32 uty = type_id(g, &Type::TInt(IntTy::Usize));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *m = (%s *)p_m.p;\n", &mc, &mc);
+    String::appendf(
+        &mut b,
+        "    cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 2u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    if (m->slots.len == 0) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t mask = m->slots.len - 1;\n");
+    String::appendf(&mut b, "    cb_read(p_k.tok, NULL, 0, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s *k = (%s *)p_k.p;\n", &sc, &sc);
+    String::appendf(&mut b, "    uint64_t i = cb_hash_bytes((const void *)k->bytes.ptr, k->bytes.len) & mask;\n");
+    String::appendf(&mut b, "    int keys_read = 0;\n");
+    String::appendf(&mut b, "    for (;;) {\n");
+    String::appendf(&mut b, "        uint64_t *se = m->slots.ptr + i;\n");
+    String::appendf(&mut b, "        cb_elem_access(se, sizeof(*se), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", uty);
+    String::appendf(&mut b, "        uint64_t e = *se;\n");
+    String::appendf(&mut b, "        if (e == UINT64_MAX) break;\n");
+    String::appendf(
+        &mut b,
+        "        if (!keys_read) { cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0); keys_read = 1; }\n",
+    );
+    String::appendf(&mut b, "        if (e >= m->keys.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s *ke = m->keys.ptr + e;\n", &sc);
+    String::appendf(&mut b, "        cb_elem_access(ke, sizeof(*ke), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", sty);
+    String::appendf(
+        &mut b,
+        "        if (cb_bytes_eq((const void *)ke->bytes.ptr, ke->bytes.len, (const void *)k->bytes.ptr, k->bytes.len)) break;\n",
+    );
+    String::appendf(&mut b, "        i = (i + 1) & mask;\n");
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    return i;\n");
+    b
+}
+
+// D-0196: `HashMap::find_str` (`get_str`, `get_mut_str`,
+// `contains_str`, `remove_str`): `native_map_find_string`'s probe with
+// the key's bytes from the `str`, a plain value (no read of it to check;
+// `key_hash` of a `str` is its bytes' hash, as a `String`'s is).
+export fn native_map_find_str(ref<Gen, exclusive> g, ref<Type, shared> v) : String
+{
+    Type st = nm0("std::String");
+    String sc = ctype(g, &st);
+    String mc = ctype(g, &nm2("std::HashMap", &st, v));
+    u32 sty = type_id(g, &st);
+    u32 uty = type_id(g, &Type::TInt(IntTy::Usize));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *m = (%s *)p_m.p;\n", &mc, &mc);
+    String::appendf(
+        &mut b,
+        "    cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 2u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    if (m->slots.len == 0) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t mask = m->slots.len - 1;\n");
+    String::appendf(&mut b, "    uint64_t i = cb_hash_bytes((const void *)p_k.p, p_k.n) & mask;\n");
+    String::appendf(&mut b, "    int keys_read = 0;\n");
+    String::appendf(&mut b, "    for (;;) {\n");
+    String::appendf(&mut b, "        uint64_t *se = m->slots.ptr + i;\n");
+    String::appendf(&mut b, "        cb_elem_access(se, sizeof(*se), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", uty);
+    String::appendf(&mut b, "        uint64_t e = *se;\n");
+    String::appendf(&mut b, "        if (e == UINT64_MAX) break;\n");
+    String::appendf(
+        &mut b,
+        "        if (!keys_read) { cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0); keys_read = 1; }\n",
+    );
+    String::appendf(&mut b, "        if (e >= m->keys.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s *ke = m->keys.ptr + e;\n", &sc);
+    String::appendf(&mut b, "        cb_elem_access(ke, sizeof(*ke), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", sty);
+    String::appendf(
+        &mut b,
+        "        if (cb_bytes_eq((const void *)ke->bytes.ptr, ke->bytes.len, (const void *)p_k.p, p_k.n)) break;\n",
+    );
+    String::appendf(&mut b, "        i = (i + 1) & mask;\n");
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    return i;\n");
+    b
+}
+
+// The probe `HashMap::find` makes (`native_map_find_string`,
+// `native_map_find_scalar`), inline in another native body: `m` the
+// map, `kp` a `K *` to the key, `read_k` the key's checked read (none
+// for a key the body owns: a fresh value's read cannot fail). Leaves
+// the slot in `s`.
+export fn map_probe(ref<Gen, exclusive> g, ref<Type, shared> k, ref<String, shared> kp, Option<String> read_k) : String
+{
+    String kc = ctype(g, k);
+    u32 kty = type_id(g, k);
+    u32 uty = type_id(g, &Type::TInt(IntTy::Usize));
+    bool text = is_string_ty(k, false);
+    String b = String::new();
+    String::appendf(
+        &mut b,
+        "    cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 2u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    if (m->slots.len == 0) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t mask = m->slots.len - 1;\n");
+    match (&read_k)
+    {
+        Some(rk) : String::appendf(&mut b, "    cb_read(%s, NULL, 0, CB_NOLOC, 0);\n", rk),
+        None     : {},
+    }
+    String::appendf(&mut b, "    %s *kq = %s;\n", &kc, kp);
+    if (text)
+    {
+        String::appendf(&mut b, "    uint64_t s = cb_hash_bytes((const void *)kq->bytes.ptr, kq->bytes.len) & mask;\n");
+    }
+    else
+    {
+        String::appendf(&mut b, "    uint64_t s = cb_hash_bytes((const void *)kq, sizeof(*kq)) & mask;\n");
+    }
+    // The probe makes no runtime check: the reads of `m.keys` cannot
+    // fail where the read of `m.slots` above passed (one path, held
+    // for the call, nothing derived from it alive); no object outlives
+    // a `std` call over a cell of `slots`, a private field only `std`
+    // reaches; and a key element can be held only shared (`key_at`),
+    // which a shared read never clashes with.
+    String::appendf(&mut b, "    for (;;) {\n");
+    String::appendf(&mut b, "        uint64_t e0 = m->slots.ptr[s];\n");
+    String::appendf(&mut b, "        if (e0 == UINT64_MAX) break;\n");
+    String::appendf(&mut b, "        if (e0 >= m->keys.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s *ke = m->keys.ptr + e0;\n", &kc);
+    if (text)
+    {
+        String::appendf(
+            &mut b,
+            "        if (cb_bytes_eq((const void *)ke->bytes.ptr, ke->bytes.len, (const void *)kq->bytes.ptr, kq->bytes.len)) break;\n",
+        );
+    }
+    else
+    {
+        String::appendf(&mut b, "        if (*ke == *kq) break;\n");
+    }
+    String::appendf(&mut b, "        s = (s + 1) & mask;\n");
+    String::appendf(&mut b, "    }\n");
+    b
+}
+
+// ---- Queue ----
+
+// `q.head` is field 0, `q.tail` field 1.
+fn fld(u32 k) : str
+{
+    if (k == 0) { "head" } else { "tail" }
+}
+
+// `Queue::front`/`Queue::back` (`rule.stdlib.queue`, D-0137) realized
+// natively, as `HashMap::get` is: the body's checked reads of the two
+// stacks' lengths, then the element's `[Reclaim]` + `[Borrow]` and the
+// `Option`'s return in one runtime call (`cb_elem_borrow_datum`)
+// rather than the general construction of an `Option` holding a
+// reference. The front is `head`'s last element, else `tail`'s first;
+// the back is `tail`'s last, else `head`'s first. Element types as
+// for the native `get`: none holding a reference or a `fn` value.
+export fn native_queue_peek(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<Vec<Type>, shared> targs,
+) : Option<String>
+{
+    if (Vec::len(targs) != 1)
+    {
+        return None;
+    }
+    ref<Type, shared> v = &targs[0];
+    u64 vsize = size_align(g, v).size;
+    if (vsize == 0 || has_refs(g, v) || holds_fn(g, v))
+    {
+        return None;
+    }
+    String qc = ctype(g, &nm1("std::Queue", v));
+    String vc = ctype(g, v);
+    u32 vty = type_id(g, v);
+    String oc = ctype(g, &nm1("std::Option", &ref_ty(v, Mode::Shared)));
+    // field 0 is `head`, 1 is `tail`; a `Vec`'s field 1 is `len`.
+    bool front = String::eq_str(name, "std::Queue::front");
+    u32 near = if (front) { 0 } else { 1 };
+    u32 far = if (front) { 1 } else { 0 };
+    str near_at = "len - 1";
+    str far_at = "0";
+    String b = String::new();
+    String::appendf(&mut b, "    %s *q = (%s *)p_q.p;\n", &qc, &qc);
+    String::appendf(&mut b, "    %s r;\n", &oc);
+    String::appendf(&mut b, "    %s *ve;\n", &vc);
+    String::appendf(
+        &mut b,
+        "    cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        near,
+    );
+    String::appendf(
+        &mut b,
+        "    if (q->%s.len > 0) { ve = q->%s.ptr + (q->%s.%s); }\n",
+        fld(near),
+        fld(near),
+        fld(near),
+        near_at,
+    );
+    String::appendf(&mut b, "    else {\n");
+    String::appendf(
+        &mut b,
+        "        cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        far,
+    );
+    String::appendf(&mut b, "        if (q->%s.len == 0) { r.tag = 1u; cb_send_datum_none(); return r; }\n", fld(far));
+    String far_ix = if (far_at == "0") { String::from_str("0") } else { sprintf("q->%s.%s", fld(far), far_at) };
+    String::appendf(&mut b, "        ve = q->%s.ptr + (%s);\n", fld(far), &far_ix);
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    r.tag = 0u;\n");
+    String::appendf(&mut b, "    r.u.v0 = (void *)ve;\n");
+    String::appendf(&mut b, "    cb_elem_borrow_datum(ve, %vu, CB_SHARED);\n", vty);
+    String::appendf(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// `took_front` is field 2, `took_back` field 3.
+fn took_f(u32 k) : str
+{
+    if (k == 2) { "took_front" } else { "took_back" }
+}
+
+// `Queue::pop_front`/`pop_back` (`rule.stdlib.queue`, D-0137) realized
+// natively for a plain element type, as `Vec::pop` is: the body's pop
+// of one of its two stacks made through the queue's own path (`q.head`
+// is field 0, `q.tail` field 1; a `Vec`'s field 1 is `len`), with the
+// native `Vec::pop`'s checked read and write of `len`, so no path is
+// formed for the stack itself. `shift`, when the stack is empty, is
+// called as the body calls it, on paths to the stacks formed for the
+// call. (The pushes stay as written: the body's call of the native
+// `Vec::push` measured faster than a native `Queue::push_back`.)
+export fn native_queue_op(
+    ref<Gen, exclusive> g,
+    ref<String, shared> name,
+    ref<Vec<Type>, shared> targs,
+) : Option<String>
+{
+    if (Vec::len(targs) != 1)
+    {
+        return None;
+    }
+    ref<Type, shared> v = &targs[0];
+    u64 size = size_align(g, v).size;
+    if (size == 0 || !plain_data(g, v))
+    {
+        return None;
+    }
+    String qc = ctype(g, &nm1("std::Queue", v));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *q = (%s *)p_q.p;\n", &qc, &qc);
+    // `pop_front` takes from `head` (field 0), refilling it from `tail`,
+    // and records `took_front` (field 2); `pop_back` the reverse.
+    bool front = String::eq_str(name, "std::Queue::pop_front");
+    u32 near = if (front) { 0 } else { 1 };
+    u32 far = if (front) { 1 } else { 0 };
+    u32 took = if (front) { 2 } else { 3 };
+    u32 other = if (front) { 3 } else { 2 };
+    String shift = request_fn(g, StringView::of("std::Queue::shift"), one_ty(v));
+    Type ot = nm1("std::Option", v);
+    String oc = ctype(g, &ot);
+    String::appendf(&mut b, "    %s r;\n", &oc);
+    String::appendf(
+        &mut b,
+        "    cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        near,
+    );
+    String::appendf(&mut b, "    if (q->%s.len == 0) {\n", fld(near));
+    String::appendf(
+        &mut b,
+        "        cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        far,
+    );
+    String::appendf(
+        &mut b,
+        "        if (q->%s.len == 0) { %s return r; }\n",
+        fld(far),
+        &tag_set(g, &ot, StringView::of("r"), 1),
+    );
+    String::appendf(&mut b, "        cb_write(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu } }, 1, 0u, CB_NOLOC, 0);\n", took);
+    String::appendf(&mut b, "        q->%s = 1;\n", took_f(took));
+    String::appendf(&mut b, "        cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu } }, 1, CB_NOLOC, 0);\n", other);
+    String::appendf(&mut b, "        uint8_t half = q->%s;\n", took_f(other));
+    String::appendf(
+        &mut b,
+        "        uint64_t ta = cb_borrow_unstamped(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        far,
+    );
+    String::appendf(
+        &mut b,
+        "        uint64_t tb = cb_borrow_unstamped(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        near,
+    );
+    String::appendf(
+        &mut b,
+        "        %s(((cb_ref){ (void *)&q->%s, ta }), ((cb_ref){ (void *)&q->%s, tb }), half);\n",
+        &shift,
+        fld(far),
+        fld(near),
+    );
+    String::appendf(&mut b, "        cb_call_done(tb);\n");
+    String::appendf(&mut b, "        cb_call_done(ta);\n");
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    uint64_t n = q->%s.len - 1;\n", fld(near));
+    String::appendf(
+        &mut b,
+        "    cb_write(p_q.tok, (cb_proj[]){ { CB_FIELD, %vu }, { CB_FIELD, 1u } }, 2, 0u, CB_NOLOC, 0);\n",
+        near,
+    );
+    String::appendf(&mut b, "    q->%s.len = n;\n", fld(near));
+    String::appendf(&mut b, "    %s\n", &tag_set(g, &ot, StringView::of("r"), 0));
+    String::appendf(&mut b, "    r.u.v0 = q->%s.ptr[n];\n", fld(near));
+    String::appendf(&mut b, "    cb_release((uint8_t *)(q->%s.ptr + n), %vu);\n", fld(near), size);
+    String::appendf(&mut b, "    return r;\n");
+    Some(b)
+}
+
+// ---- HashMap::get, get_mut, contains, entry, insert ----
+
+// `HashMap::get`, `get_mut`, `contains`, `entry` and `insert` (`spec/21`
+// §4) for `String`, integer and `bool` keys, natively: each body's
+// checked reads of `m`'s fields through the path the call holds (one
+// per field: nothing in between writes them), its arithmetic faults,
+// the probe (`map_probe`), the element accesses and borrows the
+// `Vec::index_*` calls make, and the result as the body returns it.
+// `entry` and `insert` only for a plain value type (a pushed value
+// needs no move). A key passed by value is received (`cb_recv` for a
+// `String`) and, when not stored, destroyed as the body's frame would.
+export fn native_map_op(ref<Gen, exclusive> g, ref<String, shared> name, ref<Vec<Type>, shared> targs) : Option<String>
+{
+    if (Vec::len(targs) != 2)
+    {
+        return None;
+    }
+    ref<Type, shared> k = &targs[0];
+    ref<Type, shared> v = &targs[1];
+    bool text = is_string_ty(k, true);
+    if (!text && !is_int_or_bool(k))
+    {
+        return None;
+    }
+    u64 vsize = size_align(g, v).size;
+    if (vsize == 0 || has_refs(g, v) || holds_fn(g, v))
+    {
+        return None;
+    }
+    bool plain_v = plain_data(g, v);
+    bool entry_or_insert = String::eq_str(name, "std::HashMap::entry") || String::eq_str(name, "std::HashMap::insert");
+    if (entry_or_insert && !plain_v)
+    {
+        return None;
+    }
+    String mc = ctype(g, &nm2("std::HashMap", k, v));
+    String kc = ctype(g, k);
+    String vc = ctype(g, v);
+    u32 vty = type_id(g, v);
+    u32 uty = type_id(g, &Type::TInt(IntTy::Usize));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *m = (%s *)p_m.p;\n", &mc, &mc);
+    if (String::eq_str(
+        name,
+        "std::HashMap::get",
+    ) || String::eq_str(name, "std::HashMap::get_mut") || String::eq_str(name, "std::HashMap::contains"))
+    {
+        String probe = map_probe(g, k, &sprintf("(%s *)p_k.p", &kc), Some(String::from_str("p_k.tok")));
+        String::append(&mut b, &probe);
+        String::appendf(&mut b, "    uint64_t e = m->slots.ptr[s];\n");
+        if (String::eq_str(name, "std::HashMap::contains"))
+        {
+            String::appendf(&mut b, "    return (uint8_t)(e != UINT64_MAX);\n");
+            return Some(b);
+        }
+        bool excl = String::eq_str(name, "std::HashMap::get_mut");
+        Mode mode = if (excl) { Mode::Exclusive } else { Mode::Shared };
+        String oc = ctype(g, &nm1("std::Option", &ref_ty(v, mode)));
+        str m = if (excl) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+        String::appendf(&mut b, "    %s r;\n", &oc);
+        String::appendf(&mut b, "    if (e == UINT64_MAX) { r.tag = 1u; cb_send_datum_none(); return r; }\n");
+        if (excl)
+        {
+            // `&mut m.values`: an exclusive borrow through `m`, which a
+            // live shared path to the map meets (D-0222).
+            String::appendf(
+                &mut b,
+                "    cb_borrow_check(p_m.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+            );
+        }
+        String::appendf(&mut b, "    if (e >= m->values.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s *ve = m->values.ptr + e;\n", &vc);
+        String::appendf(&mut b, "    r.tag = 0u;\n");
+        String::appendf(&mut b, "    r.u.v0 = (void *)ve;\n");
+        String::appendf(&mut b, "    cb_elem_borrow_datum(ve, %vu, %s);\n", vty, m);
+        String::appendf(&mut b, "    return r;\n");
+        return Some(b);
+    }
+    // `entry(m, k, fresh)` / `insert(m, k, v)`.
+    bool insert = String::eq_str(name, "std::HashMap::insert");
+    str vp = if (insert) { "p_v" } else { "p_fresh" };
+    if (text)
+    {
+        String::appendf(&mut b, "    uint64_t ok = cb_recv(&p_k);\n");
+    }
+    // `reserve_one(m)`.
+    String reslot = request_fn(g, StringView::of("std::HashMap::reslot"), two_ty(k, v));
+    // Every path the text takes makes an exclusive borrow through
+    // `m` — `&mut m.slots` and the pushes of `keys` and `values`
+    // for a new key, `&mut m.values` for an existing one — and
+    // each faults where any would, at the call: one exclusive
+    // check of the map, in place of `find`'s first read, stands
+    // for them all (D-0222; the fields are private, so no path
+    // outside `std` reaches one field alone).
+    String::appendf(&mut b, "    cb_borrow_check(p_m.tok, NULL, 0, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t n = m->slots.len, a, c;\n");
+    String::appendf(
+        &mut b,
+        "    if (__builtin_add_overflow(m->keys.len, (uint64_t)1, &a) || __builtin_mul_overflow(a, (uint64_t)4, &a) || __builtin_mul_overflow(n, (uint64_t)3, &c)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+    );
+    String::appendf(
+        &mut b,
+        "    if (a > c) { uint64_t n2; if (__builtin_mul_overflow(n, (uint64_t)2, &n2)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0); %s(((cb_ref){ p_m.p, p_m.tok }), n2); }\n",
+        &reslot,
+    );
+    // `find`'s own first read of `m`, made just above.
+    String probe0 = map_probe(g, k, &String::from_str("&p_k"), None);
+    String probe = replace_once(
+        &probe0,
+        StringView::of("    cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 2u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n"),
+        StringView::of(""),
+    );
+    String::append(&mut b, &probe);
+    String::appendf(&mut b, "    uint64_t e = m->slots.ptr[s];\n");
+    String growk = request_fn(g, StringView::of("std::Vec::grow"), one_ty(k));
+    String growv = request_fn(g, StringView::of("std::Vec::grow"), one_ty(v));
+    Type ot = nm1("std::Option", v);
+    if (insert)
+    {
+        String oc = ctype(g, &ot);
+        String::appendf(&mut b, "    %s r;\n", &oc);
+    }
+    String::appendf(&mut b, "    if (e == UINT64_MAX) {\n");
+    String::appendf(&mut b, "        e = m->keys.len;\n");
+    // The exclusive borrows of `slots`, `keys` and `values` were
+    // checked at entry. No object lies over a cell of `slots`.
+    String::appendf(&mut b, "        m->slots.ptr[s] = e;\n");
+    String::appendf(
+        &mut b,
+        "        if (m->keys.len == m->keys.cap) { uint64_t gt = cb_borrow_unstamped(p_m.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0); %s(((cb_ref){ (void *)&m->keys, gt })); cb_call_done(gt); }\n",
+        &growk,
+    );
+    String::appendf(&mut b, "        m->keys.ptr[m->keys.len] = p_k;\n");
+    if (text)
+    {
+        String::appendf(&mut b, "        cb_raw_move_in(ok, &m->keys.ptr[m->keys.len]);\n");
+    }
+    String::appendf(&mut b, "        m->keys.len += 1;\n");
+    String::appendf(
+        &mut b,
+        "        if (m->values.len == m->values.cap) { uint64_t gt = cb_borrow_unstamped(p_m.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0); %s(((cb_ref){ (void *)&m->values, gt })); cb_call_done(gt); }\n",
+        &growv,
+    );
+    String::appendf(&mut b, "        m->values.ptr[m->values.len] = %s;\n", vp);
+    String::appendf(&mut b, "        m->values.len += 1;\n");
+    if (insert)
+    {
+        String::appendf(&mut b, "        %s\n", &tag_set(g, &ot, StringView::of("r"), 1));
+        String::appendf(&mut b, "        return r;\n");
+    }
+    String::appendf(&mut b, "    } else {\n");
+    if (text)
+    {
+        String::appendf(&mut b, "        cb_consume(ok, CB_NOLOC, 0);\n");
+    }
+    if (insert)
+    {
+        // `Some(Vec::replace(&mut m.values, e, v))`, its borrow checked at entry.
+        String::appendf(
+            &mut b,
+            "        if (e >= m->values.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "        %s *ve = m->values.ptr + e;\n", &vc);
+        String::appendf(&mut b, "        %s\n", &tag_set(g, &ot, StringView::of("r"), 0));
+        String::appendf(&mut b, "        r.u.v0 = *ve;\n");
+        String::appendf(&mut b, "        cb_release((uint8_t *)ve, %vu);\n", vsize);
+        String::appendf(&mut b, "        *ve = %s;\n", vp);
+        String::appendf(&mut b, "        return r;\n");
+    }
+    String::appendf(&mut b, "    }\n");
+    if (!insert)
+    {
+        // `Vec::index_exclusive(&mut m.values, e)`, its borrow checked at entry.
+        String::appendf(&mut b, "    if (e >= m->values.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+        String::appendf(&mut b, "    %s *ve = m->values.ptr + e;\n", &vc);
+        String::appendf(&mut b, "    return (cb_ref){ (void *)ve, cb_elem_borrow(ve, %vu, CB_EXCLUSIVE) };\n", vty);
+    }
+    Some(b)
+}
+
+// A native `get_mut` body without the found branch's exclusive check
+// of `m.values` (D-0222), for a map the call checked exclusively.
+export fn map_excl_unchecked(ref<String, shared> b) : String
+{
+    StringView chk = StringView::of("    cb_borrow_check(p_m.tok, (cb_proj[]){ { CB_FIELD, 1u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n");
+    assert(String::contains(b, chk), "get_mut's check");
+    replace_once(b, chk, StringView::of(""))
+}
+
+// A native `entry` body returning the value's address instead of a
+// reference to it: the element access its caller's read and write
+// through that reference would make (`cb_elem_access`, exclusive, a
+// write: the read after it cannot fail on an initialized element).
+export fn entry_acc_body(ref<String, shared> b, u32 vty) : String
+{
+    String ret = sprintf("    return (cb_ref){ (void *)ve, cb_elem_borrow(ve, %vu, CB_EXCLUSIVE) };", vty);
+    assert(String::contains(b, String::as_view(&ret)), "entry's return");
+    String to = sprintf("    cb_elem_access(ve, sizeof(*ve), %vu, CB_EXCLUSIVE, 1, CB_NOLOC, 0);\n    return ve;", vty);
+    String::replace(b, String::as_view(&ret), String::as_view(&to))
+}
+
+// A native `get_mut` body returning the value's address (NULL for no
+// entry) instead of an `Option` holding a reference to it: the element
+// access its caller's read and write through that reference would
+// make, as `entry_acc_body`'s.
+// D-0200: and `get`'s, the access shared, a read.
+export fn get_mut_acc_body(ref<String, shared> b, u32 vty, bool excl) : String
+{
+    str m = if (excl) { "CB_EXCLUSIVE" } else { "CB_SHARED" };
+    u32 w = if (excl) { 1 } else { 0 };
+    StringView none = StringView::of("{ r.tag = 1u; cb_send_datum_none(); return r; }");
+    String some = sprintf(
+        "    r.tag = 0u;\n    r.u.v0 = (void *)ve;\n    cb_elem_borrow_datum(ve, %vu, %s);\n    return r;",
+        vty,
+        m,
+    );
+    assert(String::contains(b, none) && String::contains(b, String::as_view(&some)), "get_mut's returns");
+    String r1 = String::replace(b, none, StringView::of("return NULL;"));
+    String to = sprintf("    cb_elem_access(ve, sizeof(*ve), %vu, %s, %v, CB_NOLOC, 0);\n    return ve;", vty, m, w);
+    String::replace(&r1, String::as_view(&some), String::as_view(&to))
+}
+
+// `HashMap::find` with an integer or `bool` key: as for `String` keys
+// (`native_map_find_string`), `key_hash`'s read of `*k` and its hash
+// of the value's bytes (`cb_hash_bytes`, as `lower_key_bytes` makes
+// it), and for each candidate key its element access and `key_eq`'s
+// comparison, which for these types is equality of the values.
+export fn native_map_find_scalar(ref<Gen, exclusive> g, ref<Type, shared> k, ref<Type, shared> v) : String
+{
+    String kc = ctype(g, k);
+    String mc = ctype(g, &nm2("std::HashMap", k, v));
+    u32 kty = type_id(g, k);
+    u32 uty = type_id(g, &Type::TInt(IntTy::Usize));
+    String b = String::new();
+    String::appendf(&mut b, "    %s *m = (%s *)p_m.p;\n", &mc, &mc);
+    String::appendf(
+        &mut b,
+        "    cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 2u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    if (m->slots.len == 0) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    uint64_t mask = m->slots.len - 1;\n");
+    String::appendf(&mut b, "    cb_read(p_k.tok, NULL, 0, CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "    %s kv = *(%s *)p_k.p;\n", &kc, &kc);
+    String::appendf(&mut b, "    uint64_t i = cb_hash_bytes((const void *)&kv, sizeof(kv)) & mask;\n");
+    String::appendf(&mut b, "    int keys_read = 0;\n");
+    String::appendf(&mut b, "    for (;;) {\n");
+    String::appendf(&mut b, "        uint64_t *se = m->slots.ptr + i;\n");
+    String::appendf(&mut b, "        cb_elem_access(se, sizeof(*se), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", uty);
+    String::appendf(&mut b, "        uint64_t e = *se;\n");
+    String::appendf(&mut b, "        if (e == UINT64_MAX) break;\n");
+    String::appendf(
+        &mut b,
+        "        if (!keys_read) { cb_read(p_m.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0); keys_read = 1; }\n",
+    );
+    String::appendf(&mut b, "        if (e >= m->keys.len) cb_fault(\"diag.index-out-of-bounds\", CB_NOLOC, 0);\n");
+    String::appendf(&mut b, "        %s *ke = m->keys.ptr + e;\n", &kc);
+    String::appendf(&mut b, "        cb_elem_access(ke, sizeof(*ke), %vu, CB_SHARED, 0, CB_NOLOC, 0);\n", kty);
+    String::appendf(&mut b, "        if (*ke == kv) break;\n");
+    String::appendf(&mut b, "        i = (i + 1) & mask;\n");
+    String::appendf(&mut b, "    }\n");
+    String::appendf(&mut b, "    return i;\n");
+    b
+}
+
+// ---- PriorityQueue ----
+
+// `native_pq`'s `less(a, b)`: the key types' order where the queue is
+// keyed, else its `less` called with bare element addresses.
+fn pq_less(ref<Option<SearchOps>, shared> lt, ref<String, shared> thunk, StringView a, StringView b) : String
+{
+    String keyed = match (lt)
+    {
+        Some(ops) :
+        {
+            String ea = sprintf("q->items.ptr[%v]", a);
+            String eb = sprintf("q->items.ptr[%v]", b);
+            search_lt(ops, String::as_view(&ea), String::as_view(&eb))
+        },
+        None      : String::from_str("0"),
+    };
+    sprintf(
+        "(q->keyed ? (%s) : %s(q->less, ((cb_ref){ (void *)&q->items.ptr[%v], 0 }), ((cb_ref){ (void *)&q->items.ptr[%v], 0 })))",
+        &keyed,
+        thunk,
+        a,
+        b,
+    )
+}
+
+// `native_pq`'s `before(i, j)`: the earlier arrival unless the later goes first.
+fn pq_before(ref<Option<SearchOps>, shared> lt, ref<String, shared> thunk, StringView i, StringView j) : String
+{
+    String lji = pq_less(lt, thunk, j, i);
+    String lij = pq_less(lt, thunk, i, j);
+    sprintf("((q->seqs.ptr[%v] < q->seqs.ptr[%v]) ? !%s : %s)", i, j, &lji, &lij)
+}
+
+// `native_pq`'s `sift_up(at)`.
+fn pq_sift_up(
+    ref<Option<SearchOps>, shared> lt,
+    ref<String, shared> thunk,
+    ref<String, shared> tc,
+    StringView at,
+) : String
+{
+    String bf = pq_before(lt, thunk, StringView::of("i"), StringView::of("p"));
+    sprintf(
+        "    { uint64_t i = %v, t = i; while (t > 0) { uint64_t p = (t - 1) / 2; if (!%s) break; t = p; }\n      if (t != i) { %s x = q->items.ptr[i]; uint64_t xs = q->seqs.ptr[i]; uint64_t j = i; while (j != t) { uint64_t p = (j - 1) / 2; q->items.ptr[j] = q->items.ptr[p]; q->seqs.ptr[j] = q->seqs.ptr[p]; j = p; } q->items.ptr[t] = x; q->seqs.ptr[t] = xs; } }\n",
+        at,
+        &bf,
+        tc,
+    )
+}
+
+// D-0193: `PriorityQueue::push` and `pop` for plain elements, natively:
+// the same binary heap and the same comparisons in the same order
+// (`before`: the earlier arrival unless the later goes first). The body
+// reaches everything through `q`, borrowed exclusively by the call: its
+// first check (`&mut q.items` for `push`, the read of `q.items.len` for
+// `pop`, then its borrow) is made, and the rest cannot fail. The order
+// is the key types' (`keyed`, compared in C where `search_ops` has the
+// type) or `less`, called with bare element addresses when its closure
+// keeps nothing it is given (`cb_fn_pure`, D-0191). Any other queue, or
+// one with an element borrowed, takes the prelude's body.
+export fn native_pq(ref<Gen, exclusive> g, ref<String, shared> name, ref<Type, shared> t) : Option<String>
+{
+    u64 size = size_align(g, t).size;
+    // D-0200: or a resource holding no reference, no `fn` and no
+    // destructor of the program's own (`objectless_type`): moved within
+    // the heap as bytes, as a plain element is (no element has an object
+    // where the entry test finds none); received and sent at the ends.
+    bool res = is_resource(g, t) && objectless_type(g, t);
+    if (size == 0 || !(plain_data(g, t) || res))
+    {
+        return None;
+    }
+    String qc = ctype(g, &nm1("std::PriorityQueue", t));
+    String tc = ctype(g, t);
+    Vec<Type> ps = Vec::new();
+    Vec::push(&mut ps, ref_ty(t, Mode::Shared));
+    Vec::push(&mut ps, ref_ty(t, Mode::Shared));
+    Type ft = Type::TFn(Box::new(FnTy { .params = ps, .ret = Type::TBool }));
+    String thunk_c = thunk(g, &ft);
+    Option<SearchOps> lt = search_ops(g, t);
+    String grow_t = request_fn(g, StringView::of("std::Vec::grow"), one_ty(t));
+    String grow_s = request_fn(g, StringView::of("std::Vec::grow"), one_ty(&Type::TInt(IntTy::U64)));
+    String fb = std_fallback(g);
+    bool push = String::eq_str(name, "std::PriorityQueue::push");
+    str args = if (push) { "p_q, p_x" } else { "p_q" };
+    String b = String::new();
+    String::appendf(&mut b, "    %s *q = (%s *)p_q.p;\n", &qc, &qc);
+    String::appendf(
+        &mut b,
+        "    if ((q->keyed && %s) || (!q->keyed && !cb_fn_pure(q->less)) || cb_live_in(q->items.ptr, q->items.len * %vu)) return %s(%s);\n",
+        if (Option::is_some(&lt)) { "0" } else { "1" },
+        size,
+        &fb,
+        args,
+    );
+    if (push)
+    {
+        if (res)
+        {
+            // The element's record ends as it enters the heap's cells,
+            // as `cb_raw_move_in` ends a reference-free value's.
+            String::appendf(&mut b, "    uint64_t xo = cb_recv(&p_x);\n");
+        }
+        String::appendf(
+            &mut b,
+            "    cb_borrow_check(p_q.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+        if (res)
+        {
+            String::appendf(&mut b, "    cb_forget_obj(xo);\n");
+        }
+        String::appendf(
+            &mut b,
+            "    if (q->items.len == q->items.cap) %s(((cb_ref){ (void *)&q->items, 0 }));\n",
+            &grow_t,
+        );
+        String::appendf(&mut b, "    q->items.ptr[q->items.len] = p_x; q->items.len += 1;\n");
+        String::appendf(
+            &mut b,
+            "    if (q->seqs.len == q->seqs.cap) %s(((cb_ref){ (void *)&q->seqs, 0 }));\n",
+            &grow_s,
+        );
+        String::appendf(&mut b, "    q->seqs.ptr[q->seqs.len] = q->next; q->seqs.len += 1;\n");
+        String::appendf(
+            &mut b,
+            "    if (__builtin_add_overflow(q->next, (uint64_t)1, &q->next)) cb_fault(\"diag.arith-overflow\", CB_NOLOC, 0);\n",
+        );
+        String::append(&mut b, &pq_sift_up(&lt, &thunk_c, &tc, StringView::of("q->items.len - 1")));
+    }
+    else
+    {
+        Type ot = nm1("std::Option", t);
+        String opt_c = ctype(g, &ot);
+        String::appendf(
+            &mut b,
+            "    cb_read(p_q.tok, (cb_proj[]){ { CB_FIELD, 0u }, { CB_FIELD, 1u } }, 2, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    %s r;\n", &opt_c);
+        String::appendf(&mut b, "    uint64_t n = q->items.len;\n");
+        String none = tag_set(g, &ot, StringView::of("r"), 1);
+        if (res)
+        {
+            u32 otid = type_id(g, &ot);
+            String::appendf(
+                &mut b,
+                "    if (n == 0) { %s uint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro); return r; }\n",
+                &none,
+                otid,
+            );
+        }
+        else
+        {
+            String::appendf(&mut b, "    if (n == 0) { %s return r; }\n", &none);
+        }
+        String::appendf(
+            &mut b,
+            "    cb_borrow_check(p_q.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+        );
+        String::appendf(&mut b, "    %s top = q->items.ptr[0];\n", &tc);
+        String::appendf(&mut b, "    uint64_t last = n - 1, hole = 0;\n");
+        String::appendf(
+            &mut b,
+            "    while (2 * hole + 1 < last) { uint64_t c = 2 * hole + 1; if (c + 1 < last && %s) c = c + 1; q->items.ptr[hole] = q->items.ptr[c]; q->seqs.ptr[hole] = q->seqs.ptr[c]; hole = c; }\n",
+            &pq_before(&lt, &thunk_c, StringView::of("c + 1"), StringView::of("c")),
+        );
+        String::appendf(
+            &mut b,
+            "    if (hole != last) { q->items.ptr[hole] = q->items.ptr[last]; q->seqs.ptr[hole] = q->seqs.ptr[last]; }\n",
+        );
+        String::appendf(&mut b, "    q->items.len = last; q->seqs.len = last;\n");
+        String::appendf(&mut b, "    if (hole != last)\n");
+        String::append(&mut b, &pq_sift_up(&lt, &thunk_c, &tc, StringView::of("hole")));
+        String some = tag_set(g, &ot, StringView::of("r"), 0);
+        if (res)
+        {
+            u32 otid = type_id(g, &ot);
+            String::appendf(
+                &mut b,
+                "    %s r.u.v0 = top; uint64_t ro = cb_new(&r, %vu, CB_NOLOC, 0); cb_send(ro); return r;\n",
+                &some,
+                otid,
+            );
+        }
+        else
+        {
+            String::appendf(&mut b, "    %s r.u.v0 = top; return r;\n", &some);
+        }
+    }
+    Some(b)
+}
+
+// D-0200: whether destroying a `t` runs no code of the program's and
+// no check can fail in it: plain data, a container an objectless local
+// may be (`objectless_type`), or an `Option` of either.
+export fn silent_drop(ref<Gen, exclusive> g, ref<Type, shared> t) : bool
+{
+    if ((plain_data(g, t) && !has_refs(g, t) && !holds_fn(g, t)) || objectless_type(g, t))
+    {
+        return true;
+    }
+    match (t)
+    {
+        Type::TNamed(n) : String::eq_str(
+            &Box::get(n).name,
+            "std::Option",
+        ) && Vec::len(&Box::get(n).args) == 1 && silent_drop(g, &Box::get(n).args[0]),
+        _ : false,
+    }
+}
+
+// ---- HashSet ----
+
+// D-0200: `HashSet<String>::insert(s, k)` natively: the body receives
+// `k`, borrows `s.map` exclusively (the one check that can fail), moves
+// `k` into `HashMap::insert(&mut s.map, k, true)` and answers whether
+// that found none. Here the same borrow (unstamped, ended after the
+// call, as `native_append_bytes`' `grow` borrow is), and the key handed
+// to the map's `_rawk` form with no object: its record ends at once
+// (`cb_forget_obj`), as the map's own keys' do.
+export fn native_set_insert_string(ref<Gen, exclusive> g) : Option<String>
+{
+    Type st = nm0("std::String");
+    String setc = ctype(g, &nm1("std::HashSet", &st));
+    String ins = request_fn(g, StringView::of("std::HashMap::insert"), two_ty(&st, &Type::TBool));
+    String oc = ctype(g, &nm1("std::Option", &Type::TBool));
+    String b = String::new();
+    String::appendf(&mut b, "    uint64_t o = cb_recv(&p_k);\n");
+    String::appendf(
+        &mut b,
+        "    uint64_t tk = cb_borrow_unstamped(p_s.tok, (cb_proj[]){ { CB_FIELD, 0u } }, 1, CB_EXCLUSIVE, CB_NOLOC, 0);\n",
+    );
+    String::appendf(&mut b, "    cb_forget_obj(o);\n");
+    String::appendf(
+        &mut b,
+        "    %s r = %s_rawk(((cb_ref){ (void *)&((%s *)p_s.p)->map, tk }), p_k, 1);\n",
+        &oc,
+        &ins,
+        &setc,
+    );
+    String::appendf(&mut b, "    cb_call_done(tk);\n");
+    String::appendf(&mut b, "    return (uint8_t)(r.tag != 0u);\n");
+    // D-0200: the `_raw` form, for a key made with no object
+    // (`Fx::lower_set_insert_fresh`): nothing to receive or end.
+    String raw = lines_without(&b, StringView::of("cb_recv(&p_k)"), StringView::of("cb_forget_obj(o)"));
+    emit_raw_form(g, &raw);
+    Some(b)
+}

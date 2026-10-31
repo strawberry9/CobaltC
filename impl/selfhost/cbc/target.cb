@@ -1,0 +1,311 @@
+// D-0255: the targets `cbc --target` compiles for, as impl/cobc/src/target.rs
+// has them, and what each one decides: the runtime it links and where it
+// is, the system libraries, the executable's name, the default C compiler
+// and the linker's flags. Both are x86-64 with 64-bit addresses and
+// little-endian byte order, so no layout rule depends on which. With the
+// runtime's link knowledge (impl/cbrt/src/link_info.rs, which cobc compiles
+// in by `#[path]`), and the path operations of Rust's `Path` the driver
+// uses.
+
+import std;
+import build_info;
+
+export enum Target
+{
+    LinuxX64,
+    WindowsX64,
+}
+
+// `TRIPLES`: each target's name.
+export fn triples() : Vec<str>
+{
+    Vec<str> v = Vec::new();
+    Vec::push(&mut v, "x86_64-unknown-linux-gnu");
+    Vec::push(&mut v, "x86_64-pc-windows-gnu");
+    v
+}
+
+export fn Target::parse(StringView s) : Option<Target>
+{
+    if (StringView::eq_str(s, "x86_64-unknown-linux-gnu"))
+    {
+        return Some(Target::LinuxX64);
+    }
+    if (StringView::eq_str(s, "x86_64-pc-windows-gnu"))
+    {
+        return Some(Target::WindowsX64);
+    }
+    None
+}
+
+// Whether this program runs on Windows: its paths there join with `\`
+// (cobc decides it when it is built, `cfg!(windows)`; a program written in
+// CobaltC has no such test, and the path grammar is the platform's).
+export fn on_windows() : bool
+{
+    path_join("a", "b") == "a\\b"
+}
+
+// The target `cbc` itself runs on: its own platform's programs by default.
+// cobc's is `None` where it cannot compile natively (an MSVC build); cbc,
+// built by cobc, runs only where cobc's programs run, both x86-64.
+export fn Target::host() : Option<Target>
+{
+    if (on_windows()) { Some(Target::WindowsX64) } else { Some(Target::LinuxX64) }
+}
+
+export fn Target::eq(Target a, Target b) : bool
+{
+    Target::windows(a) == Target::windows(b)
+}
+
+// Whether `t` is the host (`Some(t) == Target::host()`).
+export fn is_host(Target t) : bool
+{
+    match (Target::host())
+    {
+        Some(h) : Target::eq(h, t),
+        None    : false,
+    }
+}
+
+export fn Target::triple(Target t) : str
+{
+    match (t)
+    {
+        LinuxX64   : "x86_64-unknown-linux-gnu",
+        WindowsX64 : "x86_64-pc-windows-gnu",
+    }
+}
+
+export fn Target::windows(Target t) : bool
+{
+    match (t)
+    {
+        WindowsX64 : true,
+        LinuxX64   : false,
+    }
+}
+
+// The runtime library's file name for `triple` (`link_info::lib_file_for`).
+export fn lib_file_for(StringView triple) : Option<str>
+{
+    if (StringView::eq_str(triple, "x86_64-unknown-linux-gnu") || StringView::eq_str(triple, "x86_64-pc-windows-gnu"))
+    {
+        return Some("libcbrt.a");
+    }
+    None
+}
+
+// The system libraries the runtime needs on `triple`, as `-l` names for
+// the C compiler after `-lcbrt` (`link_info::link_libs_for`): the target's
+// `--print native-static-libs`, less what the C compiler links on its own
+// (libc, libgcc; msvcrt).
+export fn link_libs_for(StringView triple) : Option<Vec<str>>
+{
+    Vec<str> v = Vec::new();
+    if (StringView::eq_str(triple, "x86_64-unknown-linux-gnu"))
+    {
+        Vec::push(&mut v, "pthread");
+        Vec::push(&mut v, "dl");
+        Vec::push(&mut v, "m");
+        return Some(v);
+    }
+    if (StringView::eq_str(triple, "x86_64-pc-windows-gnu"))
+    {
+        Vec::push(&mut v, "kernel32");
+        Vec::push(&mut v, "advapi32");
+        Vec::push(&mut v, "bcrypt");
+        Vec::push(&mut v, "ntdll");
+        Vec::push(&mut v, "userenv");
+        Vec::push(&mut v, "ws2_32");
+        return Some(v);
+    }
+    None
+}
+
+export fn Target::lib_file(Target t) : str
+{
+    Option::expect(lib_file_for(StringView::of(Target::triple(t))), "a supported target")
+}
+
+export fn Target::link_libs(Target t) : Vec<str>
+{
+    Option::expect(link_libs_for(StringView::of(Target::triple(t))), "a supported target")
+}
+
+// `prog.cb` -> `prog` (`prog.exe` for Windows).
+export fn Target::exe_name(Target t, StringView stem) : String
+{
+    if (Target::windows(t)) { with_extension(stem, "exe") } else { String::from_view(stem) }
+}
+
+// The C compiler when `--cc` names none: the platform's own natively,
+// MinGW's cross compiler for Windows from Linux.
+export fn Target::default_cc(Target t, Option<Target> host) : str
+{
+    bool host_windows = match (host)
+    {
+        Some(h) : Target::windows(h),
+        None    : false,
+    };
+    match (t)
+    {
+        WindowsX64 : if (host_windows) { "gcc" } else { "x86_64-w64-mingw32-gcc" },
+        LinuxX64   : "cc",
+    }
+}
+
+// Where the runtime for this target is: beside `cbc` for its own target
+// (`target/release`), else in Cargo's directory for the triple
+// (`target/<triple>/release`, from `cargo build -p cbrt --target …`), or
+// `<triple>/` beside `cbc` in an unpacked release. `cobc_dir` is the
+// directory of this executable, or the one `build_info::CBRT_DIR` names.
+export fn Target::runtime_dir(Target t, StringView cobc_dir) : String
+{
+    if (is_host(t))
+    {
+        return String::from_view(cobc_dir);
+    }
+    String packaged = path_join(cobc_dir, StringView::of(Target::triple(t)));
+    if (exists(String::as_view(&path_join(String::as_view(&packaged), StringView::of(Target::lib_file(t))))))
+    {
+        return packaged;
+    }
+    match (path_parent(cobc_dir))
+    {
+        Some(p) : path_join(
+            String::as_view(&path_join(String::as_view(&p), StringView::of(Target::triple(t)))),
+            "release",
+        ),
+        None : packaged,
+    }
+}
+
+// The command that builds the runtime this target needs, for the messages
+// when it is missing or stale.
+export fn Target::runtime_build(Target t) : String
+{
+    if (is_host(t))
+    {
+        return String::from_str("`cargo build --release -p cbrt -p cobc` (without --release for a debug cobc)");
+    }
+    match (t)
+    {
+        WindowsX64 : String::from_str(
+            "`cargo +1.77.2 build --release -p cbrt --target x86_64-pc-windows-gnu` (Rust 1.77.2, whose runtime still runs on Windows 7)",
+        ),
+        LinuxX64 : sprintf("`cargo build --release -p cbrt --target %v`", Target::triple(t)),
+    }
+}
+
+// ---- Rust's `Path`, as far as the driver uses it ----
+
+// Whether anything is at `p` (`Path::exists`).
+export fn exists(StringView p) : bool
+{
+    Result::is_ok(&path_kind(p))
+}
+
+export fn is_file(StringView p) : bool
+{
+    match (path_kind(p))
+    {
+        Ok(File(_)) : true,
+        _           : false,
+    }
+}
+
+export fn is_dir(StringView p) : bool
+{
+    match (path_kind(p))
+    {
+        Ok(Dir) : true,
+        _       : false,
+    }
+}
+
+// `base.join(tail)`, an empty `base` giving `tail` alone.
+export fn pjoin(StringView base, StringView tail) : String
+{
+    if (StringView::len(base) == 0)
+    {
+        return String::from_view(tail);
+    }
+    path_join(base, tail)
+}
+
+// `Path::parent`, `None` for a root or the empty path.
+export fn parent(StringView p) : Option<String>
+{
+    path_parent(p)
+}
+
+// `Path::with_file_name`: `p`'s last part replaced by `name`.
+export fn with_file_name(StringView p, StringView name) : String
+{
+    match (path_parent(p))
+    {
+        Some(d) : pjoin(String::as_view(&d), name),
+        None    : String::from_view(name),
+    }
+}
+
+// `Path::with_extension`: `p`'s extension replaced by `ext` (removed for an
+// empty one), or added where it has none.
+export fn with_extension(StringView p, str ext) : String
+{
+    String stem = match (path_stem(p))
+    {
+        Some(s) : s,
+        None    : return String::from_view(p),
+    };
+    String name = if (StringView::len(StringView::of(ext)) == 0) { stem } else { sprintf("%s.%v", &stem, ext) };
+    with_file_name(p, String::as_view(&name))
+}
+
+// `Path::file_stem`, empty for none.
+export fn stem_of(StringView p) : String
+{
+    Option::unwrap_or(path_stem(p), String::new())
+}
+
+// `Path::file_name`, empty for none.
+export fn name_of(StringView p) : String
+{
+    Option::unwrap_or(path_file_name(p), String::new())
+}
+
+// `fs::canonicalize`, `None` where it fails.
+export fn canonical(StringView p) : Option<String>
+{
+    Result::ok(path_canonical(p))
+}
+
+// The directory the runtime is looked for in (`runtime_dir`'s `cobc_dir`):
+// `build_info::CBRT_DIR` when set (impl/selfhost/build.sh sets it to the
+// directory of the cobc that built cbc, where `libcbrt.a` is), else this
+// executable's, as cobc's (`current_exe().parent()`).
+export fn runtime_home() : Result<String, String>
+{
+    if (StringView::len(StringView::of(CBRT_DIR)) > 0)
+    {
+        return Ok(String::from_str(CBRT_DIR));
+    }
+    exe_dir()
+}
+
+// This executable's directory (`current_exe().parent()`).
+export fn exe_dir() : Result<String, String>
+{
+    String here = match (current_exe())
+    {
+        Ok(e)  : e,
+        Err(e) : return Err(String::from_str(FileError::text(&e))),
+    };
+    match (path_parent(String::as_view(&here)))
+    {
+        Some(d) : Ok(d),
+        None    : Err(String::from_str("no parent dir")),
+    }
+}

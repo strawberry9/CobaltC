@@ -1,0 +1,2483 @@
+// cobc's analysis_strings.rs (`objectless_strings`), analysis_refs.rs's
+// `fusion_plan`, `pure_view` / `pure_view_in` and the uses.rs walks they need
+// (`trim_of`, `view_uses`, `view_uses_fused`), written in CobaltC (D-0274
+// stage 4). cobc keys its answers by node address; cbc by `Expr::id` (an
+// arm by its body's id with `ARM_BIT`).
+
+import std;
+import ast;
+import state;
+import layout;
+import typeops;
+import items;
+import direct;
+import refs4;
+import analyses;
+
+// `objectless_strings`' answer: the candidate bindings (a `let`'s
+// initializer's id, an arm's `body.id | ARM_BIT`, a by-value parameter's
+// `(index + 1) | PARAM_BIT` in a decided program), and those of them moved
+// away (cobc's `!id`), compared (`id | 1`), indexed (`id | 2`) and, D-0294,
+// assigned whole (`id | 4`).
+export struct Objectless
+{
+    export HashSet<usize> ids;
+    export HashSet<usize> moved;
+    export HashSet<usize> compared;
+    export HashSet<usize> indexed;
+    export HashSet<usize> assigned;
+}
+
+// D-0286: a by-value parameter that is a candidate (cobc: the `Param`'s
+// address): its name and its id.
+export struct Cand
+{
+    export String name;
+    export usize id;
+}
+
+// A candidate at the root of `x`, `x.f`, `x.f.g`…, and the first field
+// named, if any (cobc's `field_root`).
+struct FieldRoot
+{
+    usize id;
+    Option<String> first;
+}
+
+// ---- small syntax helpers (cobc's uses.rs) ----
+
+// cobc's `strip_parens`.
+fn strip(ref<Expr, shared> e) : ref<Expr, shared>
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(i) : strip(Box::get(i)),
+        _                   : e,
+    }
+}
+
+// cobc's `path_name`: a one-segment path's name (type arguments or not),
+// through parens.
+fn path_name(ref<Expr, shared> e) : Option<String>
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                return Some(String::clone(&Box::get(p).segs[0]));
+            }
+            None
+        },
+        _                  : None,
+    }
+}
+
+// The function `segs` names, as cobc's items key it: a `std` item may be
+// named without `std::`.
+fn key_of(ref<Gen, exclusive> g, ref<Vec<String>, shared> segs) : String
+{
+    String k = String::join(&segs[0..$], "::");
+    if (HashMap::contains(&g.prog.table.fns, &k))
+    {
+        return k;
+    }
+    sprintf("std::%s", &k)
+}
+
+// Whether `key` is a function from the prelude's own source (`in_prelude`),
+// its body loaded first; false when there is no such function.
+fn prelude_fn(ref<Gen, exclusive> g, ref<String, shared> key) : bool
+{
+    if (is_pending(&g.prog.table, key))
+    {
+        match (load_body(&mut g.prog.table, &g.prog.front, key))
+        {
+            Ok(_)  : {},
+            Err(_) : assert(false, "cobc: a std body that does not load"),
+        }
+    }
+    match (HashMap::get(&g.prog.table.fns, key))
+    {
+        Some(f) : in_prelude(String::as_view(key), f),
+        None    : false,
+    }
+}
+
+// The type of parameter `j` of `key`, if `key` is a function with one.
+fn param_ty(ref<Gen, exclusive> g, ref<String, shared> key, usize j) : Option<Type>
+{
+    match (HashMap::get(&g.prog.table.fns, key))
+    {
+        Some(f) : if (j < Vec::len(&f.params)) { Some(clone(&f.params[j].ty)) } else { None },
+        None    : None,
+    }
+}
+
+// The prelude's trims of a `StringView` (cobc's `TRIMS`).
+fn is_trim(ref<String, shared> k) : bool
+{
+    String::eq_str(k, "std::StringView::trim") || String::eq_str(k, "std::StringView::trim_start") || String::eq_str(
+        k,
+        "std::StringView::trim_end",
+    )
+}
+
+fn is_shared_ref(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(m) : Box::get(m).mode == Mode::Shared,
+        _             : false,
+    }
+}
+
+// `std`'s `String` builders, which change the `String` they are lent and keep
+// no reference to it (each is native or a few `Vec` calls that take an
+// unchecked reference, token 0, as any reader does).
+fn is_builder(ref<String, shared> k) : bool
+{
+    String::eq_str(k, "std::String::append") || String::eq_str(k, "std::String::push_ascii") || String::eq_str(
+        k,
+        "std::String::push_code_point",
+    ) || String::eq_str(k, "std::String::clear") || String::eq_str(k, "std::String::truncate")
+}
+
+// cobc's `appended_text`: the text argument of `String::append`.
+fn appended_text(ref<Gen, exclusive> g, ref<String, shared> name, usize j) : bool
+{
+    String::eq_str(name, "std::String::append") && j == 1 && prelude_fn(g, name)
+}
+
+// `StringView::trim(x)` (or `trim_start`, `trim_end`) of a bare name `x`:
+// which, and `x` (cobc's `trim_of`).
+export struct TrimOf
+{
+    export String k;
+    export String x;
+}
+
+export fn trim_of(ref<Expr, shared> e) : Option<TrimOf>
+{
+    ref<CallExpr, shared> call = match (&strip(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    ref<PathExpr, shared> p = match (&call.callee.kind)
+    {
+        ExprKind::EPath(q) : Box::get(q),
+        _                  : return None,
+    };
+    if (Vec::len(&p.targs) != 0 || Vec::len(&call.args) != 1)
+    {
+        return None;
+    }
+    String k = String::join(&p.segs[0..$], "::");
+    if (!String::starts_with(&k, StringView::of("std::")))
+    {
+        k = sprintf("std::%s", &k);
+    }
+    if (!is_trim(&k))
+    {
+        return None;
+    }
+    match (path_name(&call.args[0]))
+    {
+        Some(x) : Some(TrimOf { .k = k, .x = x }),
+        None    : None,
+    }
+}
+
+// What cobc's `visit_expr` sees of names: every one-segment path, and every
+// closure's captures (closures' bodies included, no match literals).
+struct Seen
+{
+    Vec<String> paths;
+    Vec<String> caps;
+}
+
+fn sn_expr(ref<Expr, shared> e, ref<Seen, exclusive> out)
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)    :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                Vec::push(&mut out.paths, String::clone(&Box::get(p).segs[0]));
+            }
+        },
+        ExprKind::EClosure(c) :
+        {
+            foreach (n in &Box::get(c).captures)
+            {
+                Vec::push(&mut out.caps, String::clone(n));
+            }
+        },
+        _                     : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                sn_expr(&f.value, out);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                sn_expr(a, out);
+            }
+        },
+        ExprKind::EArrayRepeat(a) : sn_expr(&Box::get(a).value, out),
+        ExprKind::EUnary(u)       : sn_expr(&Box::get(u).e, out),
+        ExprKind::EBinary(b)      :
+        {
+            sn_expr(&Box::get(b).a, out);
+            sn_expr(&Box::get(b).b, out);
+        },
+        ExprKind::EBorrow(bb)     : sn_expr(&Box::get(bb).e, out),
+        ExprKind::ESliceOf(s)     :
+        {
+            sn_expr(&Box::get(s).base, out);
+            sn_expr(&Box::get(s).lo, out);
+            sn_expr(&Box::get(s).hi, out);
+        },
+        ExprKind::EDeref(a)       : sn_expr(Box::get(a), out),
+        ExprKind::EField(f)       : sn_expr(&Box::get(f).e, out),
+        ExprKind::EIndex(p)       :
+        {
+            sn_expr(&Box::get(p).a, out);
+            sn_expr(&Box::get(p).b, out);
+        },
+        ExprKind::ECall(c)        :
+        {
+            sn_expr(&Box::get(c).callee, out);
+            foreach (a in &Box::get(c).args)
+            {
+                sn_expr(a, out);
+            }
+        },
+        ExprKind::EAssign(p)      :
+        {
+            sn_expr(&Box::get(p).a, out);
+            sn_expr(&Box::get(p).b, out);
+        },
+        ExprKind::EPropagate(a)   : sn_expr(Box::get(a), out),
+        ExprKind::EBlock(b)       : sn_block(b, out),
+        ExprKind::EUnsafe(b)      : sn_block(b, out),
+        ExprKind::EIf(i)          :
+        {
+            sn_expr(&Box::get(i).cond, out);
+            sn_block(&Box::get(i).then_, out);
+            match (&Box::get(i).else_)
+            {
+                Some(f) : sn_expr(f, out),
+                None    : {},
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            sn_expr(&Box::get(w).cond, out);
+            sn_block(&Box::get(w).body, out);
+            match (&Box::get(w).step)
+            {
+                Some(s) : sn_expr(s, out),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            sn_expr(&Box::get(m).scrut, out);
+            foreach (a in &Box::get(m).arms)
+            {
+                sn_expr(Box::get(&a.body), out);
+            }
+        },
+        ExprKind::EReturn(v)      :
+        {
+            match (v)
+            {
+                Some(r) : sn_expr(Box::get(r), out),
+                None    : {},
+            }
+        },
+        ExprKind::EClosure(c)     : sn_block(&Box::get(c).body, out),
+        ExprKind::EParen(a)       : sn_expr(Box::get(a), out),
+        _                         : {},
+    }
+}
+
+fn sn_block(ref<Block, shared> b, ref<Seen, exclusive> out)
+{
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : sn_expr(e, out),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : sn_expr(&Box::get(d).init, out),
+            Stmt::SExpr(e)        : sn_expr(Box::get(e), out),
+            Stmt::SBlockLike(e)   : sn_expr(Box::get(e), out),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : sn_expr(Box::get(t), out),
+        None    : {},
+    }
+}
+
+fn new_seen() : Seen
+{
+    Seen { .paths = Vec::new(), .caps = Vec::new() }
+}
+
+// ---- fusion_plan ----
+
+// D-0200: a fusable text loop's parts (cobc's `FusionPlan`), from
+// `fusion_plan(g, b, local)`:
+// - `cname`: the loop's binder (each piece);
+// - `on_string`: the text is a `String` (lent) rather than a view;
+// - `chars`: the pieces are characters (`chars`) rather than words
+//   (`split_whitespace`);
+// - `derived`: the locals the body trims the piece into
+//   (`let t = StringView::trim(c);`, at the body's top level);
+// - `source_id`, `be_id`: the ids of the text (the collection call's
+//   argument, cobc's `source`) and of the loop's block-like statement (cobc's
+//   `be`). The nodes themselves are `fusion_source(b)`, `fusion_be(b)` and
+//   `fusion_body(b)` (the block `be` is), for the `b` the plan was made for.
+export struct FusionPlan
+{
+    export String cname;
+    export bool on_string;
+    export bool chars;
+    export Vec<String> derived;
+    export usize source_id;
+    export usize be_id;
+}
+
+fn let_named(ref<Stmt, shared> st, str prefix) : bool
+{
+    match (st)
+    {
+        Stmt::SLet(l) : Option::is_some(&Box::get(l).init) && String::starts_with(
+            &Box::get(l).name,
+            StringView::of(prefix),
+        ),
+        _ : false,
+    }
+}
+
+fn let_init(ref<Stmt, shared> st) : Option<ref<Expr, shared>>
+{
+    match (st)
+    {
+        Stmt::SLet(l) :
+        {
+            match (&Box::get(l).init)
+            {
+                Some(e) : Some(e),
+                None    : None,
+            }
+        },
+        _             : None,
+    }
+}
+
+// A call whose callee is the one-segment path `name`.
+fn call_of(ref<Expr, shared> e, str name) : Option<ref<CallExpr, shared>>
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(c) :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1 && String::eq_str(&Box::get(p).segs[0], name))
+                    {
+                        return Some(Box::get(c));
+                    }
+                    None
+                },
+                _                  : None,
+            }
+        },
+        _                  : None,
+    }
+}
+
+// The loop of a fused-loop block (`$e`, `$d`, `$i` and the `while` with a
+// step whose body takes the piece and runs the block): the `while`'s body.
+fn fe_loop(ref<Block, shared> b) : Option<ref<Block, shared>>
+{
+    if (Vec::len(&b.stmts) != 3)
+    {
+        return None;
+    }
+    if (!let_named(&b.stmts[0], "$e") || !let_named(&b.stmts[1], "$d") || !let_named(&b.stmts[2], "$i"))
+    {
+        return None;
+    }
+    ref<Expr, shared> dr = Option::expect(let_init(&b.stmts[1]), "an initializer");
+    ref<CallExpr, shared> dc = match (call_of(dr, "$each_drain"))
+    {
+        Some(c) : c,
+        None    : return None,
+    };
+    if (Vec::len(&dc.args) < 2)
+    {
+        return None;
+    }
+    match (&dc.args[1].kind)
+    {
+        ExprKind::EInt(n) :
+        {
+            if (Box::get(n).v != 1)
+            {
+                return None;
+            }
+        },
+        _                 : return None,
+    }
+    ref<Expr, shared> tail = match (&b.tail)
+    {
+        Some(t) : Box::get(t),
+        None    : return None,
+    };
+    ref<WhileExpr, shared> w = match (&tail.kind)
+    {
+        ExprKind::EWhile(x) : Box::get(x),
+        _                   : return None,
+    };
+    if (Option::is_none(&w.step))
+    {
+        return None;
+    }
+    ref<Block, shared> wb = &w.body;
+    if (Vec::len(&wb.stmts) != 2 || Option::is_some(&wb.tail))
+    {
+        return None;
+    }
+    ref<Expr, shared> take = match (let_init(&wb.stmts[0]))
+    {
+        Some(t) : t,
+        None    : return None,
+    };
+    match (call_of(take, "$each_take"))
+    {
+        Some(_) : {},
+        None    : return None,
+    }
+    match (&wb.stmts[1])
+    {
+        Stmt::SBlockLike(be) :
+        {
+            match (&Box::get(be).kind)
+            {
+                ExprKind::EBlock(_) : {},
+                _                   : return None,
+            }
+        },
+        _                    : return None,
+    }
+    Some(wb)
+}
+
+// The collection call of a fused-loop block (the `$e` initializer, through
+// parens): a path callee with no type arguments and one argument.
+fn fe_coll(ref<Block, shared> b) : Option<ref<CallExpr, shared>>
+{
+    ref<Expr, shared> coll = match (let_init(&b.stmts[0]))
+    {
+        Some(e) : strip(e),
+        None    : return None,
+    };
+    match (&coll.kind)
+    {
+        ExprKind::ECall(c) :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).targs) == 0 && Vec::len(&Box::get(c).args) == 1)
+                    {
+                        return Some(Box::get(c));
+                    }
+                    None
+                },
+                _                  : None,
+            }
+        },
+        _                  : None,
+    }
+}
+
+fn fe_segs(ref<CallExpr, shared> c) : ref<Vec<String>, shared>
+{
+    Option::expect(path_segs(&c.callee), "a fused loop's callee path")
+}
+
+// Whether `b` has a fused text loop's shape (everything `fusion_plan` asks
+// of its syntax but the callee's binding).
+fn fusion_shape(ref<Block, shared> b) : bool
+{
+    Option::is_some(&fe_loop(b)) && Option::is_some(&fe_coll(b))
+}
+
+// The one-segment name of a fused-loop block's collection call, whose
+// binding `fusion_plan`'s `local` answers for (cobc's `local(&segs[0])`):
+// `None` when `b` has no such shape or the callee has several segments
+// (then `local` is not asked).
+export fn fusion_name(ref<Block, shared> b) : Option<String>
+{
+    if (!fusion_shape(b))
+    {
+        return None;
+    }
+    ref<Vec<String>, shared> segs = fe_segs(Option::expect(fe_coll(b), "a collection call"));
+    if (Vec::len(segs) == 1)
+    {
+        return Some(String::clone(&segs[0]));
+    }
+    None
+}
+
+// The text of the fused loop `b` (the collection call's argument; cobc's
+// `plan.source`), for a block `fusion_plan` accepted.
+export fn fusion_source(ref<Block, shared> b) : ref<Expr, shared>
+{
+    ref<CallExpr, shared> c = Option::expect(fe_coll(b), "a fused loop");
+    &c.args[0]
+}
+
+// The loop's block-like statement (cobc's `plan.be`).
+export fn fusion_be(ref<Block, shared> b) : ref<Expr, shared>
+{
+    Option::expect(fe_be(b), "a fused loop")
+}
+
+fn fe_be(ref<Block, shared> b) : Option<ref<Expr, shared>>
+{
+    ref<Block, shared> wb = match (fe_loop(b))
+    {
+        Some(x) : x,
+        None    : return None,
+    };
+    match (&wb.stmts[1])
+    {
+        Stmt::SBlockLike(be) : Some(Box::get(be)),
+        _                    : None,
+    }
+}
+
+// The block `fusion_be(b)` is: the loop's body.
+export fn fusion_body(ref<Block, shared> b) : ref<Block, shared>
+{
+    Option::expect(fe_body(b), "a fused loop")
+}
+
+fn fe_body(ref<Block, shared> b) : Option<ref<Block, shared>>
+{
+    ref<Expr, shared> be = match (fe_be(b))
+    {
+        Some(x) : x,
+        None    : return None,
+    };
+    match (&be.kind)
+    {
+        ExprKind::EBlock(body) : Some(body),
+        _                      : None,
+    }
+}
+
+// The fused loop's binder (each piece).
+fn fe_cname(ref<Block, shared> b) : String
+{
+    ref<Block, shared> wb = Option::expect(fe_loop(b), "a fused loop");
+    match (&wb.stmts[0])
+    {
+        Stmt::SLet(l) : String::clone(&Box::get(l).name),
+        _             : String::new(),
+    }
+}
+
+// D-0200: whether the block `b` is a `foreach` over `chars` or
+// `split_whitespace` that `Fx::lower_fused_text_loop` lowers fused, and its
+// parts (cobc's `fusion_plan`). `local`: whether the collection call's
+// one-segment name (`fusion_name(b)`) is a binding where the block is (a
+// local of that name would be what the call calls); unused for a callee of
+// several segments.
+export fn fusion_plan(ref<Gen, exclusive> g, ref<Block, shared> b, bool local) : Option<FusionPlan>
+{
+    if (boot(g, 4))
+    {
+        return None;
+    }
+    if (!fusion_shape(b))
+    {
+        return None;
+    }
+    String cname = fe_cname(b);
+    ref<CallExpr, shared> coll = Option::expect(fe_coll(b), "a collection call");
+    ref<Vec<String>, shared> segs = fe_segs(coll);
+    if (Vec::len(segs) == 1 && local)
+    {
+        return None;
+    }
+    String k = key_of(g, segs);
+    bool on_string = false;
+    bool chars = false;
+    if (String::eq_str(&k, "std::StringView::chars"))
+    {
+        chars = true;
+    }
+    else if (String::eq_str(&k, "std::StringView::split_whitespace"))
+    {
+    }
+    else if (String::eq_str(&k, "std::String::chars"))
+    {
+        on_string = true;
+        chars = true;
+    }
+    else if (String::eq_str(&k, "std::String::split_whitespace"))
+    {
+        on_string = true;
+    }
+    else
+    {
+        return None;
+    }
+    if (!prelude_fn(g, &k))
+    {
+        return None;
+    }
+    ref<Block, shared> body = fusion_body(b);
+    // The body: `c` only as a pure view, or copied (`String::from_view`), or
+    // trimmed into a local of its own (`let t = StringView::trim(c);`,
+    // `trim_start`, `trim_end`, at the body's top level) that is itself used
+    // only so; nothing the collection names.
+    Vec<String> derived = Vec::new();
+    foreach (st in &body.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l) :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) :
+                    {
+                        match (trim_of(e))
+                        {
+                            Some(t) :
+                            {
+                                if (String::eq(&t.x, &cname))
+                                {
+                                    Vec::push(&mut derived, String::clone(&Box::get(l).name));
+                                }
+                            },
+                            None    : {},
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            _             : {},
+        }
+    }
+    Vec<String> no_visit = Vec::new();
+    ViewTest c_ok = ViewTest::FuseCOk(Vec::len(&derived) != 0);
+    bool w_ok = vu_block(g, body, 0, &cname, &c_ok, false, &mut no_visit);
+    // Each trimmed local, from just after its `let` (its own declaration is
+    // no use of it; cobc's `after`, a copy of the rest of the block).
+    bool t_ok = true;
+    ViewTest ok = ViewTest::FuseOk;
+    foreach (t in &derived)
+    {
+        if (!t_ok)
+        {
+            break;
+        }
+        if (String::eq(t, &cname))
+        {
+            t_ok = false;
+            break;
+        }
+        Option<usize> at = None;
+        for (usize i = 0; i < Vec::len(&body.stmts); i += 1)
+        {
+            if (Option::is_none(&at))
+            {
+                match (&body.stmts[i])
+                {
+                    Stmt::SLet(l) :
+                    {
+                        if (String::eq(&Box::get(l).name, t))
+                        {
+                            at = Some(i);
+                        }
+                    },
+                    _             : {},
+                }
+            }
+        }
+        t_ok = match (at)
+        {
+            Some(i) : vu_block(g, body, i + 1, t, &ok, false, &mut no_visit),
+            None    : false,
+        };
+    }
+    if (!(w_ok && t_ok))
+    {
+        return None;
+    }
+    ref<Expr, shared> source = &coll.args[0];
+    Seen named = new_seen();
+    sn_expr(source, &mut named);
+    Seen inside = new_seen();
+    sn_block(body, &mut inside);
+    bool clash = false;
+    foreach (n in &inside.paths)
+    {
+        if (Vec::contains(&named.paths, n))
+        {
+            clash = true;
+        }
+    }
+    foreach (n in &inside.caps)
+    {
+        if (Vec::contains(&named.paths, n))
+        {
+            clash = true;
+        }
+    }
+    if (clash)
+    {
+        return None;
+    }
+    Some(FusionPlan { .cname = cname, .on_string = on_string, .chars = chars, .derived = derived, .source_id = source.id, .be_id = fusion_be(b).id })
+}
+
+// ---- view_uses / view_uses_fused ----
+
+// The callee test a view walk asks of a call handed the view whole (cobc
+// passes a closure): `fusion_plan`'s `ok` (a pure view parameter, or
+// `String::from_view`) and `c_ok` (that, or a trim when the body has trimmed
+// locals); `pure_view_in`'s `callee` (a pure view parameter of a function no
+// binding of the body shadows, within the same recursion), whose `bound`
+// and parameter names also answer a fused loop's `local`.
+enum ViewTest
+{
+    FuseOk,
+    FuseCOk(bool),
+    ViewIn(ViewCtx),
+}
+
+struct ViewCtx
+{
+    HashSet<String> bound;
+    Vec<String> pnames;
+}
+
+fn vt_ok(
+    ref<Gen, exclusive> g,
+    ref<ViewTest, shared> t,
+    ref<Vec<String>, shared> segs,
+    usize at,
+    ref<Vec<String>, exclusive> visiting,
+) : bool
+{
+    match (t)
+    {
+        ViewTest::FuseOk     : fuse_ok(g, segs, at),
+        ViewTest::FuseCOk(d) :
+        {
+            if (fuse_ok(g, segs, at))
+            {
+                return true;
+            }
+            String k2 = key_of(g, segs);
+            at == 0 && is_trim(&k2) && *d
+        },
+        ViewTest::ViewIn(c)  :
+        {
+            if (Vec::len(segs) == 1 && HashSet::contains(&c.bound, &segs[0]))
+            {
+                return false;
+            }
+            String k = key_of(g, segs);
+            pure_view_in(g, &k, at, visiting)
+        },
+    }
+}
+
+fn fuse_ok(ref<Gen, exclusive> g, ref<Vec<String>, shared> segs, usize at) : bool
+{
+    String k2 = key_of(g, segs);
+    pure_view(g, &k2, at) || (String::eq_str(&k2, "std::String::from_view") && prelude_fn(g, &k2))
+}
+
+// `e` is the path `v` itself, no type arguments, through parens.
+fn is_v(ref<Expr, shared> e, ref<String, shared> v) : bool
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EPath(p) : Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 0 && String::eq(
+            &Box::get(p).segs[0],
+            v,
+        ),
+        _ : false,
+    }
+}
+
+// `v.bytes`, through parens.
+fn bytes_of(ref<Expr, shared> e, ref<String, shared> v) : bool
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EField(f) : String::eq_str(&Box::get(f).name, "bytes") && is_v(&Box::get(f).e, v),
+        _                   : false,
+    }
+}
+
+// `*f(…)`, through parens.
+fn deref_call(ref<Expr, shared> e) : bool
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EDeref(inner) :
+        {
+            match (&strip(Box::get(inner)).kind)
+            {
+                ExprKind::ECall(_) : true,
+                _                  : false,
+            }
+        },
+        _                       : false,
+    }
+}
+
+fn is_cmp(BinOp op) : bool
+{
+    op == BinOp::Eq || op == BinOp::Ne || op == BinOp::Lt || op == BinOp::Le || op == BinOp::Gt || op == BinOp::Ge
+}
+
+// `v` used in `b` only as `v.bytes[i]` read, `slice_len(v.bytes)`, or a
+// whole argument of a call the test `t` accepts, named by no other argument
+// of it (cobc's `view_uses`; `fused`: `view_uses_fused` with
+// `pure_view_in`'s judge of a fused text loop over `v` itself).
+fn vu_expr(
+    ref<Gen, exclusive> g,
+    ref<Expr, shared> e,
+    ref<String, shared> v,
+    ref<ViewTest, shared> t,
+    bool fused,
+    ref<Vec<String>, exclusive> visiting,
+) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EPath(_)        : !is_v(e, v),
+        ExprKind::EIndex(p)       :
+        {
+            if (bytes_of(&Box::get(p).a, v))
+            {
+                return vu_expr(g, &Box::get(p).b, v, t, fused, visiting);
+            }
+            vu_expr(g, &Box::get(p).a, v, t, fused, visiting) && vu_expr(g, &Box::get(p).b, v, t, fused, visiting)
+        },
+        ExprKind::ECall(cb)       :
+        {
+            ref<CallExpr, shared> c = Box::get(cb);
+            match (&c.callee.kind)
+            {
+                ExprKind::EPath(pp) :
+                {
+                    ref<Vec<String>, shared> segs = &Box::get(pp).segs;
+                    if (Vec::len(segs) == 1 && String::eq_str(
+                        &segs[0],
+                        "slice_len",
+                    ) && Vec::len(&c.args) == 1 && bytes_of(
+                        &c.args[0],
+                        v,
+                    ))
+                    {
+                        return true;
+                    }
+                    if (!vu_expr(g, &c.callee, v, t, fused, visiting))
+                    {
+                        return false;
+                    }
+                    for (usize j = 0; j < Vec::len(&c.args); j += 1)
+                    {
+                        if (is_v(&c.args[j], v))
+                        {
+                            if (!vt_ok(g, t, segs, j, visiting))
+                            {
+                                return false;
+                            }
+                            for (usize k = 0; k < Vec::len(&c.args); k += 1)
+                            {
+                                if (k != j && names_in(&c.args[k], v))
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                        else if (!vu_expr(g, &c.args[j], v, t, fused, visiting))
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                },
+                _                   :
+                {
+                    if (!vu_expr(g, &c.callee, v, t, fused, visiting))
+                    {
+                        return false;
+                    }
+                    foreach (a in &c.args)
+                    {
+                        if (!vu_expr(g, a, v, t, fused, visiting))
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                },
+            }
+        },
+        ExprKind::EField(f)       :
+        {
+            ref<Expr, shared> a = &Box::get(f).e;
+            !is_v(a, v) && !bytes_of(a, v) && vu_expr(g, a, v, t, fused, visiting)
+        },
+        // `&*f(…)` / `&mut *f(…)` (a compound assignment's target, as the
+        // parser writes it): a reborrow of the call's result, whose arguments
+        // are evaluated as any are.
+        ExprKind::EBorrow(bb)     :
+        {
+            ref<Expr, shared> a = &Box::get(bb).e;
+            if (deref_call(a))
+            {
+                return vu_expr(g, a, v, t, fused, visiting);
+            }
+            if (names_in(a, v))
+            {
+                return false;
+            }
+            vu_expr(g, a, v, t, fused, visiting)
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            ref<SliceExpr, shared> sl = Box::get(s);
+            if (names_in(&sl.base, v))
+            {
+                return false;
+            }
+            vu_expr(g, &sl.base, v, t, fused, visiting) && vu_expr(g, &sl.lo, v, t, fused, visiting) && vu_expr(
+                g,
+                &sl.hi,
+                v,
+                t,
+                fused,
+                visiting,
+            )
+        },
+        ExprKind::EClosure(_)     : !names_in(e, v),
+        ExprKind::EUnary(u)       : vu_expr(g, &Box::get(u).e, v, t, fused, visiting),
+        ExprKind::EDeref(a)       : vu_expr(g, Box::get(a), v, t, fused, visiting),
+        ExprKind::EPropagate(a)   : vu_expr(g, Box::get(a), v, t, fused, visiting),
+        ExprKind::EParen(a)       : vu_expr(g, Box::get(a), v, t, fused, visiting),
+        ExprKind::EArrayRepeat(a) : vu_expr(g, &Box::get(a).value, v, t, fused, visiting),
+        // CHG-0237: `v == t`, `v < t`, … : a comparison reads the text and
+        // keeps nothing of it (`[View-Eq]`, `[Cmp-Text]`).
+        ExprKind::EBinary(bx)     :
+        {
+            ref<BinaryExpr, shared> b = Box::get(bx);
+            if (is_cmp(b.op) && (is_v(&b.a, v) || is_v(&b.b, v)))
+            {
+                return (is_v(&b.a, v) || vu_expr(g, &b.a, v, t, fused, visiting)) && (is_v(&b.b, v) || vu_expr(
+                    g,
+                    &b.b,
+                    v,
+                    t,
+                    fused,
+                    visiting,
+                ));
+            }
+            vu_expr(g, &b.a, v, t, fused, visiting) && vu_expr(g, &b.b, v, t, fused, visiting)
+        },
+        // A target that is `*f(…)` (`*HashMap::entry(…) += 1`): the call's
+        // arguments, evaluated as any are; any other target must not name
+        // `v`.
+        ExprKind::EAssign(p)      :
+        {
+            ref<PairExpr, shared> pa = Box::get(p);
+            bool lhs = if (deref_call(&pa.a)) { vu_expr(g, &pa.a, v, t, fused, visiting) } else { !names_in(&pa.a, v) };
+            lhs && vu_expr(g, &pa.b, v, t, fused, visiting)
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                if (!vu_expr(g, &f.value, v, t, fused, visiting))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                if (!vu_expr(g, a, v, t, fused, visiting))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        ExprKind::EBlock(b)       : vu_fused_or_block(g, b, v, t, fused, visiting),
+        ExprKind::EUnsafe(b)      : vu_fused_or_block(g, b, v, t, fused, visiting),
+        ExprKind::EIf(i)          :
+        {
+            ref<IfExpr, shared> x = Box::get(i);
+            if (!vu_expr(g, &x.cond, v, t, fused, visiting) || !vu_block(g, &x.then_, 0, v, t, fused, visiting))
+            {
+                return false;
+            }
+            match (&x.else_)
+            {
+                Some(f) : vu_expr(g, f, v, t, fused, visiting),
+                None    : true,
+            }
+        },
+        ExprKind::EWhile(w)       :
+        {
+            ref<WhileExpr, shared> x = Box::get(w);
+            if (!vu_expr(g, &x.cond, v, t, fused, visiting) || !vu_block(g, &x.body, 0, v, t, fused, visiting))
+            {
+                return false;
+            }
+            match (&x.step)
+            {
+                Some(s) : vu_expr(g, s, v, t, fused, visiting),
+                None    : true,
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            ref<MatchExpr, shared> x = Box::get(m);
+            if (names_in(&x.scrut, v))
+            {
+                return false;
+            }
+            foreach (a in &x.arms)
+            {
+                match (&a.binder)
+                {
+                    Some(n) :
+                    {
+                        if (String::eq(n, v))
+                        {
+                            return false;
+                        }
+                    },
+                    None    : {},
+                }
+                if (!vu_expr(g, Box::get(&a.body), v, t, fused, visiting))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(x) : vu_expr(g, Box::get(x), v, t, fused, visiting),
+                None    : true,
+            }
+        },
+        _                         : true,
+    }
+}
+
+// A block expression: `fused`'s verdict on it when it is a fused text loop
+// over `v` itself, else its statements.
+fn vu_fused_or_block(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> b,
+    ref<String, shared> v,
+    ref<ViewTest, shared> t,
+    bool fused,
+    ref<Vec<String>, exclusive> visiting,
+) : bool
+{
+    if (fused)
+    {
+        match (vu_fused(g, b, v, t, visiting))
+        {
+            Some(r) : return r,
+            None    : {},
+        }
+    }
+    vu_block(g, b, 0, v, t, fused, visiting)
+}
+
+// `pure_view_in`'s `fused`: a fused text loop over the view itself
+// (`Fx::lower_fused_text_loop`) reads it and keeps nothing; its body is
+// judged as any. Every name bound in the body or a parameter counts as a
+// local, as many as the lowering can see or more.
+fn vu_fused(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> bl,
+    ref<String, shared> v,
+    ref<ViewTest, shared> t,
+    ref<Vec<String>, exclusive> visiting,
+) : Option<bool>
+{
+    bool local = match (t)
+    {
+        ViewTest::ViewIn(c) :
+        {
+            match (fusion_name(bl))
+            {
+                Some(n) : HashSet::contains(&c.bound, &n) || Vec::contains(&c.pnames, &n),
+                None    : false,
+            }
+        },
+        _                   : false,
+    };
+    FusionPlan plan = match (fusion_plan(g, bl, local))
+    {
+        Some(p) : p,
+        None    : return None,
+    };
+    if (!is_v(fusion_source(bl), v) || plan.on_string || String::eq(&plan.cname, v))
+    {
+        return None;
+    }
+    Some(vu_block(g, fusion_body(bl), 0, v, t, false, visiting))
+}
+
+// `b`'s statements from `from` on, and its last expression.
+fn vu_block(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> b,
+    usize from,
+    ref<String, shared> v,
+    ref<ViewTest, shared> t,
+    bool fused,
+    ref<Vec<String>, exclusive> visiting,
+) : bool
+{
+    for (usize i = from; i < Vec::len(&b.stmts); i += 1)
+    {
+        bool ok = match (&b.stmts[i])
+        {
+            Stmt::SLet(l)         :
+            {
+                ref<LetStmt, shared> ls = Box::get(l);
+                if (String::eq(&ls.name, v))
+                {
+                    false
+                }
+                else
+                {
+                    match (&ls.init)
+                    {
+                        Some(e) : vu_expr(g, e, v, t, fused, visiting),
+                        None    : true,
+                    }
+                }
+            },
+            Stmt::SDestructure(d) : !Vec::contains(&Box::get(d).fields, v) && !names_in(&Box::get(d).init, v),
+            Stmt::SExpr(e)        : vu_expr(g, Box::get(e), v, t, fused, visiting),
+            Stmt::SBlockLike(e)   : vu_expr(g, Box::get(e), v, t, fused, visiting),
+        };
+        if (!ok)
+        {
+            return false;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(e) : vu_expr(g, Box::get(e), v, t, fused, visiting),
+        None    : true,
+    }
+}
+
+// ---- pure_view ----
+
+// `pure_view`'s memo (cobc's `view_memo`), kept in `reader_memo` under keys
+// of their own: `view KEY#POS` (no function's key holds a space).
+fn view_memo_key(ref<String, shared> key, usize pos) : String
+{
+    sprintf("view %s#%v", key, pos)
+}
+
+// Whether parameter `pos` of the non-generic function `key`, a `StringView`,
+// is a *pure view* (cobc's `pure_view`, after its stage gate, which
+// `direct::pure_view` keeps): the body reads it only as `v.bytes[i]` and
+// `slice_len(v.bytes)`, or hands it whole to a pure view parameter, and the
+// function's result holds no reference, so nothing derived from it outlives
+// the call. Recursion answers no (no fixed point; no is safe).
+export fn pure_view_impl(ref<Gen, exclusive> g, ref<String, shared> key, usize pos) : bool
+{
+    Vec<String> visiting = Vec::new();
+    pure_view_in(g, key, pos, &mut visiting)
+}
+
+fn pure_view_in(ref<Gen, exclusive> g, ref<String, shared> key, usize pos, ref<Vec<String>, exclusive> visiting) : bool
+{
+    String id = view_memo_key(key, pos);
+    match (HashMap::get(&g.reader_memo, &id))
+    {
+        Some(b) : return *b,
+        None    : {},
+    }
+    if (Vec::contains(visiting, &id))
+    {
+        return false;
+    }
+    FnDecl f = match (fn_decl(g, key))
+    {
+        Some(fd) : fd,
+        None     : return false,
+    };
+    // D-0200: `File::write_text`'s text, native (`native_file_write`): its
+    // bytes read for the write, nothing of the view kept.
+    if (pos == 1 && String::eq_str(key, "std::File::write_text") && in_prelude(String::as_view(key), &f))
+    {
+        return true;
+    }
+    bool view_param = pos < Vec::len(&f.params) && match (&f.params[pos].ty)
+    {
+        Type::TNamed(n) : String::eq_str(&Box::get(n).name, "std::StringView") && Vec::len(&Box::get(n).args) == 0,
+        _               : false,
+    };
+    if (Vec::len(&f.type_params) != 0 || !view_param || used_as_value(g, key))
+    {
+        HashMap::insert(&mut g.reader_memo, id, false);
+        return false;
+    }
+    // The result holds no reference (CHG-0237: a `String` too, not only plain
+    // data), so nothing of the view can leave in it.
+    bool void_ret = match (&f.ret)
+    {
+        Type::TVoid : true,
+        _           : false,
+    };
+    if (!(void_ret || plain_data(g, &f.ret) || (resolved(&f.ret, &f.type_params) && !has_refs(g, &f.ret) && !holds_fn(
+        g,
+        &f.ret,
+    ))))
+    {
+        HashMap::insert(&mut g.reader_memo, id, false);
+        return false;
+    }
+    String name = String::clone(&f.params[pos].name);
+    HashSet<String> bound = bound_names(&f.body);
+    Vec::push(visiting, String::clone(&id));
+    Vec<String> pnames = Vec::new();
+    foreach (p in &f.params)
+    {
+        Vec::push(&mut pnames, String::clone(&p.name));
+    }
+    ViewTest t = ViewTest::ViewIn(ViewCtx { .bound = bound, .pnames = pnames });
+    bool ok = vu_block(g, &f.body, 0, &name, &t, true, visiting);
+    Vec::pop(visiting);
+    if (Vec::len(visiting) == 0 || ok)
+    {
+        HashMap::insert(&mut g.reader_memo, id, ok);
+    }
+    ok
+}
+
+// ---- objectless_strings ----
+
+// The walk's state (cobc's `W`).
+struct OW
+{
+    HashSet<String> bound;
+    Vec<HashMap<String, usize>> scopes;
+    HashSet<usize> bad;
+    HashSet<usize> seen;
+    // D-0200: the candidates moved out (`move_out`): only a `String` knows
+    // how to be left empty there (`read_place`).
+    HashSet<usize> moved;
+    HashSet<usize> compared;
+    HashSet<usize> indexed;
+    // D-0294: the candidates assigned whole (`x = e`, decided).
+    HashSet<usize> assigned;
+    HashMap<usize, String> names;
+    usize depth;
+    // D-0286: by candidate, the fields read by value (and `=f` written).
+    HashMap<usize, HashSet<String>> fields;
+    // D-0286: the next block walked is the function's last expression
+    // (`unsafe { … x }` ending the body): its own last expression is the
+    // function's result too.
+    bool tail_next;
+}
+
+// The binding a name resolves to here: 0 for one that is not a candidate (a
+// parameter, a binder, a `let` with no initializer).
+fn ow_id(ref<OW, shared> w, ref<String, shared> n) : Option<usize>
+{
+    usize i = Vec::len(&w.scopes);
+    while (i > 0)
+    {
+        i -= 1;
+        match (HashMap::get(&w.scopes[i], n))
+        {
+            Some(id) : return Some(*id),
+            None     : {},
+        }
+    }
+    None
+}
+
+// A candidate's id (not 0) for the name `n`.
+fn ow_cand(ref<OW, shared> w, ref<String, shared> n) : Option<usize>
+{
+    match (ow_id(w, n))
+    {
+        Some(id) : if (id != 0) { Some(id) } else { None },
+        None     : None,
+    }
+}
+
+fn ow_bind(ref<OW, exclusive> w, ref<String, shared> n, usize id)
+{
+    usize top = Vec::len(&w.scopes) - 1;
+    HashMap::insert(&mut w.scopes[top], String::clone(n), id);
+}
+
+fn mark_bad(ref<OW, exclusive> w, ref<String, shared> n)
+{
+    match (ow_cand(w, n))
+    {
+        Some(id) :
+        {
+            HashSet::insert(&mut w.bad, id);
+        },
+        None     : {},
+    }
+}
+
+// D-0286: `x`, `x.f`, `x.f.g`…: the candidate at its root (not 0), and the
+// first field named, if any.
+fn ow_field_root(ref<OW, shared> w, ref<Expr, shared> e) : Option<FieldRoot>
+{
+    ref<Expr, shared> r = strip(e);
+    Option<String> first = None;
+    while (true)
+    {
+        match (&r.kind)
+        {
+            ExprKind::EField(f) :
+            {
+                first = Some(String::clone(&Box::get(f).name));
+                r = strip(&Box::get(f).e);
+            },
+            _                   : break,
+        }
+    }
+    ref<PathExpr, shared> pe = match (&r.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return None,
+    };
+    if (Vec::len(&pe.segs) != 1 || Vec::len(&pe.targs) != 0)
+    {
+        return None;
+    }
+    match (ow_cand(w, &pe.segs[0]))
+    {
+        Some(id) : Some(FieldRoot { .id = id, .first = first }),
+        None     : None,
+    }
+}
+
+// A field read or written (`=f`) of candidate `id` (cobc's `fields`).
+fn ow_note_field(ref<OW, exclusive> w, usize id, String f)
+{
+    match (HashMap::get_mut(&mut w.fields, &id))
+    {
+        Some(set) :
+        {
+            _ = HashSet::insert(set, f);
+        },
+        None      :
+        {
+            HashSet<String> set = HashSet::new();
+            HashSet::insert(&mut set, f);
+            HashMap::insert(&mut w.fields, id, set);
+        },
+    }
+}
+
+// A `match`'s arms (cobc's `match_arms`).
+fn ow_match_arms(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Vec<Arm>, shared> arms)
+{
+    foreach (a in arms)
+    {
+        w.depth += 1;
+        Vec::push(&mut w.scopes, HashMap::new());
+        // D-0200: an arm's binder is a candidate as a `let` is, by the arm
+        // (its body's id with `ARM_BIT`; `Fx::lower_match` binds it
+        // objectless when it takes a payload of such a type by value).
+        match (&a.binder)
+        {
+            Some(b) :
+            {
+                usize id = Box::get(&a.body).id | ARM_BIT;
+                HashMap::insert(&mut w.names, id, String::clone(b));
+                ow_bind(w, b, id);
+            },
+            None    : {},
+        }
+        match (&a.lit)
+        {
+            Some(l) : ow_expr(g, w, Box::get(l)),
+            None    : {},
+        }
+        // D-0294 (decided): an arm whose body is a candidate alone moves it
+        // out, as a block's tail does.
+        if (!(g.decided && move_out(w, Box::get(&a.body))))
+        {
+            ow_expr(g, w, Box::get(&a.body));
+        }
+        Vec::pop(&mut w.scopes);
+        w.depth -= 1;
+    }
+}
+
+// A call's callee path's segments, when it is a path.
+fn path_segs(ref<Expr, shared> callee) : Option<ref<Vec<String>, shared>>
+{
+    match (&callee.kind)
+    {
+        ExprKind::EPath(p) : Some(&Box::get(p).segs),
+        _                  : None,
+    }
+}
+
+// The callee may be a local: one segment (or none) that the body binds.
+fn maybe_local(ref<OW, shared> w, ref<Vec<String>, shared> segs) : bool
+{
+    Vec::len(segs) < 2 && (Vec::len(segs) == 0 || HashSet::contains(&w.bound, &segs[0]))
+}
+
+// Another argument than `j` names `s`.
+fn other_names(ref<Vec<Expr>, shared> args, usize j, ref<String, shared> s) : bool
+{
+    for (usize i = 0; i < Vec::len(args); i += 1)
+    {
+        if (i != j && names_in(&args[i], s))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// `&s` (shared) of a one-segment path, through parens: `s`.
+fn borrowed_name(ref<Expr, shared> e, Mode mode) : Option<String>
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EBorrow(b) :
+        {
+            if (Box::get(b).mode == mode)
+            {
+                return path_name(&Box::get(b).e);
+            }
+            None
+        },
+        _                    : None,
+    }
+}
+
+// `&s` handed to a reader parameter (`reader_param`) of a named function, or
+// as `String::append`'s text, no other argument naming `s`.
+fn reader_arg(
+    ref<Gen, exclusive> g,
+    ref<OW, shared> w,
+    ref<Expr, shared> callee,
+    ref<Vec<Expr>, shared> args,
+    usize j,
+) : Option<String>
+{
+    String s = match (borrowed_name(&args[j], Mode::Shared))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    ref<Vec<String>, shared> segs = match (path_segs(callee))
+    {
+        Some(x) : x,
+        None    : return None,
+    };
+    if (maybe_local(w, segs))
+    {
+        return None;
+    }
+    String k = key_of(g, segs);
+    if (!HashMap::contains(&g.prog.table.fns, &k))
+    {
+        return None;
+    }
+    bool shared_ref = match (param_ty(g, &k, j))
+    {
+        Some(pt) : is_shared_ref(&pt),
+        None     : false,
+    };
+    if (!(appended_text(g, &k, j) || (shared_ref && reader_param(g, &k, j))))
+    {
+        return None;
+    }
+    if (other_names(args, j, &s))
+    {
+        return None;
+    }
+    Some(s)
+}
+
+// `&mut s` handed to a builder as its first argument, or (D-0200) to any
+// writer parameter (`writer_param`), no other argument naming `s`.
+fn builder_arg(
+    ref<Gen, exclusive> g,
+    ref<OW, shared> w,
+    ref<Expr, shared> callee,
+    ref<Vec<Expr>, shared> args,
+    usize j,
+) : Option<String>
+{
+    String s = match (borrowed_name(&args[j], Mode::Exclusive))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    ref<Vec<String>, shared> segs = match (path_segs(callee))
+    {
+        Some(x) : x,
+        None    : return None,
+    };
+    if (maybe_local(w, segs))
+    {
+        return None;
+    }
+    String k = key_of(g, segs);
+    bool builder = j == 0 && is_builder(&k) && prelude_fn(g, &k);
+    if (!builder && !writer_param(g, &k, j))
+    {
+        return None;
+    }
+    if (other_names(args, j, &s))
+    {
+        return None;
+    }
+    Some(s)
+}
+
+// D-0200: `x` alone as argument `j`, moved: the parameter a value (not a
+// reference, a slice or a `fn`), or the callee a variant (no function of
+// that name); no other argument naming `x`.
+fn moved_arg(
+    ref<Gen, exclusive> g,
+    ref<OW, shared> w,
+    ref<Expr, shared> callee,
+    ref<Vec<Expr>, shared> args,
+    usize j,
+) : Option<String>
+{
+    String s = match (path_name(&args[j]))
+    {
+        Some(n) : n,
+        None    : return None,
+    };
+    ref<Vec<String>, shared> segs = match (path_segs(callee))
+    {
+        Some(x) : x,
+        None    : return None,
+    };
+    if (Vec::len(segs) == 1 && HashSet::contains(&w.bound, &segs[0]))
+    {
+        return None;
+    }
+    if (Vec::len(segs) == 1 && String::starts_with(&segs[0], StringView::of("$")))
+    {
+        return None;
+    }
+    String k = key_of(g, segs);
+    if (HashMap::contains(&g.prog.table.fns, &k))
+    {
+        match (param_ty(g, &k, j))
+        {
+            Some(pt) :
+            {
+                match (pt)
+                {
+                    Type::TRef(_)   : return None,
+                    Type::TSlice(_) : return None,
+                    Type::TFn(_)    : return None,
+                    _               : {},
+                }
+            },
+            None     : return None,
+        }
+    }
+    else
+    {
+        // A variant constructor: a name that is no function (an intrinsic's
+        // name is not a variant's).
+        if (Vec::len(segs) == 1)
+        {
+            slice<u8, shared> b0 = StringView::as_bytes(String::as_view(&segs[0]));
+            if (slice_len(b0) == 0 || !(b0[0] >= b'A' && b0[0] <= b'Z'))
+            {
+                return None;
+            }
+        }
+    }
+    if (other_names(args, j, &s))
+    {
+        return None;
+    }
+    Some(s)
+}
+
+// `return s` (control leaves, so nothing uses `s` after) or the function
+// body's last expression `s`: the value moves out, given an object there
+// (`read_place`).
+fn move_out(ref<OW, exclusive> w, ref<Expr, shared> e) : bool
+{
+    match (&strip(e).kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1 && Vec::len(&Box::get(p).targs) == 0)
+            {
+                match (ow_cand(w, &Box::get(p).segs[0]))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.moved, id);
+                        return true;
+                    },
+                    None     : {},
+                }
+            }
+        },
+        _                  : {},
+    }
+    false
+}
+
+// A block inside the body: its last expression is not the function's.
+fn ow_nested(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
+{
+    w.depth += 1;
+    ow_block(g, w, b);
+    w.depth -= 1;
+}
+
+fn ow_block(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
+{
+    bool tail_here = replace(&mut w.tail_next, false);
+    w.depth += 1;
+    Vec::push(&mut w.scopes, HashMap::new());
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l)         :
+            {
+                ref<LetStmt, shared> ls = Box::get(l);
+                match (&ls.init)
+                {
+                    Some(e) :
+                    {
+                        // D-0200: `let y = x;` moves `x` (into a binding of
+                        // its own type, or a copy of plain data, which
+                        // `read_place` gives no object either way).
+                        if (!move_out(w, e))
+                        {
+                            ow_expr(g, w, e);
+                        }
+                        HashMap::insert(&mut w.names, e.id, String::clone(&ls.name));
+                        ow_bind(w, &ls.name, e.id);
+                    },
+                    None    : ow_bind(w, &ls.name, 0),
+                }
+            },
+            Stmt::SDestructure(d) :
+            {
+                ow_expr(g, w, &Box::get(d).init);
+                foreach (n in &Box::get(d).names)
+                {
+                    ow_bind(w, n, 0);
+                }
+            },
+            Stmt::SExpr(e)        : ow_expr(g, w, Box::get(e)),
+            Stmt::SBlockLike(e)   : ow_expr(g, w, Box::get(e)),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) :
+        {
+            ref<Expr, shared> te = Box::get(t);
+            bool at_tail = w.depth == 1 || (tail_here && g.decided);
+            // D-0286: a block (or `unsafe` block) that is the function's
+            // last expression, and no fused text loop: its own last
+            // expression is the function's result too.
+            Option<ref<Block, shared>> inner = None;
+            if (at_tail)
+            {
+                match (&strip(te).kind)
+                {
+                    ExprKind::EBlock(ib)  :
+                    {
+                        if (Option::is_none(&fusion_plan(g, ib, ow_fusion_local(w, ib))))
+                        {
+                            inner = Some(ib);
+                        }
+                    },
+                    ExprKind::EUnsafe(ib) :
+                    {
+                        if (Option::is_none(&fusion_plan(g, ib, ow_fusion_local(w, ib))))
+                        {
+                            inner = Some(ib);
+                        }
+                    },
+                    _                     : {},
+                }
+            }
+            if (Option::is_some(&inner) && g.decided)
+            {
+                w.tail_next = true;
+                ow_nested(g, w, Option::unwrap(inner));
+            }
+            else if (!((at_tail || g.decided) && move_out(w, te)))
+            {
+                // (D-0294: in a decided program any block's tail that is a
+                // candidate alone moves it out, `read_place`.)
+                ow_expr(g, w, te);
+            }
+        },
+        None    : {},
+    }
+    Vec::pop(&mut w.scopes);
+    w.depth -= 1;
+}
+
+// `fusion_plan`'s `local` for a block: whether the loop's name is bound in
+// any scope of the walk.
+fn ow_fusion_local(ref<OW, shared> w, ref<Block, shared> b) : bool
+{
+    match (fusion_name(b))
+    {
+        Some(n) :
+        {
+            foreach (m in &w.scopes)
+            {
+                if (HashMap::contains(m, &n))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        None    : false,
+    }
+}
+
+fn ow_call(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<CallExpr, shared> call)
+{
+    ref<Expr, shared> c = &call.callee;
+    ref<Vec<Expr>, shared> args = &call.args;
+    usize n = Vec::len(args);
+    Vec<bool> handled = Vec::filled(n, false);
+    bool fmt = match (&c.kind)
+    {
+        ExprKind::EPath(p) : Vec::len(&Box::get(p).segs) == 1 && String::eq_str(&Box::get(p).segs[0], "$fmt"),
+        _                  : false,
+    };
+    // D-0200: a candidate moved away by value -- an argument of a by-value
+    // parameter, or of a variant constructor -- no other argument naming it.
+    Vec<Option<String>> moves = Vec::new();
+    for (usize j = 0; j < n; j += 1)
+    {
+        Vec::push(&mut moves, moved_arg(g, w, c, args, j));
+    }
+    for (usize j = 0; j < n; j += 1)
+    {
+        match (&moves[j])
+        {
+            Some(s) :
+            {
+                match (ow_cand(w, s))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.moved, id);
+                        handled[j] = true;
+                        continue;
+                    },
+                    None     : {},
+                }
+            },
+            None    : {},
+        }
+        // `printf`'s `&s` (`$fmt`): read where it is formatted
+        // (`lower_intrinsic`'s `$fmt`).
+        Option<String> f = None;
+        if (fmt && j > 0)
+        {
+            match (borrowed_name(&args[j], Mode::Shared))
+            {
+                Some(nm) :
+                {
+                    usize count = 0;
+                    for (usize i = 1; i < n; i += 1)
+                    {
+                        if (names_in(&args[i], &nm))
+                        {
+                            count += 1;
+                        }
+                    }
+                    if (count == 1)
+                    {
+                        f = Some(nm);
+                    }
+                },
+                None     : {},
+            }
+        }
+        if (Option::is_none(&f))
+        {
+            f = reader_arg(g, w, c, args, j);
+        }
+        if (Option::is_none(&f))
+        {
+            f = builder_arg(g, w, c, args, j);
+        }
+        match (&f)
+        {
+            Some(s) :
+            {
+                match (ow_cand(w, s))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                    },
+                    None     : {},
+                }
+                handled[j] = true;
+            },
+            None    : {},
+        }
+    }
+    ow_expr(g, w, c);
+    for (usize j = 0; j < n; j += 1)
+    {
+        if (!handled[j])
+        {
+            ow_expr(g, w, &args[j]);
+        }
+    }
+}
+
+// The candidate a one-segment path names, if any.
+fn path_cand(ref<OW, shared> w, ref<Expr, shared> e) : Option<usize>
+{
+    match (path_name(e))
+    {
+        Some(n) : ow_cand(w, &n),
+        None    : None,
+    }
+}
+
+fn ow_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Expr, shared> e)
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(c)        : ow_call(g, w, Box::get(c)),
+        ExprKind::EPath(p)        :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                mark_bad(w, &Box::get(p).segs[0]);
+            }
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            // D-0200: a candidate as a field's value moves in, no other
+            // field naming it.
+            ref<Vec<FieldInit>, shared> fs = &Box::get(s).fields;
+            for (usize i = 0; i < Vec::len(fs); i += 1)
+            {
+                Option<usize> moved = None;
+                match (path_name(&fs[i].value))
+                {
+                    Some(x) :
+                    {
+                        bool other = false;
+                        for (usize k = 0; k < Vec::len(fs); k += 1)
+                        {
+                            if (k != i && names_in(&fs[k].value, &x))
+                            {
+                                other = true;
+                            }
+                        }
+                        if (!other)
+                        {
+                            moved = ow_cand(w, &x);
+                        }
+                    },
+                    None    : {},
+                }
+                match (moved)
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.moved, id);
+                    },
+                    None     : ow_expr(g, w, &fs[i].value),
+                }
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                ow_expr(g, w, a);
+            }
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(a) :
+                {
+                    if (!move_out(w, Box::get(a)))
+                    {
+                        ow_expr(g, w, Box::get(a));
+                    }
+                },
+                None    : {},
+            }
+        },
+        ExprKind::EBorrow(bb)     :
+        {
+            ref<Expr, shared> x = &Box::get(bb).e;
+            match (&strip(x).kind)
+            {
+                ExprKind::EIndex(p) :
+                {
+                    // D-0294 (decided): `&x[i]` of a candidate is a borrow of
+                    // `x` (its address, token 0) and a bounds check.
+                    if (g.decided)
+                    {
+                        match (path_cand(w, &Box::get(p).a))
+                        {
+                            Some(id) :
+                            {
+                                HashSet::insert(&mut w.seen, id);
+                                ow_expr(g, w, &Box::get(p).b);
+                                return;
+                            },
+                            None     : {},
+                        }
+                    }
+                    match (path_name(&Box::get(p).a))
+                    {
+                        Some(n) :
+                        {
+                            mark_bad(w, &n);
+                            ow_expr(g, w, &Box::get(p).b);
+                            return;
+                        },
+                        None    : {},
+                    }
+                },
+                _                   : {},
+            }
+            // D-0286: in a decided program, a borrow of a candidate or of a
+            // field of one (its address, token 0).
+            if (g.decided)
+            {
+                match (ow_field_root(w, x))
+                {
+                    Some(fr) :
+                    {
+                        HashSet::insert(&mut w.seen, fr.id);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+            ow_expr(g, w, x);
+        },
+        ExprKind::EArrayRepeat(a) : ow_expr(g, w, &Box::get(a).value),
+        ExprKind::EUnary(u)       : ow_expr(g, w, &Box::get(u).e),
+        ExprKind::EDeref(a)       : ow_expr(g, w, Box::get(a)),
+        ExprKind::EField(f)       :
+        {
+            // D-0286: a field read of a candidate (recorded: only plain data
+            // may be read so).
+            if (g.decided)
+            {
+                match (ow_field_root(w, e))
+                {
+                    Some(fr) :
+                    {
+                        FieldRoot { id, first } = fr;
+                        HashSet::insert(&mut w.seen, id);
+                        match (first)
+                        {
+                            Some(fname) : ow_note_field(w, id, fname),
+                            None        : {},
+                        }
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+            ow_expr(g, w, &Box::get(f).e);
+        },
+        ExprKind::EPropagate(a)   :
+        {
+            // D-0294 (decided): `x?` moves the candidate out.
+            if (g.decided && move_out(w, Box::get(a)))
+            {
+                return;
+            }
+            ow_expr(g, w, Box::get(a));
+        },
+        ExprKind::EParen(a)       : ow_expr(g, w, Box::get(a)),
+        ExprKind::EBinary(bx)     :
+        {
+            ref<BinaryExpr, shared> b = Box::get(bx);
+            if (is_cmp(b.op))
+            {
+                // D-0200: a candidate compared (`==`, `<`, …): read where it
+                // stands, for a `String` (`lower_text_operand`); marked
+                // (`id | 1`) so a binding of another type stays tracked.
+                match (path_cand(w, &b.a))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.compared, id);
+                    },
+                    None     : ow_expr(g, w, &b.a),
+                }
+                match (path_cand(w, &b.b))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.compared, id);
+                    },
+                    None     : ow_expr(g, w, &b.b),
+                }
+                return;
+            }
+            ow_expr(g, w, &b.a);
+            ow_expr(g, w, &b.b);
+        },
+        ExprKind::EIndex(p)       :
+        {
+            // D-0200: `x[i]` read, or written whole (`x[i] = v`), for a
+            // candidate: a bounds-checked element access of a vector nothing
+            // else reaches; marked (`id | 2`) so only a `Vec` of plain data
+            // stays objectless. A borrow of an element (`&x[i]`) is not
+            // this: it falls to `Borrow` above.
+            match (path_cand(w, &Box::get(p).a))
+            {
+                Some(id) :
+                {
+                    HashSet::insert(&mut w.seen, id);
+                    HashSet::insert(&mut w.indexed, id);
+                    ow_expr(g, w, &Box::get(p).b);
+                    return;
+                },
+                None     : {},
+            }
+            ow_expr(g, w, &Box::get(p).a);
+            ow_expr(g, w, &Box::get(p).b);
+        },
+        ExprKind::EAssign(p)      :
+        {
+            ref<Expr, shared> a = &Box::get(p).a;
+            ref<Expr, shared> b = &Box::get(p).b;
+            if (g.decided)
+            {
+                // D-0294: a field of a candidate written (recorded as `=f`:
+                // `Fx::objectless_binding` allows it of plain data and quiet
+                // types, whose old value the write destroys, `lower_assign`),
+                // or the candidate assigned whole (`id | 4`, a quiet type).
+                bool a_field = match (&strip(a).kind)
+                {
+                    ExprKind::EField(_) : true,
+                    _                   : false,
+                };
+                if (a_field)
+                {
+                    match (ow_field_root(w, a))
+                    {
+                        Some(fr) :
+                        {
+                            FieldRoot { id, first } = fr;
+                            HashSet::insert(&mut w.seen, id);
+                            match (first)
+                            {
+                                Some(fname) : ow_note_field(w, id, sprintf("=%s", &fname)),
+                                None        : {},
+                            }
+                            ow_expr(g, w, b);
+                            return;
+                        },
+                        None     : {},
+                    }
+                }
+                match (path_cand(w, a))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        HashSet::insert(&mut w.assigned, id);
+                        bool other_name = match (path_name(b))
+                        {
+                            Some(nb) : match (path_name(a))
+                            {
+                                Some(na) : !String::eq(&nb, &na),
+                                None     : true,
+                            },
+                            None : false,
+                        };
+                        if (!(other_name && move_out(w, b)))
+                        {
+                            ow_expr(g, w, b);
+                        }
+                        return;
+                    },
+                    None     : {},
+                }
+                // D-0294 (decided): a candidate moved into a place (`p.f = x`),
+                // the place not naming it.
+                bool moved_in = match (path_name(b))
+                {
+                    Some(nb) : !names_in(a, &nb) && move_out(w, b),
+                    None     : false,
+                };
+                if (moved_in)
+                {
+                    ow_expr(g, w, a);
+                    return;
+                }
+            }
+            ow_expr(g, w, a);
+            ow_expr(g, w, b);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            // D-0294 (decided): `&x[a..b]`, a read of `x` (its slice carries
+            // token 0).
+            if (g.decided)
+            {
+                match (path_cand(w, &Box::get(s).base))
+                {
+                    Some(id) :
+                    {
+                        HashSet::insert(&mut w.seen, id);
+                        ow_expr(g, w, &Box::get(s).lo);
+                        ow_expr(g, w, &Box::get(s).hi);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+            ow_expr(g, w, &Box::get(s).base);
+            ow_expr(g, w, &Box::get(s).lo);
+            ow_expr(g, w, &Box::get(s).hi);
+        },
+        ExprKind::EBlock(b)       : ow_block_expr(g, w, b),
+        ExprKind::EUnsafe(b)      : ow_block_expr(g, w, b),
+        ExprKind::EIf(i)          :
+        {
+            ref<IfExpr, shared> x = Box::get(i);
+            ow_expr(g, w, &x.cond);
+            ow_nested(g, w, &x.then_);
+            match (&x.else_)
+            {
+                Some(e2) : ow_expr(g, w, e2),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(wh)      :
+        {
+            ref<WhileExpr, shared> x = Box::get(wh);
+            ow_expr(g, w, &x.cond);
+            ow_nested(g, w, &x.body);
+            match (&x.step)
+            {
+                Some(s) : ow_expr(g, w, s),
+                None    : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            ref<MatchExpr, shared> x = Box::get(m);
+            // D-0294 (decided): a candidate matched in place (`lower_match`'s
+            // place scrutinee): moved away when an arm binds a payload (the
+            // arm sets its flag). Not an arm binding the whole value
+            // (`other : …`), which moves it out of the binding's object
+            // (`lower_match_scalar`).
+            if (g.decided)
+            {
+                match (path_cand(w, &x.scrut))
+                {
+                    Some(id) :
+                    {
+                        bool whole = false;
+                        bool any_binder = false;
+                        foreach (a in &x.arms)
+                        {
+                            whole = whole || (Option::is_none(&a.variant) && Option::is_some(&a.binder));
+                            any_binder = any_binder || Option::is_some(&a.binder);
+                        }
+                        if (whole)
+                        {
+                            mark_bad(w, &Option::expect(path_name(&x.scrut), "a candidate's name"));
+                        }
+                        else
+                        {
+                            HashSet::insert(&mut w.seen, id);
+                            if (any_binder)
+                            {
+                                HashSet::insert(&mut w.moved, id);
+                            }
+                        }
+                        ow_match_arms(g, w, &x.arms);
+                        return;
+                    },
+                    None     : {},
+                }
+            }
+            ow_expr(g, w, &x.scrut);
+            ow_match_arms(g, w, &x.arms);
+        },
+        ExprKind::EClosure(cl)    :
+        {
+            ref<ClosureExpr, shared> x = Box::get(cl);
+            foreach (c in &x.captures)
+            {
+                mark_bad(w, c);
+            }
+            // Every name the body uses, resolved out here: a closure's own
+            // parameters shadow nothing it sees.
+            HashSet<String> pnames = HashSet::new();
+            foreach (p in &x.params)
+            {
+                HashSet::insert(&mut pnames, String::clone(&p.name));
+            }
+            Seen used = new_seen();
+            sn_block(&x.body, &mut used);
+            foreach (n in &used.paths)
+            {
+                if (!HashSet::contains(&pnames, n))
+                {
+                    mark_bad(w, n);
+                }
+            }
+        },
+        _                         : {},
+    }
+}
+
+// A block expression: D-0200: a fused text loop (`fusion_plan`) over `&x`
+// is a read of `x` (`lower_fused_text_loop` lends it as the source only);
+// its body as any block.
+fn ow_block_expr(ref<Gen, exclusive> g, ref<OW, exclusive> w, ref<Block, shared> b)
+{
+    bool local = match (fusion_name(b))
+    {
+        Some(n) :
+        {
+            bool any = false;
+            foreach (m in &w.scopes)
+            {
+                if (HashMap::contains(m, &n))
+                {
+                    any = true;
+                }
+            }
+            any
+        },
+        None    : false,
+    };
+    match (fusion_plan(g, b, local))
+    {
+        Some(plan) :
+        {
+            match (borrowed_name(fusion_source(b), Mode::Shared))
+            {
+                Some(n) :
+                {
+                    match (ow_cand(w, &n))
+                    {
+                        Some(id) :
+                        {
+                            HashSet::insert(&mut w.seen, id);
+                            w.depth += 1;
+                            HashMap<String, usize> sc = HashMap::new();
+                            HashMap::insert(&mut sc, String::clone(&plan.cname), 0);
+                            Vec::push(&mut w.scopes, sc);
+                            ow_nested(g, w, fusion_body(b));
+                            Vec::pop(&mut w.scopes);
+                            w.depth -= 1;
+                            return;
+                        },
+                        None     : {},
+                    }
+                },
+                None    : {},
+            }
+        },
+        None       : {},
+    }
+    ow_nested(g, w, b);
+}
+
+// The `String` locals (and, since D-0200, other objectless values) of a
+// function body that need no runtime object (cobc's `objectless_strings`):
+// declared once, by `let` with an initializer (or an arm's binder); no
+// parameter, binder, capture or destructured field of the name; and every
+// mention of the name is `&s` handed to a reader parameter (`reader_param`)
+// of a named function, as no other argument of that call names it, `&mut s`
+// to a builder or writer parameter, a move (by value, `return`, the last
+// expression, a struct field), a comparison, an element access, or a fused
+// text loop's source. D-0196: by binding, not by name: each `let` with an
+// initializer is a candidate of its own (by its initializer's id), and a use
+// resolves to the innermost binding of its name.
+export fn objectless_strings(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> body,
+    ref<Vec<String>, shared> params,
+) : Objectless
+{
+    HashMap<usize, HashSet<String>> fields = HashMap::new();
+    objectless_strings_with(g, body, params, &Vec::new(), &mut fields)
+}
+
+// `objectless_strings`, the parameters `cands` (name, id) candidates as a
+// `let` with an initializer is (D-0286: a decided program's by-value
+// parameters, which arrive with no object). In a decided program (D-0286) a
+// candidate may also be borrowed whole or by a field anywhere (the borrow is
+// its address, token 0), and its fields read; `fields` gets, by candidate,
+// the fields read by value, which `Fx::objectless_binding` allows only of
+// plain data (no field is moved out of an objectless local).
+export fn objectless_strings_with(
+    ref<Gen, exclusive> g,
+    ref<Block, shared> body,
+    ref<Vec<String>, shared> params,
+    ref<Vec<Cand>, shared> cands,
+    ref<HashMap<usize, HashSet<String>>, exclusive> fields,
+) : Objectless
+{
+    HashSet<String> bound = bound_names(body);
+    HashMap<String, usize> top = HashMap::new();
+    foreach (p in params)
+    {
+        HashSet::insert(&mut bound, String::clone(p));
+        usize id = 0;
+        foreach (c in cands)
+        {
+            if (String::eq(&c.name, p))
+            {
+                id = c.id;
+                break;
+            }
+        }
+        HashMap::insert(&mut top, String::clone(p), id);
+    }
+    Vec<HashMap<String, usize>> scopes = Vec::new();
+    Vec::push(&mut scopes, top);
+    OW w = OW {
+        .bound = bound,
+        .scopes = scopes,
+        .bad = HashSet::new(),
+        .seen = HashSet::new(),
+        .moved = HashSet::new(),
+        .compared = HashSet::new(),
+        .indexed = HashSet::new(),
+        .assigned = HashSet::new(),
+        .names = HashMap::new(),
+        .depth = 0,
+        .fields = HashMap::new(),
+        .tail_next = false,
+    };
+    ow_block(g, &mut w, body);
+    *fields = replace(&mut w.fields, HashMap::new());
+    // A candidate moved away is recorded in `moved` too (cobc's `!id`): its
+    // binding gets a moved flag (`Fx::objectless_bound`).
+    Objectless o = Objectless {
+        .ids = HashSet::new(),
+        .moved = HashSet::new(),
+        .compared = HashSet::new(),
+        .indexed = HashSet::new(),
+        .assigned = HashSet::new(),
+    };
+    foreach (x in &w.seen)
+    {
+        if (!HashSet::contains(&w.bad, x))
+        {
+            HashSet::insert(&mut o.ids, *x);
+            if (HashSet::contains(&w.moved, x))
+            {
+                HashSet::insert(&mut o.moved, *x);
+            }
+            if (HashSet::contains(&w.compared, x))
+            {
+                HashSet::insert(&mut o.compared, *x);
+            }
+            if (HashSet::contains(&w.indexed, x))
+            {
+                HashSet::insert(&mut o.indexed, *x);
+            }
+            if (HashSet::contains(&w.assigned, x))
+            {
+                HashSet::insert(&mut o.assigned, *x);
+            }
+        }
+    }
+    o
+}

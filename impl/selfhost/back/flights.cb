@@ -1,0 +1,551 @@
+// D-0286 (impl/cobc/src/lower/flights.rs): values between functions in a
+// decided program, which travel with no object: a by-value argument or a
+// result is handed over as its bytes, the sender's record of it ended
+// (`cb_forget_obj`), and the receiver takes it objectless or gives it an
+// object of its own (`cb_new`).
+
+import std;
+import ast;
+import state;
+import layout;
+import passes;
+import gen;
+
+// A resource argument leaves for a by-value parameter: in flight
+// (`cb_send`); in a decided program, as its value alone, its object's
+// record ended here (an inert value, `inert_c`, has none).
+export fn give_arg(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<V, shared> t, str what)
+{
+    match (&t.obj)
+    {
+        Some(o) :
+        {
+            if (g.decided)
+            {
+                emit(x, String::as_view(&sprintf("cb_forget_obj(%s);", o)));
+            }
+            else
+            {
+                emit(x, String::as_view(&sprintf("cb_send(%s);", o)));
+            }
+        },
+        None    :
+        {
+            if (!(g.decided && HashSet::contains(&x.inert_c, &t.c)))
+            {
+                eprintf("cobc: a resource argument without an object: %s (`%s`)\n", what, &t.c);
+                assert(false, "cobc: a resource argument without an object");
+            }
+        },
+    }
+}
+
+// D-0286: the call `e`, if it is one, gives its resource result to the
+// consumer about to lower it with no object (`finish_call`). Unless nothing
+// is evaluated between the call and the consumer (`last`), only a result
+// whose end frees memory alone (`objectless_type`): a fault in a later
+// argument or field leaves its bytes unfreed, which no code of the program
+// sees. (cobc keys the call by its arguments' address; cbc by `args_key`.)
+export fn arm_inert(ref<Gen, shared> g, ref<Fx, exclusive> x, ref<Expr, shared> e, bool last)
+{
+    if (!g.decided)
+    {
+        return;
+    }
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : x.inert_result = Some(InertResult { .key = args_key(&Box::get(c).args), .last = last }),
+        _                  : {},
+    }
+}
+
+// D-0286: `e` builds an aggregate itself (a struct literal, or a variant),
+// which `objectless` makes with no object.
+export fn literal_expr(ref<Gen, shared> g, ref<Fx, shared> x, ref<Expr, shared> e) : bool
+{
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::EStructLit(_) : true,
+        ExprKind::EPath(p)      :
+        {
+            ref<Vec<String>, shared> segs = &Box::get(p).segs;
+            if (Vec::len(segs) == 1 && Option::is_some(&lookup(x, String::as_view(&segs[0]))))
+            {
+                return false;
+            }
+            Option::is_some(&variant_of(g, segs))
+        },
+        ExprKind::ECall(c)      :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    ref<Vec<String>, shared> segs = &Box::get(p).segs;
+                    if (Vec::len(segs) == 1 && Option::is_some(&lookup(x, String::as_view(&segs[0]))))
+                    {
+                        return false;
+                    }
+                    if (HashMap::contains(&g.prog.table.fns, &String::join(&segs[0..$], "::")))
+                    {
+                        return false;
+                    }
+                    Option::is_some(&variant_of(g, segs))
+                },
+                _                  : false,
+            }
+        },
+        _                       : false,
+    }
+}
+
+// D-0294: `e` is `Box::new(…)`, `std`'s (`lower_box_new`).
+export fn box_new_expr(ref<Gen, shared> g, ref<Fx, shared> x, ref<Expr, shared> e) : bool
+{
+    ref<CallExpr, shared> c = match (&strip_parens(e).kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return false,
+    };
+    ref<Vec<String>, shared> segs = match (&c.callee.kind)
+    {
+        ExprKind::EPath(p) : &Box::get(p).segs,
+        _                  : return false,
+    };
+    if (Vec::len(&c.args) != 1 || (Vec::len(segs) == 1 && Option::is_some(&lookup(x, String::as_view(&segs[0])))))
+    {
+        return false;
+    }
+    String k0 = String::join(&segs[0..$], "::");
+    String k = if (HashMap::contains(&g.prog.table.fns, &k0)) { k0 } else { sprintf("std::%s", &k0) };
+    if (!String::eq_str(&k, "std::Box::new"))
+    {
+        return false;
+    }
+    match (HashMap::get(&g.prog.table.fns, &k))
+    {
+        Some(f) : in_prelude(String::as_view(&k), f),
+        None    : false,
+    }
+}
+
+// D-0286: `e` is `x.f…` for an objectless local `x`.
+export fn objectless_root(ref<Fx, shared> x, ref<Expr, shared> e) : bool
+{
+    ref<Expr, shared> r = strip_parens(e);
+    while (true)
+    {
+        match (&r.kind)
+        {
+            ExprKind::EField(f) : r = strip_parens(&Box::get(f).e),
+            _                   : break,
+        }
+    }
+    match (path_name(r))
+    {
+        Some(n) :
+        {
+            match (lookup(x, String::as_view(&n)))
+            {
+                Some(b) :
+                {
+                    bool local = match (&b.kind)
+                    {
+                        BindKind::Local : true,
+                        _               : false,
+                    };
+                    local && HashSet::contains(&x.objectless_c, &b.c)
+                },
+                None    : false,
+            }
+        },
+        None    : false,
+    }
+}
+
+// A call's resource result `t` arrives: received from flight; in a decided
+// program, given an object where it lands. The object's name.
+export fn take_result(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> t,
+    ref<Type, shared> ty,
+    usize line,
+) : String
+{
+    String o = fresh(g, "o");
+    if (g.decided)
+    {
+        u32 tid = type_id(g, ty);
+        String lc = loc(g, x.std_body, line);
+        emit(x, String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, %s);", &o, t, tid, &lc)));
+    }
+    else
+    {
+        emit(x, String::as_view(&sprintf("uint64_t %s = cb_recv(&%s);", &o, t)));
+    }
+    o
+}
+
+// A resource parameter's C name and its type's id (`ground_native`'s `tids`).
+export struct ParamTid
+{
+    export String name;
+    export u32 tid;
+}
+
+// A receive found in a native's text: the object's name and the parameter
+// received.
+struct Recv
+{
+    String x;
+    String p;
+}
+
+// `s` with its bytes `i..j` replaced by `to`.
+fn splice(ref<String, shared> s, usize i, usize j, StringView to) : String
+{
+    StringView v = String::as_view(s);
+    String out = String::from_view(StringView::sub(v, 0, i));
+    String::append(&mut out, to);
+    String::append(&mut out, StringView::sub(v, j, StringView::len(v)));
+    out
+}
+
+fn find_from(ref<String, shared> s, usize at, StringView needle) : Option<usize>
+{
+    StringView v = String::as_view(s);
+    match (StringView::find(StringView::sub(v, at, StringView::len(v)), needle))
+    {
+        Some(k) : Some(at + k),
+        None    : None,
+    }
+}
+
+fn ident_name(StringView name) : bool
+{
+    if (StringView::len(name) == 0)
+    {
+        return false;
+    }
+    foreach (c in StringView::as_bytes(name))
+    {
+        if (!(ascii_is_alnum(*c) || *c == b'_'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The statement `st` (`call(x…`) stands at `i`, the position of its `x`.
+fn stmt_at(ref<String, shared> s, usize i, ref<String, shared> st) : bool
+{
+    usize k = match (String::find(st, "("))
+    {
+        Some(k) : k + 1,
+        None    : 0,
+    };
+    if (i < k)
+    {
+        return false;
+    }
+    StringView v = String::as_view(s);
+    StringView::starts_with(StringView::sub(v, i - k, StringView::len(v)), String::as_view(st))
+}
+
+// A native body's fixed text, made for a decided program (D-0286). Its
+// parameters arrive with no object and its result leaves with none, so:
+// an object received for a parameter (`cb_recv(&p_x)`) that the body only
+// ends, sends on or moves (`cb_forget_obj`, `cb_send`, `cb_move_to`,
+// `cb_raw_move_in`) is not made, and those uses go with it, as in the
+// natives' `_raw` forms; one the body uses otherwise is made where it
+// would have been received (`cb_new`, of the parameter's type, `tids`).
+// Every other send ends its object's record instead, and an object made
+// only to be ended at once is not made (`ground_sends`). A receive of
+// anything else is an error: the text is one this rule does not know.
+// A removed statement leaves an empty one where it stood, so that an `if`
+// it was the body of keeps one.
+export fn ground_native(ref<String, shared> text, ref<Vec<ParamTid>, shared> tids) : Result<String, String>
+{
+    String s = String::clone(text);
+    // A result received and ended at once (a call's, in a `__raw` form).
+    while (true)
+    {
+        usize i = match (String::find(&s, "cb_forget_obj(cb_recv(&"))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        usize j = match (find_from(&s, i, "));"))
+        {
+            Some(j) : j - i,
+            None    : return Err(String::from_str("an unclosed receive")),
+        };
+        s = splice(&s, i, i + j + 3, ";");
+    }
+    Vec<Recv> recvs = Vec::new();
+    usize at = 0;
+    while (true)
+    {
+        usize i = match (find_from(&s, at, "uint64_t "))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        at = i + 9;
+        StringView rest = StringView::sub(String::as_view(&s), i + 9, String::len(&s));
+        usize eq = match (StringView::find(rest, " = cb_recv(&"))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        StringView name = StringView::sub(rest, 0, eq);
+        if (!ident_name(name))
+        {
+            continue;
+        }
+        StringView after = StringView::sub(rest, eq + 12, StringView::len(rest));
+        usize close = match (StringView::find(after, ");"))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        Vec::push(
+            &mut recvs,
+            Recv { .x = String::from_view(name), .p = String::from_view(StringView::sub(after, 0, close)) },
+        );
+    }
+    foreach (r in &recvs)
+    {
+        String decl = sprintf("uint64_t %s = cb_recv(&%s);", &r.x, &r.p);
+        Vec<String> ends = Vec::new();
+        Vec::push(&mut ends, sprintf("cb_forget_obj(%s);", &r.x));
+        Vec::push(&mut ends, sprintf("cb_send(%s);", &r.x));
+        Vec<String> moves = Vec::new();
+        Vec::push(&mut moves, sprintf("cb_move_to(%s, ", &r.x));
+        Vec::push(&mut moves, sprintf("cb_raw_move_in(%s, ", &r.x));
+        // Every mention of `x` is one of these statements (each written
+        // `call(x…`, so the mention is preceded by the call's name).
+        bool only = true;
+        Vec<usize> positions = ident_positions(&s, &r.x);
+        foreach (i in &positions)
+        {
+            bool in_decl = *i >= 9 && StringView::starts_with(
+                StringView::sub(String::as_view(&s), *i - 9, String::len(&s)),
+                String::as_view(&decl),
+            );
+            bool ok = in_decl;
+            foreach (e in &ends)
+            {
+                ok = ok || stmt_at(&s, *i, e);
+            }
+            foreach (m in &moves)
+            {
+                ok = ok || stmt_at(&s, *i, m);
+            }
+            if (!ok)
+            {
+                only = false;
+                break;
+            }
+        }
+        if (only)
+        {
+            s = String::replace(&s, String::as_view(&decl), ";");
+            foreach (e in &ends)
+            {
+                s = String::replace(&s, String::as_view(e), ";");
+            }
+            foreach (m in &moves)
+            {
+                while (true)
+                {
+                    usize i = match (String::find(&s, String::as_view(m)))
+                    {
+                        Some(i) : i,
+                        None    : break,
+                    };
+                    usize j = match (find_from(&s, i, ");"))
+                    {
+                        Some(j) : j - i,
+                        None    : return Err(sprintf("an unclosed `%s`", m)),
+                    };
+                    s = splice(&s, i, i + j + 2, ";");
+                }
+            }
+        }
+        else
+        {
+            Option<u32> tid = None;
+            foreach (t in tids)
+            {
+                if (String::eq(&t.name, &r.p))
+                {
+                    tid = Some(t.tid);
+                }
+            }
+            u32 id = match (tid)
+            {
+                Some(t) : t,
+                None    : return Err(sprintf("a receive of `%s`, no parameter", &r.p)),
+            };
+            s = String::replace(
+                &s,
+                String::as_view(&decl),
+                String::as_view(&sprintf("uint64_t %s = cb_new(&%s, %vu, CB_NOLOC, 0);", &r.x, &r.p, id)),
+            );
+        }
+    }
+    if (String::contains(&s, "cb_recv("))
+    {
+        return Err(String::from_str("a native receives what is no parameter"));
+    }
+    String s2 = ground_sends(&s);
+    // D-0294: the body's own records that nothing reads (a result bound
+    // and taken back, say).
+    String s3 = elide_record_chains(&s2);
+    Ok(tidy(&s3))
+}
+
+// Text made for a decided program that sends what it made (a helper's
+// result): each send ends its object's record instead, and an object made
+// only to be ended at once is not made.
+export fn ground_sends(ref<String, shared> text) : String
+{
+    String s = String::replace(text, "cb_send(", "cb_forget_obj(");
+    // `uint64_t o = cb_new(&v, Tu, CB_NOLOC, 0);` then `cb_forget_obj(o);`
+    // with nothing between: `o` names a record already ended after that.
+    usize at = 0;
+    while (true)
+    {
+        usize i = match (find_from(&s, at, "uint64_t "))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        at = i + 9;
+        StringView v = String::as_view(&s);
+        StringView rest = StringView::sub(v, i + 9, StringView::len(v));
+        usize eq = match (StringView::find(rest, " = cb_new(&"))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        String name = String::from_view(StringView::sub(rest, 0, eq));
+        if (!ident_name(String::as_view(&name)))
+        {
+            continue;
+        }
+        usize close = match (StringView::find(rest, ");"))
+        {
+            Some(k) : k,
+            None    : continue,
+        };
+        usize end = i + 9 + close + 2;
+        String forget = sprintf("cb_forget_obj(%s);", &name);
+        StringView tail = StringView::sub(v, end, StringView::len(v));
+        usize gap = StringView::len(tail) - StringView::len(StringView::trim_start(tail));
+        if (!StringView::starts_with(StringView::sub(tail, gap, StringView::len(tail)), String::as_view(&forget)))
+        {
+            continue;
+        }
+        usize stop = end + gap + String::len(&forget);
+        s = splice(&s, i, stop, ";");
+        at = i;
+    }
+    tidy(&s)
+}
+
+// The positions of `x` as a whole identifier in `s`.
+fn ident_positions(ref<String, shared> s, ref<String, shared> x) : Vec<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(String::as_view(s));
+    usize n = slice_len(b);
+    usize xn = String::len(x);
+    Vec<usize> out = Vec::new();
+    usize at = 0;
+    while (true)
+    {
+        usize i = match (find_from(s, at, String::as_view(x)))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        usize j = i + xn;
+        bool before = i == 0 || !(ascii_is_alnum(b[i - 1]) || b[i - 1] == b'_');
+        bool after = j >= n || !(ascii_is_alnum(b[j]) || b[j] == b'_');
+        if (before && after)
+        {
+            Vec::push(&mut out, i);
+        }
+        at = j;
+    }
+    out
+}
+
+// The empty statements the rewrites left: a line of one goes, and a run of
+// them within a line becomes one.
+export fn tidy(ref<String, shared> s) : String
+{
+    String out = String::new();
+    String::reserve(&mut out, String::len(s));
+    foreach (line in split_inclusive_lines(String::as_view(s)))
+    {
+        bool nl = StringView::ends_with(line, "\n");
+        StringView body = if (nl) { StringView::sub(line, 0, StringView::len(line) - 1) } else { line };
+        StringView t = StringView::trim(body);
+        if (StringView::len(t) > 0)
+        {
+            bool empty_stmt = true;
+            foreach (c in StringView::as_bytes(t))
+            {
+                if (*c != b';' && *c != b' ')
+                {
+                    empty_stmt = false;
+                }
+            }
+            if (empty_stmt)
+            {
+                continue;
+            }
+        }
+        String l = String::from_view(body);
+        while (String::contains(&l, "; ;"))
+        {
+            l = String::replace(&l, "; ;", ";");
+        }
+        while (String::contains(&l, ";;") && !String::contains(&l, "for ("))
+        {
+            l = String::replace(&l, ";;", ";");
+        }
+        String::append(&mut out, &l);
+        if (nl)
+        {
+            String::push_ascii(&mut out, b'\n');
+        }
+    }
+    out
+}
+
+// Rust's `split_inclusive('\n')`: each line with its newline, the last
+// without one when the text does not end in one.
+fn split_inclusive_lines(StringView text) : Vec<StringView>
+{
+    Vec<StringView> parts = Vec::new();
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize start = 0;
+    for (usize k = 0; k < slice_len(b); k += 1)
+    {
+        if (b[k] == b'\n')
+        {
+            Vec::push(&mut parts, StringView::sub(text, start, k + 1));
+            start = k + 1;
+        }
+    }
+    if (start < slice_len(b))
+    {
+        Vec::push(&mut parts, StringView::sub(text, start, slice_len(b)));
+    }
+    parts
+}

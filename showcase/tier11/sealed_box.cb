@@ -1,0 +1,108 @@
+// Sealed messages
+//
+// Shows: two parties who have never shared a secret agreeing on one and
+// sending each other encrypted, authenticated messages, the way TLS 1.3
+// does underneath. Each has an X25519 key pair; each computes the same 32
+// shared bytes from its own private key and the other's public key
+// (`x25519`); HKDF turns them into one key per direction, bound to a
+// label; ChaCha20-Poly1305 seals each message under a counter as nonce,
+// with a header sent in the clear but protected. Changing one bit of a
+// message, its header, or replaying it under another counter, is refused.
+// The private keys are RFC 7748's examples so the output is fixed; real
+// ones come from `x25519_private_key()`.
+
+import std;
+
+fn key_for(slice<u8, shared> shared, str label) : Vec<u8>
+{
+    Vec<u8> none = Vec::new();
+    hkdf_sha256(&none[0..$], shared, StringView::as_bytes(StringView::of(label)), 32)
+}
+
+fn nonce(u64 counter) : Vec<u8>
+{
+    Vec<u8> n = Vec::filled(4, 0: u8);
+    Vec::push_be(&mut n, counter);
+    n
+}
+
+fn main()
+{
+    Vec<u8> alice = Result::unwrap_or(
+        from_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"),
+        Vec::new(),
+    );
+    Vec<u8> bob = Result::unwrap_or(
+        from_hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"),
+        Vec::new(),
+    );
+    array<u8, 32> alice_public = x25519_public_key(&alice[0..$]);
+    array<u8, 32> bob_public = x25519_public_key(&bob[0..$]);
+    printf("alice sends her public key: %s\n", &to_hex(&alice_public[0..$]));
+    printf("bob sends his public key:   %s\n", &to_hex(&bob_public[0..$]));
+    array<u8, 32> alice_shared = Option::unwrap(x25519(&alice[0..$], &bob_public[0..$]));
+    array<u8, 32> bob_shared = Option::unwrap(x25519(&bob[0..$], &alice_public[0..$]));
+    printf("both compute the same secret: %v\n\n", digest_eq(&alice_shared[0..$], &bob_shared[0..$]));
+    Vec<u8> alice_to_bob = key_for(&alice_shared[0..$], "alice to bob");
+    Vec<u8> bob_reads = key_for(&bob_shared[0..$], "alice to bob");
+    array<str, 3> notes = ["meet at the harbour", "bring the map", "noon, not dawn"];
+    Vec<Vec<u8>> sent = Vec::new();
+    for (usize i = 0; i < 3; i += 1)
+    {
+        Vec<u8> header = String::into_bytes(sprintf("msg %u", i));
+        Vec<u8> sealed = chacha20_poly1305_seal(
+            &alice_to_bob[0..$],
+            &nonce(widen<u64>(i))[0..$],
+            &header[0..$],
+            StringView::as_bytes(StringView::of(notes[i])),
+        );
+        printf("msg %u sealed: %s\n", i, &to_hex(&sealed[0..$]));
+        match (chacha20_poly1305_open(&bob_reads[0..$], &nonce(widen<u64>(i))[0..$], &header[0..$], &sealed[0..$]))
+        {
+            Some(p) : printf("  bob reads: %s\n", &Result::unwrap_or(String::from_utf8(p), String::new())),
+            None    : printf("  bob refuses it\n"),
+        }
+        Vec::push(&mut sent, sealed);
+    }
+    slice<u8, shared> header0 = StringView::as_bytes("msg 0");
+    slice<u8, shared> header9 = StringView::as_bytes("msg 9");
+    Vec<u8> flipped = Vec::clone(&sent[0]);
+    flipped[2] = flipped[2] ^ 0x20;
+    printf(
+        "\none bit changed in transit: %s\n",
+        if (Option::is_none(&chacha20_poly1305_open(
+            &bob_reads[0..$],
+            &nonce(0)[0..$],
+            header0,
+            &flipped[0..$],
+        ))) { "refused" } else { "accepted" },
+    );
+    printf(
+        "header changed:             %s\n",
+        if (Option::is_none(&chacha20_poly1305_open(
+            &bob_reads[0..$],
+            &nonce(0)[0..$],
+            header9,
+            &sent[0][0..$],
+        ))) { "refused" } else { "accepted" },
+    );
+    printf(
+        "replayed as message 1:      %s\n",
+        if (Option::is_none(&chacha20_poly1305_open(
+            &bob_reads[0..$],
+            &nonce(1)[0..$],
+            header0,
+            &sent[0][0..$],
+        ))) { "refused" } else { "accepted" },
+    );
+    Vec<u8> wrong_key = key_for(&bob_shared[0..$], "bob to alice");
+    printf(
+        "read with the other key:    %s\n",
+        if (Option::is_none(&chacha20_poly1305_open(
+            &wrong_key[0..$],
+            &nonce(0)[0..$],
+            header0,
+            &sent[0][0..$],
+        ))) { "refused" } else { "accepted" },
+    );
+}

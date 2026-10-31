@@ -1,0 +1,4574 @@
+// The recursive-descent parser for CobaltC (spec/22), as coby's
+// (impl/src/parser.rs) is written, function for function: the same
+// grammar, the same rewrites (`p op= e`, `for`, `foreach`, `if (pattern =
+// e)`, local constants and types hoisted), the same pre-scans, and the
+// same messages. It parses a program as coby parses it after the prelude:
+// the prelude's skeleton (prelude.cb, `coby --prelude-summary`) is
+// pre-scanned in front of the program's tokens, and the counters its
+// hidden names continue from start where the prelude left them.
+
+import std;
+import lexer;
+import ast;
+import prelude;
+
+export struct SyntaxError
+{
+    export String msg;
+    export usize line;
+    export usize col;
+}
+
+// A constant's value for array lengths: known, or declared twice with
+// different values (`known` false).
+struct ConstLen
+{
+    bool known;
+    u128 v;
+}
+
+struct ModLen
+{
+    u128 v;
+    bool exported;
+}
+
+struct Undo
+{
+    usize pos;
+    Tok tok;
+}
+
+// A pattern: the variant chain (outermost first), the binder, the
+// literal, and a struct pattern (D-0224), whose binder is hidden.
+struct StructPat
+{
+    String struct_name;
+    Vec<String> fields;
+    Vec<String> names;
+    bool rest;
+    String hidden;
+    usize line;
+    usize col;
+}
+
+struct Pat
+{
+    Vec<String> chain;
+    Option<String> binder;
+    Option<Box<Expr>> lit;
+    Option<StructPat> sp;
+}
+
+struct Fields
+{
+    Vec<String> fields;
+    Vec<String> names;
+    bool rest;
+}
+
+struct TypeParams
+{
+    Vec<String> names;
+    Vec<Option<Bound>> bounds;
+}
+
+// A scope of the function being parsed: a name to `None` (a local
+// variable) or `Some(hidden)` (a local constant, or under `::NAME` a local
+// type, by its hidden item name).
+struct Parser
+{
+    Vec<PTok> toks;
+    usize pos;
+    HashMap<String, ConstLen> const_lengths;
+    HashMap<String, ModLen> module_lengths;
+    Vec<String> module_path;
+    HashSet<String> type_names;
+    Vec<Undo> undo_log;
+    usize fresh;
+    usize bracket_depth;
+    bool slice_ok;
+    Vec<HashMap<String, Option<String>>> scopes;
+    Vec<Item> hoisted;
+    usize local_consts;
+    Vec<String> fn_type_params;
+    bool in_const_init;
+    Option<String> const_error;
+    Vec<HashMap<String, usize>> regions;
+    Option<usize> join_at;
+    Option<String> local_error;
+    Vec<UnitTest> tests;
+    HashMap<String, usize> test_names;
+    // The tests before this text's (`__unittest_N` counts from it + 1): the
+    // prelude's for a program, none for the prelude itself.
+    usize test_base;
+}
+
+// ---- constant expressions (D-0126) ----
+
+const i128 I128_MAX = 170141183460469231731687303715884105727;
+
+fn i128_min() : i128
+{
+    -I128_MAX - 1
+}
+
+fn to_i128(u128 v) : Option<i128>
+{
+    if (v > reinterpret<u128>(I128_MAX))
+    {
+        return None;
+    }
+    Some(reinterpret<i128>(v))
+}
+
+fn checked_add(i128 a, i128 b) : Option<i128>
+{
+    if ((b > 0 && a > I128_MAX - b) || (b < 0 && a < i128_min() - b))
+    {
+        return None;
+    }
+    Some(a + b)
+}
+
+fn checked_sub(i128 a, i128 b) : Option<i128>
+{
+    if ((b < 0 && a > I128_MAX + b) || (b > 0 && a < i128_min() + b))
+    {
+        return None;
+    }
+    Some(a - b)
+}
+
+// `|a|`, exact even for the least `i128`.
+fn magnitude(i128 a) : u128
+{
+    if (a >= 0)
+    {
+        return reinterpret<u128>(a);
+    }
+    reinterpret<u128>(~a) + 1
+}
+
+fn checked_mul(i128 a, i128 b) : Option<i128>
+{
+    u128 x = magnitude(a);
+    u128 y = magnitude(b);
+    if (y != 0 && x > (~(0: u128)) / y)
+    {
+        return None;
+    }
+    u128 prod = x * y;
+    u128 top = reinterpret<u128>(I128_MAX) + 1;
+    if ((a < 0) != (b < 0))
+    {
+        if (prod > top)
+        {
+            return None;
+        }
+        if (prod == top)
+        {
+            return Some(i128_min());
+        }
+        return Some(-reinterpret<i128>(prod));
+    }
+    if (prod >= top)
+    {
+        return None;
+    }
+    Some(reinterpret<i128>(prod))
+}
+
+fn shift_left(i128 a, i128 b) : i128
+{
+    // Rust's `checked_shl` for a shift below 127: the bits shifted out are lost.
+    u128 x = reinterpret<u128>(a);
+    u32 s = narrow<u32>(b);
+    if (s > 0)
+    {
+        u128 keep = (~(0: u128)) >> s;
+        x = (x & keep) << s;
+    }
+    reinterpret<i128>(x)
+}
+
+fn shift_right(i128 a, i128 b) : i128
+{
+    u32 s = narrow<u32>(b);
+    if (a >= 0)
+    {
+        return a >> s;
+    }
+    ~((~a) >> s)
+}
+
+fn apply(u8 op, i128 a, i128 b) : Option<i128>
+{
+    match (op)
+    {
+        b'+' : checked_add(a, b),
+        b'-' : checked_sub(a, b),
+        b'*' : checked_mul(a, b),
+        b'/' : if (b == 0 || (a == i128_min() && b == -1)) { None } else { Some(a / b) },
+        b'%' : if (b == 0 || (a == i128_min() && b == -1)) { None } else { Some(a % b) },
+        b'&' : Some(a & b),
+        b'|' : Some(a | b),
+        b'^' : Some(a ^ b),
+        b'l' : if (b >= 0 && b < 127) { Some(shift_left(a, b)) } else { None },
+        b'r' : if (b >= 0 && b < 127) { Some(shift_right(a, b)) } else { None },
+        _    : None,
+    }
+}
+
+// Who answers a name in a constant expression: the root's constants
+// (the first pre-scan), a module's (the second, from `path` outward), or
+// an array length's (the parser, which also says why a name is not one).
+const u8 LOOK_ROOT = 0;
+const u8 LOOK_MODULE = 1;
+const u8 LOOK_LENGTH = 2;
+
+struct Folder
+{
+    usize i;
+    usize hi;
+    u8 look;
+    Vec<String> path;
+    Option<String> problem;
+}
+
+fn fold_lookup(ref<Parser, shared> p, ref<Folder, exclusive> f, ref<Vec<String>, shared> segs) : Option<i128>
+{
+    if (f.look == LOOK_ROOT)
+    {
+        if (Vec::len(segs) != 1)
+        {
+            return None;
+        }
+        return match (HashMap::get(&p.const_lengths, &segs[0]))
+        {
+            Some(c) : if (c.known) { to_i128(c.v) } else { None },
+            None    : None,
+        };
+    }
+    if (f.look == LOOK_MODULE)
+    {
+        String q = String::join(&segs[0..$], "::");
+        usize up = Vec::len(&f.path) + 1;
+        while (up > 0)
+        {
+            up -= 1;
+            String key = if (up == 0)
+            {
+                String::clone(&q)
+            }
+            else
+            {
+                sprintf("%s::%s", &String::join(&f.path[0..up], "::"), &q)
+            };
+            match (HashMap::get(&p.module_lengths, &key))
+            {
+                Some(m) : return to_i128(m.v),
+                None    : {},
+            }
+        }
+        if (Vec::len(segs) == 1)
+        {
+            match (HashMap::get(&p.const_lengths, &segs[0]))
+            {
+                Some(c) : if (c.known) { return to_i128(c.v); },
+                None    : {},
+            }
+        }
+        return None;
+    }
+    if (Vec::len(segs) == 1)
+    {
+        return match (HashMap::get(&p.const_lengths, &segs[0]))
+        {
+            Some(c) :
+            {
+                if (c.known)
+                {
+                    to_i128(c.v)
+                }
+                else
+                {
+                    f.problem = Some(sprintf(
+                        "`%s` is declared as constants of different values; write the length as a number",
+                        &segs[0],
+                    ));
+                    None
+                }
+            },
+            None    :
+            {
+                f.problem = Some(sprintf(
+                    "`%s` is not a constant whose value is known before the program runs (D-0074, D-0126)",
+                    &segs[0],
+                ));
+                None
+            },
+        };
+    }
+    match (module_length(p, segs))
+    {
+        Ok(v)  : to_i128(v),
+        Err(m) :
+        {
+            f.problem = Some(m);
+            None
+        },
+    }
+}
+
+fn fold_peek(ref<Parser, shared> p, ref<Folder, shared> f) : Tok
+{
+    if (f.i < f.hi)
+    {
+        return p.toks[f.i].tok;
+    }
+    Tok::Eof
+}
+
+fn fold_expr(ref<Parser, shared> p, ref<Folder, exclusive> f, u8 min_prec) : Option<i128>
+{
+    i128 lhs = fold_unary(p, f)?;
+    while (true)
+    {
+        Tok t = fold_peek(p, f);
+        u8 prec = 0;
+        u8 op = 0;
+        match (t)
+        {
+            Tok::Pipe    : { prec = 1; op = b'|'; },
+            Tok::Caret   : { prec = 2; op = b'^'; },
+            Tok::Amp     : { prec = 3; op = b'&'; },
+            Tok::Shl     : { prec = 4; op = b'l'; },
+            Tok::Shr     : { prec = 4; op = b'r'; },
+            Tok::Plus    : { prec = 5; op = b'+'; },
+            Tok::Minus   : { prec = 5; op = b'-'; },
+            Tok::Star    : { prec = 6; op = b'*'; },
+            Tok::Slash   : { prec = 6; op = b'/'; },
+            Tok::Percent : { prec = 6; op = b'%'; },
+            _            : {},
+        }
+        if (prec == 0 || prec < min_prec)
+        {
+            break;
+        }
+        f.i += 1;
+        i128 rhs = fold_expr(p, f, prec + 1)?;
+        lhs = apply(op, lhs, rhs)?;
+    }
+    Some(lhs)
+}
+
+fn fold_unary(ref<Parser, shared> p, ref<Folder, exclusive> f) : Option<i128>
+{
+    if (f.i >= f.hi)
+    {
+        return None;
+    }
+    Tok t = p.toks[f.i].tok;
+    if (t == Tok::Minus)
+    {
+        f.i += 1;
+        i128 v = fold_unary(p, f)?;
+        if (v == i128_min())
+        {
+            return None;
+        }
+        return Some(-v);
+    }
+    if (t == Tok::Tilde)
+    {
+        f.i += 1;
+        return Some(~fold_unary(p, f)?);
+    }
+    if (t == Tok::LParen)
+    {
+        f.i += 1;
+        i128 v = fold_expr(p, f, 1)?;
+        if (fold_peek(p, f) != Tok::RParen)
+        {
+            return None;
+        }
+        f.i += 1;
+        return Some(v);
+    }
+    if (t == Tok::Int)
+    {
+        i128 v = to_i128(p.toks[f.i].ival)?;
+        f.i += 1;
+        return Some(v);
+    }
+    if (t == Tok::Ident)
+    {
+        Vec<String> segs = Vec::new();
+        while (fold_peek(p, f) == Tok::Ident)
+        {
+            Vec::push(&mut segs, String::clone(&p.toks[f.i].text));
+            f.i += 1;
+            if (fold_peek(p, f) == Tok::ColonColon)
+            {
+                f.i += 1;
+            }
+            else
+            {
+                break;
+            }
+        }
+        return fold_lookup(p, f, &segs);
+    }
+    None
+}
+
+// The tokens `lo..hi` as a constant expression, folded; `None` when they
+// are not one.
+fn fold_const(ref<Parser, shared> p, usize lo, usize hi, ref<Folder, exclusive> f) : Option<i128>
+{
+    f.i = lo;
+    f.hi = hi;
+    i128 v = fold_expr(p, f, 1)?;
+    if (f.i == hi) { Some(v) } else { None }
+}
+
+fn folder(u8 look) : Folder
+{
+    Folder { .i = 0, .hi = 0, .look = look, .path = Vec::new(), .problem = None }
+}
+
+// ---- construction: the pre-scans ----
+
+fn tok_at(ref<Vec<PTok>, shared> toks, usize i) : Tok
+{
+    if (i < Vec::len(toks))
+    {
+        return toks[i].tok;
+    }
+    Tok::Eof
+}
+
+fn new_parser(Vec<PTok> toks, usize start) : Parser
+{
+    Parser p = Parser {
+        .toks = toks,
+        .pos = start,
+        .const_lengths = HashMap::new(),
+        .module_lengths = HashMap::new(),
+        .module_path = Vec::new(),
+        .type_names = HashSet::new(),
+        .undo_log = Vec::new(),
+        .fresh = 0,
+        .bracket_depth = 0,
+        .slice_ok = false,
+        .scopes = Vec::new(),
+        .hoisted = Vec::new(),
+        .local_consts = 0,
+        .fn_type_params = Vec::new(),
+        .in_const_init = false,
+        .const_error = None,
+        .regions = Vec::new(),
+        .join_at = None,
+        .local_error = None,
+        .tests = Vec::new(),
+        .test_names = HashMap::new(),
+        .test_base = PRELUDE_TESTS,
+    };
+    usize n = Vec::len(&p.toks);
+    // `struct Name` / `enum Name` anywhere, so decl-stmt disambiguation
+    // (spec/22 §2, rule 4) has the full item set.
+    for (usize i = 0; i < n; i += 1)
+    {
+        Tok t = p.toks[i].tok;
+        if (t == Tok::Struct || t == Tok::Enum || t == Tok::Bitstruct)
+        {
+            if (tok_at(&p.toks, i + 1) == Tok::Ident)
+            {
+                HashSet::insert(&mut p.type_names, String::clone(&p.toks[i + 1].text));
+            }
+            else if (tok_at(&p.toks, i + 2) == Tok::Ident)
+            {
+                HashSet::insert(&mut p.type_names, String::clone(&p.toks[i + 2].text));
+            }
+        }
+    }
+    // D-0074, D-0126: `const τ NAME = <constant expression>;` anywhere,
+    // folded to a fixpoint.
+    for (usize pass = 0; pass < 8; pass += 1)
+    {
+        bool changed = false;
+        for (usize i = 0; i < n; i += 1)
+        {
+            if (p.toks[i].tok != Tok::Const)
+            {
+                continue;
+            }
+            usize j = NONE;
+            usize lim = if (i + 10 < n) { i + 10 } else { n };
+            for (usize x = i + 1; x < lim; x += 1)
+            {
+                if (p.toks[x].tok == Tok::Eq)
+                {
+                    j = x;
+                    break;
+                }
+            }
+            if (j == NONE || p.toks[j - 1].tok != Tok::Ident)
+            {
+                continue;
+            }
+            usize k = NONE;
+            for (usize x = j + 1; x < n; x += 1)
+            {
+                if (p.toks[x].tok == Tok::Semi)
+                {
+                    k = x;
+                    break;
+                }
+            }
+            if (k == NONE)
+            {
+                continue;
+            }
+            Folder f = folder(LOOK_ROOT);
+            i128 v = match (fold_const(&p, j + 1, k, &mut f))
+            {
+                Some(v) : v,
+                None    : continue,
+            };
+            if (v < 0)
+            {
+                continue;
+            }
+            u128 uv = reinterpret<u128>(v);
+            String name = String::clone(&p.toks[j - 1].text);
+            // 1: declared before with another value; 2: not declared before.
+            u8 action = match (HashMap::get(&p.const_lengths, &name))
+            {
+                Some(c) : if (c.known && c.v != uv) { 1 } else { 0 },
+                None    : 2,
+            };
+            if (action == 1)
+            {
+                HashMap::insert(&mut p.const_lengths, name, ConstLen { .known = false, .v = 0 });
+                changed = true;
+            }
+            else if (action == 2)
+            {
+                HashMap::insert(&mut p.const_lengths, name, ConstLen { .known = true, .v = uv });
+                changed = true;
+            }
+        }
+        if (!changed)
+        {
+            break;
+        }
+    }
+    // D-0105: the same constants under their modules' names.
+    Vec<String> stack_names = Vec::new();
+    Vec<usize> stack_depths = Vec::new();
+    usize depth = 0;
+    usize i = 0;
+    while (i < n)
+    {
+        Tok t = p.toks[i].tok;
+        if (t == Tok::Module && tok_at(&p.toks, i + 1) == Tok::Ident && tok_at(&p.toks, i + 2) == Tok::LBrace)
+        {
+            depth += 1;
+            Vec::push(&mut stack_names, String::clone(&p.toks[i + 1].text));
+            Vec::push(&mut stack_depths, depth);
+            i += 3;
+            continue;
+        }
+        if (t == Tok::LBrace)
+        {
+            depth += 1;
+        }
+        else if (t == Tok::RBrace)
+        {
+            usize s = Vec::len(&stack_depths);
+            if (s > 0 && stack_depths[s - 1] == depth)
+            {
+                Vec::pop(&mut stack_depths);
+                Vec::pop(&mut stack_names);
+            }
+            if (depth > 0)
+            {
+                depth -= 1;
+            }
+        }
+        else if (t == Tok::Const && Vec::len(&stack_depths) > 0 && depth == stack_depths[Vec::len(&stack_depths) - 1])
+        {
+            usize j = NONE;
+            usize lim = if (i + 10 < n) { i + 10 } else { n };
+            for (usize x = i + 1; x < lim; x += 1)
+            {
+                if (p.toks[x].tok == Tok::Eq)
+                {
+                    j = x;
+                    break;
+                }
+            }
+            if (j != NONE && p.toks[j - 1].tok == Tok::Ident)
+            {
+                usize k = NONE;
+                for (usize x = j + 1; x < n; x += 1)
+                {
+                    if (p.toks[x].tok == Tok::Semi)
+                    {
+                        k = x;
+                        break;
+                    }
+                }
+                if (k != NONE)
+                {
+                    Folder f = folder(LOOK_MODULE);
+                    f.path = Vec::clone(&stack_names);
+                    match (fold_const(&p, j + 1, k, &mut f))
+                    {
+                        Some(v) :
+                        {
+                            if (v >= 0)
+                            {
+                                bool exported = i > 0 && p.toks[i - 1].tok == Tok::Export;
+                                String key = sprintf(
+                                    "%s::%s",
+                                    &String::join(&stack_names[0..$], "::"),
+                                    &p.toks[j - 1].text,
+                                );
+                                HashMap::insert(
+                                    &mut p.module_lengths,
+                                    key,
+                                    ModLen { .v = reinterpret<u128>(v), .exported = exported },
+                                );
+                            }
+                        },
+                        None    : {},
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    p
+}
+
+const usize NONE = ~0;
+
+// ---- tokens ----
+
+fn cur(ref<Parser, shared> p) : Tok
+{
+    p.toks[p.pos].tok
+}
+
+fn peek_tok(ref<Parser, shared> p, usize k) : Tok
+{
+    tok_at(&p.toks, p.pos + k)
+}
+
+fn cur_text(ref<Parser, shared> p) : String
+{
+    String::clone(&p.toks[p.pos].text)
+}
+
+fn cur_is_word(ref<Parser, shared> p, str w) : bool
+{
+    cur(p) == Tok::Ident && p.toks[p.pos].text == w
+}
+
+fn line(ref<Parser, shared> p) : usize
+{
+    p.toks[p.pos].line
+}
+
+fn col(ref<Parser, shared> p) : usize
+{
+    p.toks[p.pos].col
+}
+
+fn bump(ref<Parser, exclusive> p)
+{
+    if (p.pos + 1 < Vec::len(&p.toks))
+    {
+        p.pos += 1;
+    }
+}
+
+fn err_at(ref<Parser, shared> p, StringView msg) : SyntaxError
+{
+    SyntaxError { .msg = String::from_view(msg), .line = line(p), .col = col(p) }
+}
+
+fn found(ref<Parser, shared> p) : String
+{
+    display(&p.toks[p.pos])
+}
+
+// A token kind as a message names it: `;`, the end of the file.
+fn kind_display(Tok t) : String
+{
+    if (t == Tok::Eof)
+    {
+        return String::from_str("the end of the file");
+    }
+    sprintf("`%s`", spelling(t))
+}
+
+fn expect_close_angle(ref<Parser, exclusive> p) : Result<void, SyntaxError>
+{
+    Tok t = cur(p);
+    if (t == Tok::Gt)
+    {
+        bump(p);
+        return Ok(());
+    }
+    if (t == Tok::Shr)
+    {
+        Vec::push(&mut p.undo_log, Undo { .pos = p.pos, .tok = Tok::Shr });
+        p.toks[p.pos].tok = Tok::Gt;
+        return Ok(());
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected `>`, found %s", &found(p)))))
+}
+
+fn expect(ref<Parser, exclusive> p, Tok t) : Result<void, SyntaxError>
+{
+    if (cur(p) == t)
+    {
+        bump(p);
+        return Ok(());
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected %s, found %s", &kind_display(t), &found(p)))))
+}
+
+fn eat(ref<Parser, exclusive> p, Tok t) : bool
+{
+    if (cur(p) == t)
+    {
+        bump(p);
+        return true;
+    }
+    false
+}
+
+fn reserved_name(StringView w) : String
+{
+    sprintf(
+        "`%v` is a reserved word (the name of a built-in type), so it cannot name a variable, field, parameter or function; choose another name",
+        w,
+    )
+}
+
+fn reserved_call(StringView w) : String
+{
+    bool numeric = StringView::eq_str(w, "f32") || StringView::eq_str(w, "f64") || StringView::starts_with(w, "i")
+        || (StringView::starts_with(w, "u") && !StringView::eq_str(w, "unit"));
+    if (numeric)
+    {
+        return sprintf(
+            "%s; to convert a value, use `widen<%v>(…)`, `narrow<%v>(…)`, `to_float<…>` or `to_int<…>`",
+            &reserved_name(w),
+            w,
+            w,
+        );
+    }
+    reserved_name(w)
+}
+
+// Whether `w` is a lower-case word (a keyword's spelling).
+fn lower_word(StringView w) : bool
+{
+    if (StringView::len(w) == 0)
+    {
+        return false;
+    }
+    foreach (b in StringView::as_bytes(w))
+    {
+        if (!ascii_is_lower(*b) && *b != b'_')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn ident(ref<Parser, exclusive> p) : Result<String, SyntaxError>
+{
+    Tok t = cur(p);
+    if (t == Tok::Ident)
+    {
+        String s = cur_text(p);
+        bump(p);
+        return Ok(s);
+    }
+    if (t == Tok::TypeName)
+    {
+        return Err(err_at(p, String::as_view(&reserved_name(String::as_view(&p.toks[p.pos].text)))));
+    }
+    // `fn f(i32 match)`: a keyword where a name belongs.
+    String shown = found(p);
+    StringView word = trim_backticks(String::as_view(&shown));
+    if (lower_word(word))
+    {
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf("`%v` is a keyword, so it cannot be a name; choose another name", word)),
+        ));
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected a name, found %s", &shown))))
+}
+
+// `s` without the backticks at either end (`str::trim_matches('`')`).
+fn trim_backticks(StringView s) : StringView
+{
+    usize lo = 0;
+    usize hi = StringView::len(s);
+    slice<u8, shared> b = StringView::as_bytes(s);
+    while (lo < hi && b[lo] == b'`')
+    {
+        lo += 1;
+    }
+    while (hi > lo && b[hi - 1] == b'`')
+    {
+        hi -= 1;
+    }
+    StringView::sub(s, lo, hi)
+}
+
+// ---- items ----
+
+fn parse_program(ref<Parser, exclusive> p) : Result<Program, SyntaxError>
+{
+    Vec<Item> items = Vec::new();
+    while (cur(p) != Tok::Eof)
+    {
+        Item it = parse_item(p)?;
+        Vec::push(&mut items, it);
+        Vec::append(&mut items, replace(&mut p.hoisted, Vec::new()));
+    }
+    Ok(Program { .items = items, .tests = replace(&mut p.tests, Vec::new()) })
+}
+
+fn parse_item(ref<Parser, exclusive> p) : Result<Item, SyntaxError>
+{
+    bool export_ = eat(p, Tok::Export);
+    Tok t = cur(p);
+    if (t == Tok::Unittest)
+    {
+        if (export_)
+        {
+            return Err(err_at(p, "`export` on a `unittest`, which declares no name"));
+        }
+        return Ok(Item::IFn(Box::new(parse_unittest(p)?)));
+    }
+    if (t == Tok::Fn)
+    {
+        return Ok(Item::IFn(Box::new(parse_fn(p, export_, false)?)));
+    }
+    if (t == Tok::Const)
+    {
+        return Ok(Item::IFn(Box::new(parse_const(p, export_)?)));
+    }
+    // D-0258: `static T NAME = literal;`, a global atomic.
+    if (t == Tok::Static)
+    {
+        return Ok(Item::IStatic(Box::new(parse_static(p, export_)?)));
+    }
+    // `extern "…";` names foreign code to link; it takes no `export`.
+    if (t == Tok::Extern && peek_tok(p, 1) == Tok::Str)
+    {
+        if (export_)
+        {
+            return Err(err_at(p, "`export` on `extern \"…\";`, which declares no name"));
+        }
+        usize l = line(p);
+        bump(p);
+        String code = cur_text(p);
+        bump(p);
+        expect(p, Tok::Semi)?;
+        return Ok(Item::IExternCode(Box::new(ExternCodeItem { .code = code, .line = l })));
+    }
+    // D-0146: `unsafe extern fn`.
+    if (t == Tok::Unsafe && peek_tok(p, 1) == Tok::Extern)
+    {
+        bump(p);
+        if (peek_tok(p, 1) == Tok::Str)
+        {
+            return Err(err_at(p, "`unsafe` on `extern \"…\";`, which declares no signature: write `extern \"…\";`"));
+        }
+        return Ok(Item::IExtern(Box::new(parse_extern(p, export_)?)));
+    }
+    // D-0257: `extern fn name(…) : τ { … }` defines a function C calls.
+    if (t == Tok::Extern)
+    {
+        bump(p);
+        return Ok(Item::IFn(Box::new(parse_fn(p, export_, true)?)));
+    }
+    if (t == Tok::Resource || t == Tok::Struct)
+    {
+        return Ok(Item::IStruct(Box::new(parse_struct(p, export_)?)));
+    }
+    if (t == Tok::Bitstruct)
+    {
+        return Ok(Item::IStruct(Box::new(parse_bitstruct(p, export_)?)));
+    }
+    if (t == Tok::Enum)
+    {
+        return Ok(Item::IEnum(Box::new(parse_enum(p, export_)?)));
+    }
+    if (t == Tok::Module)
+    {
+        bump(p);
+        usize l = line(p);
+        String name = ident(p)?;
+        expect(p, Tok::LBrace)?;
+        Vec::push(&mut p.module_path, String::clone(&name));
+        Vec<Item> items = Vec::new();
+        while (cur(p) != Tok::RBrace)
+        {
+            match (parse_item(p))
+            {
+                Ok(it) : Vec::push(&mut items, it),
+                Err(e) :
+                {
+                    Vec::pop(&mut p.module_path);
+                    return Err(e);
+                },
+            }
+            Vec::append(&mut items, replace(&mut p.hoisted, Vec::new()));
+        }
+        Vec::pop(&mut p.module_path);
+        expect(p, Tok::RBrace)?;
+        return Ok(Item::IModule(Box::new(ModuleItem { .export_ = export_, .name = name, .items = items, .line = l })));
+    }
+    if (t == Tok::Import)
+    {
+        usize l = line(p);
+        bump(p);
+        Vec<String> segs = Vec::new();
+        Vec::push(&mut segs, ident(p)?);
+        while (eat(p, Tok::ColonColon))
+        {
+            Vec::push(&mut segs, ident(p)?);
+        }
+        expect(p, Tok::Semi)?;
+        return Ok(Item::IImport(Box::new(ImportItem { .export_ = export_, .path = String::join(
+            &segs[0..$],
+            "::",
+        ), .line = l })));
+    }
+    // The C habits a newcomer brings to file scope.
+    if (t == Tok::Ident)
+    {
+        String w = cur_text(p);
+        if (w == "static_assert")
+        {
+            return Err(err_at(
+                p,
+                "`static_assert` is a statement: write it inside a function body, such as `main` (D-0052)",
+            ));
+        }
+        if (w == "int" || w == "char" || w == "long" || w == "short" || w == "unsigned" || w == "float" || w == "double" || w == "void")
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf(
+                    "`%s` is C; a function is `fn name(T param, …) : T { … }`, and the types are `i32`, `u8`, `f64`, … (`spec/22`)",
+                    &w,
+                )),
+            ));
+        }
+    }
+    if (t == Tok::TypeName)
+    {
+        String w = cur_text(p);
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf(
+                "found `%s` at file scope: a program has no global variables; write `const %s NAME = …;` for a constant, or keep the value in `main` and pass it on",
+                &w,
+                &w,
+            )),
+        ));
+    }
+    if (t == Tok::Semi)
+    {
+        return Err(err_at(
+            p,
+            "a stray `;` at file scope: a declaration ends at its `}` and needs no `;` after it (C's `struct P { … };`)",
+        ));
+    }
+    if (t == Tok::Auto)
+    {
+        return Err(err_at(
+            p,
+            "found `auto` at file scope: a program has no global variables; write `const T NAME = …;` for a constant, or keep the value in `main` and pass it on",
+        ));
+    }
+    Err(err_at(
+        p,
+        String::as_view(&sprintf(
+            "expected a declaration (`fn`, `struct`, `enum`, `const`, `module`, `import`, …), found %s",
+            &found(p),
+        )),
+    ))
+}
+
+fn parse_type_params(ref<Parser, exclusive> p) : Result<Vec<String>, SyntaxError>
+{
+    TypeParams tp = parse_bounded_type_params(p)?;
+    foreach (b in &tp.bounds)
+    {
+        if (Option::is_some(b))
+        {
+            return Err(err_at(
+                p,
+                "a bound (`T: ordered`) is written on a function's type parameters, not on a struct's or an enum's; bound the functions that use the operations",
+            ));
+        }
+    }
+    TypeParams { names, bounds } = tp;
+    Ok(names)
+}
+
+// `<T, U: ordered>` (D-0090): each type parameter with its bound, if any.
+fn parse_bounded_type_params(ref<Parser, exclusive> p) : Result<TypeParams, SyntaxError>
+{
+    TypeParams tp = TypeParams { .names = Vec::new(), .bounds = Vec::new() };
+    if (eat(p, Tok::Lt))
+    {
+        while (true)
+        {
+            Vec::push(&mut tp.names, ident(p)?);
+            if (eat(p, Tok::Colon))
+            {
+                String w = ident(p)?;
+                match (bound_from(String::as_view(&w)))
+                {
+                    Some(b) : Vec::push(&mut tp.bounds, Some(b)),
+                    None    :
+                    {
+                        return Err(err_at(
+                            p,
+                            String::as_view(&sprintf(
+                                "`%s` is not a bound; a type parameter's bound is one of `eq`, `ordered`, `number`, `integer`, `clone`",
+                                &w,
+                            )),
+                        ));
+                    },
+                }
+            }
+            else
+            {
+                Vec::push(&mut tp.bounds, None);
+            }
+            if (!eat(p, Tok::Comma))
+            {
+                break;
+            }
+        }
+        expect_close_angle(p)?;
+    }
+    Ok(tp)
+}
+
+fn parse_params(ref<Parser, exclusive> p) : Result<Vec<ParamDecl>, SyntaxError>
+{
+    Vec<ParamDecl> ps = Vec::new();
+    expect(p, Tok::LParen)?;
+    if (!eat(p, Tok::RParen))
+    {
+        while (true)
+        {
+            Type ty = parse_type(p)?;
+            no_c_array_suffix(p)?;
+            String name = ident(p)?;
+            Vec::push(&mut ps, ParamDecl { .ty = ty, .name = name });
+            // D-0098: a trailing comma before `)`.
+            if (!eat(p, Tok::Comma) || cur(p) == Tok::RParen)
+            {
+                break;
+            }
+        }
+        expect(p, Tok::RParen)?;
+    }
+    Ok(ps)
+}
+
+fn parse_ret_type(ref<Parser, exclusive> p) : Result<Type, SyntaxError>
+{
+    if (eat(p, Tok::Colon))
+    {
+        return parse_type(p);
+    }
+    Ok(Type::TVoid)
+}
+
+// A constant's type, or `auto` (D-0068), `Void` until `consts` decides.
+struct ConstType
+{
+    Type ty;
+    bool auto_type;
+}
+
+fn parse_const_type(ref<Parser, exclusive> p) : Result<ConstType, SyntaxError>
+{
+    if (eat(p, Tok::Auto))
+    {
+        return Ok(ConstType { .ty = Type::TVoid, .auto_type = true });
+    }
+    Ok(ConstType { .ty = parse_type(p)?, .auto_type = false })
+}
+
+// `T[N] name` as C writes it: name the form CobaltC uses (D-0072).
+fn no_c_array_suffix(ref<Parser, shared> p) : Result<void, SyntaxError>
+{
+    if (cur(p) == Tok::LBracket)
+    {
+        return Err(err_at(
+            p,
+            "a fixed-size array's type is written `array<T, N>`, as in `array<i32, 4> xs = [1, 2, 3, 4];`",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_static(ref<Parser, exclusive> p, bool export_) : Result<StaticDecl, SyntaxError>
+{
+    expect(p, Tok::Static)?;
+    usize l = line(p);
+    if (cur(p) == Tok::Auto)
+    {
+        return Err(err_at(p, "a `static` names its type: `static Atomic<u64> NAME = 0;`"));
+    }
+    Type ty = parse_type(p)?;
+    no_c_array_suffix(p)?;
+    String name = ident(p)?;
+    if (cur(p) != Tok::Eq)
+    {
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf("a `static` has its first value: `static %s %s = …;`", &type_display(&ty), &name)),
+        ));
+    }
+    expect(p, Tok::Eq)?;
+    Expr init = parse_expr(p)?;
+    expect(p, Tok::Semi)?;
+    Ok(StaticDecl { .export_ = export_, .name = name, .ty = ty, .init = init, .line = l })
+}
+
+fn const_fn(bool export_, String name, ConstType ct, Expr e, usize l) : FnDecl
+{
+    ConstType { ty, auto_type } = ct;
+    FnDecl {
+        .export_ = export_,
+        .assoc_type = None,
+        .name = name,
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = Vec::new(),
+        .ret = ty,
+        .body = block_of(Vec::new(), Some(e)),
+        .line = l,
+        .is_const = true,
+        .auto_type = auto_type,
+        .derived = false,
+        .c_entry = false,
+    }
+}
+
+// `const τ NAME = e;` (D-0036).
+fn parse_const(ref<Parser, exclusive> p, bool export_) : Result<FnDecl, SyntaxError>
+{
+    expect(p, Tok::Const)?;
+    usize l = line(p);
+    ConstType ct = parse_const_type(p)?;
+    no_c_array_suffix(p)?;
+    String name = ident(p)?;
+    expect(p, Tok::Eq)?;
+    Expr e = parse_expr(p)?;
+    expect(p, Tok::Semi)?;
+    Ok(const_fn(export_, name, ct, e, l))
+}
+
+// The scopes a function's body sees of the enclosing function: its local
+// types and constants, not its variables (D-0069).
+fn visible_scopes(ref<Vec<HashMap<String, Option<String>>>, shared> scopes) : Vec<HashMap<String, Option<String>>>
+{
+    Vec<HashMap<String, Option<String>>> out = Vec::new();
+    foreach (m in scopes)
+    {
+        HashMap<String, Option<String>> v = HashMap::new();
+        for (usize i = 0; i < HashMap::len(m); i += 1)
+        {
+            ref<Option<String>, shared> val = HashMap::value_at(m, i);
+            if (Option::is_some(val))
+            {
+                HashMap::insert(&mut v, String::clone(HashMap::key_at(m, i)), clone(val));
+            }
+        }
+        Vec::push(&mut out, v);
+    }
+    out
+}
+
+fn scope_of_names(ref<Vec<String>, shared> names) : HashMap<String, Option<String>>
+{
+    HashMap<String, Option<String>> m = HashMap::new();
+    foreach (n in names)
+    {
+        HashMap::insert(&mut m, String::clone(n), None);
+    }
+    m
+}
+
+fn param_names(ref<Vec<ParamDecl>, shared> ps) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    foreach (x in ps)
+    {
+        Vec::push(&mut out, String::clone(&x.name));
+    }
+    out
+}
+
+fn parse_fn(ref<Parser, exclusive> p, bool export_, bool c_entry) : Result<FnDecl, SyntaxError>
+{
+    expect(p, Tok::Fn)?;
+    usize l = line(p);
+    // D-0230: `unittest` blocks are the functions `__unittest_N`.
+    if (cur(p) == Tok::Ident && String::starts_with(&p.toks[p.pos].text, "__unittest_"))
+    {
+        return Err(err_at(p, "names beginning `__unittest_` are reserved for `unittest` blocks"));
+    }
+    String first = ident(p)?;
+    Option<String> assoc = None;
+    String name = String::new();
+    if (eat(p, Tok::ColonColon))
+    {
+        assoc = Some(first);
+        name = ident(p)?;
+    }
+    else
+    {
+        name = first;
+    }
+    // D-0069: `fn T::f` in a block, `T` a local type: the function of
+    // `T`'s hidden item.
+    Option<String> assoc_type = match (assoc)
+    {
+        Some(t) :
+        {
+            match (lookup_type(p, String::as_view(&t)))
+            {
+                Some(h) : Some(h),
+                None    :
+                {
+                    if (Vec::len(&p.scopes) > 0)
+                    {
+                        return Err(err_at(
+                            p,
+                            String::as_view(&sprintf(
+                                "a function declared in a block must belong to a type declared there, not `%s`",
+                                &t,
+                            )),
+                        ));
+                    }
+                    Some(t)
+                },
+            }
+        },
+        None    : None,
+    };
+    TypeParams tp = parse_bounded_type_params(p)?;
+    Vec<ParamDecl> params = parse_params(p)?;
+    Type ret = parse_ret_type(p)?;
+    // D-0257: a function C calls has one C name.
+    if (c_entry)
+    {
+        if (cur(p) == Tok::Semi)
+        {
+            return Err(err_at(
+                p,
+                "an `extern fn` declaration is written `unsafe extern fn`: its signature is an unchecked claim about foreign code (D-0146); `extern fn` with a body defines a function C calls (D-0257)",
+            ));
+        }
+        if (Option::is_some(&assoc_type))
+        {
+            return Err(err_at(
+                p,
+                "a function C calls (`extern fn` with a body) is not an associated function: C has one name for it",
+            ));
+        }
+        if (Vec::len(&tp.names) > 0)
+        {
+            return Err(err_at(
+                p,
+                "a function C calls (`extern fn` with a body) is not generic: C cannot instantiate it",
+            ));
+        }
+    }
+    Vec<String> saved_tps = replace(&mut p.fn_type_params, Vec::clone(&tp.names));
+    Vec<HashMap<String, Option<String>>> visible = visible_scopes(&p.scopes);
+    Vec<HashMap<String, Option<String>>> saved_scopes = replace(&mut p.scopes, visible);
+    Vec<String> pn = param_names(&params);
+    Vec::push(&mut p.scopes, scope_of_names(&pn));
+    Vec<HashMap<String, usize>> saved_regions = replace(&mut p.regions, Vec::new());
+    open_binder_region(p, &pn, l);
+    Result<Block, SyntaxError> body = parse_block(p);
+    p.regions = saved_regions;
+    p.join_at = None;
+    p.scopes = saved_scopes;
+    p.fn_type_params = saved_tps;
+    Block b = match (body)
+    {
+        Ok(x)  : x,
+        Err(e) : return Err(e),
+    };
+    TypeParams { names, bounds } = tp;
+    Ok(FnDecl {
+        .export_ = export_,
+        .assoc_type = assoc_type,
+        .name = name,
+        .type_params = names,
+        .type_bounds = bounds,
+        .params = params,
+        .ret = ret,
+        .body = b,
+        .line = l,
+        .is_const = false,
+        .auto_type = false,
+        .derived = false,
+        .c_entry = c_entry,
+    })
+}
+
+// Whether a test's name holds a control character.
+fn has_control(ref<String, shared> s) : bool
+{
+    foreach (b in String::as_bytes(s))
+    {
+        if (*b < 0x20 || *b == 0x7F)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// How far above `line` the line `first` is, as messages say it.
+fn lines_above(usize line, usize first) : String
+{
+    usize n = if (line > first) { line - first } else { 0 };
+    if (n == 0)
+    {
+        return String::from_str("on this line");
+    }
+    if (n == 1)
+    {
+        return String::from_str("on the line above");
+    }
+    sprintf("%v lines above", n)
+}
+
+// A diagnostic with its message, at `line`: `diag.x\u{1}message@line`.
+fn named_at(str id, ref<String, shared> msg, usize line) : String
+{
+    sprintf("%s\u{1}%s@%v", id, msg, line)
+}
+
+// D-0230: `unittest "name" { … }`, the hidden, exported function
+// `__unittest_N` of its module.
+fn parse_unittest(ref<Parser, exclusive> p) : Result<FnDecl, SyntaxError>
+{
+    usize l = line(p);
+    expect(p, Tok::Unittest)?;
+    Option<String> name = None;
+    if (cur(p) == Tok::Str)
+    {
+        String s = cur_text(p);
+        usize name_line = line(p);
+        bump(p);
+        String modname = String::join(&p.module_path[0..$], "::");
+        String key = sprintf("%s\u{0}%s", &modname, &s);
+        Option<String> bad = None;
+        if (String::len(&s) == 0)
+        {
+            bad = Some(String::from_str("a `unittest`'s name is not empty: leave it out, or say what the test checks"));
+        }
+        else if (has_control(&s))
+        {
+            bad = Some(String::from_str("a `unittest`'s name holds no control character (a newline, a tab, …): the report shows it on one line"));
+        }
+        else
+        {
+            match (HashMap::get(&p.test_names, &key))
+            {
+                Some(first) :
+                {
+                    bad = Some(sprintf(
+                        "this module already has a test named \"%s\" (%s); give each test of a module its own name",
+                        &s,
+                        &lines_above(name_line, *first),
+                    ));
+                },
+                None        : {},
+            }
+        }
+        match (bad)
+        {
+            Some(msg) :
+            {
+                if (Option::is_none(&p.local_error))
+                {
+                    p.local_error = Some(named_at("diag.unittest-name", &msg, name_line));
+                }
+            },
+            None      :
+            {
+                HashMap::insert(&mut p.test_names, key, name_line);
+            },
+        }
+        name = Some(s);
+    }
+    if (cur(p) != Tok::LBrace)
+    {
+        return Err(err_at(p, "expected the test's body `{` after `unittest` and its name"));
+    }
+    Vec<HashMap<String, Option<String>>> saved_scopes = replace(&mut p.scopes, Vec::new());
+    Vec<HashMap<String, usize>> saved_regions = replace(&mut p.regions, Vec::new());
+    Vec<String> saved_tps = replace(&mut p.fn_type_params, Vec::new());
+    Vec::push(&mut p.scopes, HashMap::new());
+    Vec<String> none = Vec::new();
+    open_binder_region(p, &none, l);
+    Result<Block, SyntaxError> body = parse_block(p);
+    p.regions = saved_regions;
+    p.join_at = None;
+    p.scopes = saved_scopes;
+    p.fn_type_params = saved_tps;
+    Block b = match (body)
+    {
+        Ok(x)  : x,
+        Err(e) : return Err(e),
+    };
+    String fn_name = sprintf("__unittest_%v", Vec::len(&p.tests) + p.test_base + 1);
+    Vec::push(
+        &mut p.tests,
+        UnitTest { .module_ = Vec::clone(&p.module_path), .fn_name = String::clone(&fn_name), .name = name, .line = l },
+    );
+    Ok(FnDecl {
+        .export_ = true,
+        .assoc_type = None,
+        .name = fn_name,
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = Vec::new(),
+        .ret = Type::TVoid,
+        .body = b,
+        .line = l,
+        .is_const = false,
+        .auto_type = false,
+        .derived = false,
+        .c_entry = false,
+    })
+}
+
+fn parse_extern(ref<Parser, exclusive> p, bool export_) : Result<ExternDecl, SyntaxError>
+{
+    expect(p, Tok::Extern)?;
+    expect(p, Tok::Fn)?;
+    usize l = line(p);
+    String name = ident(p)?;
+    Vec<ParamDecl> params = parse_params(p)?;
+    Type ret = parse_ret_type(p)?;
+    expect(p, Tok::Semi)?;
+    Ok(ExternDecl { .export_ = export_, .name = name, .params = params, .ret = ret, .line = l })
+}
+
+fn is_power_of_two(u128 v) : bool
+{
+    v != 0 && (v & (v - 1)) == 0
+}
+
+fn parse_struct(ref<Parser, exclusive> p, bool export_) : Result<StructDecl, SyntaxError>
+{
+    bool resource_ = eat(p, Tok::Resource);
+    expect(p, Tok::Struct)?;
+    usize l = line(p);
+    String name = ident(p)?;
+    Vec<String> type_params = parse_type_params(p)?;
+    // D-0251: `align(N)`, a contextual word here and nowhere else.
+    Option<u64> align = None;
+    if (cur_is_word(p, "align"))
+    {
+        bump(p);
+        expect(p, Tok::LParen)?;
+        bool ok = cur(p) == Tok::Int && Option::is_none(&p.toks[p.pos].sfx) && is_power_of_two(p.toks[p.pos].ival) && p.toks[p.pos].ival <= 4096;
+        if (!ok)
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf("`align(N)` on `%s` takes a power of two from 1 to 4096", &name)),
+            ));
+        }
+        align = Some(narrow<u64>(p.toks[p.pos].ival));
+        bump(p);
+        expect(p, Tok::RParen)?;
+    }
+    expect(p, Tok::LBrace)?;
+    Vec<FieldDecl> fields = Vec::new();
+    while (cur(p) != Tok::RBrace)
+    {
+        bool fexport = eat(p, Tok::Export);
+        Type ty = parse_type(p)?;
+        no_c_array_suffix(p)?;
+        String fname = ident(p)?;
+        expect(p, Tok::Semi)?;
+        Vec::push(&mut fields, FieldDecl { .export_ = fexport, .ty = ty, .name = fname, .width = None });
+    }
+    expect(p, Tok::RBrace)?;
+    Ok(StructDecl {
+        .export_ = export_,
+        .resource_ = resource_,
+        .name = name,
+        .type_params = type_params,
+        .fields = fields,
+        .line = l,
+        .bits = None,
+        .align = align,
+    })
+}
+
+// The address width the parser measures `isize`/`usize` in (`crate::value::ADDR_WIDTH`).
+const u32 ADDR_WIDTH = 64;
+
+// D-0118: `bitstruct Name : uN { f : w; … }`.
+fn parse_bitstruct(ref<Parser, exclusive> p, bool export_) : Result<StructDecl, SyntaxError>
+{
+    expect(p, Tok::Bitstruct)?;
+    usize l = line(p);
+    String name = ident(p)?;
+    expect(p, Tok::Colon)?;
+    Type bt = parse_type(p)?;
+    IntTy backing = match (bt)
+    {
+        Type::TInt(t) :
+        {
+            if (int_ty_signed(t))
+            {
+                return Err(err_at(
+                    p,
+                    String::as_view(&sprintf(
+                        "a `bitstruct` is backed by an unsigned integer type (`u8` to `u128`), not `%s`",
+                        &type_display(&bt),
+                    )),
+                ));
+            }
+            t
+        },
+        _             :
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf(
+                    "a `bitstruct` is backed by an unsigned integer type (`u8` to `u128`), not `%s`",
+                    &type_display(&bt),
+                )),
+            ));
+        },
+    };
+    u32 total = int_ty_bits(backing, ADDR_WIDTH);
+    expect(p, Tok::LBrace)?;
+    Vec<FieldDecl> fields = Vec::new();
+    u32 used = 0;
+    while (cur(p) != Tok::RBrace)
+    {
+        bool fexport = eat(p, Tok::Export);
+        String fname = ident(p)?;
+        expect(p, Tok::Colon)?;
+        bool ok = cur(p) == Tok::Int && Option::is_none(&p.toks[p.pos].sfx) && p.toks[p.pos].ival >= 1 && p.toks[p.pos].ival <= 128;
+        if (!ok)
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf(
+                    "field `%s` of `%s` needs a width in bits, 1 to %v, after the `:`",
+                    &fname,
+                    &name,
+                    total,
+                )),
+            ));
+        }
+        u32 w = narrow<u32>(p.toks[p.pos].ival);
+        bump(p);
+        expect(p, Tok::Semi)?;
+        if (w > total)
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf(
+                    "field `%s` of `%s` is %v bits wide, but `%s` has only %v",
+                    &fname,
+                    &name,
+                    w,
+                    &name,
+                    total,
+                )),
+            ));
+        }
+        IntTy fty = if (w <= 8) { IntTy::U8 } else if (w <= 16) { IntTy::U16 } else if (w <= 32) { IntTy::U32 } else if (w <= 64) { IntTy::U64 } else { IntTy::U128 };
+        used += w;
+        Vec::push(
+            &mut fields,
+            FieldDecl { .export_ = fexport, .ty = Type::TInt(fty), .name = fname, .width = Some(w) },
+        );
+    }
+    expect(p, Tok::RBrace)?;
+    if (used != total)
+    {
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf(
+                "the fields of `bitstruct %s` fill %v of its %v bits; they must fill it exactly (name the unused bits, e.g. `pad : %v;`)",
+                &name,
+                used,
+                total,
+                if (total > used) { total - used } else { 0 },
+            )),
+        ));
+    }
+    Ok(StructDecl {
+        .export_ = export_,
+        .resource_ = false,
+        .name = name,
+        .type_params = Vec::new(),
+        .fields = fields,
+        .line = l,
+        .bits = Some(backing),
+        .align = None,
+    })
+}
+
+fn parse_enum(ref<Parser, exclusive> p, bool export_) : Result<EnumDecl, SyntaxError>
+{
+    bool resource_ = eat(p, Tok::Resource);
+    expect(p, Tok::Enum)?;
+    usize l = line(p);
+    String name = ident(p)?;
+    Vec<String> type_params = parse_type_params(p)?;
+    // D-0106: `enum Op : u8 { … }`: each variant has a code of that type.
+    Option<Type> code_ty = None;
+    if (eat(p, Tok::Colon))
+    {
+        Type t = parse_type(p)?;
+        bool is_int = match (t)
+        {
+            Type::TInt(_) : true,
+            _             : false,
+        };
+        if (!is_int)
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf("an enum's code type is an integer type, not `%s`", &type_display(&t))),
+            ));
+        }
+        if (Vec::len(&type_params) > 0)
+        {
+            return Err(err_at(p, "a generic enum cannot have codes"));
+        }
+        if (Vec::len(&p.scopes) > 0)
+        {
+            return Err(err_at(p, "an enum declared in a function cannot have codes; declare it at module level"));
+        }
+        code_ty = Some(t);
+    }
+    bool coded = Option::is_some(&code_ty);
+    Vec<i128> codes = Vec::new();
+    expect(p, Tok::LBrace)?;
+    Vec<VariantDecl> variants = Vec::new();
+    while (cur(p) != Tok::RBrace)
+    {
+        String vname = ident(p)?;
+        Option<Type> payload = None;
+        if (eat(p, Tok::LParen))
+        {
+            Type t = parse_type(p)?;
+            if (cur(p) == Tok::Comma)
+            {
+                // D-0073: say what to do instead.
+                return Err(err_at(
+                    p,
+                    "a variant carries one payload; to carry several values, make the payload a struct",
+                ));
+            }
+            expect(p, Tok::RParen)?;
+            payload = Some(t);
+        }
+        if (coded && Option::is_some(&payload))
+        {
+            return Err(err_at(p, "an enum with codes has no payloads"));
+        }
+        if (cur(p) == Tok::Eq)
+        {
+            if (!coded)
+            {
+                return Err(err_at(
+                    p,
+                    String::as_view(&sprintf(
+                        "a variant's number needs the enum's code type (D-0106): `enum %s : u8 { %s = 1, … }`",
+                        &name,
+                        &vname,
+                    )),
+                ));
+            }
+            bump(p);
+            bool neg = eat(p, Tok::Minus);
+            if (!(cur(p) == Tok::Int && Option::is_none(&p.toks[p.pos].sfx)))
+            {
+                return Err(err_at(
+                    p,
+                    String::as_view(&sprintf("a variant's code is an integer literal, found %s", &found(p))),
+                ));
+            }
+            // `v as i128`: the literal's bits.
+            i128 v = reinterpret<i128>(p.toks[p.pos].ival);
+            bump(p);
+            Vec::push(&mut codes, if (neg) { -v } else { v });
+        }
+        else if (coded)
+        {
+            usize nc = Vec::len(&codes);
+            Vec::push(&mut codes, if (nc == 0) { 0 } else { codes[nc - 1] + 1 });
+        }
+        usize nc = Vec::len(&codes);
+        if (coded && nc > 0)
+        {
+            i128 last = codes[nc - 1];
+            for (usize k = 0; k + 1 < nc; k += 1)
+            {
+                if (codes[k] == last)
+                {
+                    return Err(err_at(
+                        p,
+                        String::as_view(&sprintf("two variants of `%s` have the code %v", &name, last)),
+                    ));
+                }
+            }
+        }
+        Vec::push(&mut variants, VariantDecl { .name = vname, .payload = payload });
+        if (!eat(p, Tok::Comma))
+        {
+            break;
+        }
+    }
+    expect(p, Tok::RBrace)?;
+    // D-0106: `Op::code(Op v) : T` and `Op::from_code(T n) : Option<Op>`,
+    // written as CobaltC and parsed here, hoisted beside the enum.
+    match (&code_ty)
+    {
+        Some(t) :
+        {
+            String vis = if (export_) { String::from_str("export ") } else { String::new() };
+            String tt = type_display(t);
+            Vec<String> to = Vec::new();
+            Vec<String> from = Vec::new();
+            for (usize k = 0; k < Vec::len(&variants); k += 1)
+            {
+                Vec::push(&mut to, sprintf("%s::%s : %v", &name, &variants[k].name, codes[k]));
+                Vec::push(&mut from, sprintf("%v : Some(%s::%s)", codes[k], &name, &variants[k].name));
+            }
+            String text = sprintf(
+                "%sfn %s::code(%s v) : %s { match (v) { %s } }\n%sfn %s::from_code(%s c) : Option<%s> { match (c) { %s, _ : None } }\n",
+                &vis,
+                &name,
+                &name,
+                &tt,
+                &String::join(&to[0..$], ", "),
+                &vis,
+                &name,
+                &tt,
+                &name,
+                &String::join(&from[0..$], ", "),
+            );
+            Vec<PTok> toks = match (lex_tokens(&text))
+            {
+                Ok(t)  : t,
+                Err(e) : return Err(err_at(p, String::as_view(&sprintf("internal: enum codes: %s", &e.msg)))),
+            };
+            for (usize k = 0; k < Vec::len(&toks); k += 1)
+            {
+                toks[k].line = l;
+            }
+            Parser sub = new_parser(toks, 0);
+            sub.type_names = HashSet::clone(&p.type_names);
+            HashSet::insert(&mut sub.type_names, String::clone(&name));
+            while (cur(&sub) != Tok::Eof)
+            {
+                Item it = parse_item(&mut sub)?;
+                Vec::push(&mut p.hoisted, it);
+            }
+        },
+        None    : {},
+    }
+    Ok(EnumDecl { .export_ = export_, .resource_ = resource_, .name = name, .type_params = type_params, .variants = variants, .line = l })
+}
+
+// ---- types ----
+
+fn boxed_ty(Type t) : Box<Type>
+{
+    Box::new(t)
+}
+
+fn parse_type(ref<Parser, exclusive> p) : Result<Type, SyntaxError>
+{
+    Tok t = cur(p);
+    if (t == Tok::Void)
+    {
+        bump(p);
+        return Ok(Type::TVoid);
+    }
+    if (t == Tok::TypeName)
+    {
+        String n = cur_text(p);
+        // `array(p)`: no type is followed by `(`.
+        if (peek_tok(p, 1) == Tok::LParen)
+        {
+            return Err(err_at(p, String::as_view(&reserved_call(String::as_view(&n)))));
+        }
+        bump(p);
+        if (n == "f32")
+        {
+            return Ok(Type::TF32);
+        }
+        if (n == "f64")
+        {
+            return Ok(Type::TF64);
+        }
+        if (n == "bool")
+        {
+            return Ok(Type::TBool);
+        }
+        if (n == "str")
+        {
+            return Ok(Type::TStr);
+        }
+        if (n == "ref" || n == "slice")
+        {
+            expect(p, Tok::Lt)?;
+            Type inner = parse_type(p)?;
+            expect(p, Tok::Comma)?;
+            Mode m = ident_or_mode(p)?;
+            expect_close_angle(p)?;
+            Box<ModedTy> b = Box::new(ModedTy { .inner = inner, .mode = m });
+            return Ok(if (n == "ref") { Type::TRef(b) } else { Type::TSlice(b) });
+        }
+        if (n == "rawptr" || n == "handle" || n == "mutex" || n == "guard")
+        {
+            expect(p, Tok::Lt)?;
+            Type inner = parse_type(p)?;
+            expect_close_angle(p)?;
+            Box<Type> b = Box::new(inner);
+            return Ok(match (String::as_view(&n))
+            {
+                "rawptr" : Type::TRawptr(b),
+                "handle" : Type::THandle(b),
+                "mutex"  : Type::TMutex(b),
+                _        : Type::TGuard(b),
+            });
+        }
+        if (n == "array")
+        {
+            expect(p, Tok::Lt)?;
+            Type inner = parse_type(p)?;
+            expect(p, Tok::Comma)?;
+            u128 len = array_length(p)?;
+            expect_close_angle(p)?;
+            return Ok(Type::TArray(Box::new(SizedTy { .inner = inner, .n = len })));
+        }
+        if (n == "simd")
+        {
+            // D-0254: the vector shapes; another is a type error, reported
+            // once the item is read.
+            usize l = line(p);
+            expect(p, Tok::Lt)?;
+            Type inner = parse_type(p)?;
+            expect(p, Tok::Comma)?;
+            u128 len = array_length(p)?;
+            expect_close_angle(p)?;
+            u128 lane = match (inner)
+            {
+                Type::TInt(it) : if (it == IntTy::I128 || it == IntTy::U128) { 0 } else
+                {
+                    widen<u128>(int_ty_bits(
+                        it,
+                        64,
+                    )) / 8
+                },
+                Type::TF32 : 4,
+                Type::TF64 : 8,
+                _          : 0,
+            };
+            bool ok = false;
+            if (lane > 0 && len >= 2 && is_power_of_two(len) && len <= 64)
+            {
+                u128 bytes = len * lane;
+                ok = bytes == 8 || bytes == 16 || bytes == 32 || bytes == 64;
+            }
+            if (!ok && Option::is_none(&p.local_error))
+            {
+                String msg = sprintf(
+                    "`simd<%s, %v>` is not a vector shape: the lanes are an integer type (not 128-bit) or a float, their number a power of two from 2, and the whole 8, 16, 32 or 64 bytes (such as `simd<f32, 4>`, `simd<u8, 16>`, `simd<f64, 4>`)",
+                    &type_display(&inner),
+                    len,
+                );
+                p.local_error = Some(named_at("diag.type-mismatch", &msg, l));
+            }
+            return Ok(Type::TSimd(Box::new(SizedTy { .inner = inner, .n = len })));
+        }
+        match (int_ty_from(String::as_view(&n)))
+        {
+            Some(it) : return Ok(Type::TInt(it)),
+            None     : {},
+        }
+        return Err(err_at(p, String::as_view(&sprintf("unknown type constructor %s", &n))));
+    }
+    if (t == Tok::Fn)
+    {
+        bump(p);
+        expect(p, Tok::LParen)?;
+        Vec<Type> params = Vec::new();
+        if (!eat(p, Tok::RParen))
+        {
+            while (true)
+            {
+                Vec::push(&mut params, parse_type(p)?);
+                if (!eat(p, Tok::Comma) || cur(p) == Tok::RParen)
+                {
+                    break;
+                }
+            }
+            expect(p, Tok::RParen)?;
+        }
+        Type ret = parse_ret_type(p)?;
+        return Ok(Type::TFn(Box::new(FnTy { .params = params, .ret = ret })));
+    }
+    if (t == Tok::Ident)
+    {
+        String first = cur_text(p);
+        bump(p);
+        // A declared type may be named by a qualified path (`geom::Point`).
+        String name = match (lookup_type(p, String::as_view(&first)))
+        {
+            Some(h) : if (cur(p) != Tok::ColonColon) { h } else { first },
+            None    : first,
+        };
+        while (cur(p) == Tok::ColonColon)
+        {
+            bump(p);
+            String seg = ident(p)?;
+            name = sprintf("%s::%s", &name, &seg);
+        }
+        Vec<Type> args = Vec::new();
+        if (eat(p, Tok::Lt))
+        {
+            while (true)
+            {
+                Vec::push(&mut args, parse_type(p)?);
+                if (!eat(p, Tok::Comma))
+                {
+                    break;
+                }
+            }
+            expect_close_angle(p)?;
+        }
+        return Ok(Type::TNamed(Box::new(NamedTy { .name = name, .args = args })));
+    }
+    if (t == Tok::LParen && peek_tok(p, 1) == Tok::RParen)
+    {
+        return Err(err_at(
+            p,
+            "the unit type is written `void` (`()` is its value): `Result<void, E>`, `fn f() : void`",
+        ));
+    }
+    if (t == Tok::LParen)
+    {
+        return Err(err_at(p, "CobaltC has no tuple types (D-0073): declare a struct with named fields"));
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected a type, found %s", &found(p)))))
+}
+
+fn ident_or_mode(ref<Parser, exclusive> p) : Result<Mode, SyntaxError>
+{
+    if (cur_is_word(p, "shared"))
+    {
+        bump(p);
+        return Ok(Mode::Shared);
+    }
+    if (cur_is_word(p, "exclusive"))
+    {
+        bump(p);
+        return Ok(Mode::Exclusive);
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected `shared` or `exclusive`, found %s", &found(p)))))
+}
+
+// A module's constant named `m::N` (D-0105), found from the current module
+// outward and visible here.
+fn module_length(ref<Parser, shared> p, ref<Vec<String>, shared> segs) : Result<u128, String>
+{
+    String q = String::join(&segs[0..$], "::");
+    usize mp = Vec::len(&p.module_path);
+    usize up = mp + 1;
+    while (up > 0)
+    {
+        up -= 1;
+        String key = if (up == 0) { String::clone(&q) } else
+        {
+            sprintf(
+                "%s::%s",
+                &String::join(&p.module_path[0..up], "::"),
+                &q,
+            )
+        };
+        match (HashMap::get(&p.module_lengths, &key))
+        {
+            Some(m) :
+            {
+                // The declaring module's path, and whether the parser is inside it.
+                Vec<String> decl_mod = Vec::new();
+                if (up > 0)
+                {
+                    Vec::extend_from(&mut decl_mod, &p.module_path[0..up]);
+                }
+                Vec::extend_from(&mut decl_mod, &segs[0..Vec::len(segs) - 1]);
+                bool inside = mp >= Vec::len(&decl_mod);
+                for (usize k = 0; inside && k < Vec::len(&decl_mod); k += 1)
+                {
+                    inside = p.module_path[k] == decl_mod[k];
+                }
+                if (!m.exported && !inside)
+                {
+                    return Err(sprintf(
+                        "`%s` is not exported from its module, so it cannot be an array length here",
+                        &q,
+                    ));
+                }
+                return Ok(m.v);
+            },
+            None    : {},
+        }
+    }
+    Err(sprintf("an array length is a constant expression; `%s` is not a constant of a module in this program", &q))
+}
+
+// An array length (`array<T, N>`, `[v; N]`): a constant expression,
+// folded here. Outside parentheses `>`, `>>`, `]`, `;` and `,` end it.
+fn array_length(ref<Parser, exclusive> p) : Result<u128, SyntaxError>
+{
+    usize start = p.pos;
+    usize depth = 0;
+    usize end = start;
+    usize n = Vec::len(&p.toks);
+    while (end < n)
+    {
+        Tok t = p.toks[end].tok;
+        if (t == Tok::LParen)
+        {
+            depth += 1;
+        }
+        else if (t == Tok::RParen)
+        {
+            if (depth == 0)
+            {
+                break;
+            }
+            depth -= 1;
+        }
+        else if (depth == 0 && (t == Tok::Gt || t == Tok::Shr || t == Tok::RBracket || t == Tok::Semi || t == Tok::Comma || t == Tok::LBrace || t == Tok::RBrace || t == Tok::Ge))
+        {
+            break;
+        }
+        end += 1;
+    }
+    if (end == start)
+    {
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf("expected an array length (a constant expression), found %s", &found(p))),
+        ));
+    }
+    Folder f = folder(LOOK_LENGTH);
+    Option<i128> value = fold_const(p, start, end, &mut f);
+    match (value)
+    {
+        Some(v) :
+        {
+            if (v >= 0)
+            {
+                p.pos = end;
+                return Ok(reinterpret<u128>(v));
+            }
+            return Err(err_at(p, "an array length is not negative"));
+        },
+        None    :
+        {
+            match (&f.problem)
+            {
+                Some(m) : return Err(err_at(p, String::as_view(m))),
+                None    :
+                {
+                    return Err(err_at(
+                        p,
+                        "an array length is a constant expression: an integer literal, a constant, or `+ - * / % & | ^ << >> ~ ( )` over them, with no division by zero or overflow",
+                    ));
+                },
+            }
+        },
+    }
+}
+
+fn is_known_type(ref<Parser, shared> p, usize at) : bool
+{
+    tok_at(&p.toks, at) == Tok::Ident && HashSet::contains(&p.type_names, &p.toks[at].text)
+}
+
+// `T [ N ] name`: a C-style array declaration.
+fn c_array_decl_ahead(ref<Parser, shared> p) : bool
+{
+    bool ty = peek_tok(p, 0) == Tok::TypeName || is_known_type(p, p.pos);
+    ty && peek_tok(
+        p,
+        1,
+    ) == Tok::LBracket && peek_tok(p, 2) == Tok::Int && peek_tok(p, 3) == Tok::RBracket && peek_tok(p, 4) == Tok::Ident
+}
+
+// `Mutex<`, `Array<`, … at the start of a statement, naming no declared
+// type: the lower-case built-in type constructor it spells.
+fn capitalized_builtin_ahead(ref<Parser, shared> p) : Option<str>
+{
+    if (peek_tok(p, 0) != Tok::Ident || is_known_type(p, p.pos) || peek_tok(p, 1) != Tok::Lt)
+    {
+        return None;
+    }
+    StringView name = String::as_view(&p.toks[p.pos].text);
+    if (StringView::len(name) == 0 || !ascii_is_upper(StringView::as_bytes(name)[0]))
+    {
+        return None;
+    }
+    String lower = String::to_ascii_lower(&p.toks[p.pos].text);
+    foreach (b in ["mutex", "array", "handle", "guard", "slice", "ref", "rawptr", "simd"])
+    {
+        if (lower == b)
+        {
+            return Some(b);
+        }
+    }
+    None
+}
+
+fn cur_ident_text(ref<Parser, shared> p) : String
+{
+    if (cur(p) == Tok::Ident)
+    {
+        return cur_text(p);
+    }
+    found(p)
+}
+
+fn is_type_start(ref<Parser, shared> p) : bool
+{
+    Tok t = cur(p);
+    t == Tok::TypeName || t == Tok::Void || t == Tok::Fn || is_known_type(p, p.pos) || qualified_type_ahead(p)
+}
+
+// `m::…::Name`, a path whose last segment names a declared struct or enum.
+fn qualified_type_ahead(ref<Parser, shared> p) : bool
+{
+    usize i = p.pos;
+    usize hops = 0;
+    usize last = NONE;
+    while (true)
+    {
+        if (tok_at(&p.toks, i) != Tok::Ident)
+        {
+            return false;
+        }
+        last = i;
+        if (tok_at(&p.toks, i + 1) == Tok::ColonColon)
+        {
+            i += 2;
+            hops += 1;
+        }
+        else
+        {
+            break;
+        }
+    }
+    hops > 0 && last != NONE && HashSet::contains(&p.type_names, &p.toks[last].text)
+}
+
+// ---- blocks and statements ----
+
+fn parse_block(ref<Parser, exclusive> p) : Result<Block, SyntaxError>
+{
+    // D-0131: the body its binders govern joins their region.
+    bool joins = p.join_at == Some(p.pos);
+    p.join_at = None;
+    expect(p, Tok::LBrace)?;
+    Vec::push(&mut p.scopes, HashMap::new());
+    if (!joins)
+    {
+        Vec::push(&mut p.regions, HashMap::new());
+    }
+    Result<Block, SyntaxError> r = parse_block_body(p);
+    if (!joins)
+    {
+        Vec::pop(&mut p.regions);
+    }
+    Vec::pop(&mut p.scopes);
+    r
+}
+
+fn parse_block_body(ref<Parser, exclusive> p) : Result<Block, SyntaxError>
+{
+    Vec<Stmt> stmts = Vec::new();
+    Option<Expr> tail = None;
+    while (cur(p) != Tok::RBrace)
+    {
+        // `T[N] x` as C writes it (D-0072).
+        if (c_array_decl_ahead(p))
+        {
+            return Err(err_at(
+                p,
+                "a fixed-size array's type is written `array<T, N>`, as in `array<i32, 4> xs = [1, 2, 3, 4];`",
+            ));
+        }
+        // `Mutex<T> m = …`: the built-in type constructors are lower case.
+        match (capitalized_builtin_ahead(p))
+        {
+            Some(lower) :
+            {
+                str hint = if (StringView::eq_str(
+                    StringView::of(lower),
+                    "mutex",
+                )) { " (`Mutex::new(v)` makes one)" } else { "" };
+                return Err(err_at(
+                    p,
+                    String::as_view(&sprintf(
+                        "`%s` is not a type; the built-in type is written `%s<…>`%s",
+                        &cur_ident_text(p),
+                        lower,
+                        hint,
+                    )),
+                ));
+            },
+            None        : {},
+        }
+        // `;;` or `{ … };`: C's empty statement.
+        if (cur(p) == Tok::Semi)
+        {
+            return Err(err_at(
+                p,
+                "a stray `;`: CobaltC has no empty statement, and a block, `if`, loop or `match` needs no `;` after its `}`",
+            ));
+        }
+        match (try_parse_stmt(p, &mut stmts)?)
+        {
+            Some(t) :
+            {
+                tail = Some(t);
+                break;
+            },
+            None    : {},
+        }
+    }
+    expect(p, Tok::RBrace)?;
+    Ok(block_of(stmts, tail))
+}
+
+// D-0066: a name bound in the current scope, declared on `line`.
+fn bind_local(ref<Parser, exclusive> p, StringView name, Option<String> konst, usize l)
+{
+    declare_in_region(p, name, l);
+    usize n = Vec::len(&p.scopes);
+    if (n > 0)
+    {
+        HashMap::insert(&mut p.scopes[n - 1], String::from_view(name), konst);
+    }
+}
+
+// D-0131, `[Binding-Form-Redeclared]`: a name is declared once in its
+// declaration region.
+fn declare_in_region(ref<Parser, exclusive> p, StringView name, usize l)
+{
+    if (StringView::eq_str(name, "_") || StringView::starts_with(name, "$"))
+    {
+        return;
+    }
+    usize n = Vec::len(&p.regions);
+    if (n == 0)
+    {
+        return;
+    }
+    String key = String::from_view(name);
+    Option<usize> first = match (HashMap::get(&p.regions[n - 1], &key))
+    {
+        Some(f) : Some(*f),
+        None    : None,
+    };
+    match (first)
+    {
+        Some(f) :
+        {
+            if (Option::is_none(&p.local_error))
+            {
+                String msg = sprintf(
+                    "`%v` is already declared in this block (%s); a block declares a name once, counting the parameters and the loop's or pattern's names that govern it: assign to it (`%v = …`), or choose another name (as when the type changes); an inner block may declare its own",
+                    name,
+                    &lines_above(l, f),
+                    name,
+                );
+                p.local_error = Some(named_at("diag.duplicate-local", &msg, l));
+            }
+        },
+        None    :
+        {
+            HashMap::insert(&mut p.regions[n - 1], key, l);
+        },
+    }
+}
+
+// Opens the declaration region of `names` (D-0131), joined by the block
+// that begins at the current token, if one does.
+fn open_binder_region(ref<Parser, exclusive> p, ref<Vec<String>, shared> names, usize l)
+{
+    Vec::push(&mut p.regions, HashMap::new());
+    foreach (nm in names)
+    {
+        declare_in_region(p, String::as_view(nm), l);
+    }
+    p.join_at = if (cur(p) == Tok::LBrace) { Some(p.pos) } else { None };
+}
+
+fn close_binder_region(ref<Parser, exclusive> p)
+{
+    Vec::pop(&mut p.regions);
+    p.join_at = None;
+}
+
+// The innermost binding in `scopes` of `key`, if any.
+fn scope_lookup(ref<Parser, shared> p, ref<String, shared> key) : Option<Option<String>>
+{
+    usize k = Vec::len(&p.scopes);
+    while (k > 0)
+    {
+        k -= 1;
+        match (HashMap::get(&p.scopes[k], key))
+        {
+            Some(v) : return Some(clone(v)),
+            None    : {},
+        }
+    }
+    None
+}
+
+// D-0069: the hidden name of a local type `name` in scope.
+fn lookup_type(ref<Parser, shared> p, StringView name) : Option<String>
+{
+    match (scope_lookup(p, &sprintf("::%v", name)))
+    {
+        Some(v) : v,
+        None    : None,
+    }
+}
+
+// The innermost binding of `name` in the function: `Some(Some(k))` a
+// local constant hoisted as `k`, `Some(None)` a local variable.
+fn lookup_local(ref<Parser, shared> p, StringView name) : Option<Option<String>>
+{
+    scope_lookup(p, &String::from_view(name))
+}
+
+fn set_name(ref<Item, exclusive> it, String name)
+{
+    match (it)
+    {
+        Item::IStruct(s) : Box::get_mut(s).name = name,
+        Item::IEnum(e)   : Box::get_mut(e).name = name,
+        _                : {},
+    }
+}
+
+// `struct`/`enum` in a block (D-0069): the item `N$k` of the module.
+fn parse_local_type(ref<Parser, exclusive> p) : Result<void, SyntaxError>
+{
+    usize at = if (cur(p) == Tok::Resource) { 2 } else { 1 };
+    if (peek_tok(p, at) != Tok::Ident)
+    {
+        return Err(err_at(p, "expected a type name"));
+    }
+    String name = String::clone(&p.toks[p.pos + at].text);
+    p.local_consts += 1;
+    String hidden = sprintf("%s$%v", &name, p.local_consts);
+    usize n = Vec::len(&p.scopes);
+    if (n > 0)
+    {
+        HashMap::insert(&mut p.scopes[n - 1], sprintf("::%s", &name), Some(String::clone(&hidden)));
+    }
+    bool is_enum = peek_tok(p, at - 1) == Tok::Enum;
+    Item it = if (cur(p) == Tok::Bitstruct)
+    {
+        Item::IStruct(Box::new(parse_bitstruct(p, false)?))
+    }
+    else if (is_enum)
+    {
+        Item::IEnum(Box::new(parse_enum(p, false)?))
+    }
+    else
+    {
+        Item::IStruct(Box::new(parse_struct(p, false)?))
+    };
+    set_name(&mut it, hidden);
+    Vec::push(&mut p.hoisted, it);
+    Ok(())
+}
+
+// Whether `t` names one of `params` (a function's type parameters).
+fn type_mentions(ref<Type, shared> t, ref<Vec<String>, shared> params) : bool
+{
+    match (t)
+    {
+        Type::TNamed(n)  :
+        {
+            ref<NamedTy, shared> x = Box::get(n);
+            if (Vec::contains(params, &x.name))
+            {
+                return true;
+            }
+            foreach (a in &x.args)
+            {
+                if (type_mentions(a, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Type::TRef(m)    : type_mentions(&Box::get(m).inner, params),
+        Type::TSlice(m)  : type_mentions(&Box::get(m).inner, params),
+        Type::TRawptr(x) : type_mentions(Box::get(x), params),
+        Type::TArray(s)  : type_mentions(&Box::get(s).inner, params),
+        Type::THandle(x) : type_mentions(Box::get(x), params),
+        Type::TMutex(x)  : type_mentions(Box::get(x), params),
+        Type::TGuard(x)  : type_mentions(Box::get(x), params),
+        Type::TFn(f)     :
+        {
+            ref<FnTy, shared> x = Box::get(f);
+            foreach (a in &x.params)
+            {
+                if (type_mentions(a, params))
+                {
+                    return true;
+                }
+            }
+            type_mentions(&x.ret, params)
+        },
+        _                : false,
+    }
+}
+
+fn targs_mention(ref<Vec<Type>, shared> ts, ref<Vec<String>, shared> params) : bool
+{
+    foreach (t in ts)
+    {
+        if (type_mentions(t, params))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether an expression's type arguments name one of `params`.
+fn expr_mentions_types(ref<Expr, shared> e, ref<Vec<String>, shared> params) : bool
+{
+    if (Vec::len(params) == 0)
+    {
+        return false;
+    }
+    match (&e.kind)
+    {
+        ExprKind::EPath(b)        : targs_mention(&Box::get(b).targs, params),
+        ExprKind::EStructLit(b)   :
+        {
+            ref<StructLitExpr, shared> x = Box::get(b);
+            if (targs_mention(&x.targs, params))
+            {
+                return true;
+            }
+            foreach (f in &x.fields)
+            {
+                if (expr_mentions_types(&f.value, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayLit(xs)   :
+        {
+            foreach (x in xs)
+            {
+                if (expr_mentions_types(x, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayRepeat(b) : expr_mentions_types(&Box::get(b).value, params),
+        ExprKind::EUnary(b)       : expr_mentions_types(&Box::get(b).e, params),
+        ExprKind::EParen(x)       : expr_mentions_types(Box::get(x), params),
+        ExprKind::EField(b)       : expr_mentions_types(&Box::get(b).e, params),
+        ExprKind::EDeref(x)       : expr_mentions_types(Box::get(x), params),
+        ExprKind::EBorrow(b)      : expr_mentions_types(&Box::get(b).e, params),
+        ExprKind::EPropagate(x)   : expr_mentions_types(Box::get(x), params),
+        ExprKind::EBinary(b) : expr_mentions_types(
+            &Box::get(b).a,
+            params,
+        ) || expr_mentions_types(&Box::get(b).b, params),
+        ExprKind::EIndex(b) : expr_mentions_types(
+            &Box::get(b).a,
+            params,
+        ) || expr_mentions_types(&Box::get(b).b, params),
+        ExprKind::EAssign(b) : expr_mentions_types(
+            &Box::get(b).a,
+            params,
+        ) || expr_mentions_types(&Box::get(b).b, params),
+        ExprKind::ECall(b)        :
+        {
+            ref<CallExpr, shared> x = Box::get(b);
+            if (expr_mentions_types(&x.callee, params))
+            {
+                return true;
+            }
+            foreach (a in &x.args)
+            {
+                if (expr_mentions_types(a, params))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                         : false,
+    }
+}
+
+// `const τ N = e;` in a block (D-0066): the constant `N$k` of the module.
+fn parse_local_const(ref<Parser, exclusive> p) : Result<void, SyntaxError>
+{
+    expect(p, Tok::Const)?;
+    usize l = line(p);
+    ConstType ct = parse_const_type(p)?;
+    String name = ident(p)?;
+    expect(p, Tok::Eq)?;
+    bool saved = replace(&mut p.in_const_init, true);
+    Result<Expr, SyntaxError> er = parse_expr(p);
+    p.in_const_init = saved;
+    Expr e = match (er)
+    {
+        Ok(x)  : x,
+        Err(e) : return Err(e),
+    };
+    expect(p, Tok::Semi)?;
+    if (Option::is_none(&p.const_error) && (type_mentions(
+        &ct.ty,
+        &p.fn_type_params,
+    ) || expr_mentions_types(&e, &p.fn_type_params)))
+    {
+        p.const_error = Some(sprintf("diag.const-not-constant@%v", l));
+    }
+    p.local_consts += 1;
+    String hidden = sprintf("%s$%v", &name, p.local_consts);
+    Vec::push(&mut p.hoisted, Item::IFn(Box::new(const_fn(false, String::clone(&hidden), ct, e, l))));
+    bind_local(p, String::as_view(&name), Some(hidden), l);
+    Ok(())
+}
+
+// Returns the block's final expression when this statement is one.
+fn try_parse_stmt(ref<Parser, exclusive> p, ref<Vec<Stmt>, exclusive> stmts) : Result<Option<Expr>, SyntaxError>
+{
+    // D-0258: a `static` is an item of a module, never a local.
+    if (cur(p) == Tok::Static)
+    {
+        return Err(err_at(
+            p,
+            "a `static` is an item of its module: declare it at file scope, outside any function (a local that every call shares is what a static is for)",
+        ));
+    }
+    usize decl_line = line(p);
+    usize decl_col = col(p);
+    // D-0230: a test is an item of its module.
+    if (cur(p) == Tok::Unittest)
+    {
+        return Err(err_at(
+            p,
+            "a `unittest` is declared at module scope (the top level of a file or a module), not inside a function",
+        ));
+    }
+    bool in_fn = Vec::len(&p.scopes) > 0;
+    // D-0066: a local constant.
+    if (cur(p) == Tok::Const && in_fn)
+    {
+        parse_local_const(p)?;
+        return Ok(None);
+    }
+    // D-0069: a local type, and a function of one.
+    if (in_fn)
+    {
+        Tok t = cur(p);
+        Tok next = peek_tok(p, 1);
+        bool local_type = t == Tok::Struct || t == Tok::Enum || t == Tok::Bitstruct || (t == Tok::Resource && (next == Tok::Struct || next == Tok::Enum));
+        if (local_type)
+        {
+            parse_local_type(p)?;
+            return Ok(None);
+        }
+        if (t == Tok::Fn && next == Tok::Ident)
+        {
+            if (peek_tok(p, 2) != Tok::ColonColon)
+            {
+                return Err(err_at(
+                    p,
+                    "a function declared in a block must belong to a type declared there (`fn T::name`); for a local function, use a closure",
+                ));
+            }
+            FnDecl f = parse_fn(p, false, false)?;
+            Vec::push(&mut p.hoisted, Item::IFn(Box::new(f)));
+            return Ok(None);
+        }
+    }
+    // A block-like statement (no `;` required).
+    if (is_block_like_start(p))
+    {
+        Expr e = parse_block_like(p)?;
+        if (cur(p) == Tok::RBrace)
+        {
+            return Ok(Some(e));
+        }
+        Vec::push(stmts, Stmt::SBlockLike(Box::new(e)));
+        return Ok(None);
+    }
+    // decl-stmt? A leading type is necessary but not sufficient: parse the
+    // type and look at what follows; a name confirms a declaration.
+    bool unknown_type_decl = peek_tok(
+        p,
+        0,
+    ) == Tok::Ident && peek_tok(p, 1) == Tok::Ident && (peek_tok(p, 2) == Tok::Eq || peek_tok(p, 2) == Tok::Semi);
+    if (is_type_start(p) || unknown_type_decl)
+    {
+        usize save = p.pos;
+        Type ty = parse_type(p)?;
+        if (cur(p) == Tok::Ident)
+        {
+            String name = ident(p)?;
+            Option<Expr> init = None;
+            if (eat(p, Tok::Eq))
+            {
+                init = Some(parse_expr(p)?);
+            }
+            expect(p, Tok::Semi)?;
+            bind_local(p, String::as_view(&name), None, decl_line);
+            Vec::push(stmts, let_stmt(Some(ty), String::as_view(&name), init, decl_line, decl_col));
+            return Ok(None);
+        }
+        p.pos = save;
+    }
+    if (cur(p) == Tok::Auto)
+    {
+        bump(p);
+        String name = ident(p)?;
+        expect(p, Tok::Eq)?;
+        Expr init = parse_expr(p)?;
+        expect(p, Tok::Semi)?;
+        bind_local(p, String::as_view(&name), None, decl_line);
+        Vec::push(stmts, let_stmt(None, String::as_view(&name), Some(init), decl_line, decl_col));
+        return Ok(None);
+    }
+    // destructuring: path '{' identifier (',' identifier)* '}' '=' expr ';'
+    // Recognised by its shape alone (spec/22 disambiguation (5), CHG-0347).
+    if (cur(p) == Tok::Ident)
+    {
+        usize at = 0;
+        Vec<String> segs = Vec::new();
+        while (peek_tok(p, at) == Tok::Ident)
+        {
+            Vec::push(&mut segs, String::clone(&p.toks[p.pos + at].text));
+            if (peek_tok(p, at + 1) == Tok::ColonColon)
+            {
+                at += 2;
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (Vec::len(&segs) > 0 && segs[0] != "_" && peek_is_destructure_at(p, at))
+        {
+            for (usize k = 0; k <= at; k += 1)
+            {
+                bump(p);
+            }
+            String name = if (Vec::len(&segs) == 1) { String::clone(&segs[0]) } else
+            {
+                String::join(
+                    &segs[0..$],
+                    "::",
+                )
+            };
+            expect(p, Tok::LBrace)?;
+            Fields fs = destructure_fields(p)?;
+            expect(p, Tok::RBrace)?;
+            expect(p, Tok::Eq)?;
+            Expr init = parse_expr(p)?;
+            expect(p, Tok::Semi)?;
+            Fields { fields, names, rest } = fs;
+            foreach (f in &fields)
+            {
+                bind_local(p, String::as_view(f), None, decl_line);
+            }
+            String struct_name = if (Vec::len(&segs) == 1)
+            {
+                Option::unwrap_or(
+                    lookup_type(p, String::as_view(&name)),
+                    String::clone(&name),
+                )
+            }
+            else { name };
+            Vec::push(
+                stmts,
+                Stmt::SDestructure(Box::new(DestructureStmt { .struct_name = struct_name, .fields = fields, .names = names, .rest = rest, .init = init })),
+            );
+            return Ok(None);
+        }
+    }
+    // D-0099: `_ = e;` evaluates `e` and ends its value at once: a block
+    // holding one hidden binding of it.
+    if (cur_is_word(p, "_") && peek_tok(p, 1) == Tok::Eq)
+    {
+        usize l = line(p);
+        usize c = col(p);
+        bump(p);
+        bump(p);
+        Expr init = parse_expr(p)?;
+        expect(p, Tok::Semi)?;
+        Vec<Stmt> hold = Vec::new();
+        Vec::push(&mut hold, let_stmt(None, "$discard", Some(init), l, c));
+        Vec::push(stmts, Stmt::SExpr(Box::new(mk(ExprKind::EBlock(block_of(hold, None)), l, c))));
+        return Ok(None);
+    }
+    // An expression statement.
+    Expr e = parse_expr(p)?;
+    if (cur(p) == Tok::RBrace)
+    {
+        return Ok(Some(e));
+    }
+    expect(p, Tok::Semi)?;
+    Vec::push(stmts, Stmt::SExpr(Box::new(e)));
+    Ok(None)
+}
+
+// The token `at` on is a path's last name: `{ item (, item)* (, ..)? } =`
+// follows, an item `identifier` or `identifier : identifier` (D-0104), or
+// `{ .. } =`.
+fn peek_is_destructure_at(ref<Parser, shared> p, usize at) : bool
+{
+    if (peek_tok(p, at + 1) != Tok::LBrace)
+    {
+        return false;
+    }
+    usize k = 2;
+    while (true)
+    {
+        Tok t = peek_tok(p, at + k);
+        if (t == Tok::DotDot)
+        {
+            k += 1;
+            break;
+        }
+        if (t != Tok::Ident)
+        {
+            return false;
+        }
+        k += 1;
+        if (peek_tok(p, at + k) == Tok::Colon)
+        {
+            if (peek_tok(p, at + k + 1) != Tok::Ident)
+            {
+                return false;
+            }
+            k += 2;
+        }
+        if (peek_tok(p, at + k) == Tok::Comma)
+        {
+            k += 1;
+            continue;
+        }
+        break;
+    }
+    peek_tok(p, at + k) == Tok::RBrace && peek_tok(p, at + k + 1) == Tok::Eq
+}
+
+fn is_block_like_start(ref<Parser, shared> p) : bool
+{
+    Tok t = cur(p);
+    t == Tok::LBrace || t == Tok::Unsafe || t == Tok::If || t == Tok::While || t == Tok::For || t == Tok::Foreach || t == Tok::Match
+}
+
+// The names a pattern's arm scope binds, in the order its map holds them.
+fn scope_keys(ref<HashMap<String, Option<String>>, shared> m) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    for (usize i = 0; i < HashMap::len(m); i += 1)
+    {
+        Vec::push(&mut out, String::clone(HashMap::key_at(m, i)));
+    }
+    out
+}
+
+fn parse_block_like(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Tok t = cur(p);
+    if (t == Tok::LBrace)
+    {
+        return Ok(mk(ExprKind::EBlock(parse_block(p)?), l, c));
+    }
+    if (t == Tok::Unsafe)
+    {
+        bump(p);
+        return Ok(mk(ExprKind::EUnsafe(parse_block(p)?), l, c));
+    }
+    if (t == Tok::If)
+    {
+        return parse_if(p);
+    }
+    if (t == Tok::While)
+    {
+        bump(p);
+        expect(p, Tok::LParen)?;
+        match (try_condition_pattern(p))
+        {
+            Some(pat) :
+            {
+                // D-0115, spec/14 `[While-Pattern]`:
+                // `while (true) { match (e) { pattern : body, _ : break } }`.
+                Expr scrut = parse_expr(p)?;
+                expect(p, Tok::RParen)?;
+                no_empty_body(p, "while")?;
+                HashMap<String, Option<String>> arm_scope = pattern_scope(p, &mut pat);
+                Vec<String> keys = scope_keys(&arm_scope);
+                open_binder_region(p, &keys, l);
+                Vec::push(&mut p.scopes, arm_scope);
+                Result<Block, SyntaxError> br = parse_block(p);
+                Vec::pop(&mut p.scopes);
+                close_binder_region(p);
+                Block b = match (br)
+                {
+                    Ok(x)  : x,
+                    Err(e) : return Err(e),
+                };
+                Expr stop = mk(ExprKind::EBreak, l, c);
+                Expr m = pattern_if(l, c, pat, scrut, b, Some(stop));
+                Vec<Stmt> body = Vec::new();
+                Vec::push(&mut body, Stmt::SBlockLike(Box::new(m)));
+                Expr always = mk(ExprKind::EBool(true), l, c);
+                return Ok(mk(
+                    ExprKind::EWhile(Box::new(WhileExpr { .cond = always, .body = block_of(
+                        body,
+                        None,
+                    ), .step = None })),
+                    l,
+                    c,
+                ));
+            },
+            None      : {},
+        }
+        Expr cnd = parse_expr(p)?;
+        expect(p, Tok::RParen)?;
+        no_empty_body(p, "while")?;
+        Block b = parse_block(p)?;
+        return Ok(mk(ExprKind::EWhile(Box::new(WhileExpr { .cond = cnd, .body = b, .step = None })), l, c));
+    }
+    if (t == Tok::For)
+    {
+        return parse_for(p);
+    }
+    if (t == Tok::Foreach)
+    {
+        return parse_foreach(p);
+    }
+    if (t == Tok::Match)
+    {
+        return parse_match(p);
+    }
+    Err(err_at(
+        p,
+        String::as_view(&sprintf("expected a block, `if`, `while`, `for`, `foreach` or `match`, found %s", &found(p))),
+    ))
+}
+
+// `else` and what follows it, if there is one.
+fn parse_else(ref<Parser, exclusive> p) : Result<Option<Expr>, SyntaxError>
+{
+    if (!eat(p, Tok::Else))
+    {
+        return Ok(None);
+    }
+    if (cur(p) == Tok::If)
+    {
+        return Ok(Some(parse_if(p)?));
+    }
+    Block b = parse_block(p)?;
+    Ok(Some(mk(ExprKind::EBlock(b), line(p), col(p))))
+}
+
+fn parse_if(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    expect(p, Tok::If)?;
+    expect(p, Tok::LParen)?;
+    match (try_condition_pattern(p))
+    {
+        Some(pat) :
+        {
+            Expr scrut = parse_expr(p)?;
+            expect(p, Tok::RParen)?;
+            no_empty_body(p, "if")?;
+            HashMap<String, Option<String>> arm_scope = pattern_scope(p, &mut pat);
+            Vec<String> keys = scope_keys(&arm_scope);
+            open_binder_region(p, &keys, l);
+            Vec::push(&mut p.scopes, arm_scope);
+            Result<Block, SyntaxError> tr = parse_block(p);
+            Vec::pop(&mut p.scopes);
+            close_binder_region(p);
+            Block then_b = match (tr)
+            {
+                Ok(x)  : x,
+                Err(e) : return Err(e),
+            };
+            Option<Expr> else_e = parse_else(p)?;
+            return Ok(pattern_if(l, c, pat, scrut, then_b, else_e));
+        },
+        None      : {},
+    }
+    Expr cnd = parse_expr(p)?;
+    expect(p, Tok::RParen)?;
+    no_empty_body(p, "if")?;
+    Block then_b = parse_block(p)?;
+    Option<Expr> else_e = parse_else(p)?;
+    Ok(mk(ExprKind::EIf(Box::new(IfExpr { .cond = cnd, .then_ = then_b, .else_ = else_e })), l, c))
+}
+
+fn lit_expr(ExprKind kind, usize l, usize c) : Option<Box<Expr>>
+{
+    Some(Box::new(mk(kind, l, c)))
+}
+
+// A pattern (D-0056, D-0057, D-0224): the variant chain (outermost first),
+// the binder, the literal, and a struct pattern.
+fn parse_pattern(ref<Parser, exclusive> p) : Result<Pat, SyntaxError>
+{
+    Pat pat = Pat { .chain = Vec::new(), .binder = None, .lit = None, .sp = None };
+    usize opened = 0;
+    while (true)
+    {
+        // D-0057: a literal ends the pattern.
+        usize ll = line(p);
+        usize lc = col(p);
+        Tok t = cur(p);
+        if (t == Tok::Int)
+        {
+            IntLit v = IntLit { .v = p.toks[p.pos].ival, .sfx = clone(&p.toks[p.pos].sfx) };
+            bump(p);
+            pat.lit = lit_expr(ExprKind::EInt(Box::new(v)), ll, lc);
+            break;
+        }
+        if (t == Tok::Minus)
+        {
+            bump(p);
+            if (cur(p) != Tok::Int)
+            {
+                return Err(err_at(p, "expected an integer literal after `-` in a pattern"));
+            }
+            IntLit v = IntLit { .v = p.toks[p.pos].ival, .sfx = clone(&p.toks[p.pos].sfx) };
+            bump(p);
+            Expr inner = mk(ExprKind::EInt(Box::new(v)), ll, lc);
+            pat.lit = lit_expr(ExprKind::EUnary(Box::new(UnaryExpr { .op = UnOp::Neg, .e = inner })), ll, lc);
+            break;
+        }
+        if (t == Tok::Float)
+        {
+            return Err(err_at(p, "a float literal cannot be a pattern (D-0057): compare it with `==`"));
+        }
+        // D-0127: a text literal, matched by its bytes.
+        if (t == Tok::Str)
+        {
+            String s = cur_text(p);
+            bump(p);
+            pat.lit = lit_expr(ExprKind::EStr(s), ll, lc);
+            break;
+        }
+        if (t == Tok::True || t == Tok::False)
+        {
+            bump(p);
+            pat.lit = lit_expr(ExprKind::EBool(t == Tok::True), ll, lc);
+            break;
+        }
+        Vec<String> path = Vec::new();
+        if (t == Tok::Ident)
+        {
+            Vec::push(&mut path, cur_text(p));
+            bump(p);
+            while (eat(p, Tok::ColonColon))
+            {
+                Vec::push(&mut path, ident(p)?);
+            }
+        }
+        else if (t == Tok::LParen && peek_tok(p, 1) == Tok::RParen)
+        {
+            return Err(err_at(
+                p,
+                "`()` is not a pattern (D-0057); the unit type has one value, so `_` matches it: `Ok(_)`",
+            ));
+        }
+        else
+        {
+            return Err(err_at(p, "expected pattern in match arm"));
+        }
+        bool qualified = Vec::len(&path) > 1;
+        String name = String::clone(&path[Vec::len(&path) - 1]);
+        if (eat(p, Tok::LParen))
+        {
+            if (name == "_")
+            {
+                return Err(err_at(p, "expected pattern in match arm"));
+            }
+            Vec::push(&mut pat.chain, name);
+            opened += 1;
+            continue;
+        }
+        // D-0224: `Name { field, field: binder, .. }`, a struct pattern.
+        if (cur(p) == Tok::LBrace && name != "_")
+        {
+            usize pl = line(p);
+            usize pc = col(p);
+            bump(p);
+            Fields { fields, names, rest } = destructure_fields(p)?;
+            expect(p, Tok::RBrace)?;
+            match (lookup_type(p, String::as_view(&path[0])))
+            {
+                Some(h) : path[0] = h,
+                None    : {},
+            }
+            p.fresh += 1;
+            String hidden = sprintf("__pattern%v", p.fresh);
+            pat.binder = Some(String::clone(&hidden));
+            pat.sp = Some(StructPat {
+                .struct_name = String::join(&path[0..$], "::"),
+                .fields = fields,
+                .names = names,
+                .rest = rest,
+                .hidden = hidden,
+                .line = pl,
+                .col = pc,
+            });
+            break;
+        }
+        if (name == "_")
+        {
+            // `_` alone: the wildcard arm, or a payload not bound.
+        }
+        else if (qualified)
+        {
+            // A variant, or a module's constant (`modres` decides).
+            match (lookup_type(p, String::as_view(&path[0])))
+            {
+                Some(h) : path[0] = h,
+                None    : {},
+            }
+            pat.binder = Some(String::join(&path[0..$], "::"));
+        }
+        else
+        {
+            // A binder, at the top too (D-0058).
+            pat.binder = Some(name);
+        }
+        break;
+    }
+    for (usize k = 0; k < opened; k += 1)
+    {
+        expect(p, Tok::RParen)?;
+    }
+    Ok(pat)
+}
+
+// `field`, `field: binder` (D-0104), and `..` last, up to the `}`.
+fn destructure_fields(ref<Parser, exclusive> p) : Result<Fields, SyntaxError>
+{
+    Fields fs = Fields { .fields = Vec::new(), .names = Vec::new(), .rest = false };
+    while (true)
+    {
+        if (eat(p, Tok::DotDot))
+        {
+            fs.rest = true;
+            break;
+        }
+        String f = ident(p)?;
+        String b = if (eat(p, Tok::Colon)) { ident(p)? } else { String::clone(&f) };
+        Vec::push(&mut fs.names, f);
+        Vec::push(&mut fs.fields, b);
+        if (!eat(p, Tok::Comma))
+        {
+            break;
+        }
+    }
+    Ok(fs)
+}
+
+// The scope an arm's body is parsed in: its binder's, or a struct
+// pattern's binders (D-0224).
+fn pattern_scope(ref<Parser, exclusive> p, ref<Pat, exclusive> pat) : HashMap<String, Option<String>>
+{
+    match (&pat.sp)
+    {
+        Some(sp) : return scope_of_names(&sp.fields),
+        None     : {},
+    }
+    arm_scope_for(p, &mut pat.binder)
+}
+
+// A struct pattern's destructuring of its hidden binder (D-0224).
+fn pattern_destructure(ref<StructPat, shared> sp) : Stmt
+{
+    Expr init = path1(String::as_view(&sp.hidden), sp.line, sp.col);
+    Stmt::SDestructure(Box::new(DestructureStmt {
+        .struct_name = String::clone(&sp.struct_name),
+        .fields = Vec::clone(&sp.fields),
+        .names = Vec::clone(&sp.names),
+        .rest = sp.rest,
+        .init = init,
+    }))
+}
+
+// D-0066: a binder that names a local constant is that constant; any
+// other binds a local for the arm.
+fn arm_scope_for(ref<Parser, exclusive> p, ref<Option<String>, exclusive> binder) : HashMap<String, Option<String>>
+{
+    HashMap<String, Option<String>> arm_scope = HashMap::new();
+    match (clone(binder))
+    {
+        Some(b) :
+        {
+            if (!String::contains(&b, "::"))
+            {
+                match (lookup_local(p, String::as_view(&b)))
+                {
+                    Some(Some(hidden)) : *binder = Some(hidden),
+                    _                  :
+                    {
+                        HashMap::insert(&mut arm_scope, b, None);
+                    },
+                }
+            }
+        },
+        None    : {},
+    }
+    arm_scope
+}
+
+// D-0115: `if (pattern = e)` / `while (pattern = e)`, tried after the `(`.
+fn try_condition_pattern(ref<Parser, exclusive> p) : Option<Pat>
+{
+    Tok t = cur(p);
+    bool starts_like_pattern = if (t == Tok::Ident)
+    {
+        Tok n = peek_tok(p, 1);
+        n == Tok::LParen || n == Tok::ColonColon
+    }
+    else
+    {
+        t == Tok::Int || t == Tok::Minus || t == Tok::True || t == Tok::False || t == Tok::Str
+    };
+    if (!starts_like_pattern)
+    {
+        return None;
+    }
+    usize save_pos = p.pos;
+    usize save_undo = Vec::len(&p.undo_log);
+    match (parse_pattern(p))
+    {
+        Ok(pat) :
+        {
+            if (cur(p) == Tok::Eq)
+            {
+                bump(p);
+                return Some(pat);
+            }
+        },
+        Err(_)  : {},
+    }
+    p.pos = save_pos;
+    Vec::truncate(&mut p.undo_log, save_undo);
+    None
+}
+
+// The `match` that `if (pattern = e) then else` stands for (D-0115):
+// `match (e) { pattern : then, _ : else }`.
+fn pattern_if(usize l, usize c, Pat pat, Expr scrut, Block then_b, Option<Expr> else_e) : Expr
+{
+    Pat { chain, binder, lit, sp } = pat;
+    match (&sp)
+    {
+        Some(s) : Vec::insert(&mut then_b.stmts, 0, pattern_destructure(s)),
+        None    : {},
+    }
+    Option<String> variant = None;
+    Vec<String> nested = Vec::new();
+    for (usize k = 0; k < Vec::len(&chain); k += 1)
+    {
+        if (k == 0)
+        {
+            variant = Some(String::clone(&chain[0]));
+        }
+        else
+        {
+            Vec::push(&mut nested, String::clone(&chain[k]));
+        }
+    }
+    Expr then_e = mk(ExprKind::EBlock(then_b), l, c);
+    Expr other = match (else_e)
+    {
+        Some(e) : e,
+        None    : mk(ExprKind::EBlock(block_of(Vec::new(), None)), l, c),
+    };
+    Vec<Arm> arms = Vec::new();
+    Vec::push(
+        &mut arms,
+        Arm { .variant = variant, .nested = nested, .binder = binder, .lit = lit, .body = Box::new(then_e) },
+    );
+    Vec::push(
+        &mut arms,
+        Arm { .variant = None, .nested = Vec::new(), .binder = None, .lit = None, .body = Box::new(other) },
+    );
+    mk(ExprKind::EMatch(Box::new(MatchExpr { .scrut = scrut, .arms = arms })), l, c)
+}
+
+fn parse_match(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    expect(p, Tok::Match)?;
+    expect(p, Tok::LParen)?;
+    Expr scrut = parse_expr(p)?;
+    expect(p, Tok::RParen)?;
+    expect(p, Tok::LBrace)?;
+    Vec<Arm> arms = Vec::new();
+    while (true)
+    {
+        if (cur(p) == Tok::RBrace)
+        {
+            break;
+        }
+        usize arm_line = line(p);
+        Pat pat = parse_pattern(p)?;
+        expect(p, Tok::Colon)?;
+        HashMap<String, Option<String>> arm_scope = pattern_scope(p, &mut pat);
+        Pat { chain, binder, lit, sp } = pat;
+        Vec<String> keys = scope_keys(&arm_scope);
+        open_binder_region(p, &keys, arm_line);
+        Vec::push(&mut p.scopes, arm_scope);
+        Result<Expr, SyntaxError> br = parse_expr(p);
+        Vec::pop(&mut p.scopes);
+        close_binder_region(p);
+        Expr body = match (br)
+        {
+            Ok(x)  : x,
+            Err(e) : return Err(e),
+        };
+        match (&sp)
+        {
+            Some(s) :
+            {
+                usize bl = body.line;
+                Vec<Stmt> st = Vec::new();
+                Vec::push(&mut st, pattern_destructure(s));
+                body = mk(ExprKind::EBlock(block_of(st, Some(body))), bl, c);
+            },
+            None    : {},
+        }
+        Option<String> variant = None;
+        Vec<String> nested = Vec::new();
+        for (usize k = 0; k < Vec::len(&chain); k += 1)
+        {
+            if (k == 0)
+            {
+                variant = Some(String::clone(&chain[0]));
+            }
+            else
+            {
+                Vec::push(&mut nested, String::clone(&chain[k]));
+            }
+        }
+        Vec::push(
+            &mut arms,
+            Arm { .variant = variant, .nested = nested, .binder = binder, .lit = lit, .body = Box::new(body) },
+        );
+        if (!eat(p, Tok::Comma))
+        {
+            break;
+        }
+    }
+    expect(p, Tok::RBrace)?;
+    Ok(mk(ExprKind::EMatch(Box::new(MatchExpr { .scrut = scrut, .arms = arms })), l, c))
+}
+
+// ---- expressions ----
+
+fn parse_expr(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    parse_assign(p)
+}
+
+fn compound_op(Tok t) : Option<BinOp>
+{
+    match (t)
+    {
+        Tok::PlusEq    : Some(BinOp::Add),
+        Tok::MinusEq   : Some(BinOp::Sub),
+        Tok::StarEq    : Some(BinOp::Mul),
+        Tok::SlashEq   : Some(BinOp::Div),
+        Tok::PercentEq : Some(BinOp::Rem),
+        Tok::AmpEq     : Some(BinOp::BitAnd),
+        Tok::PipeEq    : Some(BinOp::BitOr),
+        Tok::CaretEq   : Some(BinOp::BitXor),
+        Tok::ShlEq     : Some(BinOp::Shl),
+        Tok::ShrEq     : Some(BinOp::Shr),
+        _              : None,
+    }
+}
+
+fn parse_assign(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_logic_or(p)?;
+    if (eat(p, Tok::Eq))
+    {
+        Expr rhs = parse_assign(p)?;
+        return Ok(assign(lhs, rhs, l, c));
+    }
+    BinOp op = match (compound_op(cur(p)))
+    {
+        Some(o) : o,
+        None    : return Ok(lhs),
+    };
+    bump(p);
+    Expr rhs = parse_assign(p)?;
+    Ok(compound_assign(p, op, lhs, rhs, l, c))
+}
+
+// Whether `e` contains a call, whose evaluation may have an effect.
+fn has_call(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::ECall(_)      : true,
+        ExprKind::EUnary(b)     : has_call(&Box::get(b).e),
+        ExprKind::EBorrow(b)    : has_call(&Box::get(b).e),
+        ExprKind::EDeref(x)     : has_call(Box::get(x)),
+        ExprKind::EField(b)     : has_call(&Box::get(b).e),
+        ExprKind::EPropagate(x) : has_call(Box::get(x)),
+        ExprKind::EParen(x)     : has_call(Box::get(x)),
+        ExprKind::EBinary(b)    : has_call(&Box::get(b).a) || has_call(&Box::get(b).b),
+        ExprKind::EIndex(b)     : has_call(&Box::get(b).a) || has_call(&Box::get(b).b),
+        ExprKind::EAssign(b)    : has_call(&Box::get(b).a) || has_call(&Box::get(b).b),
+        ExprKind::EPath(_)      : false,
+        ExprKind::EInt(_)       : false,
+        ExprKind::EFloat(_)     : false,
+        ExprKind::EStr(_)       : false,
+        ExprKind::EBool(_)      : false,
+        ExprKind::EUnit         : false,
+        _                       : true,
+    }
+}
+
+// `p op= e` (D-0035): `p = p op e` with `p` evaluated once; a place with a
+// call is reached once, through a hidden exclusive reference.
+fn compound_assign(ref<Parser, exclusive> p, BinOp op, Expr lhs, Expr rhs, usize l, usize c) : Expr
+{
+    if (!has_call(&lhs))
+    {
+        Expr value = binary(op, clone(&lhs), rhs, l, c);
+        return assign(lhs, value, l, c);
+    }
+    p.fresh += 1;
+    String t = sprintf("__compound%v", p.fresh);
+    Expr deref1 = mk(ExprKind::EDeref(Box::new(path1(String::as_view(&t), l, c))), l, c);
+    Expr deref2 = mk(ExprKind::EDeref(Box::new(path1(String::as_view(&t), l, c))), l, c);
+    Expr borrow = mk(ExprKind::EBorrow(Box::new(BorrowExpr { .mode = Mode::Exclusive, .e = lhs })), l, c);
+    Expr value = binary(op, deref1, rhs, l, c);
+    Expr write = assign(deref2, value, l, c);
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, let_stmt(None, String::as_view(&t), Some(borrow), l, c));
+    Vec::push(&mut stmts, Stmt::SExpr(Box::new(write)));
+    mk(ExprKind::EBlock(block_of(stmts, None)), l, c)
+}
+
+// C's `for (…);`, `while (…);` and `if (…);`: a body is a block.
+fn no_empty_body(ref<Parser, shared> p, str what) : Result<void, SyntaxError>
+{
+    if (cur(p) == Tok::Semi)
+    {
+        bool is_if = StringView::eq_str(StringView::of(what), "if");
+        return Err(err_at(
+            p,
+            String::as_view(&sprintf(
+                "`;` after `%s (…)`: %s `%s` body is a block, so `%s (…);` is not an empty %s; remove the `;`",
+                what,
+                if (is_if) { "an" } else { "a" },
+                what,
+                what,
+                if (is_if) { "statement" } else { "loop" },
+            )),
+        ));
+    }
+    Ok(())
+}
+
+// `for (init; cond; step) body` (D-0035): `{ init; while (cond) body }`.
+fn parse_for(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    expect(p, Tok::For)?;
+    expect(p, Tok::LParen)?;
+    Vec::push(&mut p.scopes, HashMap::new());
+    Vec::push(&mut p.regions, HashMap::new());
+    Result<Expr, SyntaxError> r = parse_for_parts(p, l, c);
+    Vec::pop(&mut p.regions);
+    p.join_at = None;
+    Vec::pop(&mut p.scopes);
+    r
+}
+
+fn parse_for_parts(ref<Parser, exclusive> p, usize l, usize c) : Result<Expr, SyntaxError>
+{
+    Vec<Stmt> stmts = Vec::new();
+    if (!eat(p, Tok::Semi))
+    {
+        if (Option::is_some(&try_parse_stmt(p, &mut stmts)?))
+        {
+            return Err(err_at(p, "expected `;` after a for loop's initializer"));
+        }
+    }
+    Expr cnd = if (cur(p) == Tok::Semi) { mk(ExprKind::EBool(true), l, c) } else { parse_expr(p)? };
+    expect(p, Tok::Semi)?;
+    Option<Expr> step = if (cur(p) == Tok::RParen) { None } else { Some(parse_expr(p)?) };
+    expect(p, Tok::RParen)?;
+    no_empty_body(p, "for")?;
+    p.join_at = if (cur(p) == Tok::LBrace) { Some(p.pos) } else { None };
+    Block body = parse_block(p)?;
+    Expr lp = mk(ExprKind::EWhile(Box::new(WhileExpr { .cond = cnd, .body = body, .step = step })), l, c);
+    Ok(mk(ExprKind::EBlock(block_of(stmts, Some(lp))), l, c))
+}
+
+fn has_float(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EFloat(_)  : true,
+        ExprKind::EParen(x)  : has_float(Box::get(x)),
+        ExprKind::EUnary(b)  : has_float(&Box::get(b).e),
+        ExprKind::EBinary(b) : has_float(&Box::get(b).a) || has_float(&Box::get(b).b),
+        _                    : false,
+    }
+}
+
+fn usize_ty() : Option<Type>
+{
+    Some(Type::TInt(IntTy::Usize))
+}
+
+// `foreach (x in c) body`, `foreach (k, x in c) body` (D-0042): a counted
+// `for` over hidden bindings and the `$each_*` intrinsics.
+fn parse_foreach(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    expect(p, Tok::Foreach)?;
+    expect(p, Tok::LParen)?;
+    Vec<String> names = Vec::new();
+    Vec::push(&mut names, ident(p)?);
+    while (Vec::len(&names) < 3 && eat(p, Tok::Comma))
+    {
+        Vec::push(&mut names, ident(p)?);
+    }
+    if (cur_is_word(p, "in"))
+    {
+        bump(p);
+    }
+    else
+    {
+        return Err(err_at(p, String::as_view(&sprintf("expected `in` in a foreach, found %s", &found(p)))));
+    }
+    Expr coll = parse_expr(p)?;
+    Option<Expr> hi = if (eat(p, Tok::DotDot)) { Some(parse_expr(p)?) } else { None };
+    expect(p, Tok::RParen)?;
+    no_empty_body(p, "foreach")?;
+    open_binder_region(p, &names, l);
+    Vec::push(&mut p.scopes, scope_of_names(&names));
+    Result<Block, SyntaxError> br = parse_block(p);
+    Vec::pop(&mut p.scopes);
+    close_binder_region(p);
+    Block body = match (br)
+    {
+        Ok(x)  : x,
+        Err(e) : return Err(e),
+    };
+    p.fresh += 1;
+    usize n = p.fresh;
+    match (hi)
+    {
+        Some(h) : return Ok(foreach_range(names, coll, h, body, n, l, c)),
+        None    : {},
+    }
+    String cn = sprintf("$c%v", n);
+    String i = sprintf("$i%v", n);
+    String en = sprintf("$e%v", n);
+    String dn = sprintf("$d%v", n);
+    Option<Mode> mode = match (&coll.kind)
+    {
+        ExprKind::EBorrow(b) : Some(Box::get(b).mode),
+        _                    : None,
+    };
+    usize arity = Vec::len(&names);
+    Vec<Stmt> stmts = Vec::new();
+    String holder = String::new();
+    str key_fn = "";
+    str elem_fn = "";
+    match (mode)
+    {
+        Some(m) :
+        {
+            Vec::push(&mut stmts, let_stmt(None, String::as_view(&cn), Some(coll), l, c));
+            holder = String::clone(&cn);
+            key_fn = "$each_key";
+            elem_fn = if (m == Mode::Exclusive) { "$each_at_mut" } else { "$each_at" };
+        },
+        None    :
+        {
+            // D-0287: a call is wrapped for `modres`, which makes one of
+            // the text splitters a loop that finds its parts as it takes
+            // them, and unwraps any other.
+            bool is_call = match (&coll.kind)
+            {
+                ExprKind::ECall(_) : true,
+                _                  : false,
+            };
+            Expr coll_e = if (is_call)
+            {
+                Vec<Expr> lazy_args = Vec::new();
+                Vec::push(&mut lazy_args, coll);
+                call("$each_lazy", lazy_args, l, c)
+            }
+            else { coll };
+            Vec::push(&mut stmts, let_stmt(None, String::as_view(&en), Some(coll_e), l, c));
+            Vec<Expr> args = Vec::new();
+            Vec::push(&mut args, path1(String::as_view(&en), l, c));
+            Vec::push(&mut args, int_lit(widen<u128>(arity), l, c));
+            Vec::push(&mut stmts, let_stmt(None, String::as_view(&dn), Some(call("$each_drain", args, l, c)), l, c));
+            holder = String::clone(&dn);
+            key_fn = "$each_take_key";
+            elem_fn = "$each_take";
+        },
+    }
+    Vec::push(&mut stmts, let_stmt(usize_ty(), String::as_view(&i), Some(int_lit(0, l, c)), l, c));
+    Vec<Expr> len_args = Vec::new();
+    Vec::push(&mut len_args, path1(String::as_view(&holder), l, c));
+    Expr cnd = binary(BinOp::Lt, path1(String::as_view(&i), l, c), call("$each_len", len_args, l, c), l, c);
+    Expr step = assign(
+        path1(String::as_view(&i), l, c),
+        binary(BinOp::Add, path1(String::as_view(&i), l, c), int_lit(1, l, c), l, c),
+        l,
+        c,
+    );
+    Vec<Stmt> inner = Vec::new();
+    // Three names (a map only, D-0044): the position, then key and value.
+    if (arity == 3)
+    {
+        Vec::push(&mut inner, let_stmt(None, String::as_view(&names[0]), Some(path1(String::as_view(&i), l, c)), l, c));
+    }
+    if (arity >= 2)
+    {
+        Vec<Expr> ka = Vec::new();
+        Vec::push(&mut ka, path1(String::as_view(&holder), l, c));
+        Vec::push(&mut ka, path1(String::as_view(&i), l, c));
+        Vec::push(
+            &mut inner,
+            let_stmt(None, String::as_view(&names[arity - 2]), Some(call(StringView::of(key_fn), ka, l, c)), l, c),
+        );
+    }
+    Vec<Expr> ea = Vec::new();
+    Vec::push(&mut ea, path1(String::as_view(&holder), l, c));
+    Vec::push(&mut ea, path1(String::as_view(&i), l, c));
+    Vec::push(&mut ea, int_lit(widen<u128>(arity), l, c));
+    Vec::push(
+        &mut inner,
+        let_stmt(None, String::as_view(&names[arity - 1]), Some(call(StringView::of(elem_fn), ea, l, c)), l, c),
+    );
+    Vec::push(&mut inner, Stmt::SBlockLike(Box::new(mk(ExprKind::EBlock(body), l, c))));
+    Expr lp = mk(
+        ExprKind::EWhile(Box::new(WhileExpr { .cond = cnd, .body = block_of(inner, None), .step = Some(step) })),
+        l,
+        c,
+    );
+    Ok(mk(ExprKind::EBlock(block_of(stmts, Some(lp))), l, c))
+}
+
+fn each_range(StringView b, Expr e, usize arity, usize l, usize c) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, path1(b, l, c));
+    Vec::push(&mut args, e);
+    Vec::push(&mut args, int_lit(widen<u128>(arity), l, c));
+    call("$each_range", args, l, c)
+}
+
+fn incr(StringView name, usize l, usize c) : Expr
+{
+    assign(path1(name, l, c), binary(BinOp::Add, path1(name, l, c), int_lit(1, l, c), l, c), l, c)
+}
+
+// `foreach (x in lo .. hi) body`, `foreach (k, x in lo .. hi) body` (D-0097).
+fn foreach_range(Vec<String> names, Expr lo, Expr hi, Block body, usize n, usize l, usize c) : Expr
+{
+    String v = sprintf("$v%v", n);
+    String h = sprintf("$h%v", n);
+    String i = sprintf("$i%v", n);
+    usize arity = Vec::len(&names);
+    Vec<Stmt> stmts = Vec::new();
+    bool lo_lit = is_literal_expr(&lo);
+    bool hi_lit = is_literal_expr(&hi);
+    if (lo_lit && !hi_lit)
+    {
+        Vec::push(&mut stmts, let_stmt(None, String::as_view(&h), Some(hi), l, c));
+        Vec::push(
+            &mut stmts,
+            let_stmt(None, String::as_view(&v), Some(each_range(String::as_view(&h), lo, arity, l, c)), l, c),
+        );
+    }
+    else if (lo_lit && hi_lit && !has_float(&lo) && !has_float(&hi))
+    {
+        String z = sprintf("$z%v", n);
+        Vec::push(&mut stmts, let_stmt(usize_ty(), String::as_view(&z), Some(int_lit(0, l, c)), l, c));
+        Vec::push(
+            &mut stmts,
+            let_stmt(None, String::as_view(&v), Some(each_range(String::as_view(&z), lo, arity, l, c)), l, c),
+        );
+        Vec::push(
+            &mut stmts,
+            let_stmt(None, String::as_view(&h), Some(each_range(String::as_view(&v), hi, arity, l, c)), l, c),
+        );
+    }
+    else if (hi_lit)
+    {
+        Vec::push(&mut stmts, let_stmt(None, String::as_view(&v), Some(lo), l, c));
+        Vec::push(
+            &mut stmts,
+            let_stmt(None, String::as_view(&h), Some(each_range(String::as_view(&v), hi, arity, l, c)), l, c),
+        );
+    }
+    else
+    {
+        Vec::push(&mut stmts, let_stmt(None, String::as_view(&v), Some(lo), l, c));
+        Vec::push(&mut stmts, let_stmt(None, String::as_view(&h), Some(hi), l, c));
+        Vec::push(
+            &mut stmts,
+            Stmt::SExpr(Box::new(each_range(String::as_view(&v), mk(ExprKind::EUnit, l, c), arity, l, c))),
+        );
+    }
+    Vec<Stmt> inner = Vec::new();
+    Vec<Stmt> step = Vec::new();
+    Vec::push(&mut step, Stmt::SExpr(Box::new(incr(String::as_view(&v), l, c))));
+    if (arity >= 2)
+    {
+        Vec::push(&mut stmts, let_stmt(usize_ty(), String::as_view(&i), Some(int_lit(0, l, c)), l, c));
+        Vec::push(
+            &mut inner,
+            let_stmt(None, String::as_view(&names[arity - 2]), Some(path1(String::as_view(&i), l, c)), l, c),
+        );
+        Vec::push(&mut step, Stmt::SExpr(Box::new(incr(String::as_view(&i), l, c))));
+    }
+    Vec::push(
+        &mut inner,
+        let_stmt(None, String::as_view(&names[arity - 1]), Some(path1(String::as_view(&v), l, c)), l, c),
+    );
+    Vec::push(&mut inner, Stmt::SBlockLike(Box::new(mk(ExprKind::EBlock(body), l, c))));
+    Expr cnd = binary(BinOp::Lt, path1(String::as_view(&v), l, c), path1(String::as_view(&h), l, c), l, c);
+    Expr st = mk(ExprKind::EBlock(block_of(step, None)), l, c);
+    Expr lp = mk(
+        ExprKind::EWhile(Box::new(WhileExpr { .cond = cnd, .body = block_of(inner, None), .step = Some(st) })),
+        l,
+        c,
+    );
+    mk(ExprKind::EBlock(block_of(stmts, Some(lp))), l, c)
+}
+
+fn parse_logic_or(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_logic_and(p)?;
+    while (eat(p, Tok::OrOr))
+    {
+        Expr rhs = parse_logic_and(p)?;
+        lhs = binary(BinOp::Or, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_logic_and(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_compare(p)?;
+    while (eat(p, Tok::AndAnd))
+    {
+        Expr rhs = parse_compare(p)?;
+        lhs = binary(BinOp::And, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_compare(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_bitor(p)?;
+    BinOp op = match (cur(p))
+    {
+        Tok::EqEq  : BinOp::Eq,
+        Tok::NotEq : BinOp::Ne,
+        Tok::Lt    : BinOp::Lt,
+        Tok::Le    : BinOp::Le,
+        Tok::Gt    : BinOp::Gt,
+        Tok::Ge    : BinOp::Ge,
+        _          : return Ok(lhs),
+    };
+    bump(p);
+    Expr rhs = parse_bitor(p)?;
+    Ok(binary(op, lhs, rhs, l, c))
+}
+
+// D-0086: a shift binds tighter than `&`, `^` and `|`, looser than `+`/`-`.
+fn parse_shift(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_additive(p)?;
+    while (true)
+    {
+        BinOp op = match (cur(p))
+        {
+            Tok::Shl : BinOp::Shl,
+            Tok::Shr : BinOp::Shr,
+            _        : break,
+        };
+        bump(p);
+        Expr rhs = parse_additive(p)?;
+        lhs = binary(op, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_bitor(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_bitxor(p)?;
+    while (eat(p, Tok::Pipe))
+    {
+        Expr rhs = parse_bitxor(p)?;
+        lhs = binary(BinOp::BitOr, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_bitxor(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_bitand(p)?;
+    while (eat(p, Tok::Caret))
+    {
+        Expr rhs = parse_bitand(p)?;
+        lhs = binary(BinOp::BitXor, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_bitand(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_shift(p)?;
+    while (cur(p) == Tok::Amp)
+    {
+        bump(p);
+        Expr rhs = parse_shift(p)?;
+        lhs = binary(BinOp::BitAnd, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_additive(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_multiplicative(p)?;
+    while (true)
+    {
+        BinOp op = match (cur(p))
+        {
+            Tok::Plus  : BinOp::Add,
+            Tok::Minus : BinOp::Sub,
+            _          : break,
+        };
+        bump(p);
+        Expr rhs = parse_multiplicative(p)?;
+        lhs = binary(op, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn parse_multiplicative(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Expr lhs = parse_unary(p)?;
+    while (true)
+    {
+        BinOp op = match (cur(p))
+        {
+            Tok::Star    : BinOp::Mul,
+            Tok::Slash   : BinOp::Div,
+            Tok::Percent : BinOp::Rem,
+            _            : break,
+        };
+        bump(p);
+        Expr rhs = parse_unary(p)?;
+        lhs = binary(op, lhs, rhs, l, c);
+    }
+    Ok(lhs)
+}
+
+fn unary_of(UnOp op, Expr e, usize l, usize c) : Expr
+{
+    mk(ExprKind::EUnary(Box::new(UnaryExpr { .op = op, .e = e })), l, c)
+}
+
+fn parse_unary(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Tok t = cur(p);
+    if (t == Tok::Minus)
+    {
+        bump(p);
+        return Ok(unary_of(UnOp::Neg, parse_unary(p)?, l, c));
+    }
+    if (t == Tok::Not)
+    {
+        bump(p);
+        return Ok(unary_of(UnOp::Not, parse_unary(p)?, l, c));
+    }
+    if (t == Tok::Tilde)
+    {
+        bump(p);
+        return Ok(unary_of(UnOp::BitNot, parse_unary(p)?, l, c));
+    }
+    if (t == Tok::Amp)
+    {
+        bump(p);
+        Mode m = if (eat(p, Tok::Mut)) { Mode::Exclusive } else { Mode::Shared };
+        bool saved = p.slice_ok;
+        p.slice_ok = true;
+        Result<Expr, SyntaxError> opr = parse_unary(p);
+        p.slice_ok = saved;
+        Expr operand = match (opr)
+        {
+            Ok(x)  : x,
+            Err(e) : return Err(e),
+        };
+        // `&a[lo .. hi]`: the borrow is a slice (D-0047).
+        Expr { kind, line: ol, col: oc, .. } = operand;
+        match (kind)
+        {
+            ExprKind::ESliceOf(s) :
+            {
+                SliceExpr x = Box::into_inner(s);
+                x.mode = m;
+                return Ok(mk(ExprKind::ESliceOf(Box::new(x)), l, c));
+            },
+            other : return Ok(mk(
+                ExprKind::EBorrow(Box::new(BorrowExpr { .mode = m, .e = mk(other, ol, oc) })),
+                l,
+                c,
+            )),
+        }
+    }
+    if (t == Tok::Star)
+    {
+        bump(p);
+        return Ok(mk(ExprKind::EDeref(Box::new(parse_unary(p)?)), l, c));
+    }
+    parse_postfix(p)
+}
+
+fn parse_postfix(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    bool slice_ok = replace(&mut p.slice_ok, false);
+    Expr e = parse_primary(p)?;
+    while (true)
+    {
+        Tok t = cur(p);
+        if (t == Tok::Dot)
+        {
+            bump(p);
+            String f = ident(p)?;
+            e = mk(ExprKind::EField(Box::new(FieldExpr { .e = e, .name = f })), l, c);
+        }
+        else if (t == Tok::LBracket)
+        {
+            bump(p);
+            p.bracket_depth += 1;
+            Result<Expr, SyntaxError> idx = parse_expr(p);
+            Option<Result<Expr, SyntaxError>> hi = None;
+            if (Result::is_ok(&idx) && eat(p, Tok::DotDot))
+            {
+                hi = Some(parse_expr(p));
+            }
+            p.bracket_depth -= 1;
+            Expr ix = match (idx)
+            {
+                Ok(x)  : x,
+                Err(e) : return Err(e),
+            };
+            match (hi)
+            {
+                Some(hr) :
+                {
+                    Expr h = match (hr)
+                    {
+                        Ok(x)  : x,
+                        Err(e) : return Err(e),
+                    };
+                    expect(p, Tok::RBracket)?;
+                    // A range makes a slice, which is a borrow: `&a[i .. j]`.
+                    if (!slice_ok)
+                    {
+                        return Err(err_at(p, "a slice is a borrow: write `&a[i .. j]` or `&mut a[i .. j]`"));
+                    }
+                    return Ok(mk(
+                        ExprKind::ESliceOf(Box::new(SliceExpr { .mode = Mode::Shared, .base = e, .lo = ix, .hi = h })),
+                        l,
+                        c,
+                    ));
+                },
+                None     : {},
+            }
+            expect(p, Tok::RBracket)?;
+            e = mk(ExprKind::EIndex(Box::new(PairExpr { .a = e, .b = ix })), l, c);
+        }
+        else if (t == Tok::LParen)
+        {
+            bump(p);
+            Vec<Expr> args = Vec::new();
+            if (!eat(p, Tok::RParen))
+            {
+                while (true)
+                {
+                    Vec::push(&mut args, parse_expr(p)?);
+                    // D-0098: a trailing comma before `)`.
+                    if (!eat(p, Tok::Comma) || cur(p) == Tok::RParen)
+                    {
+                        break;
+                    }
+                }
+                expect(p, Tok::RParen)?;
+            }
+            e = mk(ExprKind::ECall(Box::new(CallExpr { .callee = e, .args = args })), l, c);
+        }
+        else if (t == Tok::Question)
+        {
+            bump(p);
+            e = mk(ExprKind::EPropagate(Box::new(e)), l, c);
+        }
+        else
+        {
+            break;
+        }
+    }
+    Ok(e)
+}
+
+struct PathTargs
+{
+    Vec<String> segs;
+    Vec<Type> targs;
+}
+
+fn parse_path_and_targs(ref<Parser, exclusive> p) : Result<PathTargs, SyntaxError>
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, ident(p)?);
+    // D-0069: `T::f`, `T::V`, `T<…>::f` and `T { … }` name a local type by
+    // its hidden item.
+    Tok t = cur(p);
+    if (t == Tok::ColonColon || t == Tok::Lt || t == Tok::LBrace)
+    {
+        match (lookup_type(p, String::as_view(&segs[0])))
+        {
+            Some(h) : segs[0] = h,
+            None    : {},
+        }
+    }
+    while (cur(p) == Tok::ColonColon)
+    {
+        bump(p);
+        Vec::push(&mut segs, ident(p)?);
+    }
+    Vec<Type> targs = Vec::new();
+    if (cur(p) == Tok::Lt)
+    {
+        match (try_type_args(p))
+        {
+            Some(ts) :
+            {
+                targs = ts;
+                // `Vec<i32>::new`: more segments after an instantiated type.
+                while (cur(p) == Tok::ColonColon)
+                {
+                    bump(p);
+                    Vec::push(&mut segs, ident(p)?);
+                }
+            },
+            None     : {},
+        }
+    }
+    Ok(PathTargs { .segs = segs, .targs = targs })
+}
+
+// spec/22 §2, disambiguation (1): `identifier '<' type (',' type)* '>'` is
+// a generic-argument list; decided by parsing one and backtracking.
+fn try_type_args(ref<Parser, exclusive> p) : Option<Vec<Type>>
+{
+    usize save_pos = p.pos;
+    usize save_undo = Vec::len(&p.undo_log);
+    bump(p);
+    Vec<Type> ts = Vec::new();
+    bool ok = false;
+    while (true)
+    {
+        match (parse_type(p))
+        {
+            Ok(t)  : Vec::push(&mut ts, t),
+            Err(_) : break,
+        }
+        if (eat(p, Tok::Comma))
+        {
+            continue;
+        }
+        ok = Result::is_ok(&expect_close_angle(p));
+        break;
+    }
+    if (ok)
+    {
+        return Some(ts);
+    }
+    while (Vec::len(&p.undo_log) > save_undo)
+    {
+        Undo u = Option::unwrap(Vec::pop(&mut p.undo_log));
+        p.toks[u.pos].tok = u.tok;
+    }
+    p.pos = save_pos;
+    None
+}
+
+fn parse_primary(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    Tok t = cur(p);
+    if (t == Tok::Dollar)
+    {
+        if (p.bracket_depth == 0)
+        {
+            return Err(err_at(p, "`$` is the length of what is being indexed; it is written only inside `[…]`"));
+        }
+        bump(p);
+        return Ok(mk(ExprKind::EDollar, l, c));
+    }
+    if (t == Tok::Int)
+    {
+        IntLit v = IntLit { .v = p.toks[p.pos].ival, .sfx = clone(&p.toks[p.pos].sfx) };
+        bump(p);
+        return Ok(mk(ExprKind::EInt(Box::new(v)), l, c));
+    }
+    if (t == Tok::Float)
+    {
+        FloatLit v = FloatLit { .v = p.toks[p.pos].fval, .sfx = clone(&p.toks[p.pos].sfx) };
+        bump(p);
+        return Ok(mk(ExprKind::EFloat(Box::new(v)), l, c));
+    }
+    if (t == Tok::Str)
+    {
+        String s = cur_text(p);
+        bump(p);
+        return Ok(mk(ExprKind::EStr(s), l, c));
+    }
+    if (t == Tok::Bytes)
+    {
+        // spec/22 byte-literal: sugar for an `array<u8, N>` of the bytes.
+        Vec<Expr> items = Vec::new();
+        foreach (b in &p.toks[p.pos].bytes)
+        {
+            Vec::push(
+                &mut items,
+                mk(
+                    ExprKind::EInt(Box::new(IntLit { .v = widen<u128>(*b), .sfx = Some(String::from_str("u8")) })),
+                    l,
+                    c,
+                ),
+            );
+        }
+        bump(p);
+        return Ok(mk(ExprKind::EArrayLit(items), l, c));
+    }
+    if (t == Tok::True || t == Tok::False)
+    {
+        bump(p);
+        return Ok(mk(ExprKind::EBool(t == Tok::True), l, c));
+    }
+    if (t == Tok::LParen)
+    {
+        bump(p);
+        if (eat(p, Tok::RParen))
+        {
+            return Ok(mk(ExprKind::EUnit, l, c));
+        }
+        Expr e = parse_expr(p)?;
+        expect(p, Tok::RParen)?;
+        return Ok(mk(ExprKind::EParen(Box::new(e)), l, c));
+    }
+    if (t == Tok::LBracket)
+    {
+        return parse_bracket(p);
+    }
+    if (t == Tok::Move)
+    {
+        bump(p);
+        return parse_closure(p, true);
+    }
+    if (t == Tok::LBrace || t == Tok::Unsafe || t == Tok::If || t == Tok::While || t == Tok::For || t == Tok::Foreach || t == Tok::Match)
+    {
+        return parse_block_like(p);
+    }
+    if (t == Tok::Return)
+    {
+        bump(p);
+        // `'return' expr?`: nothing follows when the enclosing construct ends.
+        Tok n = cur(p);
+        if (n == Tok::Semi || n == Tok::RBrace || n == Tok::Comma || n == Tok::RParen || n == Tok::RBracket)
+        {
+            return Ok(mk(ExprKind::EReturn(None), l, c));
+        }
+        return Ok(mk(ExprKind::EReturn(Some(Box::new(parse_expr(p)?))), l, c));
+    }
+    if (t == Tok::Break)
+    {
+        bump(p);
+        return Ok(mk(ExprKind::EBreak, l, c));
+    }
+    if (t == Tok::Continue)
+    {
+        bump(p);
+        return Ok(mk(ExprKind::EContinue, l, c));
+    }
+    if (t == Tok::Ident)
+    {
+        PathTargs { segs, targs } = parse_path_and_targs(p)?;
+        // `Name { f: v }`, as Rust writes a struct literal.
+        if (cur(p) == Tok::LBrace && peek_tok(p, 1) == Tok::Ident && peek_tok(p, 2) == Tok::Colon)
+        {
+            bump(p);
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf(
+                    "a struct literal names each field with a dot and `=`: `%s { .field = value, … }`",
+                    &String::join(&segs[0..$], "::"),
+                )),
+            ));
+        }
+        if (cur(p) == Tok::LBrace && brace_is_struct_lit(p))
+        {
+            bump(p);
+            Vec<FieldInit> fields = Vec::new();
+            while (cur(p) != Tok::RBrace)
+            {
+                expect(p, Tok::Dot)?;
+                String f = ident(p)?;
+                expect(p, Tok::Eq)?;
+                Expr e = parse_expr(p)?;
+                Vec::push(&mut fields, FieldInit { .name = f, .value = e });
+                if (!eat(p, Tok::Comma))
+                {
+                    break;
+                }
+            }
+            expect(p, Tok::RBrace)?;
+            return Ok(mk(
+                ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = targs, .fields = fields })),
+                l,
+                c,
+            ));
+        }
+        // D-0066: a local constant's name is its hidden constant; a local
+        // variable in a constant's initializer is not constant.
+        if (Vec::len(&segs) == 1)
+        {
+            match (lookup_local(p, String::as_view(&segs[0])))
+            {
+                Some(Some(hidden)) :
+                {
+                    Vec<String> one = Vec::new();
+                    Vec::push(&mut one, hidden);
+                    return Ok(mk(ExprKind::EPath(Box::new(PathExpr { .segs = one, .targs = targs })), l, c));
+                },
+                Some(None)         :
+                {
+                    if (p.in_const_init && Option::is_none(&p.const_error))
+                    {
+                        p.const_error = Some(sprintf("diag.const-not-constant@%v", l));
+                    }
+                },
+                None               : {},
+            }
+        }
+        return Ok(mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = targs })), l, c));
+    }
+    // `u32 slice = …`: a declaration whose name is a reserved word.
+    Tok n1 = peek_tok(p, 1);
+    if (t == Tok::TypeName && n1 == Tok::TypeName)
+    {
+        String w = String::clone(&p.toks[p.pos + 1].text);
+        bump(p);
+        return Err(err_at(p, String::as_view(&reserved_name(String::as_view(&w)))));
+    }
+    // `f32(x)`: a call of something named as a built-in type.
+    if (t == Tok::TypeName && n1 == Tok::LParen)
+    {
+        return Err(err_at(p, String::as_view(&reserved_call(String::as_view(&p.toks[p.pos].text)))));
+    }
+    // `i32 move = 1;`: a keyword as a variable's name.
+    if (t == Tok::TypeName && p.pos + 2 < Vec::len(&p.toks))
+    {
+        String shown = display(&p.toks[p.pos + 1]);
+        StringView word = trim_backticks(String::as_view(&shown));
+        Tok after = peek_tok(p, 2);
+        if (n1 != Tok::Ident && n1 != Tok::TypeName && lower_word(word) && (after == Tok::Eq || after == Tok::Semi || after == Tok::Comma || after == Tok::RParen))
+        {
+            return Err(err_at(
+                p,
+                String::as_view(&sprintf("`%v` is a keyword, so it cannot name a variable; choose another name", word)),
+            ));
+        }
+    }
+    Err(err_at(p, String::as_view(&sprintf("expected an expression, found %s", &found(p)))))
+}
+
+// `{` right after a path, followed by `.` or `}`: a struct literal.
+fn brace_is_struct_lit(ref<Parser, shared> p) : bool
+{
+    Tok n = peek_tok(p, 1);
+    n == Tok::Dot || n == Tok::RBrace
+}
+
+fn parse_bracket(ref<Parser, exclusive> p) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    // An array literal or a closure: a closure's `]` is followed by `(`.
+    usize close = find_matching_bracket(p, p.pos);
+    if (close != NONE && tok_at(&p.toks, close + 1) == Tok::LParen)
+    {
+        return parse_closure(p, false);
+    }
+    bump(p);
+    Vec<Expr> items = Vec::new();
+    if (!eat(p, Tok::RBracket))
+    {
+        Expr first = parse_expr(p)?;
+        // `[v; N]` (D-0072): N copies of v.
+        if (eat(p, Tok::Semi))
+        {
+            u128 n = array_length(p)?;
+            expect(p, Tok::RBracket)?;
+            return Ok(mk(ExprKind::EArrayRepeat(Box::new(RepeatExpr { .value = first, .n = n })), l, c));
+        }
+        Vec::push(&mut items, first);
+        // A trailing comma is allowed (D-0072).
+        while (eat(p, Tok::Comma))
+        {
+            if (cur(p) == Tok::RBracket)
+            {
+                break;
+            }
+            Vec::push(&mut items, parse_expr(p)?);
+        }
+        expect(p, Tok::RBracket)?;
+    }
+    Ok(mk(ExprKind::EArrayLit(items), l, c))
+}
+
+fn find_matching_bracket(ref<Parser, shared> p, usize open) : usize
+{
+    i64 depth = 0;
+    usize i = open;
+    while (true)
+    {
+        Tok t = tok_at(&p.toks, i);
+        if (t == Tok::LBracket)
+        {
+            depth += 1;
+        }
+        else if (t == Tok::RBracket)
+        {
+            depth -= 1;
+            if (depth == 0)
+            {
+                return i;
+            }
+        }
+        else if (t == Tok::Eof)
+        {
+            return NONE;
+        }
+        i += 1;
+    }
+    NONE
+}
+
+fn parse_closure(ref<Parser, exclusive> p, bool is_move) : Result<Expr, SyntaxError>
+{
+    usize l = line(p);
+    usize c = col(p);
+    expect(p, Tok::LBracket)?;
+    Vec<String> captures = Vec::new();
+    if (!eat(p, Tok::RBracket))
+    {
+        while (true)
+        {
+            if (cur(p) == Tok::Amp || cur(p) == Tok::AndAnd || cur_is_word(p, "ref"))
+            {
+                return Err(err_at(
+                    p,
+                    "a capture is a bare name: `[x](…) { … }` borrows `x` (exclusively when the body writes it), `move [x](…) { … }` moves or copies it",
+                ));
+            }
+            Vec::push(&mut captures, ident(p)?);
+            if (!eat(p, Tok::Comma))
+            {
+                break;
+            }
+        }
+        expect(p, Tok::RBracket)?;
+    }
+    Vec<ParamDecl> params = parse_params(p)?;
+    // D-0081: an optional result type, written as a function's is.
+    Option<Type> ret = if (eat(p, Tok::Colon)) { Some(parse_type(p)?) } else { None };
+    Vec<String> names = Vec::clone(&captures);
+    foreach (x in &params)
+    {
+        Vec::push(&mut names, String::clone(&x.name));
+    }
+    Vec::push(&mut p.scopes, scope_of_names(&names));
+    open_binder_region(p, &names, l);
+    Result<Block, SyntaxError> br = parse_block(p);
+    close_binder_region(p);
+    Vec::pop(&mut p.scopes);
+    Block body = match (br)
+    {
+        Ok(x)  : x,
+        Err(e) : return Err(e),
+    };
+    Ok(mk(
+        ExprKind::EClosure(Box::new(ClosureExpr { .is_move = is_move, .captures = captures, .params = params, .ret = ret, .body = body })),
+        l,
+        c,
+    ))
+}
+
+// ---- the entry ----
+
+// The prelude's skeleton, as tokens (its end left off).
+fn skeleton_tokens() : Vec<PTok>
+{
+    Vec<PTok> toks = Result::expect(lex_tokens(&String::from_str(PRELUDE_SKELETON)), "the prelude's skeleton lexes");
+    Vec::pop(&mut toks);
+    toks
+}
+
+// `text` parsed as coby parses a program after the prelude: the program,
+// or the error as coby gives it (`parse error at L:C: …`, `lex error at
+// L:C: …`, or a diagnostic `diag.…@N`).
+export fn parse_text(ref<String, shared> text) : Result<Program, String>
+{
+    Vec<PTok> user = match (lex_tokens(text))
+    {
+        Ok(t)  : t,
+        Err(e) : return Err(sprintf("lex error at %v:%v: %s", e.line, e.col, &e.msg)),
+    };
+    Vec<PTok> toks = skeleton_tokens();
+    usize start = Vec::len(&toks);
+    Vec::append(&mut toks, user);
+    Parser p = new_parser(toks, start);
+    p.fresh = PRELUDE_FRESH;
+    p.local_consts = PRELUDE_LOCAL_CONSTS;
+    Program program = match (parse_program(&mut p))
+    {
+        Ok(pr) : pr,
+        Err(e) : return Err(sprintf("parse error at %v:%v: %s", e.line, e.col, &e.msg)),
+    };
+    match (&p.const_error)
+    {
+        Some(d) : return Err(String::clone(d)),
+        None    : {},
+    }
+    match (&p.local_error)
+    {
+        Some(d) : return Err(String::clone(d)),
+        None    : {},
+    }
+    Ok(program)
+}
+
+// What `new_parser`'s pre-scans find in the prelude's skeleton alone: the
+// type names and the constants' lengths. A function of `std` whose tokens
+// hold no `const`, `struct`, `enum`, `bitstruct` or `module` adds nothing
+// to them, so it is parsed from these without the skeleton's tokens.
+export struct StdBase
+{
+    HashMap<String, ConstLen> const_lengths;
+    HashMap<String, ModLen> module_lengths;
+    HashSet<String> type_names;
+}
+
+export fn std_base() : StdBase
+{
+    Vec<PTok> toks = skeleton_tokens();
+    usize start = Vec::len(&toks);
+    Parser p = new_parser(toks, start);
+    StdBase {
+        .const_lengths = replace(&mut p.const_lengths, HashMap::new()),
+        .module_lengths = replace(&mut p.module_lengths, HashMap::new()),
+        .type_names = replace(&mut p.type_names, HashSet::new()),
+    }
+}
+
+// Whether the pre-scans would find anything in `toks`.
+fn prescan_reads(ref<Vec<PTok>, shared> toks) : bool
+{
+    for (usize i = 0; i < Vec::len(toks); i += 1)
+    {
+        Tok t = toks[i].tok;
+        if (t == Tok::Const || t == Tok::Struct || t == Tok::Enum || t == Tok::Bitstruct || t == Tok::Module)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// One function of `std` parsed alone (CHG-0355), as `parser.rs`'s
+// `prelude_bodies` checks that it parses: its tokens at their lines and
+// columns after the skeleton's (for the pre-scans), the hidden-name
+// counters from where the prelude's own parse had them.
+export fn parse_std_fn(
+    ref<StdBase, shared> base,
+    StringView text,
+    usize line,
+    usize col,
+    usize fresh,
+    usize local_consts,
+) : Result<Item, String>
+{
+    String padded = String::new();
+    for (usize i = 1; i < col; i += 1)
+    {
+        String::push_ascii(&mut padded, b' ');
+    }
+    String::append(&mut padded, text);
+    Vec<PTok> alone = match (lex_tokens(&padded))
+    {
+        Ok(t)  : t,
+        Err(e) : return Err(sprintf("lex error at %v:%v: %s", e.line + line - 1, e.col, &e.msg)),
+    };
+    for (usize i = 0; i < Vec::len(&alone); i += 1)
+    {
+        alone[i].line += line - 1;
+    }
+    Parser p = if (prescan_reads(&alone))
+    {
+        Vec<PTok> toks = skeleton_tokens();
+        usize start = Vec::len(&toks);
+        Vec::append(&mut toks, alone);
+        new_parser(toks, start)
+    }
+    else
+    {
+        Parser q = new_parser(Vec::new(), 0);
+        q.toks = alone;
+        q.const_lengths = clone(&base.const_lengths);
+        q.module_lengths = clone(&base.module_lengths);
+        q.type_names = clone(&base.type_names);
+        q
+    };
+    p.fresh = fresh;
+    p.local_consts = local_consts;
+    match (parse_item(&mut p))
+    {
+        Ok(it) : Ok(it),
+        Err(e) : Err(sprintf("parse error at %v:%v: %s", e.line, e.col, &e.msg)),
+    }
+}
+
+// The prelude's declarations (`PRELUDE_DECLS`, CHG-0352), parsed as coby
+// parses the prelude: on their own, the hidden names' counters from zero.
+export fn parse_prelude() : Program
+{
+    Vec<PTok> toks = Result::expect(lex_tokens(&String::from_str(PRELUDE_DECLS)), "the prelude's declarations lex");
+    Parser p = new_parser(toks, 0);
+    p.test_base = 0;
+    Result::expect(parse_program(&mut p), "the prelude's declarations parse")
+}

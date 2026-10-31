@@ -1,0 +1,58 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.net (`IpAddr::V4`, `IpAddr::V6`, `TcpStream::connect_timeout`, `TcpStream::local_addr`); rule.stdlib.http (`HttpConnection::peer_addr`) (CHG-0265); conf.net-addrs-and-http-peer
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7634206c6f6f706261636b2c207636206c6f6f706261636b2c2076340a7463703a206c6f63616c2069732074686520706565722773207065657220747275652c207065657220697320746865206c697374656e657220747275652c207634206c6f6f706261636b0a687474703a203230302c2073657276657220736177206c6f6f706261636b20747275650a
+//
+// Hermetic, on loopback: the two forms of an address taken apart by
+// their variants; a connection made with a timeout, whose local address
+// is the listener's peer's and whose peer is the listener; an HTTP server
+// in a thread that answers one request and reports the client's address
+// as loopback.
+import std;
+
+fn family(ref<IpAddr, shared> ip) : str
+{
+    match (ip)
+    {
+        V4(b) : if (b[0] == 127) { "v4 loopback" } else { "v4" },
+        V6(b) : if (b[15] == 1) { "v6 loopback" } else { "v6" },
+    }
+}
+
+fn serve(HttpServer s) : bool
+{
+    HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+    SocketAddr peer = HttpConnection::peer_addr(&c);
+    _ = HttpConnection::request(&mut c);
+    Vec<Header> h = Vec::new();
+    _ = HttpConnection::respond(&mut c, 200, &h[0..$], &b"hi\n"[0..$]);
+    HttpConnection::close(&mut c);
+    String::eq_str(&IpAddr::text(&peer.ip), "127.0.0.1")
+}
+
+fn main()
+{
+    IpAddr a = IpAddr::localhost_v4();
+    IpAddr b = IpAddr::localhost_v6();
+    IpAddr c = Result::unwrap(IpAddr::parse("192.0.2.7"));
+    printf("%v, %v, %v\n", family(&a), family(&b), family(&c));
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    TcpStream t = Result::unwrap(TcpStream::connect_timeout(at, 5000));
+    TcpStream u = Result::unwrap(TcpListener::accept(&mut l));
+    SocketAddr mine = TcpStream::local_addr(&t);
+    SocketAddr theirs = TcpStream::peer_addr(&u);
+    printf(
+        "tcp: local is the peer's peer %v, peer is the listener %v, %v\n",
+        mine.port == theirs.port,
+        TcpStream::peer_addr(&t).port == at.port,
+        family(&mine.ip),
+    );
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    u16 port = HttpServer::local_addr(&s).port;
+    auto server = spawn(serve, s);
+    Response r = Result::unwrap(http_get(String::as_view(&sprintf("http://127.0.0.1:%v/", port))));
+    printf("http: %v, server saw loopback %v\n", r.status, join(server));
+}
