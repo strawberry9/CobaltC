@@ -1,0 +1,122 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.match [Match-Through-Box] (D-0301); conf.match-through-box
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 32203320352038200a31380a6e657374656420370a3432203130330a
+//
+// `V(*x)` binds the value inside the payload's `Box`: through a shared
+// reference `x` is a shared reference to it (`Box::get`), through an
+// exclusive one an exclusive reference the arm writes through
+// (`Box::get_mut`), and by value the value itself, the box consumed
+// (`Box::into_inner`), a resource `Vec` among them. `*x` in an `if`
+// pattern, below another variant, and over `Option<Box<T>>` (one pointer,
+// D-0298), where a tree reads `Some(*n) : n.key`.
+
+import std;
+
+struct Node
+{
+    i64 key;
+    Option<Box<Node>> left;
+    Option<Box<Node>> right;
+}
+
+enum Shape
+{
+    Circle(Box<i64>),
+    Many(Box<Vec<i64>>),
+    Empty,
+}
+
+fn insert(ref<Option<Box<Node>>, exclusive> t, i64 k)
+{
+    match (t)
+    {
+        Some(*n) :
+        {
+            if (k < n.key)
+            {
+                insert(&mut n.left, k);
+            }
+            else
+            {
+                insert(&mut n.right, k);
+            }
+        },
+        None     : *t = Some(Box::new(Node { .key = k, .left = None, .right = None })),
+    }
+}
+
+fn sum(ref<Option<Box<Node>>, shared> t) : i64
+{
+    match (t)
+    {
+        Some(*n) : sum(&n.left) + n.key + sum(&n.right),
+        None     : 0,
+    }
+}
+
+fn walk(ref<Option<Box<Node>>, shared> t)
+{
+    if (Some(*n) = t)
+    {
+        walk(&n.left);
+        printf("%d ", n.key);
+        walk(&n.right);
+    }
+}
+
+fn grow(ref<Shape, exclusive> s)
+{
+    match (s)
+    {
+        Shape::Circle(*r) : *r = *r * 2,
+        Shape::Many(*v)   : Vec::push(v, 100),
+        Shape::Empty      : {},
+    }
+}
+
+fn total(Shape s) : i64
+{
+    match (s)
+    {
+        Shape::Circle(*r) : r,
+        Shape::Many(*v)   :
+        {
+            i64 t = 0;
+            foreach (x in v)
+            {
+                t += x;
+            }
+            t
+        },
+        Shape::Empty      : 0,
+    }
+}
+
+fn main() : u8
+{
+    Option<Box<Node>> t = None;
+    insert(&mut t, 5);
+    insert(&mut t, 2);
+    insert(&mut t, 8);
+    insert(&mut t, 3);
+    walk(&t);
+    printf("\n%d\n", sum(&t));
+    Shape c = Shape::Circle(Box::new(21));
+    grow(&mut c);
+    Vec<i64> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 2);
+    Shape m = Shape::Many(Box::new(v));
+    grow(&mut m);
+    Option<Shape> o = Some(Shape::Circle(Box::new(7)));
+    match (&o)
+    {
+        Some(Shape::Circle(*r)) : printf("nested %d\n", *r),
+        _                       : {},
+    }
+    printf("%d %d\n", total(c), total(m));
+    return 0;
+}

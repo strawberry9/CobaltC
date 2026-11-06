@@ -1,0 +1,52 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.crypto [Rsa-Private-Key] [Rsa-Private-Op] [Rsa-Sign-Pkcs1v15] [Rsa-Sign-Pss] (D-0169); conf.rsa-sign-vectors, conf.rsa-private-key-refusals
+// kind: positive
+// expect: ok
+// slow: interpreted big-number arithmetic takes well over the 10-second budget
+// expect-stdout-hex: 706b63733120363430313861396664353236353764386465373461353138333663636338366361316335383565343565376333313365323539633337306234303338343331346162336539383538353064663930363264386232373237633133313738343038373866343161373362623561613462623933346137643066383466643931376637303934356666313533663164393333616364663665643163613030343434653961643733353363663535623761633937393761343232666265666561646565323765663732353462353136636330393066653536323132663837353066646164333332316337623261393730656464383834633865636135333333333662370a766572696669657320747275650a707373206469666665727320747275652c207665726966696573207472756520747275652c20706b63733120666f726d207265667573656420747275650a7075626c6963207472756520747275650a726566757365643a207472756520747275650a
+//
+// A 1024-bit key made by openssl: its PKCS #1 v1.5 signature of
+// SHA-256("hello") is the one the Python `cryptography` library computes
+// (the encoding is deterministic), and `rsa_verify_pkcs1v15` accepts it;
+// two PSS signatures differ (random salts) and both verify; the public key
+// is the key's n and e; parts that do not fit (swapped p and q, a wrong d)
+// make no key.
+
+import std;
+
+fn big(str hex) : BigUint
+{
+    BigUint::from_bytes_be(&Result::unwrap_or(from_hex(StringView::of(hex)), Vec::new())[0..$])
+}
+
+const str N = "c25aedafdfc235b109831e675a14ffb15a7ff539a54edf0a73122cf52ed1f6ff29e9382d8bdbd8923cb9ef95757dbd0e303d33f82b22aa1b3a06d45a43ff184a206eba52bd415292d0af06a4c98854fa6d30de23789e4fb855f6e2878bc50be4d30bc1cd80ec4b437fec367dc7fb128048efbd62de6042143d27f602af1d02e3";
+const str D = "3e66d77dea87fe993306a85262b7ef48d057d932830309d5df106ce2e3ff822077226c69234899068afce011cac16e5c09dcfcbca78cdfb512327327f0410d58e044e4f8c4c6658c6eb5bb6621c6e0ef13c307d9077416e49cea9b9ce467e45f9d5a6201fbfc863b7e62537ea8afe9e2c33e1f7e248a2d33f9d96d1ab7f6f3d1";
+const str P = "e219e8c5bab01628a5e3c663dd3f6c4864a8a4465c20b72426c888fb18e80cdd5f60aa0cdedad6e45ce6f7627e1112382ff110f0957c5d52eb0175ad0163d30d";
+const str Q = "dc0e564fd77c29093f9ed1a4039b6f78f734cb9d074ed33c462903bc1750cef45ab41444bbaf1393db7c5ac2ab171b2f568538e39fc6e4828e1cc7f798d371af";
+
+fn main() : u8
+{
+    RsaPrivateKey key = Option::unwrap(RsaPrivateKey::new(big(N), big("010001"), big(D), big(P), big(Q)));
+    RsaPublicKey pub = RsaPrivateKey::public_key(&key);
+    array<u8, 32> digest = sha256(&b"hello"[0..$]);
+    Vec<u8> s1 = rsa_sign_pkcs1v15(&key, Sha2_256, &digest[0..$]);
+    printf("pkcs1 %s\n", &to_hex(&s1[0..$]));
+    printf("verifies %v\n", rsa_verify_pkcs1v15(&pub, Sha2_256, &digest[0..$], &s1[0..$]));
+    Vec<u8> s2 = rsa_sign_pss(&key, Sha2_256, &digest[0..$]);
+    Vec<u8> s3 = rsa_sign_pss(&key, Sha2_256, &digest[0..$]);
+    printf(
+        "pss differs %v, verifies %v %v, pkcs1 form refused %v\n",
+        !digest_eq(&s2[0..$], &s3[0..$]),
+        rsa_verify_pss(&pub, Sha2_256, &digest[0..$], &s2[0..$]),
+        rsa_verify_pss(&pub, Sha2_256, &digest[0..$], &s3[0..$]),
+        !rsa_verify_pss(&pub, Sha2_256, &digest[0..$], &s1[0..$]),
+    );
+    printf("public %v %v\n", BigUint::eq(&pub.n, &key.n), BigUint::eq(&pub.e, &BigUint::from_u64(65537)));
+    printf(
+        "refused: %v %v\n",
+        Option::is_none(&RsaPrivateKey::new(big(N), big("010001"), big(D), big(Q), big(D))),
+        Option::is_none(&RsaPrivateKey::new(big(N), big("010001"), big(P), big(P), big(Q))),
+    );
+    0
+}

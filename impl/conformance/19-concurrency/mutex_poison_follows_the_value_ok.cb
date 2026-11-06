@@ -1,0 +1,79 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.mutex-poison-follows-the-value; rule.conc.lock [Mutex-New], [Lock-Poisoned], rule.resauth.relocate-in [Relocate-In], [Fault-Contain] (D-0310, CHG-0411)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 613a206661696c656420646961672e696e6465782d6f75742d6f662d626f756e64730a6d6f7665643a206661696c656420646961672e6d757465782d706f69736f6e65640a696e2061206669656c643a206661696c656420646961672e6d757465782d706f69736f6e65640a633a206661696c656420646961672e696e6465782d6f75742d6f662d626f756e64730a643a206f6b20330a
+//
+// A mutex's state belongs to its place and goes with its value (D-0310).
+// `a` is poisoned by a thread that faults holding it (a guard used only
+// as `*g`); moved into the binding `b`, then into the field `h.m`, it is
+// still poisoned, so each later lock faults diag.mutex-poisoned. `c` is
+// poisoned the same way through a `guard<i64>`; `d`, made in the next
+// block after `c` has ended (perhaps in the same storage), is a new
+// mutex and locks.
+
+import std;
+
+struct Holder
+{
+    i64 n;
+    mutex<i64> m;
+}
+
+fn faulter(ref<mutex<i64>, shared> m, i64 k) : i64
+{
+    auto g = lock(m);
+    *g = *g + k;
+    array<i64, 2> v = [1, 2];
+    v[narrow<usize>(k)]
+}
+
+fn guard_faulter(ref<mutex<i64>, shared> m, i64 k) : i64
+{
+    guard<i64> g = lock(m);
+    *g = *g + k;
+    array<i64, 2> v = [1, 2];
+    v[narrow<usize>(k)]
+}
+
+fn reader(ref<mutex<i64>, shared> m) : i64
+{
+    auto g = lock(m);
+    *g
+}
+
+fn show(handle<i64> h)
+{
+    match (try_join(h))
+    {
+        Ok(v)  : printf("ok %v\n", v),
+        Err(f) : printf("failed %v\n", &ThreadFailure::diagnostic(&f)),
+    }
+}
+
+fn main() : u8
+{
+    {
+        mutex<i64> a = Mutex::new(1: i64);
+        printf("a: ");
+        show(spawn(faulter, &a, 5));
+        mutex<i64> b = a;
+        printf("moved: ");
+        show(spawn(reader, &b));
+        Holder h = Holder { .n = 3, .m = b };
+        printf("in a field: ");
+        show(spawn(reader, &h.m));
+    }
+    {
+        mutex<i64> c = Mutex::new(2: i64);
+        printf("c: ");
+        show(spawn(guard_faulter, &c, 5));
+    }
+    {
+        mutex<i64> d = Mutex::new(3: i64);
+        printf("d: ");
+        show(spawn(reader, &d));
+    }
+    0
+}

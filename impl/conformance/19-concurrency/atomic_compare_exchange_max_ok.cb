@@ -1,0 +1,64 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.atomic [Atomic-Op]; rule.stdlib.atomic; D-0249; conf.atomic-compare-exchange-max
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 39393936330a
+//
+// The largest value any of three threads saw, kept without a lock: read,
+// and while the candidate is larger try `compare_exchange`, starting again
+// from the value it reports when another thread got there first.
+
+import std;
+
+fn note_max(ref<Atomic<u64>, shared> best, u64 x)
+{
+    u64 seen = Atomic::load(best);
+    while (x > seen)
+    {
+        match (Atomic::compare_exchange(best, seen, x))
+        {
+            Ok(_)    : seen = x,
+            Err(now) : seen = now,
+        }
+    }
+}
+
+fn scan(ref<Atomic<u64>, shared> best, u64 seed) : u64
+{
+    foreach (i in 0..2000: u64)
+    {
+        note_max(best, (seed * 7919 + i * 104729) % 100003);
+    }
+    0
+}
+
+fn main()
+{
+    Atomic<u64> best = Atomic::new(0: u64);
+    {
+        auto a = spawn(scan, &best, 1);
+        auto b = spawn(scan, &best, 2);
+        auto c = spawn(scan, &best, 3);
+        _ = join(a) + join(b) + join(c);
+    }
+    u64 want = 0;
+    foreach (s in 1..4: u64)
+    {
+        foreach (i in 0..2000: u64)
+        {
+            u64 x = (s * 7919 + i * 104729) % 100003;
+            if (x > want)
+            {
+                want = x;
+            }
+        }
+    }
+    assert(Atomic::load(&best) == want);
+    match (Atomic::compare_exchange(&best, 1, 2))
+    {
+        Ok(_)    : assert(false),
+        Err(now) : assert(now == want),
+    }
+    printf("%v\n", want);
+}

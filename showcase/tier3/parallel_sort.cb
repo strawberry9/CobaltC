@@ -1,0 +1,128 @@
+// Parallel Merge Sort
+//
+// Shows: data parallelism by moving ownership. Each half of the list is
+// *moved* into a thread by `spawn`, sorted there, and moved back by
+// `join`; no two threads ever touch the same Vec, so there is nothing to
+// lock and no data race to rule out. After `spawn(psort, left, …)` the
+// spawning thread cannot use `left` at all: the move is checked like any
+// other. The random numbers come from `std`'s `Rng`, seeded, so every
+// run sorts the same list.
+
+import std;
+
+// A copy of v's elements [from, to).
+fn copy_range(ref<Vec<u64>, shared> v, usize from, usize to) : Vec<u64>
+{
+    Vec::from_slice(&v[from .. to])
+}
+
+// Merges two sorted lists, consuming both.
+fn merge(Vec<u64> a, Vec<u64> b) : Vec<u64>
+{
+    Vec<u64> out = Vec::new();
+    usize i = 0;
+    usize j = 0;
+    while (i < Vec::len(&a) || j < Vec::len(&b))
+    {
+        bool take_a = j == Vec::len(&b) || (i < Vec::len(&a) && a[i] <= b[j]);
+        if (take_a)
+        {
+            Vec::push(&mut out, a[i]);
+            i += 1;
+        }
+        else
+        {
+            Vec::push(&mut out, b[j]);
+            j += 1;
+        }
+    }
+    out
+}                                               // a and b are destroyed here
+
+fn sort(Vec<u64> v) : Vec<u64>
+{
+    usize n = Vec::len(&v);
+    if (n < 2)
+    {
+        return v;
+    }
+    Vec<u64> left = copy_range(&v, 0, n / 2);
+    Vec<u64> right = copy_range(&v, n / 2, n);
+    merge(sort(left), sort(right))
+}
+
+// Splits `depth` times, sorting one half of each split in a new thread.
+fn psort(Vec<u64> v, u32 depth) : Vec<u64>
+{
+    usize n = Vec::len(&v);
+    if (depth == 0 || n < 2)
+    {
+        return sort(v);
+    }
+    Vec<u64> left = copy_range(&v, 0, n / 2);
+    Vec<u64> right = copy_range(&v, n / 2, n);
+    auto h = spawn(psort, left, depth - 1);     // left moves into the new thread
+    // Vec::len(&left) here would be diag.stale-binding: left is no longer ours.
+    Vec<u64> sorted_right = psort(right, depth - 1);
+    merge(join(h), sorted_right)                // the sorted left half moves back
+}
+
+fn is_sorted(ref<Vec<u64>, shared> v) : bool
+{
+    foreach (i in 1..Vec::len(v))
+    {
+        if (v[i - 1] > v[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn show_ends(ref<Vec<u64>, shared> v)
+{
+    usize n = Vec::len(v);
+    foreach (i in 0..5)
+    {
+        printf("%v ", v[i]);
+    }
+    printf("... ");
+    foreach (i in n - 5..n)
+    {
+        printf("%v", v[i]);
+        printf("%v", if (i + 1 < n) { " " } else { "\n" });
+    }
+}
+
+fn sum(ref<Vec<u64>, shared> v) : u64
+{
+    u64 total = 0;
+    foreach (x in v)
+    {
+        total += *x;
+    }
+    total
+}
+
+fn main()
+{
+    Rng rng = Rng::new(2026);
+    Vec<u64> data = Vec::new();
+    foreach (i in 0..250)
+    {
+        Vec::push(&mut data, Rng::below(&mut rng, 100000));
+    }
+    usize count = Vec::len(&data);
+    u64 total = sum(&data);
+    printf("unsorted: ");
+    show_ends(&data);
+
+    Vec<u64> sorted = psort(data, 2);           // 2 levels of splits: 4 sorts, 3 of them in new threads
+    printf("sorted:   ");
+    show_ends(&sorted);
+    printf("in order: ");
+    printf("%v", is_sorted(&sorted));
+    printf(", same count: %v, same sum: ", Vec::len(&sorted) == count);
+    printf("%v", sum(&sorted) == total);
+    printf("\n");
+}

@@ -1,0 +1,48 @@
+// Parallel chunks
+//
+// Shows: data parallelism the aliasing rules make safe. `slice_parts`
+// splits a vector into disjoint runs, each an exclusive slice of its own,
+// and each goes to a thread of its own: the threads write to one vector at
+// once, with no lock, and no thread can reach another's elements -- an
+// exclusive slice is all it holds. `cpu_count()` sizes the split.
+
+import std;
+
+// Fills a run with squares of the positions it covers, and sums them.
+fn squares(slice<u64, exclusive> part, u64 first) : u64
+{
+    u64 sum = 0;
+    for (usize i = 0; i < slice_len(part); i += 1)
+    {
+        u64 x = first + narrow<u64>(i);
+        part[i] = x * x;
+        sum += x * x;
+    }
+    sum
+}
+
+fn main()
+{
+    usize n = 1000000;
+    Vec<u64> v = Vec::filled(n, 0: u64);
+    usize parts = if (cpu_count() < 8) { 8 } else { cpu_count() };
+    u64 total = 0;
+    {
+        Vec<slice<u64, exclusive>> chunks = slice_parts(&mut v[0..$], parts);
+        Vec<handle<u64>> hs = Vec::new();
+        u64 first = 0;
+        while (Vec::len(&chunks) > 0)
+        {
+            slice<u64, exclusive> c = Vec::remove(&mut chunks, 0);
+            u64 len = narrow<u64>(slice_len(c));
+            Vec::push(&mut hs, spawn(squares, c, first));
+            first += len;
+        }
+        foreach (h in hs)
+        {
+            total += join(h);
+        }
+    }
+    printf("sum of squares below %v: %v\n", n, total);
+    printf("v[999999] = %v\n", v[999999]);
+}

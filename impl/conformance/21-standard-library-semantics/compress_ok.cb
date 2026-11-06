@@ -1,0 +1,113 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.compress [Deflate] [Inflate] [Zlib] [Gzip] [Adler32] [Compress-Error] (D-0183); conf.deflate-inflate, conf.zlib, conf.gzip, conf.adler32, conf.inflate-errors
+// kind: positive
+// expect: ok
+// slow: inflate and deflate under the interpreter take half a minute
+// expect-stdout-hex: 7472756520747275650a74686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e2074686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f67210a7472756520326263393438353532383263636434636365353634383261636132666366353334386362616635306338326163643264323835366338326634623264353230303439653732343536353532616134653461376562383137393434326135363034303020747275650a7472756520313230203135362062663634323036320a7472756520316638623038303030303030303030303030666620376138313930376535393030303030300a30333030203020300a3462346334613036303020747275650a74727565207472756520747275650a74727565206564643634313064383030303130303420747275650a312033303032383638373220343036373934333934380a74727565207472756e6361746564206f76657273697a650a636f727275707420636865636b73756d2030207472756e63617465640a6465636f6d70726573736564206461746120746f6f206c617267650a
+//
+// Streams other implementations made (zlib at level 9: raw DEFLATE, a
+// zlib stream, a gzip member with a name) inflate to their text; every
+// kind of data round-trips through `deflate`, `zlib_deflate` and `gzip`,
+// and the compressed text is identical in every implementation;
+// Adler-32's vectors; a truncated, a corrupt and an oversize stream.
+
+import std;
+
+fn same(ref<Vec<u8>, shared> a, slice<u8, shared> b) : bool
+{
+    Vec::len(a) == slice_len(b) && digest_eq(&(*a)[0..$], b)
+}
+
+fn main()
+{
+    str text = "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog!";
+    slice<u8, shared> want = StringView::as_bytes(StringView::of(text));
+    // `zlib.compress(text, 9)[2:-4]`, `zlib.compress(text, 9)`, and
+    // `gzip.compress(text, 9, mtime=0)` with a name set, from CPython 3.10.
+    Vec<u8> raw = Result::unwrap(from_hex("2bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb8179442a560400"));
+    Vec<u8> z = Result::unwrap(from_hex("78da2bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb8179442a560400bf642062"));
+    Vec<u8> g = Result::unwrap(from_hex("1f8b08080000000002ff6869002bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb8179442a5604007a81907e59000000"));
+    printf(
+        "%v %v\n",
+        same(&Result::unwrap(inflate(&raw[0..$], 1000)), want),
+        same(&Result::unwrap(zlib_inflate(&z[0..$], 1000)), want),
+    );
+    printf("%v\n", &Result::unwrap(String::from_utf8(Result::unwrap(gunzip(&g[0..$], 1000)))));
+    Vec<u8> d = deflate(want);
+    printf(
+        "%v %v %v\n",
+        Vec::len(&d) < slice_len(want),
+        &to_hex(&d[0..$]),
+        same(&Result::unwrap(inflate(&d[0..$], 1000)), want),
+    );
+    Vec<u8> zz = zlib_deflate(want);
+    Vec<u8> gg = gzip(want);
+    printf(
+        "%v %v %v %v\n",
+        same(&Result::unwrap(zlib_inflate(&zz[0..$], 1000)), want),
+        zz[0],
+        zz[1],
+        &to_hex(&zz[Vec::len(&zz) - 4..$]),
+    );
+    printf(
+        "%v %v %v\n",
+        same(&Result::unwrap(gunzip(&gg[0..$], 1000)), want),
+        &to_hex(&gg[0..10]),
+        &to_hex(&gg[Vec::len(&gg) - 8..$]),
+    );
+    Vec<u8> none = Vec::new();
+    Vec<u8> de = deflate(&none[0..$]);
+    printf(
+        "%v %v %v\n",
+        &to_hex(&de[0..$]),
+        Vec::len(&Result::unwrap(inflate(&de[0..$], 10))),
+        Vec::len(&Result::unwrap(gunzip(&gzip(&none[0..$])[0..$], 10))),
+    );
+    Vec<u8> small = Vec::from_slice(&b"abc"[0..$]);
+    Vec<u8> ds = deflate(&small[0..$]);
+    printf("%v %v\n", &to_hex(&ds[0..$]), same(&Result::unwrap(inflate(&ds[0..$], 10)), &small[0..$]));
+    Rng r = Rng::new(5);
+    Vec<u8> noise = Vec::new();
+    foreach (i in 0..3000)
+    {
+        Vec::push(&mut noise, narrow<u8>(Rng::below(&mut r, 256)));
+    }
+    Vec<u8> dn = deflate(&noise[0..$]);
+    printf(
+        "%v %v %v\n",
+        Vec::len(&dn) >= 3000,
+        Vec::len(&dn) < 3100,
+        same(&Result::unwrap(inflate(&dn[0..$], 4000)), &noise[0..$]),
+    );
+    Vec<u8> runs = Vec::new();
+    foreach (i in 0..20000)
+    {
+        Vec::push(&mut runs, narrow<u8>(97 + (i / 1000) % 3));
+    }
+    Vec<u8> dr = deflate(&runs[0..$]);
+    printf(
+        "%v %v %v\n",
+        Vec::len(&dr) < 200,
+        &to_hex(&dr[0..8]),
+        same(&Result::unwrap(inflate(&dr[0..$], 30000)), &runs[0..$]),
+    );
+    printf("%v %v %v\n", adler32(&none[0..$]), adler32(&b"Wikipedia"[0..$]), adler32(&runs[0..$]));
+    printf(
+        "%v %v %v\n",
+        Result::is_err(&inflate(&d[0..$], 10)),
+        match (inflate(&d[0..Vec::len(&d) - 3], 1000)) { Err(Truncated) : "truncated", _ : "?" },
+        match (inflate(&d[0..$], 10)) { Err(Oversize) : "oversize", _ : "?" },
+    );
+    Vec<u8> bad = Vec::clone(&zz);
+    bad[Vec::len(&bad) - 1] = bad[Vec::len(&bad) - 1] ^ 1;
+    Vec<u8> bad_head = Vec::clone(&gg);
+    bad_head[1] = 0;
+    printf(
+        "%v %v %v\n",
+        match (zlib_inflate(&bad[0..$], 1000)) { Err(Corrupt(_)) : "corrupt checksum", _ : "?" },
+        match (gunzip(&bad_head[0..$], 1000)) { Err(Corrupt(i)) : i, _ : 99 },
+        match (zlib_inflate(&b"xyz"[0..$], 10)) { Err(Truncated) : "truncated", _ : "?" },
+    );
+    printf("%v\n", CompressError::text(&Oversize));
+}

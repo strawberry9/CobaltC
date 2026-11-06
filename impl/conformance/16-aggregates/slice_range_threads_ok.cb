@@ -1,0 +1,98 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.slice [Slice-Form] (a range); rule.conc.spawn; D-0070; conf.slice-range-threads
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 736f7274656420747275652c20666972737420302c206c617374203939380a68616c76657320313530202b203135300a6c65667420736f7274656420747275652c20726967687420736f7274656420747275650a
+//
+// Divide and conquer on one buffer: an in-place quicksort recursing into
+// the two sides of its pivot, and two threads sorting the two halves of
+// one Vec at once, each through its own exclusive slice.
+
+import std;
+
+fn next(ref<u64, exclusive> s) : u64
+{
+    *s = wrapping_add(wrapping_mul(*s, 6364136223846793005), 1442695040888963407);
+    *s >> 33
+}
+
+// In-place quicksort: partition around the last element, then sort the
+// two sides through two exclusive slices of the same run.
+fn quicksort(slice<u32, exclusive> s)
+{
+    usize n = slice_len(s);
+    if (n < 2)
+    {
+        return;
+    }
+    u32 pivot = s[n - 1];
+    usize store = 0;
+    usize i = 0;
+    while (i + 1 < n)
+    {
+        if (s[i] < pivot)
+        {
+            slice_swap(s, i, store);
+            store = store + 1;
+        }
+        i = i + 1;
+    }
+    slice_swap(s, store, n - 1);
+    slice<u32, exclusive> left = &mut s[0 .. store];
+    slice<u32, exclusive> right = &mut s[store + 1 .. $];
+    quicksort(left);
+    quicksort(right);
+}
+
+fn sorted(slice<u32, shared> s) : bool
+{
+    usize i = 1;
+    while (i < slice_len(s))
+    {
+        if (s[i - 1] > s[i])
+        {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn sort_part(slice<u32, exclusive> s) : usize
+{
+    quicksort(s);
+    slice_len(s)
+}
+
+fn main()
+{
+    u64 seed = 7;
+    Vec<u32> v = Vec::new();
+    usize k = 0;
+    while (k < 400)
+    {
+        Vec::push(&mut v, narrow_wrapping<u32>(next(&mut seed) % 1000));
+        k = k + 1;
+    }
+    quicksort(&mut v[0 .. $]);
+    printf("sorted %v, first %v, last %v\n", sorted(&v[0 .. $]), v[0], v[399]);
+
+    // Two threads sort the two halves of one Vec at once.
+    Vec<u32> w = Vec::new();
+    k = 0;
+    while (k < 300)
+    {
+        Vec::push(&mut w, narrow_wrapping<u32>(next(&mut seed) % 500));
+        k = k + 1;
+    }
+    usize mid = 150;
+    {
+        slice<u32, exclusive> a = &mut w[0 .. mid];
+        slice<u32, exclusive> b = &mut w[mid .. $];
+        auto ha = spawn(sort_part, a);
+        auto hb = spawn(sort_part, b);
+        printf("halves %v + %v\n", join(ha), join(hb));
+    }
+    printf("left sorted %v, right sorted %v\n", sorted(&w[0 .. mid]), sorted(&w[mid .. $]));
+}

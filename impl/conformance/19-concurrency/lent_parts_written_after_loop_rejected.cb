@@ -1,0 +1,49 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.spawn [Thread-Lend]; std::collections::slice_parts [Slice-Parts]; conf.lent-parts-written-after-loop
+// kind: negative
+// expect: diag.aliasing-conflict (dynamic)
+//
+// Each part of `v` is lent to a thread whose handle is kept in `hs`; the
+// threads wait on a channel. Writing an element of `v` before the handles
+// are joined meets the lent part that covers it; which part that is only
+// the values decide, so the run checks the write, and the program is not
+// decided (D-0291).
+
+import std;
+
+fn fill(ref<Channel<i32>, shared> c, slice<u64, exclusive> part) : u64
+{
+    _ = Channel::recv(c);
+    for (usize i = 0; i < slice_len(part); i += 1)
+    {
+        part[i] = 1;
+    }
+    narrow<u64>(slice_len(part))
+}
+
+fn main()
+{
+    Vec<u64> v = Vec::filled(8, 0: u64);
+    Channel<i32> ch = Channel::new(8);
+    u64 total = 0;
+    {
+        Vec<slice<u64, exclusive>> parts = slice_parts(&mut v[0..$], 2);
+        Vec<handle<u64>> hs = Vec::new();
+        while (Vec::len(&parts) > 0)
+        {
+            slice<u64, exclusive> c = Vec::remove(&mut parts, 0);
+            Vec::push(&mut hs, spawn(fill, &ch, c));
+        }
+        v[7] = 2;
+        for (usize i = 0; i < Vec::len(&hs); i += 1)
+        {
+            _ = Channel::send(&ch, 1);
+        }
+        foreach (h in hs)
+        {
+            total += join(h);
+        }
+    }
+    printf("%v %v\n", total, v[7]);
+}

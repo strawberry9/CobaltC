@@ -1,0 +1,73 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.lock [Lock] sync-exempt; CHG-0072; conf.mutex-in-shared-struct
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 706c61796564203132302c20746f74616c203132302c2073756d203132302c206c6f67203132300a
+//
+// A struct holding mutexes is shared between threads by reference:
+// each thread locks a field through its shared reference to the struct
+// and writes through the guard, including an element of a `Vec` inside
+// the mutex and a `Vec` grown through `&mut (*g).v`. The other threads'
+// shared references to the struct do not clash with the lock paths.
+
+import std;
+
+struct Tally
+{
+    Vec<u32> hits;
+    u32 total;
+}
+
+struct Board
+{
+    mutex<Tally> tally;
+    mutex<Vec<u32>> log;
+    u32 slots;
+}
+
+fn player(ref<Board, shared> b, u32 me, u32 rounds) : u32
+{
+    u32 i = 0;
+    while (i < rounds)
+    {
+        {
+            auto g = lock(&b.tally);
+            usize at = widen<usize>((me + i) % b.slots);
+            (*g).hits[at] = (*g).hits[at] + 1;
+            (*g).total = (*g).total + 1;
+        }
+        {
+            auto l = lock(&b.log);
+            Vec::push(&mut *l, me);
+        }
+        i = i + 1;
+    }
+    rounds
+}
+
+fn main()
+{
+    Vec<u32> hits = Vec::new();
+    u32 k = 0;
+    while (k < 5)
+    {
+        Vec::push(&mut hits, 0);
+        k = k + 1;
+    }
+    Board b = Board { .tally = Mutex::new(Tally { .hits = hits, .total = 0 }), .log = Mutex::new(Vec::new()), .slots = 5 };
+    u32 played = 0;
+    {
+        auto p = spawn(player, &b, 0, 40);
+        auto q = spawn(player, &b, 1, 40);
+        auto r = spawn(player, &b, 2, 40);
+        played = join(p) + join(q) + join(r);
+    }
+    auto g = lock(&b.tally);
+    u32 sum = 0;
+    foreach (h in &(*g).hits)
+    {
+        sum = sum + *h;
+    }
+    printf("played %v, total %v, sum %v, log %v\n", played, (*g).total, sum, Vec::len(&*lock(&b.log)));
+}

@@ -1,0 +1,62 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: spec/19 threads; conf.runtime-lock-after-join
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3536323038363330300a
+//
+// spawn/join and a channel producer repeated across rounds,
+// single-threaded work in between: the runtime's state stays consistent
+// as threads start and end (D-0192)
+
+import std;
+
+fn sum(u64 n) : u64
+{
+    u64 t = 0;
+    foreach (i in 0..n)
+    {
+        t += i;
+    }
+    t
+}
+
+fn produce(ref<Channel<u64>, shared> ch, u64 n)
+{
+    foreach (i in 0..n)
+    {
+        _ = Channel::send(ch, i);
+    }
+}
+
+fn main()
+{
+    u64 total = 0;
+    foreach (round in 0..200: u64)
+    {
+        auto a = spawn(sum, 1000 + round);
+        auto b = spawn(sum, 2000 + round);
+        total += join(a) + join(b);
+        Vec<String> v = Vec::new();
+        foreach (i in 0..50)
+        {
+            Vec::push(&mut v, sprintf("r%v-%v", round, i));
+        }
+        total += narrow<u64>(Vec::len(&v));
+        if (round % 20 == 0)
+        {
+            Channel<u64> ch = Channel::new(4);
+            u64 got = 0;
+            {
+                auto h = spawn(produce, &ch, 100: u64);
+                foreach (i in 0..100)
+                {
+                    got += Option::unwrap(Channel::recv(&ch));
+                }
+                join(h);
+            }
+            total += got;
+        }
+    }
+    printf("%v\n", total);
+}

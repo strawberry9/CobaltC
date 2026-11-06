@@ -1,0 +1,70 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.channel [Try-Recv] [Recv-Timeout] spec/21 §0 [Cpu-Count] (D-0185); conf.channel-try-recv, conf.channel-recv-timeout, conf.cpu-count
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6e6f6e65206e6f6e65203720380a3320333020636c6f73656420636c6f7365640a747275650a
+//
+// `try_recv` never waits: a value, `Ok(None)` while empty, `Err(())`
+// once closed and empty; `recv_timeout_ms` waits at most the time given
+// and still takes a value that is there; `cpu_count` is at least 1.
+
+import std;
+
+fn producer(ref<Channel<i32>, shared> ch) : u8
+{
+    foreach (i in 0..3)
+    {
+        _ = Channel::send(ch, narrow<i32>(i) * 10);
+    }
+    Channel::close(ch);
+    0
+}
+
+fn show(Result<Option<i32>, void> r) : str
+{
+    match (r)
+    {
+        Ok(Some(_)) : "value",
+        Ok(None)    : "none",
+        Err(_)      : "closed",
+    }
+}
+
+fn main()
+{
+    Channel<i32> ch = Channel::new(4);
+    printf("%s ", show(Channel::try_recv(&ch)));
+    printf("%s ", show(Channel::recv_timeout_ms(&ch, 20)));
+    _ = Channel::send(&ch, 7);
+    match (Channel::try_recv(&ch))
+    {
+        Ok(Some(v)) : printf("%v ", v),
+        _           : printf("? "),
+    }
+    _ = Channel::send(&ch, 8);
+    match (Channel::recv_timeout_ms(&ch, 1000))
+    {
+        Ok(Some(v)) : printf("%v\n", v),
+        _           : printf("?\n"),
+    }
+    auto h = spawn(producer, &ch);
+    i32 sum = 0;
+    usize got = 0;
+    while (true)
+    {
+        match (Channel::recv_timeout_ms(&ch, 5000))
+        {
+            Ok(Some(v)) :
+            {
+                sum += v;
+                got += 1;
+            },
+            Ok(None)    : {},
+            Err(_)      : break,
+        }
+    }
+    _ = join(h);
+    printf("%v %v %s %s\n", got, sum, show(Channel::try_recv(&ch)), show(Channel::recv_timeout_ms(&ch, 0)));
+    printf("%v\n", cpu_count() >= 1);
+}

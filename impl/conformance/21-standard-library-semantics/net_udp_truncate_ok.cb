@@ -1,0 +1,70 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.net [Udp] (D-0144); conf.net-udp-truncate
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6d61782031303a2031302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d61782039303a2039302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d61782039393a2039392062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d6178203130303a203130302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d617820313030303a203130302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d617820303a20302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a6d61782035303a2035302062797465732c2074686520646174616772616d27732066697273743a20747275652c2066726f6d207468652073656e6465723a20747275650a
+//
+// `recv_from(u, max)` of a datagram longer than `max` gives exactly its
+// first `max` bytes and the sender; the rest of that datagram is lost and
+// the next one follows whole. (A first version gave more bytes than asked
+// for, some of them not the datagram's.)
+
+import std;
+
+fn receive(ref<UdpSocket, exclusive> b, ref<UdpSocket, shared> a, usize max)
+{
+    match (UdpSocket::recv_from(b, max))
+    {
+        Ok(d)  :
+        {
+            bool prefix = true;
+            for (usize i = 0; i < Vec::len(&d.data); i += 1)
+            {
+                prefix = prefix && d.data[i] == 65 + narrow<u8>(i % 26);
+            }
+            printf(
+                "max %u: %u bytes, the datagram's first: %v, from the sender: %v\n",
+                max,
+                Vec::len(&d.data),
+                prefix,
+                d.from.port == UdpSocket::local_addr(a).port,
+            );
+        },
+        Err(e) : printf("max %u: %s\n", max, NetError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    UdpSocket a = match (UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(u)  : u,
+        Err(_) : return 1,
+    };
+    UdpSocket b = match (UdpSocket::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(u)  : u,
+        Err(_) : return 2,
+    };
+    UdpSocket::set_read_timeout_ms(&mut b, 5000);
+    Vec<u8> big = Vec::new();
+    for (usize i = 0; i < 100; i += 1)
+    {
+        Vec::push(&mut big, 65 + narrow<u8>(i % 26));
+    }
+    SocketAddr to = UdpSocket::local_addr(&b);
+    array<usize, 5> sizes = [10, 90, 99, 100, 1000];
+    foreach (max in &sizes)
+    {
+        _ = UdpSocket::send_to(&mut a, &big[0..$], to);
+        receive(&mut b, &a, *max);
+    }
+    // `max` 0 takes the whole datagram and keeps none of it; the next
+    // datagram follows whole.
+    _ = UdpSocket::send_to(&mut a, &big[0..$], to);
+    receive(&mut b, &a, 0);
+    _ = UdpSocket::send_to(&mut a, &big[0..$], to);
+    receive(&mut b, &a, 50);
+    0
+}

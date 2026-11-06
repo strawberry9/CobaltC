@@ -1,0 +1,325 @@
+// `std::stats` (spec/21 §2t, D-0267): descriptive statistics over a slice
+// of numbers. `sum` adds in the slice's own type, checked; every other
+// function converts each value to `f64` and gives an `f64`, `None` for an
+// empty slice (and for a sample statistic of fewer than two values).
+// `variance` and `stddev` are the population's (divided by the count),
+// `sample_variance` and `sample_stddev` a sample's (divided by one less);
+// `median` and `percentile` sort a copy of the values; `describe` gives
+// the common ones at once. Written in CobaltC over `std::math`'s `sqrt`
+// and `Vec::sort`.
+//
+// Every sum goes left to right, and the variance is computed in two
+// passes (the mean first, then the squared deviations), so both tools
+// give one result for one input and a conformance case can state it.
+
+// The values as `f64`, in their order, in a fresh `Vec` (for `median` and
+// `percentile`, which sort them).
+fn as_floats<T: number>(slice<T, shared> data) : Vec<f64>
+{
+    Vec<f64> out = Vec::new();
+    Vec::reserve(&mut out, slice_len(data));
+    for (usize i = 0; i < slice_len(data); i += 1)
+    {
+        Vec::push(&mut out, to_float<f64>(data[i]));
+    }
+    out
+}
+
+// The sum of the values as `f64`, left to right.
+fn float_sum<T: number>(slice<T, shared> data) : f64
+{
+    f64 total = 0.0;
+    for (usize i = 0; i < slice_len(data); i += 1)
+    {
+        total = total + to_float<f64>(data[i]);
+    }
+    total
+}
+
+// The sum of the squared deviations from `m`, left to right.
+fn squared_deviations<T: number>(slice<T, shared> data, f64 m) : f64
+{
+    f64 total = 0.0;
+    for (usize i = 0; i < slice_len(data); i += 1)
+    {
+        f64 d = to_float<f64>(data[i]) - m;
+        total = total + d * d;
+    }
+    total
+}
+
+// The element at `i` of a sorted copy, with the neighbours interpolated:
+// R's type 7, the one spreadsheets and NumPy use by default.
+fn interpolated(ref<Vec<f64>, shared> sorted, f64 h) : f64
+{
+    usize lo = to_int<usize>(floor(h));
+    f64 frac = h - to_float<f64>(lo);
+    if (lo + 1 < Vec::len(sorted) && frac > 0.0)
+    {
+        (*sorted)[lo] + frac * ((*sorted)[lo + 1] - (*sorted)[lo])
+    }
+    else
+    {
+        (*sorted)[lo]
+    }
+}
+
+/// The sum of `data`'s values in their own type; 0 for an empty slice.
+///
+/// Added left to right with `+`, so an integer sum that does not fit in `T` faults (`arith_overflow`),
+/// as `+` does. For the sum as an `f64` whatever `T` is, multiply `mean` by the count.
+export fn sum<T: number>(slice<T, shared> data) : T
+{
+    T total = 0;
+    for (usize i = 0; i < slice_len(data); i += 1)
+    {
+        total = total + data[i];
+    }
+    total
+}
+
+/// Integers and floats, an empty slice, and an overflow caught.
+unittest "sum: in the slice's own type"
+{
+    array<i32, 4> a = [3, -1, 4, 1];
+    assert(sum(&a[0..$]) == 7);
+    assert(sum(&a[0..0]) == 0);
+    array<f64, 3> f = [0.5, 0.25, 2.0];
+    assert(sum(&f[0..$]) == 2.75);
+}
+
+/// The arithmetic mean of `data`'s values; `None` for an empty slice.
+///
+/// Each value is converted to `f64` with `to_float` and the values added left to right, then divided by
+/// the count. A NaN among the values makes the mean a NaN.
+export fn mean<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    Some(float_sum(data) / to_float<f64>(n))
+}
+
+/// The population variance of `data`'s values, the mean of the squared deviations from their mean;
+/// `None` for an empty slice.
+///
+/// Two passes: the mean first, then the sum of `(x - mean)²` left to right, divided by the count. For
+/// the variance of a sample drawn from a larger population, use `sample_variance`.
+export fn variance<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    f64 m = float_sum(data) / to_float<f64>(n);
+    Some(squared_deviations(data, m) / to_float<f64>(n))
+}
+
+/// The population standard deviation of `data`'s values, the square root of `variance`; `None` for an
+/// empty slice.
+export fn stddev<T: number>(slice<T, shared> data) : Option<f64>
+{
+    match (variance(data))
+    {
+        Some(v) : Some(sqrt(v)),
+        None    : None,
+    }
+}
+
+/// The sample variance of `data`'s values, the squared deviations from their mean divided by one less
+/// than the count (Bessel's correction); `None` for fewer than two values.
+///
+/// For values that are the whole population, use `variance`.
+export fn sample_variance<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n < 2)
+    {
+        return None;
+    }
+    f64 m = float_sum(data) / to_float<f64>(n);
+    Some(squared_deviations(data, m) / to_float<f64>(n - 1))
+}
+
+/// The sample standard deviation of `data`'s values, the square root of `sample_variance`; `None` for
+/// fewer than two values.
+export fn sample_stddev<T: number>(slice<T, shared> data) : Option<f64>
+{
+    match (sample_variance(data))
+    {
+        Some(v) : Some(sqrt(v)),
+        None    : None,
+    }
+}
+
+/// The population and sample forms on the textbook values, and the empty and single-value cases.
+unittest "variance: population and sample"
+{
+    array<u32, 8> a = [2, 4, 4, 4, 5, 5, 7, 9];
+    assert(Option::unwrap(variance(&a[0..$])) == 4.0);
+    assert(Option::unwrap(stddev(&a[0..$])) == 2.0);
+    assert(Option::unwrap(sample_variance(&a[0..$])) == 32.0 / 7.0);
+    assert(Option::is_none(&variance(&a[0..0])));
+    assert(Option::unwrap(variance(&a[0..1])) == 0.0);
+    assert(Option::is_none(&sample_variance(&a[0..1])));
+}
+
+/// The median of `data`'s values: the middle one of them sorted, or the mean of the two middle ones
+/// when the count is even; `None` for an empty slice.
+///
+/// The values are copied, converted to `f64` and sorted as `Vec::sort` sorts floats (every NaN after
+/// every number); `data` is not changed.
+export fn median<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    Vec<f64> sorted = as_floats(data);
+    Vec::sort(&mut sorted);
+    if (n % 2 == 1)
+    {
+        Some(sorted[n / 2])
+    }
+    else
+    {
+        Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0)
+    }
+}
+
+/// The `p`th percentile of `data`'s values, `p` from 0 to 100, with linear interpolation between the
+/// two sorted values it falls between; `None` for an empty slice.
+///
+/// The position is `(count - 1) · p / 100` in the sorted values (R's type 7, the default of spreadsheets
+/// and NumPy): `percentile(data, 0.0)` is the minimum, `percentile(data, 100.0)` the maximum, and
+/// `percentile(data, 50.0)` the median. Faults (`assert_failed`) when `p` is below 0, above 100 or a NaN.
+export fn percentile<T: number>(slice<T, shared> data, f64 p) : Option<f64>
+{
+    assert(p >= 0.0 && p <= 100.0, "percentile: `p` is outside 0 to 100");
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    Vec<f64> sorted = as_floats(data);
+    Vec::sort(&mut sorted);
+    Some(interpolated(&sorted, to_float<f64>(n - 1) * p / 100.0))
+}
+
+/// The quartiles of a small run, the median two ways, and the ends.
+unittest "percentile: interpolated between neighbours"
+{
+    array<i64, 5> a = [15, 20, 35, 40, 50];
+    assert(Option::unwrap(percentile(&a[0..$], 25.0)) == 20.0);
+    assert(Option::unwrap(percentile(&a[0..$], 40.0)) == 29.0);
+    assert(Option::unwrap(percentile(&a[0..$], 50.0)) == 35.0);
+    assert(Option::unwrap(median(&a[0..$])) == 35.0);
+    assert(Option::unwrap(median(&a[0..4])) == 27.5);
+    assert(Option::unwrap(percentile(&a[0..$], 0.0)) == 15.0);
+    assert(Option::unwrap(percentile(&a[0..$], 100.0)) == 50.0);
+    assert(Option::is_none(&median(&a[0..0])));
+}
+
+/// The smallest of `data`'s values as an `f64`; `None` for an empty slice.
+///
+/// A NaN is passed over: the result is a NaN only when every value is one.
+export fn minimum<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    f64 m = to_float<f64>(data[0]);
+    for (usize i = 1; i < n; i += 1)
+    {
+        f64 x = to_float<f64>(data[i]);
+        if (m != m || x < m)
+        {
+            m = x;
+        }
+    }
+    Some(m)
+}
+
+/// The largest of `data`'s values as an `f64`; `None` for an empty slice.
+///
+/// A NaN is passed over: the result is a NaN only when every value is one.
+export fn maximum<T: number>(slice<T, shared> data) : Option<f64>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    f64 m = to_float<f64>(data[0]);
+    for (usize i = 1; i < n; i += 1)
+    {
+        f64 x = to_float<f64>(data[i]);
+        if (m != m || x > m)
+        {
+            m = x;
+        }
+    }
+    Some(m)
+}
+
+/// The ends of a run of integers, and a NaN passed over.
+unittest "minimum and maximum: as f64, a NaN passed over"
+{
+    array<i16, 4> a = [7, -3, 12, 0];
+    assert(Option::unwrap(minimum(&a[0..$])) == -3.0);
+    assert(Option::unwrap(maximum(&a[0..$])) == 12.0);
+    f64 nan = 0.0 / 0.0;
+    array<f64, 3> f = [nan, 2.5, 1.5];
+    assert(Option::unwrap(minimum(&f[0..$])) == 1.5);
+    assert(Option::unwrap(maximum(&f[0..$])) == 2.5);
+    assert(Option::is_none(&minimum(&f[0..0])));
+}
+
+/// What `describe` gives: the count of the values and their minimum, maximum, mean, population standard
+/// deviation and median.
+export struct Summary
+{
+    export usize count;
+    export f64 minimum;
+    export f64 maximum;
+    export f64 mean;
+    export f64 stddev;
+    export f64 median;
+}
+
+/// The count, `minimum`, `maximum`, `mean`, `stddev` and `median` of `data`'s values as one `Summary`;
+/// `None` for an empty slice.
+export fn describe<T: number>(slice<T, shared> data) : Option<Summary>
+{
+    usize n = slice_len(data);
+    if (n == 0)
+    {
+        return None;
+    }
+    f64 m = float_sum(data) / to_float<f64>(n);
+    Some(Summary {
+        .count = n,
+        .minimum = Option::unwrap(minimum(data)),
+        .maximum = Option::unwrap(maximum(data)),
+        .mean = m,
+        .stddev = sqrt(squared_deviations(data, m) / to_float<f64>(n)),
+        .median = Option::unwrap(median(data)),
+    })
+}
+
+/// A summary of response times in milliseconds.
+unittest "describe: a run of timings"
+{
+    array<u32, 6> ms = [12, 15, 11, 40, 13, 14];
+    Summary s = Option::unwrap(describe(&ms[0..$]));
+    assert(s.count == 6 && s.minimum == 11.0 && s.maximum == 40.0);
+    assert(s.mean == 17.5 && s.median == 13.5);
+    assert(s.stddev == sqrt(Option::unwrap(variance(&ms[0..$]))));
+    assert(Option::is_none(&describe(&ms[0..0])));
+}

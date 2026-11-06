@@ -1,0 +1,57 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.direct-param-element-grown-by-other-thread; spec/08 §4 [Standing-Local] H5, [Release], [Read-Stale] (D-0209, CHG-0247)
+// kind: negative
+// expect: diag.stale-binding (dynamic)
+//
+// A reference to a Vec's element -- an object over raw storage -- held by
+// a function whose reference parameters it reads directly, while another
+// thread, holding the vector exclusively, pushes until the buffer grows:
+// grow's deallocate releases the element objects, with no clash (the
+// vector's own cells and the element's are disjoint), so the held path is
+// stale when the function reads it after joining the pusher. The static
+// analysis cannot refute the spawn: the element reference reached `a`
+// through a vector of references. Found cobc reading the freed cell
+// (D-0209): a direct parameter's body ran unchecked whatever other
+// threads did; it now does so only when the thread is alone, or when the
+// parameters' objects are fresh storage.
+//
+// D-0290: the reference is stored by a call (`keep_in`), so the frame holds it
+// only as `?` and the run checks it; pushed directly, the frame holds it as a
+// borrow of `v`, and the spawn is refuted before the run.
+
+import std;
+
+fn keep_in(ref<Vec<ref<i32, shared>>, exclusive> keep, ref<i32, shared> r)
+{
+    Vec::push(keep, r);
+}
+
+fn pusher(ref<Vec<i32>, exclusive> v)
+{
+    usize i = 0;
+    while (i < 1000)
+    {
+        Vec::push(v, 1);
+        i = i + 1;
+    }
+}
+
+fn hold(ref<i32, shared> a, ref<i32, shared> b, handle<void> h) : i64
+{
+    join(h);
+    widen<i64>(*a) + widen<i64>(*b)
+}
+
+fn main()
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 7);
+    i32 x = 1;
+    Vec<ref<i32, shared>> held = Vec::new();
+    keep_in(&mut held, Vec::index_shared(&v, 0));
+    ref<i32, shared> a = *Vec::index_shared(&held, 0);
+    auto h = spawn(pusher, &mut v);
+    i64 t = hold(a, &x, h);
+    printf("%v %v\n", t, Vec::len(&v));
+}
