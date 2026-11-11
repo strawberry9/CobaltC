@@ -1,0 +1,57 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.frozen-param-element-grown-by-other-thread; spec/08 §4 [Standing-Local] H5, [Release], [Read-Stale] (D-0205, D-0209, CHG-0247)
+// kind: negative
+// expect: diag.stale-binding (dynamic)
+//
+// The same with a frozen parameter (CHG-0237): a shared reference to a
+// struct that is an element of a Vec, never written, borrowed or captured
+// by the function, which reads its fields after the pusher has grown the
+// vector. The element object is released by the growth; the frozen
+// body's entry test must therefore refuse an object over raw storage
+// unless the thread is alone (D-0209).
+//
+// D-0290: the reference is stored by a call (`keep_in`), so the frame holds it
+// only as `?` and the run checks it; pushed directly, the frame holds it as a
+// borrow of `v`, and the spawn is refuted before the run.
+
+import std;
+
+struct Row
+{
+    i32 a;
+    i32 b;
+}
+
+fn keep_in(ref<Vec<ref<Row, shared>>, exclusive> keep, ref<Row, shared> r)
+{
+    Vec::push(keep, r);
+}
+
+fn pusher(ref<Vec<Row>, exclusive> v)
+{
+    usize i = 0;
+    while (i < 1000)
+    {
+        Vec::push(v, Row { .a = 1, .b = 2 });
+        i = i + 1;
+    }
+}
+
+fn total(ref<Row, shared> r, handle<void> h) : i32
+{
+    join(h);
+    r.a + r.b
+}
+
+fn main()
+{
+    Vec<Row> v = Vec::new();
+    Vec::push(&mut v, Row { .a = 3, .b = 4 });
+    Vec<ref<Row, shared>> held = Vec::new();
+    keep_in(&mut held, Vec::index_shared(&v, 0));
+    ref<Row, shared> r = *Vec::index_shared(&held, 0);
+    auto h = spawn(pusher, &mut v);
+    i32 t = total(r, h);
+    printf("%v %v\n", t, Vec::len(&v));
+}

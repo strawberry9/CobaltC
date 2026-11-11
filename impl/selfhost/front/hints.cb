@@ -1,0 +1,287 @@
+// CHG-0445: what a diagnostic adds when the text it rejects is a form from
+// another language, or a name spelt nearly as one that exists: the CobaltC
+// form, or the name meant. Only the message changes (the registry: a
+// message's wording is not normative). The twin of impl/src/hints.rs; both
+// give the same text.
+
+import std;
+
+fn min3(usize a, usize b, usize c) : usize
+{
+    min(min(a, b), c)
+}
+
+// The optimal string alignment distance between `a` and `b` (insertions,
+// deletions, substitutions and swaps of two neighbours, each 1), or a number
+// above `limit` once it is certain to exceed it. The names compared are
+// ASCII, so bytes are characters.
+export fn distance(StringView av, StringView bv, usize limit) : usize
+{
+    slice<u8, shared> a = StringView::as_bytes(av);
+    slice<u8, shared> b = StringView::as_bytes(bv);
+    usize n = slice_len(a);
+    usize m = slice_len(b);
+    usize gap = if (n > m) { n - m } else { m - n };
+    if (gap > limit)
+    {
+        return limit + 1;
+    }
+    usize w = m + 1;
+    Vec<usize> d = Vec::filled((n + 1) * w, 0: usize);
+    for (usize i = 0; i <= n; i += 1)
+    {
+        d[i * w] = i;
+    }
+    for (usize j = 0; j <= m; j += 1)
+    {
+        d[j] = j;
+    }
+    for (usize i = 1; i <= n; i += 1)
+    {
+        for (usize j = 1; j <= m; j += 1)
+        {
+            usize cost = if (a[i - 1] == b[j - 1]) { 0 } else { 1 };
+            usize v = min3(d[(i - 1) * w + j] + 1, d[i * w + j - 1] + 1, d[(i - 1) * w + j - 1] + cost);
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1])
+            {
+                v = min(v, d[(i - 2) * w + j - 2] + 1);
+            }
+            d[i * w + j] = v;
+        }
+    }
+    d[n * w + m]
+}
+
+// The one candidate nearest to `name`: within one edit for a name of four
+// characters or fewer, two otherwise, fewer edits than half the name's length
+// (so no name of one or two characters is offered one: `y` for `x`), and
+// nearer than every other candidate (a tie names none). A candidate equal to
+// `name` is not one.
+export fn nearest(StringView name, ref<Vec<String>, shared> candidates) : Option<String>
+{
+    usize n = max(StringView::len(name), 1);
+    usize most = if (StringView::len(name) <= 4) { 1 } else { 2 };
+    usize limit = min(most, (n - 1) / 2);
+    if (limit == 0)
+    {
+        return None;
+    }
+    Option<usize> best = None;
+    usize best_d = 0;
+    bool tie = false;
+    for (usize i = 0; i < Vec::len(candidates); i += 1)
+    {
+        StringView c = &candidates[i];
+        if (c == name || StringView::len(c) == 0 || Option::is_some(&StringView::find(c, "$")))
+        {
+            continue;
+        }
+        usize d = distance(name, c, limit);
+        if (d > limit)
+        {
+            continue;
+        }
+        match (best)
+        {
+            Some(b) :
+            {
+                if (d == best_d && candidates[b] != c)
+                {
+                    tie = true;
+                }
+                else if (d < best_d)
+                {
+                    best = Some(i);
+                    best_d = d;
+                    tie = false;
+                }
+            },
+            None    :
+            {
+                best = Some(i);
+                best_d = d;
+            },
+        }
+    }
+    if (tie)
+    {
+        return None;
+    }
+    match (best)
+    {
+        Some(b) : Some(String::clone(&candidates[b])),
+        None    : None,
+    }
+}
+
+// What a plain name that names nothing means in another language, as the end
+// of the message: `; …`.
+export fn plain_name(StringView name) : Option<str>
+{
+    if (name == "NULL" || name == "null" || name == "nil" || name == "nullptr" || name == "undefined")
+    {
+        return Some("; there is no null: a value that may be absent is an `Option<T>`, and `None` where it is absent");
+    }
+    if (name == "malloc" || name == "calloc" || name == "realloc" || name == "free" || name == "new" || name == "delete")
+    {
+        return Some(
+            "; memory is not allocated by hand: a `Vec<T>` (`Vec::filled(n, 0)`), a `Box<T>` (`Box::new(x)`) or a struct holds it, and it is freed when its owner's scope ends",
+        );
+    }
+    if (name == "len" || name == "length" || name == "size" || name == "sizeof")
+    {
+        return Some(
+            "; a length is a function of the type: `Vec::len(&v)`, `StringView::len(&s)` (a `String` too), `slice_len(s)`; a type's size is `sizeof<T>()`",
+        );
+    }
+    if (name == "println" || name == "print" || name == "puts" || name == "echo" || name == "console" || name == "cout" || name == "System" || name == "fmt")
+    {
+        return Some("; printing is `printf(\"%v\\n\", x)` (`eprintf` for standard error)");
+    }
+    if (name == "assert_eq" || name == "assert_ne" || name == "assertEquals")
+    {
+        return Some("; write `assert(a == b)` (`assert(a != b)`), with a message after the condition if wanted");
+    }
+    if (name == "format")
+    {
+        return Some("; text is formatted by `sprintf(\"%v\", x)`, which gives a `String`");
+    }
+    if (name == "to_string" || name == "toString")
+    {
+        return Some("; a value's text is `sprintf(\"%v\", x)`; a copy of a view's text is `String::copy(v)`");
+    }
+    None
+}
+
+// What `T::name` that names nothing means in another language: the
+// functions of `T` it may be written as, the first that `T` has.
+export fn fn_name(StringView name) : Vec<str>
+{
+    Vec<str> out = Vec::new();
+    if (name == "length" || name == "size" || name == "count" || name == "len_of")
+    {
+        Vec::push(&mut out, "len");
+    }
+    else if (name == "push_back" || name == "add" || name == "append_one" || name == "emplace_back" || name == "pushBack")
+    {
+        Vec::push(&mut out, "push");
+    }
+    else if (name == "pop_back")
+    {
+        Vec::push(&mut out, "pop");
+    }
+    else if (name == "includes" || name == "has" || name == "contains_key" || name == "exists")
+    {
+        Vec::push(&mut out, "contains");
+    }
+    else if (name == "put" || name == "set" || name == "add_entry")
+    {
+        Vec::push(&mut out, "insert");
+    }
+    else if (name == "from" || name == "new_from" || name == "of_str")
+    {
+        Vec::push(&mut out, "copy");
+        Vec::push(&mut out, "from_slice");
+    }
+    else if (name == "to_string" || name == "toString" || name == "to_owned")
+    {
+        Vec::push(&mut out, "copy");
+    }
+    else if (name == "erase" || name == "delete" || name == "remove_at")
+    {
+        Vec::push(&mut out, "remove");
+    }
+    else if (name == "at" || name == "nth")
+    {
+        Vec::push(&mut out, "get");
+    }
+    else if (name == "equals" || name == "eq_str")
+    {
+        Vec::push(&mut out, "eq");
+    }
+    else if (name == "starts_with_str" || name == "startsWith")
+    {
+        Vec::push(&mut out, "starts_with");
+    }
+    else if (name == "ends_with_str" || name == "endsWith")
+    {
+        Vec::push(&mut out, "ends_with");
+    }
+    out
+}
+
+fn one_of(StringView name, slice<str, shared> words) : bool
+{
+    foreach (w in words)
+    {
+        if (name == *w)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// What a type name that names nothing means in another language.
+export fn type_name(StringView name) : Option<str>
+{
+    if (one_of(
+        name,
+        &[
+            "int", "int32_t", "long", "short", "unsigned", "signed", "char", "size_t", "ssize_t", "uint8_t", "uint16_t",
+            "uint32_t", "uint64_t", "int8_t", "int16_t", "int64_t", "byte", "uint", "integer",
+        ],
+    ))
+    {
+        return Some(
+            "; an integer type names its width and sign: `i32`, `u8`, `u64`, `usize`, …; C's `int` is `i32`, `char` is `u8`, `size_t` is `usize`",
+        );
+    }
+    if (one_of(name, &["float", "double", "float32", "float64"]))
+    {
+        return Some("; the floating types are `f32` and `f64` (C's `double` is `f64`)");
+    }
+    if (name == "boolean")
+    {
+        return Some("; the truth type is `bool`");
+    }
+    if (one_of(name, &["string", "string_view", "std"]))
+    {
+        return Some("; owned text is a `String`, and a view of text (a parameter, a literal) a `StringView`");
+    }
+    if (one_of(name, &["let", "var", "val"]))
+    {
+        return Some("; a local is declared with its type, `i32 x = 1;`, or with `auto x = 1;`");
+    }
+    if (name == "goto")
+    {
+        return Some("; there is no `goto`: leave a loop with `break` or `continue`, and a function with `return`");
+    }
+    if (one_of(name, &["List", "ArrayList", "vector", "Array"]))
+    {
+        return Some("; a growable array is a `Vec<T>`, a fixed one an `array<T, N>`");
+    }
+    if (one_of(name, &["Map", "HashTable", "Dictionary", "dict", "unordered_map", "map"]))
+    {
+        return Some("; a hash table is a `HashMap<K, V>`");
+    }
+    if (one_of(name, &["Set", "unordered_set", "set"]))
+    {
+        return Some("; a set is a `HashSet<T>`");
+    }
+    None
+}
+
+unittest "hints: distance and nearest"
+{
+    assert(distance("sqaure", "square", 2) == 1);
+    assert(distance("psh", "push", 1) == 1);
+    assert(distance("coutn", "count", 2) == 1);
+    assert(distance("abc", "abcdef", 2) == 3);
+    Vec<String> c = Vec::new();
+    Vec::push(&mut c, "push");
+    Vec::push(&mut c, "pop");
+    Vec::push(&mut c, "len");
+    assert(nearest("psh", &c) == Some(String::copy("push")));
+    assert(Option::is_none(&nearest("zzzzzz", &c)));
+}

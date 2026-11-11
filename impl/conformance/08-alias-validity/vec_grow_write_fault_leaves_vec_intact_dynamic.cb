@@ -1,0 +1,52 @@
+// CONFORMANCE-CASE
+// spec: 08-alias-validity
+// facility: rule.alias.clash [Write-Conflict]; D-0022; rule.fail.fault-unwind [Fault-Unwind]; conf.vec-grow-fault-intact-dynamic
+// kind: negative
+// expect: diag.aliasing-conflict (dynamic)
+// expect-stdout-hex: 5b64726f7020315d
+//
+// As conf.vec-grow-fault-intact, with the two references
+// chosen by indexes the program computes and the shared one kept in a
+// struct (tier D, D-0281), so the overlap is found by the run where the
+// callee writes (D-0283 checks frame-held arguments at the call):
+// `Vec::push` through the exclusive parameter faults at the
+// growth's write of the vector's `ptr`, beside the shared reference to the
+// same element of `vs`, after the new cells are allocated. The fault leaves
+// that `Vec` as it was: its old cells are freed exactly once, by the unwind
+// (CHG-0332). The resource's destructor shows the unwind ran.
+
+import std;
+
+resource struct R
+{
+    i64 id;
+}
+
+fn R::drop(ref<R, exclusive> self)
+{
+    printf("[drop %v]", self.id);
+}
+
+struct Held
+{
+    ref<Vec<i64>, shared> s;
+}
+
+fn grow_through(ref<Vec<i64>, exclusive> e, Held h) : usize
+{
+    Vec::push(e, 4: i64);
+    Vec::len(h.s)
+}
+
+fn main() : u8
+{
+    R a = R { .id = 1: i64 };
+    Vec<Vec<i64>> vs = Vec::new();
+    Vec::push(&mut vs, Vec::filled(3, 2: i64));
+    Vec::push(&mut vs, Vec::filled(3, 2: i64));
+    usize i = Vec::len(&vs) - 1;
+    usize j = i * 1;
+    usize n = grow_through(&mut vs[i], Held { .s = &vs[j] });
+    printf("unreached %v\n", n);
+    0
+}

@@ -1,0 +1,1588 @@
+// The code generator's state (impl/cobc/src/lower.rs, lower/program.rs,
+// lower/frames.rs): its values, places and bindings, the function body
+// being lowered, fresh names, locations, the request queue, and the
+// cleanup stack's frames and scopes, which the text passes settle.
+
+import std;
+import ast;
+import loader;
+import items;
+import typecheck;
+import check;
+import cnames;
+import strings4;
+import passes;
+
+// A location no fault reports (a line inside `std`).
+export const str NOLOC = "CB_NOLOC, 0";
+
+// A value: its C expression, its type, and the runtime object that holds it
+// when it has one.
+export struct V
+{
+    export String c;
+    export Type ty;
+    export Option<String> obj;
+}
+
+export fn unit() : V
+{
+    V { .c = "(cb_unit){}", .ty = Type::TVoid, .obj = None }
+}
+
+export fn never() : V
+{
+    V { .c = "(cb_unit){}", .ty = Type::TNever, .obj = None }
+}
+
+export fn is_never(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNever : true,
+        _            : false,
+    }
+}
+
+export fn is_void(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TVoid : true,
+        _           : false,
+    }
+}
+
+// The cleanup stack's entries: a frame, a statement scope, an objectless
+// local's drop.
+export enum Cleanup
+{
+    CFrame(u32),
+    CStmt(u32),
+    CDrop(u32),
+}
+
+// One lowered function (with the helpers emitted beside it), and whether it
+// is pure `std`.
+export struct Unit
+{
+    export String text;
+    export bool pure_std;
+}
+
+// A function asked for, at its type arguments, with its confined mask.
+export struct FnRequest
+{
+    export String name;
+    export Vec<Type> targs;
+    export u64 mask;
+}
+
+// CHG-0449: a loop's note for `--report-guards`: its file, line and text.
+export struct GuardNote
+{
+    export String file;
+    export usize line;
+    export String text;
+}
+
+// The order of the notes: by file, line, then text (cobc sorts its tuples).
+export fn note_less(ref<GuardNote, shared> a, ref<GuardNote, shared> b) : bool
+{
+    if (a.file != b.file)
+    {
+        return a.file < b.file;
+    }
+    if (a.line != b.line)
+    {
+        return a.line < b.line;
+    }
+    a.text < b.text
+}
+
+export struct Gen
+{
+    export Checked prog;
+    export Vec<String> files;
+    export HashMap<String, u32> file_ids;
+    export String fwd;
+    export String types;
+    export String strings;
+    export String protos;
+    export String fns;
+    export String thunks_out;
+    // The call thunk of each `fn` type (`thunk`), by its type code.
+    export HashMap<String, String> thunks;
+    // CHG-0436: every code a `fn` value of each type can hold (the closures
+    // boxed and the fn items taken, with the box's kind), by the type's thunk,
+    // and each thunk's parts, so that a thunk with one target calls it
+    // directly (`single_target_thunks`).
+    export HashMap<String, Vec<FnTarget>> fn_targets;
+    export Vec<ThunkSpec> thunk_specs;
+    // `direct_dispatched`'s answer for each non-generic callee, by name.
+    export HashMap<String, Option<HashSet<String>>> dispatch_memo;
+    // The C globals defined so far (`g_` statics, `k_` constants).
+    export HashSet<String> globals;
+    export String desc_aux;
+    export Vec<Option<String>> descs;
+    export Vec<u32> desc_ids;
+    export Vec<Unit> units;
+    export HashMap<String, String> fn_names;
+    export Vec<FnRequest> queue;
+    export usize queue_head;
+    export u64 uid;
+    export u64 closure_base;
+    // Each closure lowered so far, by its id (`closure_id`).
+    export HashMap<u64, ClosureInfo> closures;
+    export u32 nscope;
+    export bool line_directives;
+    // CHG-0449 `--report-guards`: each loop of the program's own files that
+    // indexes a slice, what its length guard (D-0320) is or why an index has
+    // none (`guard_note`), and `loop_guard`'s note for the loop being lowered.
+    export bool report_guards;
+    export Vec<GuardNote> guard_notes;
+    export Option<String> pending_note;
+    // The C names of types (`forward_name`), the types whose C definition
+    // is written, and the runtime descriptors' ids and positions, by
+    // `type_code`.
+    export HashMap<String, String> type_names;
+    export HashSet<String> defined;
+    export HashMap<String, u32> type_ids;
+    export HashMap<u32, usize> type_pos;
+    // String literals by their C name (`cb_s_…`): their bytes.
+    export HashMap<String, String> str_names;
+    // The names `str_names` was given, in order: a probe's additions are
+    // undone by `str_restore` without copying the table.
+    export Vec<String> str_log;
+    export u64 nstr;
+    // Ids for the expressions the lowering builds (cobc builds new nodes,
+    // with addresses of their own that no fact names).
+    export usize synth_id;
+    // The C names of the externs declared so far.
+    export HashMap<String, String> externs_out;
+    // The generated `cb_eq_…` functions, by type.
+    export HashMap<String, String> eqs;
+    // D-0315: each type's drop glue (`drop_glue`) by type code, "" for none.
+    export HashMap<String, String> glues;
+    // D-0315 (step 4): `objectless_type` asked for a noted value (`noted_type`).
+    export bool noting;
+    // D-0315 (step 4): `fn_param_noescape`'s answers, by "function#parameter".
+    export HashMap<String, bool> noescape;
+    // CHG-0429: `objectless_type_in`'s answers that hold wherever it is asked,
+    // by type code, `noting` and `decided`; the lowest depth of `seen` an
+    // answer being made has leaned on; `decided_plain`'s answers.
+    export HashMap<String, bool> ol_memo;
+    export usize ol_low;
+    export HashMap<String, bool> dp_memo;
+    // D-0315: `resolve_scopes`' name sets, for each lowering, built once.
+    export NameSets scope_sets;
+    export NameSets scope_sets_decided;
+    // The key hash and order functions made so far (`cb_kh_`, `cb_kc_`).
+    export HashMap<String, String> khs;
+    export HashMap<String, String> kcs;
+    // D-0274: the stages switched off, 1..=`bootstrap` (`bootstrap_level`,
+    // `boot`; cobc's `Gen::bootstrap`).
+    export u8 bootstrap;
+    // `--all-checks` (`COBALTC_ALL_CHECKS`) or the bootstrap form: the general
+    // checked form only (cobc's `Gen::all_checks`; `all_checks`).
+    export bool all_checks;
+    // D-0200: the closure being lowered is a predicate (`lower_closure`):
+    // its reference parameters bare addresses; and one that only reads.
+    export bool pending_pred_closure;
+    export bool pending_reader_closure;
+    // D-0192: closures whose reference parameters are all direct and never
+    // handed on: a `fn` value holding one is pure (`cb_fn_mark_pure`).
+    export HashSet<u64> pure_closures;
+    // `reader_param`'s answers, by `key#pos` (cobc's `reader_memo`).
+    export HashMap<String, bool> reader_memo;
+    // cobc's `confining` table (`confining_table`): built on first use by
+    // `confined_vecs`; empty under `--all-checks` (stage 1).
+    export Option<HashMap<String, Vec<bool>>> confining;
+    // D-0196: the body being emitted is a `__raw` form (`pending_raw_ret`).
+    export bool pending_raw_ret;
+    // D-0219: the functions with an `__arrive` twin (`emit_arrive_twin`),
+    // and the dispatchers `localize` inlines at their calls.
+    export HashSet<String> arrive_twins;
+    export HashSet<String> inline_sigs;
+    // D-0274 stage 1 (dual, frozen and direct bodies; confined variants):
+    // the variants' C names (`request_variant`, by `request_key` and mask);
+    // the next body is entered only through its dispatcher's test
+    // (`pending_tested`), is a dual body's bare form (`pending_bare`), a
+    // frozen body (`frozen_mode`), or a field dual body's fast half with these
+    // fields confined (`pending_field_confined`, by `b.f`).
+    export HashMap<String, String> variants;
+    export bool pending_tested;
+    export bool pending_bare;
+    export bool frozen_mode;
+    export Option<HashMap<String, FieldConf>> pending_field_confined;
+    // The substring helpers emitted so far (cobc's `substring_fn`,
+    // `append_substring_fn`).
+    export bool substring_fn;
+    export bool append_substring_fn;
+    // `writer_param`'s answers, by `key#pos` (cobc's `writer_memo`).
+    export HashMap<String, bool> writer_memo;
+    // `used_as_value`'s table, built on first use (cobc's `fn_values`).
+    export Option<HashSet<String>> fn_values;
+    // The function a native body is being made for (cobc's `native_ctx`):
+    // `std_fallback` emits the prelude's own body beside it.
+    export Option<NativeCtx> native_ctx;
+    // D-0257: the program is a library (`--lib`, cobc's `Gen::lib`).
+    export bool lib;
+    // D-0281 step 4c: lower the program pathless when it is eligible
+    // (`pathless_blocker`): every reference carries token 0 and `cbrt.h`'s
+    // `CB_PATHLESS` block makes the path entries no-ops.
+    export bool pathless;
+    // D-0285: the program was found decided by a first lowering (D-0284),
+    // and this lowering knows it: a reference or a slice in a value is
+    // nothing the runtime tracks (`has_refs`), so such a value owns no
+    // object and its copies copy no holds.
+    export bool decided;
+    // cobc's `Unsupported`: what this lowering cannot write (a native text
+    // `ground_native` does not know); the lowering stops at once and the
+    // driver falls back (D-0285) or reports it.
+    export Option<String> unsupported;
+    // The types given a descriptor id (`type_id`), in order: what
+    // `pathless_blocker` walks as cobc walks `type_ids.keys()`.
+    export Vec<Type> id_types;
+    // Copies of each function's declaration, made on its first uses and lent
+    // to a caller that gives them back (`get_fn`, `give_fn`): cobc shares the
+    // declaration (`Arc`); a copy moved out and back costs nothing, where one
+    // made per call copied the whole body. Several, for the uses that nest
+    // (a call of `f` among the arguments of a call of `f`, CHG-0440).
+    export HashMap<String, Vec<FnDecl>> fn_copies;
+    // The buffers probes lowered into, cleared, their room kept for the next
+    // probe (`probe_buf`, CHG-0440).
+    export Vec<String> probe_bufs;
+}
+
+export struct NativeCtx
+{
+    export String name;
+    export Vec<Type> targs;
+    export String ret_c;
+    export String sig;
+}
+
+// A name in scope: its C name, its type, and the root path of its runtime
+// object (empty for a local with none, `unchecked`).
+// How a name is bound: a local (or parameter), or a closure's capture, by
+// value (`self.f_i`) or by borrow (`*self.f_i`).
+export enum BindKind
+{
+    Local,
+    CaptureVal(usize),
+    CaptureRef(usize),
+}
+
+// D-0309: a loop `loop_bound` found a bound for (`lower_while`): the names
+// that hold its variable in the body, the bound's C name, the fixed vector
+// lengths a tagged bounds check compares with, and whether the body is being
+// lowered (not the test, not the step).
+export struct VerLoop
+{
+    export Vec<String> names;
+    export String bound;
+    export Vec<String> lens;
+    export bool in_body;
+}
+
+export struct Binding
+{
+    export String c;
+    export Type ty;
+    export String root;
+    export BindKind kind;
+}
+
+// A closure body's `self`: its C parameter and the closure's id.
+export struct SelfRef
+{
+    export String c;
+    export u64 id;
+}
+
+// A closure's capture: its name and the field's type (a reference for a
+// borrow capture).
+export struct CapField
+{
+    export String name;
+    export Type ty;
+}
+
+// What the lowering knows of a closure: its captures (the C struct's fields
+// `f0`, `f1`, ... in order), whether it moves them, its parameter and result
+// types, its C function, and whether its body writes a captured value
+// (D-0239: a call changes its own storage).
+// CHG-0436: a code a `fn` value may hold, with its box's kind (the
+// `closure` field: 0 a fn item, 1 a closure, 2 one capturing nothing, 3 one
+// writing its captures).
+export struct FnTarget
+{
+    export String code;
+    export u32 kind;
+}
+
+// CHG-0436: a thunk's parts (`thunk`), for its form with one target.
+export struct ThunkSpec
+{
+    export String name;
+    export String key;
+    export String rc;
+    export String pl;
+    export String closure_sig;
+    export String closure_args;
+    export String item_sig;
+    export String item_args;
+    export String keep;
+    export String give;
+    export String ret;
+    export String generic;
+}
+
+export struct ClosureInfo
+{
+    export Vec<CapField> fields;
+    export bool is_move;
+    export Vec<Type> params;
+    export Type ret;
+    export String cname;
+    export bool writes_self;
+}
+
+// The capture types of closure `id` (none for one not lowered yet).
+export fn closure_fields(ref<Gen, shared> g, u64 id) : Vec<Type>
+{
+    Vec<Type> out = Vec::new();
+    match (HashMap::get(&g.closures, id))
+    {
+        Some(c) :
+        {
+            foreach (f in &c.fields)
+            {
+                Vec::push(&mut out, clone(&f.ty));
+            }
+        },
+        None    : {},
+    }
+    out
+}
+
+// One function body being lowered.
+// D-0286: the call whose resource result the consumer being lowered takes
+// with no object (cobc's `inert_result`: by its arguments' key, and
+// whether nothing is evaluated after it).
+export struct InertResult
+{
+    export usize key;
+    export bool last;
+}
+
+// D-0315 (step 4): a pending noted temporary's table entry and made flag.
+export struct NotedPend
+{
+    export u32 k;
+    export u32 j;
+}
+
+export struct Fx
+{
+    // Whether the function is `std`'s own: its lines are the prelude's,
+    // and no location is reported inside it.
+    export bool std_body;
+    // D-0283: the site (`site_key` of the callee's line and column) of the
+    // call `lower_call` is lowering, for its point checks; taken as it
+    // starts (cobc's `pc_site`).
+    export Option<String> pc_site;
+    // D-0292: the body's frame records every reference formed in it (the
+    // static pass left it a conflict, or a point check): `cb_frame_push_rec`,
+    // and references arriving in it are recorded (`cb_rec_ref`).
+    export bool tracked;
+    // D-0286: by candidate, the fields the body reads by value
+    // (`objectless_strings_with`).
+    export HashMap<usize, HashSet<String>> objectless_fields;
+    // D-0286: the call whose resource result the consumer being lowered
+    // takes with no object (`arm_inert`), and the same for the
+    // `finish_call` about to run.
+    export Option<InertResult> inert_result;
+    export Option<bool> inert_now;
+    export String out;
+    export usize ind;
+    export Vec<Cleanup> cleanup;
+    export Vec<HashMap<String, Binding>> scopes;
+    export Type ret;
+    export u32 notes;
+    // D-0315: each statement scope's C block depth where it opened
+    // (cobc's `stmt_ind`, `stmt_temp_drop`).
+    export HashMap<u32, usize> stmt_ind;
+    // D-0315: how many statement temporaries the body drops under a flag
+    // (cobc's `tl`).
+    export u32 tl;
+    export u32 root_frame;
+    // The names the body borrows, captures or drops (`pinned_names`), and
+    // assigns whole (`assigned_names`).
+    export HashSet<String> pinned;
+    // `pinned` for `unchecked`: in a decided program a shared borrow of a
+    // whole plain binding pins nothing (`resolve_pinned`'s `ws`). In a closure
+    // body, `pinned`.
+    export HashSet<String> pinned_ws;
+    export HashSet<String> assigned;
+    // In a closure body, its `self`.
+    export Option<SelfRef> self_ref;
+    // `probe_type`'s cache, by expression id and expected type.
+    export HashMap<String, Type> probes;
+    // How deep in probes the lowering is; a probe lowers into a discarded
+    // buffer.
+    export u32 probing;
+    // A probe met what cobc reports as an error (a variant whose type
+    // arguments nothing fixes): the argument probes that ask skip it.
+    export bool probe_failed;
+    // The line a block's frame reports a destruction fault at (an `if`'s).
+    export Option<usize> frame_line;
+    // The open loops: the cleanup depth at their start, and the `continue`
+    // label of a `for` loop's step.
+    export Vec<Loop> loops;
+    export Vec<bool> loop_broken;
+    export HashMap<String, String> rebind_frames;
+    // The temporaries that hold an object of their own (`into_temp`).
+    export HashSet<String> obj_temps;
+    // A reference slot's token where it is not loaded (`slot_tok`).
+    export HashMap<String, String> unstored;
+    // An unchecked holder's root (`unchecked_holder`), by its C name.
+    export HashMap<String, String> holder_roots;
+    // The function's type arguments, by parameter (`Fx::sub`).
+    export HashMap<String, Type> subst;
+    // The vector lengths `$` stands for, innermost last (`lower_index_arg`).
+    export Vec<String> dollar;
+    // `e[k]` rewritten as the `Vec` index call (`vec_index_call`), by the
+    // expression's id and whether it is written; the borrows such a call
+    // takes (`index_sugar`), by id.
+    export HashMap<String, Expr> vec_index_exprs;
+    export HashSet<usize> index_sugar;
+    // The place being lowered is written (an exclusive use), or is part of
+    // a temporary borrowed as an argument (D-0103).
+    export bool place_write;
+    export bool temp_root;
+    // `?`'s scrutinee (D-0060), a `match` that is its statement's last
+    // evaluation (`stmt_match`), and an arm that gets its own scope.
+    export bool propagate_scrutinee;
+    export bool stmt_match;
+    export bool branch_scope;
+    // The function being lowered, for internal errors.
+    export String fn_name;
+    // The direct reference parameters (`direct_refs_of`), and the C names
+    // whose accesses need no check (cobc's `direct_refs`).
+    export HashSet<String> direct_params;
+    export HashSet<String> direct_refs;
+    // A direct slice's entry flag (`bind_direct_live`), by its C name.
+    export HashMap<String, String> direct_live;
+    // A predicate closure's body (`pending_pred_closure`).
+    export bool pred_body;
+    // The reference parameters no slot holds (`unstored_ref_params`).
+    export HashSet<String> unstored_params;
+    // The vectors an element access reaches with its bounds check alone: a
+    // confined holder or parameter, by name (cobc's `confined_params`), and
+    // the confined locals, by C name (`confined`).
+    export HashMap<String, ConfinedVec> confined_params;
+    export HashSet<String> confined;
+    // A loop's vectors whose header it cannot change (`loop_fixed_vecs`):
+    // by C name, the locals holding their `ptr` and `len` from before the
+    // loop, which `confined_elem_place` reads instead of the vector's.
+    export HashMap<String, Hoisted> hoisted;
+    // D-0309: each enclosing loop's `version_loops` record, innermost last
+    // (None: a loop `loop_bound` finds nothing for).
+    export Vec<Option<VerLoop>> versions;
+    // D-0320: how many enclosing loops carry a length guard (a nested loop is
+    // guarded by the outermost one), and the locals bound to a value known
+    // before the run that the body never assigns (a `foreach` range's hidden
+    // end `$hN` among them), by name (cobc's `guard_depth`, `const_locals`).
+    export usize guard_depth;
+    export HashMap<String, u128> const_locals;
+    // The parameters `lower_fn`'s mask confines (their `confined_params`
+    // entries; a holder's entry may outlive its scope there).
+    export HashSet<String> mask_params;
+    // D-0309 (`[Call-Self-Tail]`): the call being lowered is a self tail call;
+    // the C names it may jump for; whether the body jumped to `self_tail`
+    // (cobc's `self_tail_now`, `tail_targets`, `tail_used`).
+    export bool self_tail_now;
+    export Vec<String> tail_targets;
+    export bool tail_used;
+    // The binders whose path is not minted (`cb_borrow_unminted`), by C
+    // name: the base token and projections (`unminted_binders`).
+    export HashMap<String, Unminted> unminted_binders;
+    // D-0200: the C names of values with no object that need none (a `_raw`
+    // form's result: `inert_c`); the `String::copy` call whose substring
+    // is made raw (by its expression id, `raw_substring`); the `__raw` form
+    // a call into an objectless binding takes (`raw_call`).
+    export HashSet<String> inert_c;
+    // The undo log of the nine name sets while a probe's mark is open
+    // (`snapshot_names`), and how many marks are open.
+    export Vec<NameUndo> names_undo;
+    export usize name_marks;
+    export Option<usize> raw_substring;
+    export Option<String> raw_call;
+    // D-0200/D-0269 (stage 4): each objectless local's drop line, by its
+    // `CDrop` index; the analyses' answers for the body (`confined_vecs`,
+    // `objectless_strings`, `elem_ref_lets`, `quiet_locals`, `held_locals`,
+    // the pure view parameters); the objectless locals bound (`objectless_c`)
+    // and the moved flag of each that may be moved away; the `let` being
+    // bound (its initializer's id, `cur_let`); the held reference locals
+    // (`held_c`); the roots of quiet locals (`quiet_roots`).
+    export Vec<String> drop_lines;
+    export HashSet<String> confined_names;
+    export Objectless objectless_names;
+    export HashSet<usize> elem_ref_ids;
+    export HashSet<usize> quiet_ids;
+    export HashSet<String> held_locals;
+    // D-0315 (step 4): the `fn` parameters the body only calls, and whether its
+    // table is registered on every call (cobc's `callee_only`, `notes_always`).
+    export HashSet<String> callee_only;
+    export bool notes_always;
+    // D-0315 (step 4): cobc's `notes_bottom`, `s1_let`, `s1_now`, `pending_sub`,
+    // `sub_frames`.
+    export bool notes_bottom;
+    export Option<usize> s1_let;
+    export bool s1_now;
+    export bool pending_sub;
+    export HashSet<u32> sub_frames;
+    export HashSet<String> pure_views;
+    export HashSet<String> objectless_c;
+    export HashMap<String, String> moved_flag;
+    export Option<usize> cur_let;
+    export HashSet<String> held_c;
+    export HashSet<String> quiet_roots;
+    // D-0196: a `__raw` form's body (`raw_ret`): its result leaves with no
+    // object; the sinks of its last `match` (`raw_sinks`), that `match`
+    // (`raw_tail`, by its scrutinee's id), and a local returned alone
+    // (`raw_return_path`).
+    export bool raw_ret;
+    export HashSet<String> raw_sinks;
+    export Option<usize> raw_tail;
+    // D-0315: a `match`, `if` or block (keyed as `raw_tail` is) whose consumer
+    // takes its value with no object (cobc's `raw_arm`).
+    export Option<usize> raw_arm;
+    // D-0315 (step 4): `raw_arm`'s consumer evaluates nothing after it; and
+    // the match of that arming may land a value with a destructor of its own
+    // in its raw sink (cobc's `raw_arm_last`, `raw_arm_noted`).
+    export bool raw_arm_last;
+    export bool raw_arm_noted;
+    // D-0315 (step 4): the pending noted temporaries (`noted_pend`) by their C
+    // names (cobc's `noted_pending`).
+    export HashMap<String, NotedPend> noted_pending;
+    // D-0315 (step 4): the closure being boxed goes to a parameter that does
+    // not escape: a stack box; and the closure expression (by id) whose box
+    // may be one (cobc's `stack_box`, `stack_box_at`).
+    export bool stack_box;
+    export Option<usize> stack_box_at;
+    export bool raw_return_path;
+    // An inert value is being lowered (`inert_expr`): no object for it.
+    export bool objectless;
+    // D-0315: the variant being built was armed by its consumer (cobc's
+    // `lit_inert`).
+    export bool lit_inert;
+    // D-0200: the names a fused text loop's bare piece is trimmed into
+    // (`bare_trims`).
+    export HashSet<String> bare_trims;
+    // D-0200 call state (stage 4): the `HashMap::entry` call of a compound
+    // pair (`map_acc`, by its first argument's id) and whether its `_acc`
+    // variant was used; a compound pair's element borrow (`compound_elem`);
+    // the `foreach` elements aliased to `(*$c)[$i]` (`elem_alias`); the
+    // `HashMap::get[_mut]` call whose `_acc` variant is asked for
+    // (`map_get_acc`) and the value pointer it gave; the call whose
+    // `Option<ref<T>>` result's token is received unheld (`datum_tok`) and
+    // that token.
+    export Option<usize> map_acc;
+    export bool map_acc_used;
+    export bool compound_elem;
+    export HashMap<String, Expr> elem_alias;
+    export Option<usize> map_get_acc;
+    export Option<String> map_get_acc_out;
+    export Option<usize> datum_tok;
+    export Option<String> datum_tok_out;
+    // A direct element argument's borrow mode for the element access
+    // (`elem_mode`), and whether it is a reader's (`elem_reader`).
+    export Option<String> elem_mode;
+    export bool elem_reader;
+    // D-0274 stage 2: the loop steps proven not to overflow (by the
+    // expression's id) and whether the next binary operation is one.
+    export HashSet<usize> no_overflow;
+    export bool proven_next;
+    // D-0274 stage 1: a dual body's fast half (`fast_half`), a body entered
+    // only through its dispatcher's test (`entry_tested`), a frozen body
+    // (`frozen_on`); the fields a field dual body confines (`field_confined`,
+    // by `b.f`); the pure direct slice parameters (`pure_slices`); the
+    // confined fields and read-confined vectors of the body
+    // (`confined_fields` as `h.f`, `read_confined`).
+    export bool fast_half;
+    export bool entry_tested;
+    export bool frozen_on;
+    export HashMap<String, FieldConf> field_confined;
+    export HashSet<String> pure_slices;
+    export HashSet<String> confined_fields;
+    export HashSet<String> read_confined;
+}
+
+// A confined vector: the vector as a C lvalue, the path to hand on, and
+// the element type.
+// A vector's header copied before a loop (`hoist_vec_headers`): the
+// locals holding its `ptr` and `len`.
+export struct Hoisted
+{
+    export String ptr;
+    export String len;
+}
+
+export struct ConfinedVec
+{
+    export String c;
+    export String path;
+    export Type elem;
+}
+
+// A field a field dual body confines: the vector as a C lvalue and its
+// element type.
+export struct FieldConf
+{
+    export String c;
+    export Type elem;
+}
+
+export struct Unminted
+{
+    export String tok;
+    export Vec<String> projs;
+}
+
+export struct Loop
+{
+    export usize depth;
+    export Option<String> cont;
+}
+
+export fn new_gen(Checked prog) : Gen
+{
+    Gen {
+        .prog = prog,
+        .files = Vec::new(),
+        .file_ids = HashMap::new(),
+        .fwd = String::new(),
+        .types = String::new(),
+        .strings = String::new(),
+        .protos = String::new(),
+        .fns = String::new(),
+        .thunks_out = String::new(),
+        .thunks = HashMap::new(),
+        .fn_targets = HashMap::new(),
+        .thunk_specs = Vec::new(),
+        .dispatch_memo = HashMap::new(),
+        .globals = HashSet::new(),
+        .desc_aux = String::new(),
+        .descs = Vec::new(),
+        .desc_ids = Vec::new(),
+        .units = Vec::new(),
+        .fn_names = HashMap::new(),
+        .queue = Vec::new(),
+        .queue_head = 0,
+        .uid = 0,
+        .closure_base = 0,
+        .closures = HashMap::new(),
+        .nscope = 0,
+        .line_directives = true,
+        .report_guards = false,
+        .guard_notes = Vec::new(),
+        .pending_note = None,
+        .type_names = HashMap::new(),
+        .defined = HashSet::new(),
+        .type_ids = HashMap::new(),
+        .type_pos = HashMap::new(),
+        .str_names = HashMap::new(),
+        .str_log = Vec::new(),
+        .nstr = 0,
+        .synth_id = 1 << 48,
+        .externs_out = HashMap::new(),
+        .eqs = HashMap::new(),
+        .glues = HashMap::new(),
+        .noting = false,
+        .noescape = HashMap::new(),
+        .ol_memo = HashMap::new(),
+        .ol_low = max_value<usize>(),
+        .dp_memo = HashMap::new(),
+        .scope_sets = scope_name_sets(false),
+        .scope_sets_decided = scope_name_sets(true),
+        .khs = HashMap::new(),
+        .kcs = HashMap::new(),
+        .bootstrap = bootstrap_level(),
+        .all_checks = all_checks_level(),
+        .pending_pred_closure = false,
+        .pending_reader_closure = false,
+        .pure_closures = HashSet::new(),
+        .reader_memo = HashMap::new(),
+        .confining = None,
+        .writer_memo = HashMap::new(),
+        .fn_values = None,
+        .native_ctx = None,
+        .fn_copies = HashMap::new(),
+        .probe_bufs = Vec::new(),
+        .pending_raw_ret = false,
+        .arrive_twins = HashSet::new(),
+        .inline_sigs = HashSet::new(),
+        .variants = HashMap::new(),
+        .pending_tested = false,
+        .pending_bare = false,
+        .frozen_mode = false,
+        .pending_field_confined = None,
+        .substring_fn = false,
+        .append_substring_fn = false,
+        .lib = false,
+        .pathless = false,
+        .decided = false,
+        .unsupported = None,
+        .id_types = Vec::new(),
+    }
+}
+
+// An environment variable that is set and is not "0" (cobc's
+// `COBALTC_PATHLESS` / `COBALTC_DECIDED` tests: unset counts as yes).
+export fn env_not_zero(str name) : bool
+{
+    match (env_set(name))
+    {
+        Some(v) : v != "0",
+        None    : true,
+    }
+}
+
+// cobc's `unsupported`: the first reason this lowering cannot go on, kept
+// for the driver; the lowering's text after it is discarded.
+export fn set_unsupported(ref<Gen, exclusive> g, String what)
+{
+    if (Option::is_none(&g.unsupported))
+    {
+        g.unsupported = Some(what);
+    }
+}
+
+// The D-0274 stages cobc has: `COBALTC_BOOTSTRAP_UPTO=N` switches off
+// stages 1..=N (CHG-0368), `COBALTC_BOOTSTRAP_FORM` all of them.
+export const u8 BOOTSTRAP_STAGES = 10;
+
+fn env_set(str name) : Option<String>
+{
+    match (env_var(name))
+    {
+        Ok(v)  : v,
+        Err(_) : None,
+    }
+}
+
+export fn bootstrap_level() : u8
+{
+    match (env_set("COBALTC_BOOTSTRAP_UPTO"))
+    {
+        Some(v) :
+        {
+            match (StringView::parse<u8>(StringView::trim(&v)))
+            {
+                Ok(n)  : return if (n > BOOTSTRAP_STAGES) { BOOTSTRAP_STAGES } else { n },
+                Err(_) : {},
+            }
+        },
+        None    : {},
+    }
+    match (env_set("COBALTC_BOOTSTRAP_FORM"))
+    {
+        Some(v) :
+        {
+            if (StringView::len(&v) > 0 && v != "0")
+            {
+                return BOOTSTRAP_STAGES;
+            }
+        },
+        None    : {},
+    }
+    0
+}
+
+// `COBALTC_ALL_CHECKS` set, or any stage of the bootstrap form switched off.
+fn all_checks_level() : bool
+{
+    match (env_set("COBALTC_ALL_CHECKS"))
+    {
+        Some(v) :
+        {
+            if (StringView::len(&v) > 0 && v != "0")
+            {
+                return true;
+            }
+        },
+        None    : {},
+    }
+    bootstrap_level() > 0
+}
+
+// Only the general checked form is written (cobc's `Gen::all_checks`).
+export fn all_checks(ref<Gen, shared> g) : bool
+{
+    g.all_checks
+}
+
+// D-0274 stage `stage` is switched off (cobc's `Gen::boot`).
+export fn boot(ref<Gen, shared> g, u8 stage) : bool
+{
+    g.bootstrap >= stage
+}
+
+// ---- names, locations, requests ----
+
+export fn fresh(ref<Gen, exclusive> g, str prefix) : String
+{
+    g.uid += 1;
+    sprintf("%s%v", prefix, g.uid)
+}
+
+// `line` as `file, line` for `cb_at` and the runtime's reports: the
+// program's own lines only; inside `std`, `NOLOC`.
+// CHG-0449: a loop's note for `--report-guards`, at a line of the program's
+// own files (a loop in `std` is not reported).
+export fn guard_note(ref<Gen, exclusive> g, bool std_body, usize line, String text)
+{
+    if (std_body)
+    {
+        return;
+    }
+    match (resolve_line(&g.prog.ex, line))
+    {
+        Some(o) : Vec::push(&mut g.guard_notes, GuardNote { .file = String::clone(&o.file), .line = o.line, .text = text }),
+        None    : {},
+    }
+}
+
+export fn loc(ref<Gen, exclusive> g, bool std_body, usize line) : String
+{
+    if (std_body)
+    {
+        return NOLOC;
+    }
+    match (resolve_line(&g.prog.ex, line))
+    {
+        Some(o) :
+        {
+            u32 id = match (HashMap::get(&g.file_ids, &o.file))
+            {
+                Some(k) : *k,
+                None    :
+                {
+                    u32 k = narrow<u32>(Vec::len(&g.files));
+                    Vec::push(&mut g.files, String::clone(&o.file));
+                    HashMap::insert(&mut g.file_ids, String::clone(&o.file), k);
+                    k
+                },
+            };
+            sprintf("%vu, %vu", id, o.line)
+        },
+        None    : NOLOC,
+    }
+}
+
+export fn request_key(StringView name, ref<Vec<Type>, shared> targs) : String
+{
+    sprintf("%s\u{1}%s", name, &types_code(targs))
+}
+
+export fn request_fn(ref<Gen, exclusive> g, StringView name, Vec<Type> targs) : String
+{
+    String key = request_key(name, &targs);
+    match (HashMap::get(&g.fn_names, &key))
+    {
+        Some(c) : return String::clone(c),
+        None    : {},
+    }
+    let_known(g, name);
+    String c = fn_cname(name, &targs);
+    HashMap::insert(&mut g.fn_names, key, String::clone(&c));
+    Vec::push(&mut g.queue, FnRequest { .name = String::copy(name), .targs = targs, .mask = 0 });
+    c
+}
+
+// The variant of a function compiled for confined arguments in the
+// parameters `mask` names (cobc's `request_variant`).
+export fn request_variant(ref<Gen, exclusive> g, StringView name, Vec<Type> targs, u64 mask) : String
+{
+    if (mask == 0)
+    {
+        return request_fn(g, name, targs);
+    }
+    String key = sprintf("%s#%v", &request_key(name, &targs), mask);
+    match (HashMap::get(&g.variants, &key))
+    {
+        Some(c) : return String::clone(c),
+        None    : {},
+    }
+    String c = sprintf("%s_c%v", &fn_cname(name, &targs), mask);
+    HashMap::insert(&mut g.variants, key, String::clone(&c));
+    Vec::push(&mut g.queue, FnRequest { .name = String::copy(name), .targs = targs, .mask = mask });
+    c
+}
+
+export fn let_known(ref<Gen, shared> g, StringView name)
+{
+    assert(HashMap::contains(&g.prog.table.fns, &String::copy(name)), "cobc: no such function");
+}
+
+// A declaration from the prelude's own source (a program may declare its
+// own function of the same name), known by its key and a body with a line.
+// A function's declaration, its body loaded if it was pending: the copy
+// kept in `fn_copies` if there is one, else a new one.
+export fn get_fn(ref<Gen, exclusive> g, ref<String, shared> name) : Option<FnDecl>
+{
+    if (is_pending(&g.prog.table, name))
+    {
+        match (load_body(&mut g.prog.table, &g.prog.front, name))
+        {
+            Ok(_)  : {},
+            Err(_) : assert(false, "cobc: a std body that does not load"),
+        }
+    }
+    // The copy a caller gave back, if it is not lent out now (the table is
+    // not written once a body is loaded, so the copy stays the declaration).
+    match (HashMap::get_mut(&mut g.fn_copies, name))
+    {
+        Some(fs) :
+        {
+            match (Vec::pop(fs))
+            {
+                Some(f) : return Some(f),
+                None    : {},
+            }
+        },
+        None     : {},
+    }
+    match (HashMap::get(&g.prog.table.fns, name))
+    {
+        Some(f) : Some(clone(f)),
+        None    : None,
+    }
+}
+
+// An empty buffer for a probe to lower into (it lowers into a discarded
+// one): one a probe gave back, with its room, or a new one.
+export fn probe_buf(ref<Gen, exclusive> g) : String
+{
+    match (Vec::pop(&mut g.probe_bufs))
+    {
+        Some(b) : b,
+        None    : String::new(),
+    }
+}
+
+// A probe's buffer, done with: emptied and kept for the next probe.
+export fn probe_buf_done(ref<Gen, exclusive> g, String b)
+{
+    String::clear(&mut b);
+    if (Vec::len(&g.probe_bufs) < 8)
+    {
+        Vec::push(&mut g.probe_bufs, b);
+    }
+}
+
+// The copy `get_fn` gave, unchanged, kept for the next use of `name`.
+export fn give_fn(ref<Gen, exclusive> g, ref<String, shared> name, FnDecl f)
+{
+    // A few kept, as deep as the uses nest; more are dropped.
+    ref<Vec<FnDecl>, exclusive> fs = HashMap::entry(&mut g.fn_copies, name, Vec::new());
+    if (Vec::len(fs) < 4)
+    {
+        Vec::push(fs, f);
+    }
+}
+
+export fn in_prelude(StringView key, ref<FnDecl, shared> f) : bool
+{
+    if (!StringView::starts_with(key, "std::"))
+    {
+        return false;
+    }
+    if (Vec::len(&f.body.stmts) > 0)
+    {
+        return match (&f.body.stmts[0])
+        {
+            Stmt::SBlockLike(_) : true,
+            Stmt::SExpr(_)      : true,
+            Stmt::SLet(l)       : Option::is_some(&Box::get(l).init),
+            _                   : false,
+        };
+    }
+    Option::is_some(&f.body.tail)
+}
+
+// ---- frames, scopes, temporaries ----
+
+export fn emit(ref<Fx, exclusive> x, StringView s)
+{
+    for (usize k = 0; k < x.ind; k += 1)
+    {
+        String::append(&mut x.out, "    ");
+    }
+    String::append(&mut x.out, s);
+    String::push_ascii(&mut x.out, b'\n');
+}
+
+export fn at(ref<Gen, exclusive> g, ref<Fx, exclusive> x, usize line)
+{
+    String l = loc(g, x.std_body, line);
+    if (l != NOLOC)
+    {
+        emit(x, &sprintf("cb_at(%s);", &l));
+    }
+}
+
+export fn scope_marker(ref<Fx, exclusive> x, u8 kind, u32 id)
+{
+    String m = String::new();
+    String::push_ascii(&mut m, 1);
+    String::push_ascii(&mut m, kind);
+    String::append(&mut m, &sprintf("%v", id));
+    emit(x, &m);
+}
+
+export fn push_frame(ref<Gen, exclusive> g, ref<Fx, exclusive> x)
+{
+    push_frame_at(g, x, None);
+}
+
+// D-0292: a function's own frame. `R`: the body's references are recorded
+// (`Fx::tracked`), emitted as `cb_frame_push_rec` whether or not anything
+// binds into it; `G`: a decided body, light, emitted as `cb_frame_push_fn`
+// where the frame is used.
+export fn push_frame_fn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, bool tracked)
+{
+    g.nscope += 1;
+    u32 id = g.nscope;
+    scope_marker(x, if (tracked) { b'R' } else { b'G' }, id);
+    Vec::push(&mut x.cleanup, Cleanup::CFrame(id));
+}
+
+// A frame whose end reports `line` for a destruction fault: the marker
+// carries the location to `resolve_scopes`, which emits `cb_frame_push_at`.
+export fn push_frame_at(ref<Gen, exclusive> g, ref<Fx, exclusive> x, Option<usize> line)
+{
+    g.nscope += 1;
+    u32 id = g.nscope;
+    match (line)
+    {
+        Some(l) :
+        {
+            String lc = loc(g, x.std_body, l);
+            String m = String::new();
+            String::push_ascii(&mut m, 1);
+            String::push_ascii(&mut m, b'F');
+            String::append(&mut m, &sprintf("%v", id));
+            String::push_ascii(&mut m, 2);
+            String::append(&mut m, &lc);
+            emit(x, &m);
+        },
+        None    : scope_marker(x, b'F', id),
+    }
+    Vec::push(&mut x.cleanup, Cleanup::CFrame(id));
+}
+
+export fn pop_frame(ref<Fx, exclusive> x)
+{
+    // The frame's objectless locals end first (`push_drop`), then the objects
+    // the runtime records: cobc's `pop_frame` says why nothing can tell the
+    // order between the two groups from `[Block-Exit]`'s. D-0315 (step 4): a
+    // noted value's sub-frame closes with the frame below it.
+    while (true)
+    {
+        while (Vec::len(&x.cleanup) > 0)
+        {
+            u32 k = match (x.cleanup[Vec::len(&x.cleanup) - 1])
+            {
+                Cleanup::CDrop(k) : k,
+                _                 : break,
+            };
+            Vec::pop(&mut x.cleanup);
+            String line = String::clone(&x.drop_lines[widen<usize>(k)]);
+            emit(x, &line);
+        }
+        u32 fid = match (Vec::pop(&mut x.cleanup))
+        {
+            Some(Cleanup::CFrame(id)) : id,
+            _                         :
+            {
+                assert(false, "cobc: frame pop closes a statement scope");
+                0
+            },
+        };
+        scope_marker(x, b'f', fid);
+        if (!HashSet::contains(&x.sub_frames, fid))
+        {
+            break;
+        }
+    }
+}
+
+// D-0315 (step 4): the frame opened after a noted value's statement (cobc's
+// `push_sub_frame`).
+export fn push_sub_frame(ref<Gen, exclusive> g, ref<Fx, exclusive> x)
+{
+    push_frame(g, x);
+    HashSet::insert(&mut x.sub_frames, g.nscope);
+}
+
+// An objectless local bound in the innermost frame: its drop runs where that
+// frame ends or a jump leaves it. Placed just above the frame and the frame's
+// earlier drops, below any statement scope open now, so those pop first and
+// the frame's locals end last bound first (cobc's `push_drop`).
+// D-0315 (step 4): a parameter's drop, below the root frame, above the
+// parameters' drops placed earlier (cobc's `push_drop_under_root`).
+export fn push_drop_under_root(ref<Fx, exclusive> x, String line)
+{
+    u32 k = narrow<u32>(Vec::len(&x.drop_lines));
+    Vec::push(&mut x.drop_lines, line);
+    usize at = 0;
+    for (usize i = 0; i < Vec::len(&x.cleanup); i += 1)
+    {
+        bool hit = match (x.cleanup[i])
+        {
+            Cleanup::CFrame(id) : id == x.root_frame,
+            _                   : false,
+        };
+        if (hit)
+        {
+            at = i;
+            break;
+        }
+    }
+    Vec::insert(&mut x.cleanup, at, Cleanup::CDrop(k));
+}
+
+export fn push_drop(ref<Fx, exclusive> x, String line)
+{
+    u32 k = narrow<u32>(Vec::len(&x.drop_lines));
+    Vec::push(&mut x.drop_lines, line);
+    usize at = 0;
+    usize i = Vec::len(&x.cleanup);
+    while (i > 0)
+    {
+        i -= 1;
+        match (x.cleanup[i])
+        {
+            Cleanup::CFrame(_) :
+            {
+                at = i + 1;
+                break;
+            },
+            _                  : {},
+        }
+    }
+    while (at < Vec::len(&x.cleanup) && is_cdrop(&x.cleanup[at]))
+    {
+        at += 1;
+    }
+    Vec::insert(&mut x.cleanup, at, Cleanup::CDrop(k));
+}
+
+export fn is_cdrop(ref<Cleanup, shared> c) : bool
+{
+    match (c)
+    {
+        Cleanup::CDrop(_) : true,
+        _                 : false,
+    }
+}
+
+export fn push_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x)
+{
+    push_stmt_at(g, x, None);
+}
+
+// A statement scope whose end reports `line` for a destruction fault:
+// `resolve_scopes` emits `cb_stmt_push_at`.
+export fn push_stmt_at(ref<Gen, exclusive> g, ref<Fx, exclusive> x, Option<usize> line)
+{
+    g.nscope += 1;
+    u32 id = g.nscope;
+    match (line)
+    {
+        Some(l) :
+        {
+            String lc = loc(g, x.std_body, l);
+            String m = String::new();
+            String::push_ascii(&mut m, 1);
+            String::push_ascii(&mut m, b'S');
+            String::append(&mut m, &sprintf("%v", id));
+            String::push_ascii(&mut m, 2);
+            String::append(&mut m, &lc);
+            emit(x, &m);
+        },
+        None    : scope_marker(x, b'S', id),
+    }
+    HashMap::insert(&mut x.stmt_ind, id, x.ind);
+    Vec::push(&mut x.cleanup, Cleanup::CStmt(id));
+}
+
+export fn pop_stmt(ref<Fx, exclusive> x)
+{
+    // D-0315: the statement's own temporaries dropped in the C
+    // (`stmt_temp_drop`) end first, the last made first.
+    while (Vec::len(&x.cleanup) > 0)
+    {
+        u32 k = match (x.cleanup[Vec::len(&x.cleanup) - 1])
+        {
+            Cleanup::CDrop(k) : k,
+            _                 : break,
+        };
+        Vec::pop(&mut x.cleanup);
+        String line = String::clone(&x.drop_lines[widen<usize>(k)]);
+        emit(x, &line);
+    }
+    match (Vec::pop(&mut x.cleanup))
+    {
+        Some(Cleanup::CStmt(id)) : scope_marker(x, b's', id),
+        _                        : assert(false, "cobc: statement pop closes a frame"),
+    }
+}
+
+// The innermost scope or frame, left by a jump already emitted: its extent
+// in the text ends here.
+export fn end_diverged(ref<Fx, exclusive> x)
+{
+    while (true)
+    {
+        while (Vec::len(&x.cleanup) > 0)
+        {
+            bool drop = match (&x.cleanup[Vec::len(&x.cleanup) - 1])
+            {
+                Cleanup::CDrop(_) : true,
+                _                 : false,
+            };
+            if (!drop)
+            {
+                break;
+            }
+            Vec::pop(&mut x.cleanup);
+        }
+        // D-0315 (step 4): the drops below the root frame were the last.
+        if (Vec::len(&x.cleanup) == 0)
+        {
+            return;
+        }
+        u32 eid = match (Vec::pop(&mut x.cleanup))
+        {
+            Some(Cleanup::CFrame(id)) : id,
+            Some(Cleanup::CStmt(id))  : id,
+            _                         :
+            {
+                assert(false, "cobc: no scope to end");
+                0
+            },
+        };
+        scope_marker(x, b'e', eid);
+        // A noted value's sub-frame ends with the frame below it.
+        if (!HashSet::contains(&x.sub_frames, eid))
+        {
+            break;
+        }
+    }
+}
+
+// Emits the pops that leave every scope and frame above `depth`, without
+// changing the lowering's own stack.
+export fn emit_unwind_to(ref<Fx, exclusive> x, usize depth)
+{
+    usize k = Vec::len(&x.cleanup);
+    while (k > depth)
+    {
+        k -= 1;
+        match (x.cleanup[k])
+        {
+            Cleanup::CFrame(id) : scope_marker(x, b'g', id),
+            Cleanup::CStmt(id)  : scope_marker(x, b't', id),
+            Cleanup::CDrop(d)   :
+            {
+                String line = String::clone(&x.drop_lines[widen<usize>(d)]);
+                emit(x, &line);
+            },
+        }
+    }
+}
+
+// ---- blocks and expressions ----
+
+// A value's destination: a C local of type `ty`, and the variable that
+// takes its object when it has one.
+export struct Sink
+{
+    export String dst;
+    export Type ty;
+    export Option<String> ov;
+}
+
+export fn bind_in_scope(ref<Fx, exclusive> x, StringView name, Binding b)
+{
+    usize k = Vec::len(&x.scopes) - 1;
+    HashMap::insert(&mut x.scopes[k], String::copy(name), b);
+}
+
+export fn lookup(ref<Fx, shared> x, StringView name) : Option<Binding>
+{
+    usize k = Vec::len(&x.scopes);
+    while (k > 0)
+    {
+        k -= 1;
+        match (HashMap::get(&x.scopes[k], name))
+        {
+            Some(b) : return Some(clone(b)),
+            None    : {},
+        }
+    }
+    None
+}
+
+// The binding of `name` where it is, for a caller that only reads it
+// (D-0316: `HashMap::get`'s result comes from the map alone, so `name` is
+// only probed here).
+export fn lookup_ref(ref<Fx, shared> x, StringView name) : Option<ref<Binding, shared>> from x
+{
+    usize k = Vec::len(&x.scopes);
+    while (k > 0)
+    {
+        k -= 1;
+        match (HashMap::get(&x.scopes[k], name))
+        {
+            Some(b) : return Some(b),
+            None    : {},
+        }
+    }
+    None
+}
+
+// Whether `name` is bound in a scope of the body (`lookup`'s answer without
+// a copy of the binding).
+export fn is_bound(ref<Fx, shared> x, StringView name) : bool
+{
+    usize k = Vec::len(&x.scopes);
+    while (k > 0)
+    {
+        k -= 1;
+        if (HashMap::contains(&x.scopes[k], name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+export fn is_closure(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TClosure(_) : true,
+        _                 : false,
+    }
+}
+
+// ---- places ----
+
+// A place: a C lvalue, its type, the token of the path it is reached
+// through (none for an unchecked local), its projections, whether it is a
+// whole binding.
+export struct P
+{
+    export String c;
+    export Type ty;
+    export Option<String> base;
+    export Vec<String> projs;
+    export bool is_binding;
+    // The pointer expression when this place is `*p` on a raw pointer:
+    // reads and writes are trusted, moves relocate through it.
+    export Option<String> raw;
+}
+
+export fn projs_args(ref<Vec<String>, shared> projs) : String
+{
+    if (Vec::len(projs) == 0)
+    {
+        return "NULL, 0";
+    }
+    sprintf("(cb_proj[]){ %s }, %v", &String::join(projs, ", "), Vec::len(projs))
+}
+
+// Where the text literals stand (`strings`' length and `str_log`'s), so a
+// probe's additions can be undone: both only grow.
+export struct StrMark
+{
+    export usize len;
+    export usize log;
+}
+
+export fn str_mark(ref<Gen, shared> g) : StrMark
+{
+    StrMark { .len = StringView::len(&g.strings), .log = Vec::len(&g.str_log) }
+}
+
+export fn str_restore(ref<Gen, exclusive> g, StrMark m)
+{
+    String::truncate(&mut g.strings, m.len);
+    while (Vec::len(&g.str_log) > m.log)
+    {
+        String k = Option::expect(Vec::pop(&mut g.str_log), "a logged literal");
+        HashMap::remove(&mut g.str_names, &k);
+    }
+}
+
+// D-0200: the sets keyed by C names that a probe's discarded lowering may add
+// to. A probe restores the name counter (`g.uid`), so the real pass reuses
+// its names: what the probe recorded under them must not carry over (cobc's
+// `snapshot_names`).
+export struct NameSnap
+{
+    // A mark in the undo log, and how many marks were open when it was made.
+    export usize mark;
+    export usize depth;
+}
+
+// The nine name sets a probe may write, and how a write to one is undone
+// (`restore_names`).
+export enum NameSet
+{
+    InertC,
+    ObjTemps,
+    ObjectlessC,
+    DirectRefs,
+    Confined,
+    HeldC,
+    RawSinks,
+}
+
+export enum NameMap
+{
+    MovedFlag,
+    Unstored,
+}
+
+export struct SetName
+{
+    export NameSet w;
+    export String k;
+}
+
+export struct MapKey
+{
+    export NameMap w;
+    export String k;
+}
+
+export struct MapEntry
+{
+    export NameMap w;
+    export String k;
+    export String v;
+}
+
+export enum NameUndo
+{
+    // An insert of a new name: remove it.
+    Unset(SetName),
+    // A removal: put the name back.
+    Reset(SetName),
+    // An insert of a new key: remove it.
+    Unput(MapKey),
+    // An overwrite: the value before it.
+    Reput(MapEntry),
+}
+
+export fn snapshot_names(ref<Fx, exclusive> x) : NameSnap
+{
+    usize depth = x.name_marks;
+    x.name_marks += 1;
+    NameSnap { .mark = Vec::len(&x.names_undo), .depth = depth }
+}
+
+export fn restore_names(ref<Fx, exclusive> x, NameSnap n)
+{
+    while (Vec::len(&x.names_undo) > n.mark)
+    {
+        match (Vec::pop(&mut x.names_undo))
+        {
+            Some(NameUndo::Unset(n)) :
+            {
+                _ = HashSet::remove(name_set(x, n.w), &n.k);
+            },
+            Some(NameUndo::Reset(n)) :
+            {
+                SetName { w, k } = n;
+                _ = HashSet::insert(name_set(x, w), k);
+            },
+            Some(NameUndo::Unput(n)) :
+            {
+                _ = HashMap::remove(name_map(x, n.w), &n.k);
+            },
+            Some(NameUndo::Reput(n)) :
+            {
+                MapEntry { w, k, v } = n;
+                _ = HashMap::insert(name_map(x, w), k, v);
+            },
+            None                     : {},
+        }
+    }
+    x.name_marks = n.depth;
+}
+
+fn name_set(ref<Fx, exclusive> x, NameSet w) : ref<HashSet<String>, exclusive>
+{
+    match (w)
+    {
+        NameSet::InertC      : &mut x.inert_c,
+        NameSet::ObjTemps    : &mut x.obj_temps,
+        NameSet::ObjectlessC : &mut x.objectless_c,
+        NameSet::DirectRefs  : &mut x.direct_refs,
+        NameSet::Confined    : &mut x.confined,
+        NameSet::HeldC       : &mut x.held_c,
+        NameSet::RawSinks    : &mut x.raw_sinks,
+    }
+}
+
+fn name_map(ref<Fx, exclusive> x, NameMap w) : ref<HashMap<String, String>, exclusive>
+{
+    match (w)
+    {
+        NameMap::MovedFlag : &mut x.moved_flag,
+        NameMap::Unstored  : &mut x.unstored,
+    }
+}
+
+// A name added to one of the nine sets; logged while a mark is open.
+export fn names_add(ref<Fx, exclusive> x, NameSet w, String k)
+{
+    if (x.name_marks == 0)
+    {
+        _ = HashSet::insert(name_set(x, w), k);
+    }
+    else if (HashSet::insert(name_set(x, w), String::clone(&k)))
+    {
+        Vec::push(&mut x.names_undo, NameUndo::Unset(SetName { .w = w, .k = k }));
+    }
+}
+
+export fn names_drop(ref<Fx, exclusive> x, NameSet w, StringView k)
+{
+    if (HashSet::remove(name_set(x, w), k) && x.name_marks > 0)
+    {
+        Vec::push(&mut x.names_undo, NameUndo::Reset(SetName { .w = w, .k = String::copy(k) }));
+    }
+}
+
+export fn names_put(ref<Fx, exclusive> x, NameMap w, String k, String v)
+{
+    if (x.name_marks == 0)
+    {
+        _ = HashMap::insert(name_map(x, w), k, v);
+        return;
+    }
+    match (HashMap::insert(name_map(x, w), String::clone(&k), v))
+    {
+        None      : Vec::push(&mut x.names_undo, NameUndo::Unput(MapKey { .w = w, .k = k })),
+        Some(old) : Vec::push(&mut x.names_undo, NameUndo::Reput(MapEntry { .w = w, .k = k, .v = old })),
+    }
+}

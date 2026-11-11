@@ -1,0 +1,47 @@
+// CONFORMANCE-CASE
+// spec: 08-alias-validity
+// facility: conf.direct-call-lent-vec-element; [Borrow-Denied], [Standing-Local] H5 (D-0209, CHG-0247)
+// kind: negative
+// expect: diag.aliasing-conflict (static)
+//
+// The guard behind conf.direct-call-owned-locals: a local Vec lent
+// exclusively to another thread (the pusher grows it) is not the caller's
+// to borrow an element of -- the borrow `&v[0]` clashes with the held
+// exclusive path and faults before the call, so no direct body ever reads
+// a cell another thread could release. The pusher waits for a word on a
+// channel before it pushes, so it is alive at the borrow under every
+// schedule (a lent path is held until its thread ends, spec/19
+// [Thread-Lend]); `read` would send that word and join it.
+//
+// D-0282: the static pass rejects this program before it runs (it was found
+// at run time before): `h` still borrows `v`, so it cannot be read here.
+
+import std;
+
+fn pusher(ref<Vec<i32>, exclusive> v, ref<Channel<u8>, shared> go)
+{
+    _ = Channel::recv(go);
+    usize i = 0;
+    while (i < 1000)
+    {
+        Vec::push(v, 1);
+        i = i + 1;
+    }
+}
+
+fn read(ref<i32, shared> a, handle<void> h, ref<Channel<u8>, shared> go) : i64
+{
+    _ = Channel::send(go, 1);
+    join(h);
+    widen<i64>(*a)
+}
+
+fn main()
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 7);
+    Channel<u8> go = Channel::new(1);
+    auto h = spawn(pusher, &mut v, &go);
+    i64 t = read(&v[0], h, &go);          // ✗ v[0] is under the pusher's lend
+    printf("%v %v\n", t, Vec::len(&v));
+}

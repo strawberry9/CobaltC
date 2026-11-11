@@ -1,0 +1,72 @@
+// CONFORMANCE-CASE
+// spec: 14-control-flow
+// facility: rule.control.stmt [Stmt-Exit], [Fault-Contain] (D-0315); conf.discarded-noted-results-end-with-statement
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 5b616c6f6e655d2f5b66697273745d2f5b6f746865725d2f5b7368617265645d5b74686972645d5b7365636f6e645d5b6265666f72655d20360a5b616c6f6e655d2f5b66697273745d2f5b6f746865725d2f5b7368617265645d5b74686972645d5b7365636f6e645d5b6265666f72655d206f6b20360a5b616c6f6e655d2f5b66697273745d2f5b6f746865725d2f5b7368617265645d5b74686972645d5b7365636f6e645d5b6265666f72655d206661696c65640a
+//
+// A call's result whose type has a destructor of its own, discarded (the
+// value a slot gave back, the `Rc` a map's `insert` replaced): it ends where
+// its statement ends, before the next statement runs; a handle another
+// holder still shares ends nothing; a fault later in the body ends the
+// locals as before, the discarded values not again.
+
+import std;
+
+resource struct Noisy
+{
+    String name;
+    usize n;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[%v]", &self.name);
+}
+
+fn make(StringView name, usize n) : Noisy
+{
+    Noisy { .name = String::copy(name), .n = n }
+}
+
+fn put(ref<Option<Noisy>, exclusive> slot, Noisy n) : Option<Noisy>
+{
+    replace(slot, Some(n))
+}
+
+fn check(usize n, u8 at) : usize
+{
+    assert(at != 1, "refused %v", n);
+    n
+}
+
+fn run(u8 at) : usize
+{
+    Noisy before = make("before", 1);
+    _ = make("alone", 2);
+    printf("/");
+    Option<Noisy> slot = None;
+    put(&mut slot, make("first", 3));
+    put(&mut slot, make("second", 4));
+    printf("/");
+    HashMap<String, Rc<Noisy>> m = HashMap::new();
+    HashMap::insert(&mut m, String::copy("k"), Rc::new(make("shared", 5)));
+    Rc<Noisy> kept = Rc::clone(Option::expect(HashMap::get(&m, "k"), "a value"));
+    HashMap::insert(&mut m, String::copy("k"), Rc::new(make("other", 6)));
+    HashMap::insert(&mut m, String::copy("k"), Rc::new(make("third", 7)));
+    printf("/");
+    check(Rc::get(&kept).n, at) + before.n
+}
+
+fn main()
+{
+    printf(" %v\n", run(0));
+    foreach (at in [0: u8, 1])
+    {
+        match (try_join(spawn(run, at)))
+        {
+            Ok(v)  : printf(" ok %v\n", v),
+            Err(_) : printf(" failed\n"),
+        }
+    }
+}

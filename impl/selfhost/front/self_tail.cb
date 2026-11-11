@@ -1,0 +1,364 @@
+// D-0309 (`[Call-Self-Tail]`, spec/15): a function's self tail calls, by
+// expression id (coby's `self_tail.rs`, which states the conditions; this is
+// its port, the same calls for every program).
+
+import std;
+import ast;
+
+// A binding the function's own frame declares, with its type.
+export struct FrameBinding
+{
+    export String name;
+    export Type ty;
+}
+
+// The tail positions of `e`: the expression itself, and through parentheses,
+// a block's tail, both branches of an `if`/`else` and every arm of a `match`.
+// `unit`: the function returns nothing (an `if` without `else` is a tail too,
+// and so is a block's last statement when it has no tail expression).
+fn tails(ref<Expr, shared> e, bool unit, ref<Vec<Expr>, exclusive> calls)
+{
+    match (&e.kind)
+    {
+        ExprKind::EParen(x)  : tails(Box::get(x), unit, calls),
+        ExprKind::EBlock(b)  : block_tails(b, unit, calls),
+        ExprKind::EUnsafe(b) : block_tails(b, unit, calls),
+        ExprKind::EIf(i)     :
+        {
+            ref<IfExpr, shared> ie = Box::get(i);
+            if (Option::is_some(&ie.else_) || unit)
+            {
+                block_tails(&ie.then_, unit, calls);
+                match (&ie.else_)
+                {
+                    Some(el) : tails(el, unit, calls),
+                    None     : {},
+                }
+            }
+            else
+            {
+                Vec::push(calls, clone(e));
+            }
+        },
+        ExprKind::EMatch(m)  :
+        {
+            foreach (a in &Box::get(m).arms)
+            {
+                tails(Box::get(&a.body), unit, calls);
+            }
+        },
+        _                    :
+        {
+            Vec::push(calls, clone(e));
+        },
+    }
+}
+
+fn block_tails(ref<Block, shared> b, bool unit, ref<Vec<Expr>, exclusive> calls)
+{
+    match (&b.tail)
+    {
+        Some(t) : tails(Box::get(t), unit, calls),
+        None    :
+        {
+            if (unit && Vec::len(&b.stmts) > 0)
+            {
+                match (&b.stmts[Vec::len(&b.stmts) - 1])
+                {
+                    Stmt::SExpr(e)      : tails(Box::get(e), unit, calls),
+                    Stmt::SBlockLike(e) : tails(Box::get(e), unit, calls),
+                    _                   : {},
+                }
+            }
+        },
+    }
+}
+
+// What `self_tail_calls`' walk over the body outside closures finds: whether
+// a frame binding is borrowed (or a closure made), and every `return`'s
+// operand.
+struct Walk
+{
+    bool borrowed;
+    Vec<Expr> returns;
+}
+
+fn names_frame(ref<Vec<FrameBinding>, shared> frame, ref<String, shared> x) : bool
+{
+    foreach (fb in frame)
+    {
+        if (fb.name == x)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ref_ty(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TRef(_)   : true,
+        Type::TSlice(_) : true,
+        _               : false,
+    }
+}
+
+// Every binding named `x` the frame declares is a reference (or slice).
+fn through_ref(ref<Vec<FrameBinding>, shared> frame, ref<String, shared> x) : bool
+{
+    foreach (fb in frame)
+    {
+        if ((fb.name == x) && !is_ref_ty(&fb.ty))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// A borrowed place's root, through fields and indexes to a name; a
+// dereference on the way reaches the referent instead.
+fn check_place(ref<Expr, shared> place, ref<Vec<FrameBinding>, shared> frame, ref<Walk, exclusive> w)
+{
+    ref<Expr, shared> at = place;
+    bool projected = false;
+    while (true)
+    {
+        match (&at.kind)
+        {
+            ExprKind::EParen(x) :
+            {
+                at = Box::get(x);
+            },
+            ExprKind::EField(f) :
+            {
+                projected = true;
+                at = &Box::get(f).e;
+            },
+            ExprKind::EIndex(p) :
+            {
+                projected = true;
+                at = &Box::get(p).a;
+            },
+            ExprKind::EDeref(_) : return,
+            ExprKind::EPath(p)  :
+            {
+                ref<PathExpr, shared> pe = Box::get(p);
+                if (Vec::len(&pe.segs) == 1 && names_frame(frame, &pe.segs[0]))
+                {
+                    if (!projected || !through_ref(frame, &pe.segs[0]))
+                    {
+                        w.borrowed = true;
+                    }
+                }
+                return;
+            },
+            _                   : return,
+        }
+    }
+}
+
+fn walk_block(ref<Block, shared> b, ref<Vec<FrameBinding>, shared> frame, ref<Walk, exclusive> w)
+{
+    foreach (st in &b.stmts)
+    {
+        match (st)
+        {
+            Stmt::SLet(l)         :
+            {
+                match (&Box::get(l).init)
+                {
+                    Some(e) : walk(e, frame, w),
+                    None    : {},
+                }
+            },
+            Stmt::SDestructure(d) : walk(&Box::get(d).init, frame, w),
+            Stmt::SExpr(e)        : walk(Box::get(e), frame, w),
+            Stmt::SBlockLike(e)   : walk(Box::get(e), frame, w),
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : walk(Box::get(t), frame, w),
+        None    : {},
+    }
+}
+
+// coby's `visit` over `e` (closures' bodies left out) with the walk's action.
+fn walk(ref<Expr, shared> e, ref<Vec<FrameBinding>, shared> frame, ref<Walk, exclusive> w)
+{
+    match (&e.kind)
+    {
+        ExprKind::EBorrow(bb) : check_place(&Box::get(bb).e, frame, w),
+        ExprKind::ESliceOf(s) : check_place(&Box::get(s).base, frame, w),
+        ExprKind::EClosure(_) :
+        {
+            w.borrowed = true;
+        },
+        ExprKind::EReturn(r)  :
+        {
+            match (r)
+            {
+                Some(x) :
+                {
+                    Vec::push(&mut w.returns, clone(Box::get(x)));
+                },
+                None    : {},
+            }
+        },
+        _                     : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EUnary(u)       : walk(&Box::get(u).e, frame, w),
+        ExprKind::EBorrow(bb)     : walk(&Box::get(bb).e, frame, w),
+        ExprKind::EDeref(x)       : walk(Box::get(x), frame, w),
+        ExprKind::EField(f)       : walk(&Box::get(f).e, frame, w),
+        ExprKind::EPropagate(x)   : walk(Box::get(x), frame, w),
+        ExprKind::EParen(x)       : walk(Box::get(x), frame, w),
+        ExprKind::EBinary(bn)     :
+        {
+            walk(&Box::get(bn).a, frame, w);
+            walk(&Box::get(bn).b, frame, w);
+        },
+        ExprKind::EIndex(p)       :
+        {
+            walk(&Box::get(p).a, frame, w);
+            walk(&Box::get(p).b, frame, w);
+        },
+        ExprKind::EAssign(p)      :
+        {
+            walk(&Box::get(p).a, frame, w);
+            walk(&Box::get(p).b, frame, w);
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            walk(&Box::get(s).base, frame, w);
+            walk(&Box::get(s).lo, frame, w);
+            walk(&Box::get(s).hi, frame, w);
+        },
+        ExprKind::ECall(c)        :
+        {
+            walk(&Box::get(c).callee, frame, w);
+            foreach (a in &Box::get(c).args)
+            {
+                walk(a, frame, w);
+            }
+        },
+        ExprKind::EStructLit(s)   :
+        {
+            foreach (f in &Box::get(s).fields)
+            {
+                walk(&f.value, frame, w);
+            }
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                walk(a, frame, w);
+            }
+        },
+        ExprKind::EArrayRepeat(r) : walk(&Box::get(r).value, frame, w),
+        ExprKind::EBlock(b)       : walk_block(b, frame, w),
+        ExprKind::EUnsafe(b)      : walk_block(b, frame, w),
+        ExprKind::EIf(i)          :
+        {
+            walk(&Box::get(i).cond, frame, w);
+            walk_block(&Box::get(i).then_, frame, w);
+            match (&Box::get(i).else_)
+            {
+                Some(el) : walk(el, frame, w),
+                None     : {},
+            }
+        },
+        ExprKind::EWhile(wh)      :
+        {
+            walk(&Box::get(wh).cond, frame, w);
+            walk_block(&Box::get(wh).body, frame, w);
+            match (&Box::get(wh).step)
+            {
+                Some(st) : walk(st, frame, w),
+                None     : {},
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            walk(&Box::get(m).scrut, frame, w);
+            foreach (a in &Box::get(m).arms)
+            {
+                walk(Box::get(&a.body), frame, w);
+            }
+        },
+        ExprKind::EReturn(r)      :
+        {
+            match (r)
+            {
+                Some(x) : walk(Box::get(x), frame, w),
+                None    : {},
+            }
+        },
+        _                         : {},
+    }
+}
+
+// The self tail calls of `f` (named `name`), by expression id, given the types
+// of every binding its frame declares (parameters included) and `kept`, the
+// bindings condition 4 rules out (its test made by the caller): empty when a
+// condition fails (coby's `self_tail_calls`).
+export fn self_tail_calls(ref<String, shared> name, ref<FnDecl, shared> f, ref<Vec<FrameBinding>, shared> frame, bool kept) : Vec<usize>
+{
+    Vec<usize> out = Vec::new();
+    // Condition 2: not generic; condition 4: nothing in the frame to destroy.
+    if (Vec::len(&f.type_params) > 0 || kept)
+    {
+        return out;
+    }
+    // Condition 5: nothing in the frame borrowed, and no closure.
+    Walk w = Walk { .borrowed = false, .returns = Vec::new() };
+    walk_block(&f.body, frame, &mut w);
+    if (w.borrowed)
+    {
+        return out;
+    }
+    // Condition 3: the tail positions, the body's own and every `return`'s.
+    bool unit = match (&f.ret)
+    {
+        Type::TVoid : true,
+        _           : false,
+    };
+    Vec<Expr> at = Vec::new();
+    block_tails(&f.body, unit, &mut at);
+    foreach (r in &w.returns)
+    {
+        tails(r, unit, &mut at);
+    }
+    // Condition 1: a call of `name` itself, by its path.
+    HashSet<usize> seen = HashSet::new();
+    foreach (e in &at)
+    {
+        match (&e.kind)
+        {
+            ExprKind::ECall(c) :
+            {
+                match (&Box::get(c).callee.kind)
+                {
+                    ExprKind::EPath(p) :
+                    {
+                        ref<PathExpr, shared> pe = Box::get(p);
+                        if (Vec::len(&pe.targs) == 0 && (String::join(&pe.segs, "::") == name) && !HashSet::contains(&seen, e.id))
+                        {
+                            HashSet::insert(&mut seen, e.id);
+                            Vec::push(&mut out, e.id);
+                        }
+                    },
+                    _                  : {},
+                }
+            },
+            _                  : {},
+        }
+    }
+    out
+}

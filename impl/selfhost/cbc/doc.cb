@@ -1,0 +1,237 @@
+// `cbc --doc [NAME]` (CHG-0446): an item of `std`, a type with its
+// functions, or a module. The twin of impl/src/doc.rs's `lookup` and `run`,
+// over the records `coby --prelude-summary` writes into PRELUDE_DOCS
+// (`doc::encode`): cbc has no `std` source of its own to read.
+
+import std;
+import prelude;
+import hints;
+
+// One exported item, as `--doc` shows it (`doc::Record`).
+struct Record
+{
+    String module_;
+    String item;
+    String kind;
+    String signature;
+    String summary;
+    String retired;
+    String text;
+}
+
+fn records() : Vec<Record>
+{
+    Vec<Record> out = Vec::new();
+    foreach (rec in StringView::split(PRELUDE_DOCS, "\u{1e}"))
+    {
+        if (StringView::len(rec) == 0)
+        {
+            continue;
+        }
+        Vec<String> f = Vec::new();
+        foreach (part in StringView::split(rec, "\u{1f}"))
+        {
+            Vec::push(&mut f, String::copy(part));
+        }
+        if (Vec::len(&f) < 7)
+        {
+            continue;
+        }
+        Vec::push(
+            &mut out,
+            Record {
+                .module_ = String::clone(&f[0]),
+                .item = String::clone(&f[1]),
+                .kind = String::clone(&f[2]),
+                .signature = String::clone(&f[3]),
+                .summary = String::clone(&f[4]),
+                .retired = String::clone(&f[5]),
+                .text = String::clone(&f[6]),
+            },
+        );
+    }
+    out
+}
+
+// An item's line in a listing: its signature, and its summary under it.
+fn line_of(ref<Record, shared> r) : String
+{
+    String s = sprintf("  %s\n", &r.signature);
+    if (r.retired == "deprecated")
+    {
+        String::append(&mut s, "      (deprecated)\n");
+    }
+    if (StringView::len(&r.summary) > 0)
+    {
+        String::appendf(&mut s, "      %s\n", &r.summary);
+    }
+    s
+}
+
+fn module_of(StringView name) : String
+{
+    if (name == "std" || StringView::starts_with(name, "std::"))
+    {
+        return String::copy(name);
+    }
+    sprintf("std::%v", name)
+}
+
+fn is_type_kind(ref<String, shared> k) : bool
+{
+    *k == "struct" || *k == "enum" || *k == "bitstruct"
+}
+
+// A module of the listing with no name: its name and how many items it
+// exports.
+struct ModCount
+{
+    String name;
+    usize count;
+}
+
+fn mod_less(ref<ModCount, shared> a, ref<ModCount, shared> b) : bool
+{
+    a.name < b.name
+}
+
+// What `--doc NAME` prints (`Ok`), or what it says when nothing has that
+// name (`Err`, exit status 1). With no name: the modules.
+export fn lookup(Option<String> wanted) : Result<String, String>
+{
+    Vec<Record> rs = records();
+    String name = match (wanted)
+    {
+        Some(n) : n,
+        None    :
+        {
+            Vec<ModCount> mods = Vec::new();
+            foreach (r in &rs)
+            {
+                bool found = false;
+                for (usize i = 0; i < Vec::len(&mods); i += 1)
+                {
+                    if (mods[i].name == r.module_)
+                    {
+                        mods[i].count += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    Vec::push(&mut mods, ModCount { .name = String::clone(&r.module_), .count = 1 });
+                }
+            }
+            Vec::sort_by(&mut mods, mod_less);
+            String s = "The modules of `std`, and how many items each exports (`--doc MODULE` lists them):\n";
+            foreach (m in &mods)
+            {
+                String::appendf(&mut s, "  %s (%v)\n", &m.name, m.count);
+            }
+            String::append(
+                &mut s,
+                "`--doc NAME` shows an item (`Vec::push`, `printf`), a type and its functions (`Vec`), or a module (`std::text`).\n",
+            );
+            return Ok(s);
+        },
+    };
+    StringView bare = Option::unwrap_or(StringView::strip_prefix(&name, "std::"), &name);
+    // A module.
+    String m = module_of(&name);
+    Vec<usize> in_module = Vec::new();
+    for (usize i = 0; i < Vec::len(&rs); i += 1)
+    {
+        if (rs[i].module_ == m && rs[i].retired != "removed")
+        {
+            Vec::push(&mut in_module, i);
+        }
+    }
+    if (Vec::len(&in_module) > 0)
+    {
+        String s = sprintf("module `%s`: %v items\n", &m, Vec::len(&in_module));
+        foreach (i in &in_module)
+        {
+            String::append(&mut s, &line_of(&rs[*i]));
+        }
+        return Ok(s);
+    }
+    // An item: `Vec::push`, `std::collections::Vec::push`, `printf`.
+    String qualified = module_of(bare);
+    String s = String::new();
+    usize hits = 0;
+    for (usize i = 0; i < Vec::len(&rs); i += 1)
+    {
+        ref<Record, shared> r = &rs[i];
+        if (!(r.item == bare || sprintf("%s::%s", &r.module_, &r.item) == qualified))
+        {
+            continue;
+        }
+        if (hits > 0)
+        {
+            String::append(&mut s, "\n");
+        }
+        hits += 1;
+        String::append(&mut s, &r.text);
+        if (is_type_kind(&r.kind))
+        {
+            String prefix = sprintf("%s::", &r.item);
+            String fns = String::new();
+            foreach (f in &rs)
+            {
+                if (f.module_ == r.module_ && StringView::starts_with(&f.item, &prefix) && f.retired != "removed")
+                {
+                    String::append(&mut fns, &line_of(f));
+                }
+            }
+            if (StringView::len(&fns) > 0)
+            {
+                String::appendf(&mut s, "\nThe functions of `%s`:\n", &r.item);
+                String::append(&mut s, &fns);
+            }
+        }
+    }
+    if (hits > 0)
+    {
+        return Ok(s);
+    }
+    Vec<String> names = Vec::new();
+    foreach (r in &rs)
+    {
+        if (r.retired != "removed")
+        {
+            Vec::push(&mut names, String::clone(&r.item));
+        }
+    }
+    Vec::sort(&mut names);
+    Vec::dedup(&mut names);
+    match (hints::nearest(bare, &names))
+    {
+        Some(n) : Err(sprintf("nothing named `%s` in `std`; did you mean `%s`?", &name, &n)),
+        None    : Err(sprintf("nothing named `%s` in `std`; `--doc` alone lists its modules", &name)),
+    }
+}
+
+// `cbc --doc [NAME]`: the exit status.
+export fn run(ref<Vec<String>, shared> args, StringView tool) : u8
+{
+    if (Vec::len(args) > 1)
+    {
+        eprintf("usage: %v --doc [NAME]\n", tool);
+        return 2;
+    }
+    Option<String> wanted = if (Vec::len(args) == 1) { Some(String::clone(&args[0])) } else { None };
+    match (lookup(wanted))
+    {
+        Ok(s)  :
+        {
+            printf("%s", &s);
+            0
+        },
+        Err(e) :
+        {
+            eprintf("%v: %s\n", tool, &e);
+            1
+        },
+    }
+}

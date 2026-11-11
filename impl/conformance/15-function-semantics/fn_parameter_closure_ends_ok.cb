@@ -1,0 +1,69 @@
+// CONFORMANCE-CASE
+// spec: 15-function-semantics
+// facility: spec/15 closures, D-0089, [Fault-Contain] (D-0315); conf.fn-parameter-closure-ends
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 283137203230295b656e6420747769636520345d5b656e642066697273745d33370a283131203132295b656e642074776963652031305d32330a283235203237295b656e642074776963652031315d5b656e64206361705d5b656e64206a6f622031315d206f6b2035320a5b656e642074776963652031325d5b656e64206361705d5b656e64206a6f622031325d206661696c65640a5b656e642074776963652031335d5b656e64206361705d5b656e64206a6f622031335d206661696c65640a
+//
+// A closure owning a value with a destructor, passed to a `fn` parameter the
+// callee only calls: the closure ends with the parameter, once, when the
+// callee returns; a `fn` item passed the same way owns nothing. In a spawned
+// thread whose fault is contained, the closure ends with its frame, in
+// `[Block-Exit]`'s order with the callee's own locals; the program goes on.
+
+import std;
+
+resource struct Noisy
+{
+    String name;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[end %v]", &self.name);
+}
+
+fn owner(StringView name, i64 k) : fn(i64) : i64
+{
+    Noisy n = Noisy { .name = String::copy(name) };
+    move [n, k](i64 v) : i64
+    {
+        assert(v != 13, "refused %v", v);
+        v * k + reinterpret<i64>(StringView::len(&n.name))
+    }
+}
+
+fn twice(fn(i64) : i64 f, i64 x) : i64
+{
+    Noisy t = Noisy { .name = sprintf("twice %v", x) };
+    i64 a = f(x);
+    i64 b = f(x + 1);
+    printf("(%v %v)", a, b);
+    a + b
+}
+
+fn add_one(i64 v) : i64
+{
+    v + 1
+}
+
+fn job(usize n) : i64
+{
+    i64 x = reinterpret<i64>(n);
+    Noisy j = Noisy { .name = sprintf("job %v", x) };
+    twice(owner("cap", 2), x)
+}
+
+fn main()
+{
+    printf("%v\n", twice(owner("first", 3), 4));
+    printf("%v\n", twice(add_one, 10));
+    foreach (x in 11..14)
+    {
+        match (try_join(spawn(job, x)))
+        {
+            Ok(v)  : printf(" ok %v\n", v),
+            Err(_) : printf(" failed\n"),
+        }
+    }
+}

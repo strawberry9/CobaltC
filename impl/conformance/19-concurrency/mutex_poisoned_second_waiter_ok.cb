@@ -1,0 +1,57 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.mutex-poisoned-second-waiter; rule.conc.lock [Lock], [Lock-Poisoned], [Fault-Contain] (D-0204, D-0210, CHG-0248)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7365636f6e643a20646961672e6d757465782d706f69736f6e65640a6661756c7465723a20646961672e696e6465782d6f75742d6f662d626f756e64730a
+//
+// Two threads and one mutex: the first locks it, tells the second (the
+// ready channel), and faults while holding the guard; the second locks
+// after that signal -- waiting on the mutex when the fault poisons it,
+// or arriving once it is poisoned -- and its lock faults
+// diag.mutex-poisoned, contained. main collects both failures through
+// try_join; the order of the two locks is fixed by the channel, so the
+// outcome does not depend on timing.
+
+import std;
+
+fn faulter(ref<mutex<i32>, shared> m, ref<Channel<i32>, shared> ready) : i32
+{
+    auto g = lock(m);
+    *g = 99;
+    _ = Channel::send(ready, 1);
+    sleep_ms(30);
+    array<i32, 2> a = [1, 2];
+    usize i = five();
+    a[i]
+}
+
+fn second(ref<mutex<i32>, shared> m, ref<Channel<i32>, shared> ready) : i32
+{
+    _ = Channel::recv(ready);
+    auto g = lock(m);
+    *g
+}
+
+fn main()
+{
+    mutex<i32> m = Mutex::new(1);
+    Channel<i32> ready = Channel::new(1);
+    auto f = spawn(faulter, &m, &ready);
+    auto s = spawn(second, &m, &ready);
+    match (try_join(s))
+    {
+        Ok(v)  : printf("second ok %v\n", v),
+        Err(e) : printf("second: %v\n", &ThreadFailure::diagnostic(&e)),
+    }
+    match (try_join(f))
+    {
+        Ok(v)  : printf("faulter ok %v\n", v),
+        Err(e) : printf("faulter: %v\n", &ThreadFailure::diagnostic(&e)),
+    }
+}
+
+fn five() : usize
+{
+    5
+}

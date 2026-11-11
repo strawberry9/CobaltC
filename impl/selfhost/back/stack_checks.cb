@@ -1,0 +1,1205 @@
+// D-0309 (1b): the stack check (`cb_stack_check`, D-0077) kept only where the
+// depth of calls can grow without bound, or where a chain of functions without
+// one could use more than `BUDGET` bytes below the last check (cobc's
+// `lower/stack_checks.rs`, which states the rule; this is its port, the same
+// answer for every program).
+
+import std;
+import passes;
+
+const u64 BUDGET = 65536;
+const u64 UNKNOWN_STRUCT = 4096;
+const u64 HUGE = 18446744073709551615;
+
+// A function's definition in a unit: its `{` and `}` lines, and its
+// `cb_stack_check();` line if it has one.
+struct Def
+{
+    usize unit;
+    String name;
+    usize open;
+    usize close;
+    Option<usize> check;
+}
+
+// What the scan of the program's C finds: each function's direct calls (once
+// per callee), whether its address is taken, whether it calls `alloca`.
+struct Scan
+{
+    Vec<Vec<usize>> edges;
+    Vec<HashSet<usize>> seen;
+    Vec<bool> taken;
+    Vec<bool> alloca;
+}
+
+fn is_idb(u8 c) : bool
+{
+    c == b'_' || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9')
+}
+
+fn is_digit(u8 c) : bool
+{
+    c >= b'0' && c <= b'9'
+}
+
+fn is_start(u8 c) : bool
+{
+    c == b'_' || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
+}
+
+fn sat_add(u64 a, u64 b) : u64
+{
+    if (a > HUGE - b)
+    {
+        return HUGE;
+    }
+    a + b
+}
+
+fn sat_mul(u64 a, u64 b) : u64
+{
+    if (a != 0 && b > HUGE / a)
+    {
+        return HUGE;
+    }
+    a * b
+}
+
+// The decimal number `text` spells, saturating (cobc's `parse`, which no
+// generated C overflows).
+fn digits_value(StringView text) : u64
+{
+    u64 v = 0;
+    slice<u8, shared> b = StringView::as_bytes(text);
+    for (usize i = 0; i < slice_len(b); i += 1)
+    {
+        v = sat_add(sat_mul(v, 10), widen<u64>(b[i] - b'0'));
+    }
+    v
+}
+
+// The function a definition line names: the word before its `(`, its
+// attributes left out.
+fn def_name(StringView l) : Option<StringView>
+{
+    StringView rest = l;
+    while (true)
+    {
+        match (StringView::find(rest, "__attribute__(("))
+        {
+            Some(i) :
+            {
+                StringView after = &rest[i..$];
+                usize end = match (StringView::find(after, "))"))
+                {
+                    Some(e) : e + 2,
+                    None    : StringView::len(after),
+                };
+                rest = &rest[i + end..$];
+            },
+            None    : break,
+        }
+    }
+    usize open = StringView::find(rest, "(")?;
+    StringView head = StringView::trim_end(&rest[0..open]);
+    slice<u8, shared> b = StringView::as_bytes(head);
+    usize start = slice_len(b);
+    while (start > 0 && is_idb(b[start - 1]))
+    {
+        start -= 1;
+    }
+    if (start == slice_len(b))
+    {
+        return None;
+    }
+    Some(&head[start..$])
+}
+
+// The definitions of program functions (`f_…`) in a unit's lines: a line at
+// the left margin ending in `)` whose next line (past `#line` directives) is
+// `{`, to the next `}` at the left margin.
+fn defs_in(usize unit, ref<Vec<StringView>, shared> lines, ref<Vec<Def>, exclusive> out)
+{
+    usize n = Vec::len(lines);
+    usize i = 0;
+    while (i < n)
+    {
+        StringView l = lines[i];
+        slice<u8, shared> lb = StringView::as_bytes(l);
+        bool starts = slice_len(lb) > 0 && lb[0] != b' ' && lb[0] != b'{' && lb[0] != b'}' && lb[0] != b'#';
+        if (starts && StringView::ends_with(l, ")"))
+        {
+            usize j = i + 1;
+            while (j < n && StringView::starts_with(lines[j], "#line"))
+            {
+                j += 1;
+            }
+            if (j < n && (lines[j] == "{"))
+            {
+                match (def_name(l))
+                {
+                    Some(name) :
+                    {
+                        // Only a program function (`f_…`) takes part.
+                        if (StringView::starts_with(name, "f_"))
+                        {
+                            usize k = j + 1;
+                            while (k < n && lines[k] != "}")
+                            {
+                                k += 1;
+                            }
+                            Option<usize> check = None;
+                            for (usize m = j + 1; m < k; m += 1)
+                            {
+                                if ((StringView::trim(lines[m]) == "cb_stack_check();"))
+                                {
+                                    check = Some(m);
+                                    break;
+                                }
+                            }
+                            Vec::push(out, Def { .unit = unit, .name = String::copy(name), .open = j, .close = k, .check = check });
+                            i = k + 1;
+                            continue;
+                        }
+                    },
+                    None       : {},
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+// Each identifier of `text` outside string and character literals, with
+// whether the next byte past spaces is `(` (cobc's `each_ident`), applied:
+// within the body of `body` (a function's index), a call of a program
+// function is an edge and any other mention an address taken; outside every
+// body, only a mention that is not a call takes an address. `fresh`'s
+// mentions outside the units take none.
+fn scan_idents(
+    StringView text,
+    ref<HashMap<String, usize>, shared> id,
+    ref<Scan, exclusive> s,
+    Option<usize> body,
+    StringView fresh,
+)
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize n = slice_len(b);
+    usize i = 0;
+    while (i < n)
+    {
+        u8 c = b[i];
+        if (c == b'"' || c == b'\'')
+        {
+            i += 1;
+            while (i < n && b[i] != c)
+            {
+                if (b[i] == b'\\')
+                {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (is_start(c))
+        {
+            usize start = i;
+            while (i < n && is_idb(b[i]))
+            {
+                i += 1;
+            }
+            usize k = i;
+            while (k < n && b[k] == b' ')
+            {
+                k += 1;
+            }
+            bool call = k < n && b[k] == b'(';
+            StringView w = &text[start..i];
+            match (body)
+            {
+                Some(f) :
+                {
+                    if ((w == "alloca") || (w == "__builtin_alloca"))
+                    {
+                        s.alloca[f] = true;
+                    }
+                },
+                None    : {},
+            }
+            // Outside every body a call is no edge, and `fresh`'s mentions
+            // in `others` take no address.
+            bool skip = Option::is_none(&body) && (call || (w == fresh));
+            if (StringView::starts_with(w, "f_") && !skip)
+            {
+                match (HashMap::get(id, &String::copy(w)))
+                {
+                    Some(t) :
+                    {
+                        usize tk = *t;
+                        match (body)
+                        {
+                            Some(f) :
+                            {
+                                if (!call)
+                                {
+                                    s.taken[tk] = true;
+                                }
+                                else if (!HashSet::contains(&s.seen[f], tk))
+                                {
+                                    HashSet::insert(&mut s.seen[f], tk);
+                                    Vec::push(&mut s.edges[f], tk);
+                                }
+                            },
+                            None    :
+                            {
+                                s.taken[tk] = true;
+                            },
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            continue;
+        }
+        if (is_digit(c))
+        {
+            while (i < n && is_idb(b[i]))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
+
+// The runtime's value types a body may declare, by their C names, at their
+// size or more (`cbrt.h`).
+fn runtime_size(StringView w) : u64
+{
+    if ((w == "cb_ref") || (w == "cb_str") || (w == "cb_i128") || (w == "cb_u128") || (w == "cb_proj"))
+    {
+        return 16;
+    }
+    if (w == "cb_fnbox")
+    {
+        return 32;
+    }
+    if (w == "cb_fmt_arg")
+    {
+        return 64;
+    }
+    if (w == "jmp_buf")
+    {
+        return 512;
+    }
+    0
+}
+
+// The bytes of the stack a body may use (cobc's `frame_of`).
+fn frame_of(ref<Vec<StringView>, shared> lines, usize from, usize to, ref<HashMap<String, u64>, shared> sizes) : u64
+{
+    u64 total = 256;
+    for (usize li = from; li < to; li += 1)
+    {
+        StringView t = StringView::trim_start(lines[li]);
+        if (StringView::starts_with(t, "#") || StringView::starts_with(t, "static "))
+        {
+            continue;
+        }
+        slice<u8, shared> b = StringView::as_bytes(t);
+        usize n = slice_len(b);
+        u64 semis = 0;
+        for (usize q = 0; q < n; q += 1)
+        {
+            if (b[q] == b';')
+            {
+                semis += 1;
+            }
+        }
+        total = sat_add(total, 16 * semis);
+        usize i = 0;
+        while (i < n)
+        {
+            u8 c = b[i];
+            if (c == b'"')
+            {
+                i += 1;
+                while (i < n && b[i] != b'"')
+                {
+                    if (b[i] == b'\\')
+                    {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            if (is_start(c))
+            {
+                usize start = i;
+                while (i < n && is_idb(b[i]))
+                {
+                    i += 1;
+                }
+                StringView word = &t[start..i];
+                if (word == "struct")
+                {
+                    usize k = i;
+                    while (k < n && b[k] == b' ')
+                    {
+                        k += 1;
+                    }
+                    usize ns = k;
+                    while (k < n && is_idb(b[k]))
+                    {
+                        k += 1;
+                    }
+                    StringView name = &t[ns..k];
+                    usize m = k;
+                    while (m < n && b[m] == b' ')
+                    {
+                        m += 1;
+                    }
+                    if (StringView::len(name) == 0 || (m < n && b[m] == b'*'))
+                    {
+                        i = k;
+                        continue;
+                    }
+                    u64 size = match (HashMap::get(sizes, &String::copy(name)))
+                    {
+                        Some(v) : *v,
+                        None    : UNKNOWN_STRUCT,
+                    };
+                    usize ds = m;
+                    while (m < n && is_idb(b[m]))
+                    {
+                        m += 1;
+                    }
+                    u64 count = 1;
+                    if (m > ds && m < n && b[m] == b'[')
+                    {
+                        usize e = m + 1;
+                        while (e < n && is_digit(b[e]))
+                        {
+                            e += 1;
+                        }
+                        if (e > m + 1 && e < n && b[e] == b']')
+                        {
+                            count = digits_value(&t[m + 1..e]);
+                            m = e + 1;
+                        }
+                    }
+                    total = sat_add(total, sat_mul(size, count));
+                    i = if (m > k) { m } else { k };
+                    continue;
+                }
+                total = sat_add(total, runtime_size(word));
+                continue;
+            }
+            if (c == b'[')
+            {
+                usize e = i + 1;
+                while (e < n && is_digit(b[e]))
+                {
+                    e += 1;
+                }
+                if (e > i + 1 && e < n && b[e] == b']')
+                {
+                    total = sat_add(total, sat_mul(digits_value(&t[i + 1..e]), 16));
+                }
+                else if (e == i + 1 && e < n && b[e] == b']')
+                {
+                    u64 commas = 0;
+                    for (usize q = e; q < n; q += 1)
+                    {
+                        if (b[q] == b',')
+                        {
+                            commas += 1;
+                        }
+                    }
+                    total = sat_add(total, (commas + 1) * 16);
+                }
+                i = e;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    total
+}
+
+// The sizes `_Static_assert(sizeof(struct NAME) == N && …` states.
+fn struct_sizes(ref<String, shared> types) : HashMap<String, u64>
+{
+    HashMap<String, u64> out = HashMap::new();
+    HashMap::insert(&mut out, "cb_note", 32);
+    Vec<StringView> lines = StringView::lines(types);
+    foreach (l in &lines)
+    {
+        StringView rest = match (StringView::strip_prefix(*l, "_Static_assert(sizeof(struct "))
+        {
+            Some(r) : r,
+            None    : continue,
+        };
+        usize close = match (StringView::find(rest, ")"))
+        {
+            Some(c) : c,
+            None    : continue,
+        };
+        StringView name = &rest[0..close];
+        StringView eq = match (StringView::strip_prefix(&rest[close..$], ") == "))
+        {
+            Some(e) : e,
+            None    : continue,
+        };
+        slice<u8, shared> b = StringView::as_bytes(eq);
+        usize d = 0;
+        while (d < slice_len(b) && is_digit(b[d]))
+        {
+            d += 1;
+        }
+        if (d > 0)
+        {
+            HashMap::insert(&mut out, String::copy(name), digits_value(&eq[0..d]));
+        }
+    }
+    out
+}
+
+// The functions on a cycle of direct calls, and the components in reverse
+// topological order, callees first: Tarjan's, iterative (cobc's `cyclic`).
+struct Tarjan
+{
+    Vec<bool> cyc;
+    Vec<usize> order;
+}
+
+struct Frame
+{
+    usize v;
+    usize k;
+}
+
+fn tarjan(usize n, ref<Vec<Vec<usize>>, shared> edges) : Tarjan
+{
+    usize none = 18446744073709551615;
+    Vec<usize> index = Vec::filled(n, none);
+    Vec<usize> low = Vec::filled(n, 0);
+    Vec<bool> on = Vec::filled(n, false);
+    Vec<usize> stack = Vec::new();
+    Vec<bool> out = Vec::filled(n, false);
+    Vec<usize> order = Vec::new();
+    usize next = 0;
+    for (usize root = 0; root < n; root += 1)
+    {
+        if (index[root] != none)
+        {
+            continue;
+        }
+        Vec<Frame> work = Vec::new();
+        Vec::push(&mut work, Frame { .v = root, .k = 0 });
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        Vec::push(&mut stack, root);
+        on[root] = true;
+        while (Vec::len(&work) > 0)
+        {
+            usize top = Vec::len(&work) - 1;
+            usize v = work[top].v;
+            usize k = work[top].k;
+            if (k < Vec::len(&edges[v]))
+            {
+                work[top].k = k + 1;
+                usize w = edges[v][k];
+                if (index[w] == none)
+                {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    Vec::push(&mut stack, w);
+                    on[w] = true;
+                    Vec::push(&mut work, Frame { .v = w, .k = 0 });
+                }
+                else if (on[w])
+                {
+                    if (index[w] < low[v])
+                    {
+                        low[v] = index[w];
+                    }
+                }
+                continue;
+            }
+            Vec::pop(&mut work);
+            if (Vec::len(&work) > 0)
+            {
+                usize p = work[Vec::len(&work) - 1].v;
+                if (low[v] < low[p])
+                {
+                    low[p] = low[v];
+                }
+            }
+            if (low[v] == index[v])
+            {
+                Vec<usize> comp = Vec::new();
+                while (true)
+                {
+                    usize w = Option::expect(Vec::pop(&mut stack), "a component's member");
+                    on[w] = false;
+                    Vec::push(&mut comp, w);
+                    if (w == v)
+                    {
+                        break;
+                    }
+                }
+                bool self_call = false;
+                foreach (e in &edges[v])
+                {
+                    if (*e == v)
+                    {
+                        self_call = true;
+                    }
+                }
+                bool cyc = Vec::len(&comp) > 1 || self_call;
+                foreach (w in &comp)
+                {
+                    out[*w] = cyc;
+                }
+                Vec::sort(&mut comp);
+                foreach (w in &comp)
+                {
+                    Vec::push(&mut order, *w);
+                }
+            }
+        }
+    }
+    Tarjan { .cyc = out, .order = order }
+}
+
+// Takes `cb_stack_check();` out of every function of `units` the rule lets go
+// without one (cobc's `prune_stack_checks`). `others`: the rest of the
+// program's C, read for addresses taken; `types`: where the structs' sizes are
+// stated; `fresh`: the program's `main` (empty for a library).
+export fn prune_stack_checks(
+    ref<Vec<String>, exclusive> units,
+    ref<Vec<String>, shared> others,
+    ref<String, shared> types,
+    StringView fresh,
+)
+{
+    HashMap<String, u64> sizes = struct_sizes(types);
+    Vec<Def> defs = Vec::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        Vec<StringView> lines = StringView::split(&(*units)[u], "\n");
+        defs_in(u, &lines, &mut defs);
+    }
+    HashMap<String, usize> id = HashMap::new();
+    for (usize k = 0; k < Vec::len(&defs); k += 1)
+    {
+        if (HashMap::contains(&id, &defs[k].name))
+        {
+            return;
+        }
+        HashMap::insert(&mut id, String::clone(&defs[k].name), k);
+    }
+    usize n = Vec::len(&defs);
+    Scan s = Scan { .edges = Vec::new(), .seen = Vec::new(), .taken = Vec::filled(n, false), .alloca = Vec::filled(n, false) };
+    for (usize k = 0; k < n; k += 1)
+    {
+        Vec::push(&mut s.edges, Vec::new());
+        Vec::push(&mut s.seen, HashSet::new());
+    }
+    Vec<u64> frame = Vec::filled(n, 0);
+    // D-0315: each unit's definitions, in order (each unit visits its own).
+    Vec<Vec<usize>> by_unit = Vec::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        Vec::push(&mut by_unit, Vec::new());
+    }
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (defs[k].unit < Vec::len(&by_unit))
+        {
+            Vec::push(&mut by_unit[defs[k].unit], k);
+        }
+    }
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        Vec<StringView> lines = StringView::split(&(*units)[u], "\n");
+        Vec<bool> inside = Vec::filled(Vec::len(&lines), false);
+        foreach (kk in &by_unit[u])
+        {
+            usize k = *kk;
+            for (usize m = defs[k].open + 1; m < defs[k].close; m += 1)
+            {
+                scan_idents(lines[m], &id, &mut s, Some(k), fresh);
+            }
+            frame[k] = frame_of(&lines, defs[k].open + 1, defs[k].close, &sizes);
+            for (usize m = defs[k].open; m <= defs[k].close && m < Vec::len(&lines); m += 1)
+            {
+                inside[m] = true;
+            }
+        }
+        for (usize m = 0; m < Vec::len(&lines); m += 1)
+        {
+            if (!inside[m])
+            {
+                scan_idents(lines[m], &id, &mut s, None, "");
+            }
+        }
+    }
+    foreach (t in others)
+    {
+        scan_idents(t, &id, &mut s, None, fresh);
+    }
+    Vec<Vec<usize>> callers = Vec::new();
+    for (usize k = 0; k < n; k += 1)
+    {
+        Vec::push(&mut callers, Vec::new());
+    }
+    for (usize k = 0; k < n; k += 1)
+    {
+        foreach (t in &s.edges[k])
+        {
+            Vec::push(&mut callers[*t], k);
+        }
+    }
+    Tarjan tj = tarjan(n, &s.edges);
+    Vec<bool> checked = Vec::filled(n, false);
+    Vec<u64> need = Vec::filled(n, 0);
+    foreach (kk in &tj.order)
+    {
+        usize k = *kk;
+        u64 below = 0;
+        foreach (t in &s.edges[k])
+        {
+            if (!checked[*t] && *t != k && need[*t] > below)
+            {
+                below = need[*t];
+            }
+        }
+        need[k] = sat_add(frame[k], below);
+        bool entry = Vec::len(&callers[k]) == 0 && defs[k].name != fresh;
+        bool forced = tj.cyc[k] || s.taken[k] || entry || s.alloca[k];
+        bool over = false;
+        foreach (p in &callers[k])
+        {
+            if (sat_add(frame[*p], need[k]) > BUDGET)
+            {
+                over = true;
+            }
+        }
+        checked[k] = forced || over;
+    }
+    // D-0315 (step 6): and a location stored only for a quiet callee goes.
+    Vec<HashSet<usize>> quiet_gone = quiet_call_locations(units, &defs, &s.edges, &checked);
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        HashSet<usize> gone = replace(&mut quiet_gone[u], HashSet::new());
+        foreach (kk in &by_unit[u])
+        {
+            usize k = *kk;
+            if (!checked[k])
+            {
+                match (defs[k].check)
+                {
+                    Some(line) :
+                    {
+                        HashSet::insert(&mut gone, line);
+                    },
+                    None       : {},
+                }
+            }
+        }
+        if (HashSet::len(&gone) == 0)
+        {
+            continue;
+        }
+        String text = String::new();
+        {
+            Vec<StringView> lines = StringView::split(&(*units)[u], "\n");
+            bool first = true;
+            for (usize m = 0; m < Vec::len(&lines); m += 1)
+            {
+                if (HashSet::contains(&gone, m))
+                {
+                    continue;
+                }
+                if (!first)
+                {
+                    String::push_ascii(&mut text, b'\n');
+                }
+                String::append(&mut text, lines[m]);
+                first = false;
+            }
+        }
+        (*units)[u] = text;
+    }
+}
+
+// D-0309: a frame's notes (D-0269, `cb_nt`) go where no part of the program
+// calls `cb_spawn` (cobc's `drop_unused_notes`, which says why).
+// CHG-0430: in a decided program, a small function of its own (its body at
+// most `INLINE_LINES` lines past its `#line` directives, with no loop, no self
+// tail call and no stack check left by `prune_stack_checks`, so on no cycle of
+// calls, its address never taken and no entry) is defined `CB_SMALL`, and its
+// prototype with it: `static inline __attribute__((always_inline))` under GCC,
+// `static` under Clang (`cbrt.h`; cobc's `inline_small`). Only a function `localize` made `static`, with no attribute
+// of its own, in a unit that is not pure `std` (`pure`), takes part.
+const usize INLINE_LINES = 32;
+const str ALWAYS_INLINE = "CB_SMALL ";
+
+fn inline_bad(StringView b) : bool
+{
+    StringView t = StringView::trim_start(b);
+    StringView::trim(b) == "cb_stack_check();" || StringView::starts_with(t, "for (") || StringView::starts_with(
+        t,
+        "while (",
+    ) || StringView::starts_with(t, "do {") || has(b, "goto self_tail;") || has(b, "setjmp") || has(b, "alloca") || has(
+        b,
+        "va_start",
+    )
+}
+
+export fn inline_small(ref<Vec<String>, exclusive> units, ref<Vec<bool>, shared> pure, ref<String, exclusive> protos)
+{
+    HashSet<String> names = HashSet::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        // CHG-0433: not a pure `std` unit's, `static` now too (`localize`):
+        // GCC inlines those better by its own measure (every small one
+        // forced inline into Huffman's `compress` made it 12% slower).
+        if (pure[u])
+        {
+            continue;
+        }
+        String text = String::new();
+        bool changed = false;
+        {
+            Vec<StringView> lines = StringView::split(&units[u], "\n");
+            Vec<Def> defs = Vec::new();
+            defs_in(0, &lines, &mut defs);
+            HashSet<usize> heads = HashSet::new();
+            foreach (d in &defs)
+            {
+                // The definition's own line: the last before `{` that is no `#line`.
+                usize i = d.open;
+                bool found = false;
+                while (i > 0)
+                {
+                    i -= 1;
+                    if (!StringView::starts_with(lines[i], "#line"))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    continue;
+                }
+                StringView l = lines[i];
+                if (!StringView::starts_with(l, "static ") || has(l, "__attribute__") || StringView::starts_with(l, "static inline"))
+                {
+                    continue;
+                }
+                usize count = 0;
+                bool bad = false;
+                for (usize m = d.open + 1; m < d.close; m += 1)
+                {
+                    if (!StringView::starts_with(lines[m], "#line"))
+                    {
+                        count += 1;
+                    }
+                    if (inline_bad(lines[m]))
+                    {
+                        bad = true;
+                    }
+                }
+                if (bad || count > INLINE_LINES)
+                {
+                    continue;
+                }
+                HashSet::insert(&mut heads, i);
+                HashSet::insert(&mut names, String::clone(&d.name));
+            }
+            if (HashSet::len(&heads) > 0)
+            {
+                changed = true;
+                String::reserve(&mut text, StringView::len(&units[u]) + 48 * HashSet::len(&heads));
+                for (usize k = 0; k < Vec::len(&lines); k += 1)
+                {
+                    if (k > 0)
+                    {
+                        String::push_ascii(&mut text, b'\n');
+                    }
+                    if (HashSet::contains(&heads, k))
+                    {
+                        String::append(&mut text, ALWAYS_INLINE);
+                        String::append(&mut text, &lines[k][7..$]);
+                    }
+                    else
+                    {
+                        String::append(&mut text, lines[k]);
+                    }
+                }
+            }
+        }
+        if (changed)
+        {
+            units[u] = text;
+        }
+    }
+    if (HashSet::len(&names) == 0)
+    {
+        return;
+    }
+    String out = String::new();
+    {
+        Vec<StringView> plines = StringView::split(protos, "\n");
+        for (usize k = 0; k < Vec::len(&plines); k += 1)
+        {
+            if (k > 0)
+            {
+                String::push_ascii(&mut out, b'\n');
+            }
+            StringView l = plines[k];
+            bool hit = false;
+            match (StringView::strip_prefix(l, "static "))
+            {
+                Some(rest) :
+                {
+                    if (!StringView::starts_with(rest, "inline") && !has(rest, "__attribute__"))
+                    {
+                        match (def_name(rest))
+                        {
+                            Some(n) : hit = HashSet::contains(&names, &String::copy(n)),
+                            None    : {},
+                        }
+                    }
+                    if (hit)
+                    {
+                        String::append(&mut out, ALWAYS_INLINE);
+                        String::append(&mut out, rest);
+                    }
+                },
+                None       : {},
+            }
+            if (!hit)
+            {
+                String::append(&mut out, l);
+            }
+        }
+    }
+    *protos = out;
+}
+
+export fn drop_unused_notes(ref<Vec<String>, exclusive> units, ref<Vec<String>, shared> others)
+{
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        if (spawns(&(*units)[u]))
+        {
+            return;
+        }
+    }
+    foreach (t in others)
+    {
+        if (spawns(t))
+        {
+            return;
+        }
+    }
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        // D-0315 (step 4): a table registered on every call stays.
+        if (!has(&(*units)[u], "cb_nt") || has(&(*units)[u], "    uint8_t cb_nt_on = 1;"))
+        {
+            continue;
+        }
+        String text = String::new();
+        {
+            Vec<StringView> lines = StringView::split(&(*units)[u], "\n");
+            bool first = true;
+            foreach (l in &lines)
+            {
+                StringView t = StringView::trim_start(*l);
+                if (StringView::starts_with(t, "struct cb_note cb_nt[")
+                    || (t == "uint8_t cb_nt_on = cb_threaded;")
+                    || StringView::starts_with(t, "if (cb_nt_on) cb_notes_")
+                    || (StringView::starts_with(t, "cb_nt[") && has(t, "] = (struct cb_note){")))
+                {
+                    continue;
+                }
+                if (!first)
+                {
+                    String::push_ascii(&mut text, b'\n');
+                }
+                append_without_live(&mut text, *l);
+                first = false;
+            }
+        }
+        (*units)[u] = text;
+    }
+}
+
+// Whether a line of `t` calls `cb_spawn` (its prototype does not).
+fn spawns(StringView t) : bool
+{
+    Vec<StringView> lines = StringView::split(t, "\n");
+    foreach (l in &lines)
+    {
+        if (has(*l, "cb_spawn(") && !StringView::starts_with(StringView::trim_start(*l), "uint64_t cb_spawn("))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has(StringView s, StringView pat) : bool
+{
+    match (StringView::find(s, pat))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+// `line` onto `out`, without its ` cb_nt[k].live = 0;` (the end of a drop).
+fn append_without_live(ref<String, exclusive> out, StringView line)
+{
+    StringView rest = line;
+    while (true)
+    {
+        usize i = match (StringView::find(rest, "cb_nt["))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        StringView tail = &rest[i + 6..$];
+        slice<u8, shared> b = StringView::as_bytes(tail);
+        usize digits = 0;
+        while (digits < slice_len(b) && is_digit(b[digits]))
+        {
+            digits += 1;
+        }
+        if (digits > 0 && StringView::starts_with(&tail[digits..$], "].live = 0;"))
+        {
+            StringView pre = &rest[0..i];
+            match (StringView::strip_suffix(pre, " "))
+            {
+                Some(p) : String::append(out, p),
+                None    : String::append(out, pre),
+            }
+            rest = &tail[digits + 11..$];
+        }
+        else
+        {
+            String::append(out, &rest[0..i + 6]);
+            rest = tail;
+        }
+    }
+    String::append(out, rest);
+}
+
+// Whether `text` calls a function `names` holds: an identifier outside string
+// and character literals with `(` next past spaces (cobc's `each_ident`).
+fn calls_any(StringView text, ref<HashSet<String>, shared> names) : bool
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize n = slice_len(b);
+    usize i = 0;
+    while (i < n)
+    {
+        u8 c = b[i];
+        if (c == b'"' || c == b'\'')
+        {
+            i += 1;
+            while (i < n && b[i] != c)
+            {
+                if (b[i] == b'\\')
+                {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if (is_start(c))
+        {
+            usize start = i;
+            while (i < n && is_idb(b[i]))
+            {
+                i += 1;
+            }
+            usize k = i;
+            while (k < n && b[k] == b' ')
+            {
+                k += 1;
+            }
+            if (k < n && b[k] == b'(' && HashSet::contains(names, &String::copy(&text[start..i])))
+            {
+                return true;
+            }
+            continue;
+        }
+        if (is_digit(c))
+        {
+            while (i < n && is_idb(b[i]))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+// D-0315 (step 6): the location stores only a quiet callee could read, by unit
+// (cobc's `quiet_call_locations`, which says why).
+fn quiet_call_locations(
+    ref<Vec<String>, shared> units,
+    ref<Vec<Def>, shared> defs,
+    ref<Vec<Vec<usize>>, shared> edges,
+    ref<Vec<bool>, shared> checked,
+) : Vec<HashSet<usize>>
+{
+    usize n = Vec::len(defs);
+    Vec<HashSet<usize>> out = Vec::new();
+    Vec<Vec<StringView>> unit_lines = Vec::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        Vec::push(&mut out, HashSet::new());
+        Vec::push(&mut unit_lines, StringView::split(&units[u], "\n"));
+    }
+    HashSet<String> all = name_set(LOCATION_PURE);
+    foreach (d in defs)
+    {
+        HashSet::insert(&mut all, String::clone(&d.name));
+    }
+    Vec<bool> loud = Vec::filled(n, false);
+    for (usize k = 0; k < n; k += 1)
+    {
+        ref<Def, shared> d = &defs[k];
+        if (checked[k] && Option::is_some(&d.check))
+        {
+            loud[k] = true;
+            continue;
+        }
+        for (usize m = d.open + 1; m < d.close; m += 1)
+        {
+            bool is_check = match (d.check)
+            {
+                Some(c) : c == m,
+                None    : false,
+            };
+            StringView l = unit_lines[d.unit][m];
+            if (!is_check && (StringView::contains(l, "cb_at(") || reads_location(StringView::trim(l), &all)))
+            {
+                loud[k] = true;
+                break;
+            }
+        }
+    }
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (usize k = 0; k < n; k += 1)
+        {
+            if (!loud[k])
+            {
+                foreach (c in &edges[k])
+                {
+                    if (loud[*c])
+                    {
+                        loud[k] = true;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    HashSet<String> quiet = HashSet::new();
+    HashSet<String> pure = name_set(LOCATION_PURE);
+    HashSet<String> rpure = name_set(LOCATION_PURE);
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (!loud[k])
+        {
+            HashSet::insert(&mut quiet, String::clone(&defs[k].name));
+            HashSet::insert(&mut rpure, String::clone(&defs[k].name));
+        }
+    }
+    if (HashSet::len(&quiet) == 0)
+    {
+        return out;
+    }
+    for (usize k = 0; k < n; k += 1)
+    {
+        ref<Def, shared> d = &defs[k];
+        bool calls_quiet = false;
+        foreach (c in &edges[k])
+        {
+            if (!loud[*c])
+            {
+                calls_quiet = true;
+                break;
+            }
+        }
+        if (!calls_quiet)
+        {
+            continue;
+        }
+        ref<Vec<StringView>, shared> lines = &unit_lines[d.unit];
+        bool hit = false;
+        for (usize m = d.open + 1; m < d.close && !hit; m += 1)
+        {
+            if (!StringView::starts_with(StringView::trim_start(lines[m]), "cb_at("))
+            {
+                continue;
+            }
+            usize j = m + 1;
+            while (j < d.close && StringView::starts_with(lines[j], "#line"))
+            {
+                j += 1;
+            }
+            if (j < d.close && calls_any(lines[j], &quiet))
+            {
+                hit = true;
+            }
+        }
+        if (!hit)
+        {
+            continue;
+        }
+        Vec<StringView> body = Vec::new();
+        for (usize m = d.open + 1; m < d.close; m += 1)
+        {
+            Vec::push(&mut body, lines[m]);
+        }
+        Vec<bool> dead = match (dead_locations_flow(&body, &pure, &rpure, None))
+        {
+            Some(x) : x,
+            None    : dead_locations_straight(&body, &rpure),
+        };
+        for (usize i = 0; i < Vec::len(&dead); i += 1)
+        {
+            if (dead[i])
+            {
+                HashSet::insert(&mut out[d.unit], d.open + 1 + i);
+            }
+        }
+    }
+    out
+}

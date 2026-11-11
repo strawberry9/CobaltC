@@ -1,0 +1,144 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.layout [Layout-Enum-Niche] [Sizeof-Enum]; conf.option-box-one-pointer
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7472756520747275652074727565207472756520747275650a31303035390a4c656166204272616e636820370a2d3120392046756c6c0a36203320747275650a7472756520747275650a74727565207472756520390a
+//
+// D-0298: an enum of two variants, one with no payload and one holding a
+// `Box`, is laid out as the `Box` alone, so `Option<Box<T>>` is one
+// pointer and a `Box`-linked node is the size of the C struct with a
+// pointer in it. The layout changes nothing the program sees: `match`,
+// the `if` pattern, `Option::is_some`, a user enum of the same shape with
+// its variants in either order, nesting (`Option<Option<Box<T>>>` is not
+// of the shape, and keeps its discriminant), a `Vec` and a channel of
+// such values, `pop` and `swap` through them, and printing a variant's name.
+
+import std;
+
+struct Node
+{
+    i64 key;
+    Option<Box<Node>> left;
+    Option<Box<Node>> right;
+}
+
+enum Tree
+{
+    Leaf,
+    Branch(Box<Node>),
+}
+
+enum Cell
+{
+    Full(Box<i64>),
+    Empty,
+}
+
+fn insert(ref<Node, exclusive> n, i64 k)
+{
+    if (k < n.key)
+    {
+        match (&mut n.left)
+        {
+            Some(b) : insert(Box::get_mut(b), k),
+            None    : n.left = Some(Box::new(Node { .key = k, .left = None, .right = None })),
+        }
+    }
+    else
+    {
+        match (&mut n.right)
+        {
+            Some(b) : insert(Box::get_mut(b), k),
+            None    : n.right = Some(Box::new(Node { .key = k, .left = None, .right = None })),
+        }
+    }
+}
+
+fn sum(ref<Node, shared> n) : i64
+{
+    i64 s = n.key;
+    if (Some(b) = &n.left)
+    {
+        s += sum(Box::get(b));
+    }
+    if (Some(b) = &n.right)
+    {
+        s += sum(Box::get(b));
+    }
+    s
+}
+
+fn describe(ref<Cell, shared> c) : i64
+{
+    match (c)
+    {
+        Cell::Full(b) : *Box::get(b),
+        Cell::Empty   : -1,
+    }
+}
+
+fn main()
+{
+    printf(
+        "%v %v %v %v %v\n",
+        sizeof<Option<Box<i64>>>() == sizeof<rawptr<i64>>(),
+        sizeof<Tree>() == sizeof<rawptr<Node>>(),
+        sizeof<Cell>() == sizeof<rawptr<i64>>(),
+        sizeof<Node>() == 3 * sizeof<rawptr<Node>>(),
+        sizeof<Option<Option<Box<i64>>>>() > sizeof<rawptr<i64>>(),
+    );
+    Node root = Node { .key = 50, .left = None, .right = None };
+    foreach (i in 0..200)
+    {
+        insert(&mut root, narrow_wrapping<i64>((i * 37) % 101));
+    }
+    printf("%v\n", sum(&root));
+    Tree t = Tree::Leaf;
+    printf("%v ", &t);
+    t = Tree::Branch(Box::new(Node { .key = 7, .left = None, .right = None }));
+    printf("%v ", &t);
+    if (Tree::Branch(b) = &t)
+    {
+        printf("%v\n", Box::get(b).key);
+    }
+    Cell c = Cell::Empty;
+    printf("%v ", describe(&c));
+    i64 nine = 9;
+    c = Cell::Full(Box::new(nine));
+    printf("%v %v\n", describe(&c), &c);
+    Vec<Option<Box<i64>>> v = Vec::new();
+    foreach (i in 0..6)
+    {
+        if (i % 2 == 0)
+        {
+            Vec::push(&mut v, Some(Box::new(narrow_wrapping<i64>(i))));
+        }
+        else
+        {
+            Vec::push(&mut v, None);
+        }
+    }
+    swap(&mut v[0], &mut v[1]);
+    i64 total = 0;
+    usize somes = 0;
+    while (Some(o) = Vec::pop(&mut v))
+    {
+        if (Some(b) = &o)
+        {
+            total += *Box::get(b);
+            somes += 1;
+        }
+    }
+    printf("%v %v %v\n", total, somes, Vec::len(&v) == 0);
+    auto ch = Channel::new<Option<Box<i64>>>(4);
+    i64 one = 1;
+    _ = Channel::send(&ch, Some(Box::new(one)));
+    _ = Channel::send(&ch, None);
+    Option<Option<Box<i64>>> first = Channel::recv(&ch);
+    Option<Option<Box<i64>>> second = Channel::recv(&ch);
+    printf("%v %v\n", Option::is_some(&Option::unwrap(first)), Option::is_none(&Option::unwrap(second)));
+    Option<Box<i64>> taken = Some(Box::new(nine));
+    Option<Box<i64>> old = replace(&mut taken, None);
+    printf("%v %v %v\n", Option::is_none(&taken), Option::is_some(&old), Box::into_inner(Option::unwrap(old)));
+}

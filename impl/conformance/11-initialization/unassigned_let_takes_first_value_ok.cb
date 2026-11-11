@@ -1,0 +1,63 @@
+// CONFORMANCE-CASE
+// spec: 11-initialization
+// facility: rule.init.definite-assignment (D-0315); conf.unassigned-let-takes-first-value
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3420350a6661696c656420617420370a6661696c656420617420360a6d310a6d320a
+//
+// A `let` with no value of a type whose end frees memory alone, assigned
+// later on each path: its first assignment ends nothing, a later one ends the
+// value before; a fault before the first assignment ends nothing, and one
+// after ends the value once. Also a `String` result sent on a channel and
+// the send's result discarded. `coby` ran `Vec`'s destructor on the binding
+// a fault left with no value, faulted inside it and left its reference live:
+// the program's next channel faulted `diag.aliasing-conflict` (CHG-0420).
+
+import std;
+
+fn refuse(usize n) : usize
+{
+    assert(n != 7, "refused %v", n);
+    n
+}
+
+fn build(usize n, usize at) : usize
+{
+    Vec<String> v;
+    refuse(at);
+    if (n % 2 == 0)
+    {
+        v = Vec::new();
+        Vec::push(&mut v, sprintf("even %v", n));
+    }
+    else
+    {
+        v = Vec::new();
+    }
+    refuse(at + 1);
+    v = Vec::new();
+    Vec::push(&mut v, sprintf("n %v", n));
+    Vec::push(&mut v, String::copy("again"));
+    Vec::len(&v) + n
+}
+
+fn main()
+{
+    printf("%v %v\n", build(2, 0), build(3, 0));
+    foreach (at in [7: usize, 6])
+    {
+        match (try_join(spawn(build, 4, at)))
+        {
+            Ok(k)  : printf("ok %v\n", k),
+            Err(_) : printf("failed at %v\n", at),
+        }
+    }
+    Channel<String> ch = Channel::new(2);
+    _ = Channel::send(&ch, sprintf("m%v", 1));
+    _ = Channel::send(&ch, sprintf("m%v", 2));
+    Channel::close(&ch);
+    while (Some(s) = Channel::recv(&ch))
+    {
+        printf("%v\n", &s);
+    }
+}

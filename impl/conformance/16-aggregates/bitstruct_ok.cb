@@ -1,0 +1,65 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: type.bitstruct `[Repr-Bitstruct]`, `[Bitstruct-Construct]`, `[Bitfield-Read]`, `[Bitfield-Write]`, `[Bitstruct-Bits]`, `[Bitstruct-From-Bits]` (D-0118); conf.bitstruct-fields, conf.bitstruct-bits-roundtrip, conf.bitstruct-raw-image, conf.bitstruct-through-reference, conf.bitstruct-key
+// kind: positive
+// expect: ok
+//
+// Fields low bit first; `bits`/`from_bits` total and inverse; the raw
+// image is the backing integer's; reads and writes through a
+// reference, a guard and a Vec element; a bitstruct as a map key.
+
+import std;
+
+bitstruct Double : u64 { mantissa : 52; exponent : 11; sign : 1; }
+bitstruct Instr : u32 { op : 6; rd : 5; rs : 5; imm : 16; }
+bitstruct Wide : u128 { lo : 64; mid : 60; hi : 4; }
+bitstruct Flags : u8 { carry : 1; zero : 1; pad : 6; }
+
+fn main()
+{
+    Double d = Double::from_bits(reinterpret<u64>(-2.5));
+    assert(d.sign == 1 && d.exponent == 1024 && d.mantissa == 1125899906842624);
+    d.exponent = 1023;
+    assert(reinterpret<f64>(Double::bits(d)) == -1.25);
+
+    Instr i = Instr { .op = 3, .rd = 1, .rs = 2, .imm = 500 };
+    assert(Instr::bits(i) == 3 | 1 << 6 | 2 << 11 | 500 << 16);
+    Instr j = Instr::from_bits(Instr::bits(i));
+    assert(j == i && j.imm == 500 && sizeof<Instr>() == 4 && sizeof<Flags>() == 1 && sizeof<Wide>() == 16);
+    Wide w = Wide { .lo = 1, .mid = 2, .hi = 15 };
+    assert(Wide::from_bits(Wide::bits(w)) == w && w.hi == 15);
+
+    Instr copy = i;
+    unsafe
+    {
+        rawptr<Instr> p = rawptr_of(&copy);
+        rawptr<u32> q = reinterpret_ptr<u32>(p);
+        assert(*q == Instr::bits(i));
+        *q = 0xFFFFFFFF;
+        assert((*p).op == 63 && (*p).imm == 65535);
+        (*p).op = 5;
+        assert(*q == 0xFFFFFFC5);
+    }
+
+    ref<Instr, exclusive> r = &mut j;
+    r.imm = 65535;
+    assert(r.imm == 65535);
+    assert(j.rd == 1 && j.imm == 65535);             // r's borrow ended at its last use
+    mutex<Flags> m = Mutex::new(Flags { .carry = 0, .zero = 1, .pad = 0 });
+    {
+        auto g = lock(&m);
+        g.carry = 1;
+        assert(Flags::bits(*g) == 3);
+    }
+    Vec<Instr> code = Vec::filled(2, i);
+    code[1].imm = 7;
+    assert(code[0].imm == 500 && code[1].imm == 7);
+
+    HashMap<Instr, str> names = HashMap::new();
+    HashMap::insert(&mut names, i, "add");
+    assert(HashMap::contains(
+        &names,
+        &Instr { .op = 3, .rd = 1, .rs = 2, .imm = 500 },
+    ) && !HashMap::contains(&names, &code[1]));
+    printf("ok\n");
+}
