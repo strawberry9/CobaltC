@@ -1,0 +1,328 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.hashmap [Key-Hash] [Key-Eq] (D-0330); D-0134 (remove, swap_remove); D-0116 (clone); conf.hashmap-many-keys
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 753634206b6579733a2032303030302073746570732c203920636c656172732c20636865636b6564203230302074696d65730a74657874206b6579733a2032303030302073746570732c203920636c656172732c20636865636b6564203230302074696d65730a737472756374206b6579733a2032303030302073746570732c203920636c656172732c20636865636b6564203230302074696d65730a736574733a2033303030206b6579732c20756e696f6e20343530302c20696e74657273656374696f6e20313530302c20646966666572656e636520313530300a
+//
+// A `HashMap` holds what a plain list of pairs holds, entry for entry and
+// in the same order, through thousands of steps chosen at random: `insert`
+// of new and of present keys, `entry`, `get`, `get_mut`, `contains`,
+// `remove` (the order kept), `swap_remove` (the last entry moved into the
+// gap), `clone` and `clear`, while the table grows many times over and is
+// emptied again. The same steps on integer keys, on `String` keys looked
+// up by views, and on struct keys with a `String` field. Nothing here can
+// see a hash: the result is the same whatever seed the run's hashes took.
+
+import std;
+
+struct Tag
+{
+    u32 id;
+    String name;
+}
+
+fn tag(u64 k) : Tag
+{
+    Tag { .id = narrow<u32>(k), .name = sprintf("t%v", k % 7) }
+}
+
+// Where `k` is in `keys`, or its length.
+fn at(ref<Vec<u64>, shared> keys, u64 k) : usize
+{
+    foreach (i, x in keys)
+    {
+        if (*x == k)
+        {
+            return i;
+        }
+    }
+    Vec::len(keys)
+}
+
+// 0: u64 keys; 1: `String` keys; 2: struct keys.
+struct Maps
+{
+    HashMap<u64, u64> a;
+    HashMap<String, u64> b;
+    HashMap<Tag, u64> c;
+    Vec<u64> keys;
+    Vec<u64> vals;
+}
+
+fn same(ref<Maps, shared> m, u32 kind)
+{
+    usize n = Vec::len(&m.keys);
+    if (kind == 0)
+    {
+        assert(HashMap::len(&m.a) == n, "length");
+        foreach (i in 0..n)
+        {
+            assert(*HashMap::key_at(&m.a, i) == m.keys[i] && *HashMap::value_at(&m.a, i) == m.vals[i], "entry");
+        }
+    }
+    else if (kind == 1)
+    {
+        assert(HashMap::len(&m.b) == n, "length");
+        foreach (i in 0..n)
+        {
+            String k = sprintf("key-%v", m.keys[i]);
+            assert(*HashMap::key_at(&m.b, i) == k && *HashMap::value_at(&m.b, i) == m.vals[i], "entry");
+        }
+    }
+    else
+    {
+        assert(HashMap::len(&m.c) == n, "length");
+        foreach (i in 0..n)
+        {
+            Tag k = tag(m.keys[i]);
+            ref<Tag, shared> have = HashMap::key_at(&m.c, i);
+            assert(have.id == k.id && have.name == k.name && *HashMap::value_at(&m.c, i) == m.vals[i], "entry");
+        }
+    }
+}
+
+fn found(ref<Maps, shared> m, u32 kind, u64 k) : Option<u64>
+{
+    if (kind == 0)
+    {
+        return match (HashMap::get(&m.a, k))
+        {
+            Some(v) : Some(*v),
+            None    : None,
+        };
+    }
+    if (kind == 1)
+    {
+        String s = sprintf("key-%v", k);
+        return match (HashMap::get(&m.b, &s))
+        {
+            Some(v) : Some(*v),
+            None    : None,
+        };
+    }
+    Tag t = tag(k);
+    match (HashMap::get(&m.c, &t))
+    {
+        Some(v) : Some(*v),
+        None    : None,
+    }
+}
+
+fn put(ref<Maps, exclusive> m, u32 kind, u64 k, u64 v) : Option<u64>
+{
+    if (kind == 0)
+    {
+        return HashMap::insert(&mut m.a, k, v);
+    }
+    if (kind == 1)
+    {
+        return HashMap::insert(&mut m.b, sprintf("key-%v", k), v);
+    }
+    HashMap::insert(&mut m.c, tag(k), v)
+}
+
+fn bump(ref<Maps, exclusive> m, u32 kind, u64 k, u64 fresh)
+{
+    if (kind == 0)
+    {
+        *HashMap::entry(&mut m.a, k, fresh) += 1;
+    }
+    else if (kind == 1)
+    {
+        String s = sprintf("key-%v", k);
+        *HashMap::entry(&mut m.b, &s, fresh) += 1;
+    }
+    else
+    {
+        Tag t = tag(k);
+        *HashMap::entry(&mut m.c, &t, fresh) += 1;
+    }
+}
+
+fn take(ref<Maps, exclusive> m, u32 kind, u64 k, bool swap) : Option<u64>
+{
+    if (kind == 0)
+    {
+        return if (swap) { HashMap::swap_remove(&mut m.a, k) } else { HashMap::remove(&mut m.a, k) };
+    }
+    if (kind == 1)
+    {
+        String s = sprintf("key-%v", k);
+        return if (swap) { HashMap::swap_remove(&mut m.b, &s) } else { HashMap::remove(&mut m.b, &s) };
+    }
+    Tag t = tag(k);
+    if (swap) { HashMap::swap_remove(&mut m.c, &t) } else { HashMap::remove(&mut m.c, &t) }
+}
+
+fn has(ref<Maps, shared> m, u32 kind, u64 k) : bool
+{
+    if (kind == 0)
+    {
+        return HashMap::contains(&m.a, k);
+    }
+    if (kind == 1)
+    {
+        String s = sprintf("key-%v", k);
+        return HashMap::contains(&m.b, &s);
+    }
+    Tag t = tag(k);
+    HashMap::contains(&m.c, &t)
+}
+
+fn run(u32 kind, str name)
+{
+    Maps m = Maps { .a = HashMap::new(), .b = HashMap::new(), .c = HashMap::new(), .keys = Vec::new(), .vals = Vec::new() };
+    Rng rng = Rng::new(20261120 + widen<u64>(kind));
+    usize clears = 0;
+    usize checks = 0;
+    // The keys come from a range that grows and shrinks, so the table fills,
+    // empties by removals, and fills again.
+    foreach (step in 0..20000)
+    {
+        u64 range = if ((step / 2500) % 2 == 0) { 3000 } else { 40 };
+        u64 k = Rng::below(&mut rng, range);
+        u64 v = Rng::next_u64(&mut rng) >> 8;
+        u64 what = Rng::below(&mut rng, 100);
+        usize i = at(&m.keys, k);
+        bool present = i < Vec::len(&m.keys);
+        if (what < 40)
+        {
+            Option<u64> old = put(&mut m, kind, k, v);
+            if (present)
+            {
+                assert(Option::unwrap(old) == m.vals[i], "insert: the old value");
+                m.vals[i] = v;
+            }
+            else
+            {
+                assert(Option::is_none(&old), "insert: no old value");
+                Vec::push(&mut m.keys, k);
+                Vec::push(&mut m.vals, v);
+            }
+        }
+        else if (what < 55)
+        {
+            bump(&mut m, kind, k, v);
+            if (present)
+            {
+                m.vals[i] = m.vals[i] + 1;
+            }
+            else
+            {
+                Vec::push(&mut m.keys, k);
+                Vec::push(&mut m.vals, v + 1);
+            }
+        }
+        else if (what < 70)
+        {
+            Option<u64> got = found(&m, kind, k);
+            assert(has(&m, kind, k) == present, "contains");
+            if (present)
+            {
+                assert(Option::unwrap(got) == m.vals[i], "get");
+            }
+            else
+            {
+                assert(Option::is_none(&got), "get: absent");
+            }
+        }
+        else if (what < 84)
+        {
+            Option<u64> old = take(&mut m, kind, k, false);
+            if (present)
+            {
+                assert(Option::unwrap(old) == m.vals[i], "remove");
+                Vec::remove(&mut m.keys, i);
+                Vec::remove(&mut m.vals, i);
+            }
+            else
+            {
+                assert(Option::is_none(&old), "remove: absent");
+            }
+        }
+        else if (what < 99)
+        {
+            Option<u64> old = take(&mut m, kind, k, true);
+            if (present)
+            {
+                assert(Option::unwrap(old) == m.vals[i], "swap_remove");
+                Vec::swap_remove(&mut m.keys, i);
+                Vec::swap_remove(&mut m.vals, i);
+            }
+            else
+            {
+                assert(Option::is_none(&old), "swap_remove: absent");
+            }
+        }
+        else
+        {
+            // A copy stands for the map from here on.
+            if (kind == 0)
+            {
+                HashMap<u64, u64> copy = HashMap::clone(&m.a);
+                m.a = copy;
+            }
+            else if (kind == 1)
+            {
+                HashMap<String, u64> copy = HashMap::clone(&m.b);
+                m.b = copy;
+            }
+            else
+            {
+                HashMap<Tag, u64> copy = HashMap::clone(&m.c);
+                m.c = copy;
+            }
+        }
+        if (step % 2200 == 2199)
+        {
+            HashMap::clear(&mut m.a);
+            HashMap::clear(&mut m.b);
+            HashMap::clear(&mut m.c);
+            Vec::clear(&mut m.keys);
+            Vec::clear(&mut m.vals);
+            clears = clears + 1;
+        }
+        if (step % 100 == 99)
+        {
+            same(&m, kind);
+            checks = checks + 1;
+        }
+    }
+    printf("%v: 20000 steps, %v clears, checked %v times\n", name, clears, checks);
+}
+
+fn sets()
+{
+    HashSet<String> a = HashSet::new();
+    HashSet<String> b = HashSet::new();
+    foreach (i in 0..3000)
+    {
+        HashSet::insert(&mut a, sprintf("s%v", i));
+        HashSet::insert(&mut b, sprintf("s%v", i + 1500));
+    }
+    HashSet<String> u = HashSet::union(&a, &b);
+    HashSet<String> n = HashSet::intersection(&a, &b);
+    HashSet<String> d = HashSet::difference(&a, &b);
+    foreach (i in 0..1500)
+    {
+        assert(*HashSet::key_at(&n, i) == sprintf("s%v", i + 1500), "intersection's order");
+        assert(*HashSet::key_at(&d, i) == sprintf("s%v", i), "difference's order");
+        assert(*HashSet::key_at(&u, 3000 + i) == sprintf("s%v", i + 3000), "union's order");
+    }
+    printf(
+        "sets: %v keys, union %v, intersection %v, difference %v\n",
+        HashSet::len(&a),
+        HashSet::len(&u),
+        HashSet::len(&n),
+        HashSet::len(&d),
+    );
+}
+
+fn main()
+{
+    run(0, "u64 keys");
+    run(1, "text keys");
+    run(2, "struct keys");
+    sets();
+}

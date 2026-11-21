@@ -1,0 +1,58 @@
+# D-0286: in a decided program values pass between functions with no object:
+# past the runtime's header the C neither sends nor receives one, a `String`
+# taken by value is bound objectless and none is bound in the function, and
+# the program ends as its first lowering does (COBALTC_DECIDED=0), under both
+# C compilers.
+file prog.cb
+import std;
+
+fn twice(String s) : String
+{
+    String r = String::clone(&s);
+    String::append(&mut r, &s);
+    r
+}
+
+fn first(Vec<String> v) : Option<String>
+{
+    if (Vec::len(&v) == 0)
+    {
+        return None;
+    }
+    Some(twice(String::clone(&v[0])))
+}
+
+fn main()
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, String::copy("ab"));
+    match (first(v))
+    {
+        Some(x) : printf("%s %v\n", &x, StringView::len(&x)),
+        None : printf("none\n"),
+    }
+    match (first(Vec::new()))
+    {
+        Some(x) : printf("%s\n", &x),
+        None : printf("none\n"),
+    }
+}
+end
+run env COBALTC_DECIDED=1 $COBC -v --keep-c --cc $CC -o d prog.cb
+status 0
+stderr-has lowered pathless and decided
+cut d.c after-types.c "/* ---- types ---- */" ""
+file-lacks after-types.c cb_send(
+file-lacks after-types.c cb_recv(
+cut d.c twice.c " struct s_std__String f_twice(struct s_std__String p_s)\n{" "\n}\n"
+file-lacks twice.c cb_bind(
+file-has twice.c cb_drop_plain_buf(&p_s,
+run ./d
+status 0
+stdout-is abab 4\nnone\n
+run env COBALTC_DECIDED=0 $COBC -v --keep-c --cc $CC -o p prog.cb
+status 0
+file-has p.c cb_recv(
+run ./p
+status 0
+stdout-is abab 4\nnone\n

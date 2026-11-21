@@ -1,0 +1,86 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.layout [Layout-Struct]; [Allocate]; D-0251; conf.struct-align-addresses
+// kind: positive
+// expect: ok
+// cobc-only: links the program's own C code
+// expect-stdout-hex: 616c69676e65640a
+//
+// Every place an object of an aligned type lives is on its boundary: a
+// local, a field, `Vec` and array elements, a `Box`, a mutex's interior, an
+// enum's payload and a thread's argument, for 64 and for 4096. C code reads
+// the addresses.
+
+import std;
+
+extern "./extern_code/address.c";
+
+unsafe extern fn addr_mod(rawptr<u8> p, u64 m) : u64;
+
+struct Slot align(64)
+{
+    u64 n;
+}
+
+struct Page align(4096)
+{
+    u8 b;
+}
+
+struct Holder
+{
+    u8 tag;
+    Slot s;
+    u8 after;
+}
+
+fn off<T>(ref<T, shared> r, u64 m) : u64
+{
+    unsafe { addr_mod(reinterpret_ptr<u8>(rawptr_of(r)), m) }
+}
+
+fn in_thread(Slot s, u8 pad) : u64
+{
+    off(&s, 64) + widen<u64>(pad) * 0
+}
+
+fn main()
+{
+    Slot a = Slot { .n = 1 };
+    Page p = Page { .b = 2 };
+    u64 bad = off(&a, 64) + off(&p, 4096);
+    Holder h = Holder { .tag = 1, .s = Slot { .n = 2 }, .after = 3 };
+    bad = bad + off(&h.s, 64) + off(&h, 64);
+    Vec<Slot> v = Vec::new();
+    foreach (i in 0..10: u64)
+    {
+        Vec::push(&mut v, Slot { .n = i });
+    }
+    foreach (i in 0..10: usize)
+    {
+        bad = bad + off(&v[i], 64);
+    }
+    array<Slot, 3> arr = [Slot { .n = 1 }, Slot { .n = 2 }, Slot { .n = 3 }];
+    bad = bad + off(&arr[1], 64) + off(&arr[2], 64);
+    auto m = Mutex::new(Slot { .n = 5 });
+    {
+        auto g = lock(&m);
+        bad = bad + off(&*g, 64);
+    }
+    Option<Slot> o = Some(Slot { .n = 9 });
+    match (&o)
+    {
+        Some(s) : bad = bad + off(s, 64),
+        None    : bad = bad + 1,
+    }
+    Box<Slot> b = Box::new(Slot { .n = 4 });
+    bad = bad + off(Box::get(&b), 64);
+    auto t = spawn(in_thread, Slot { .n = 7 }, 1);
+    bad = bad + join(t);
+    Vec<Page> ps = Vec::new();
+    Vec::push(&mut ps, Page { .b = 1 });
+    Vec::push(&mut ps, Page { .b = 2 });
+    bad = bad + off(&ps[1], 4096);
+    assert(bad == 0);
+    printf("aligned\n");
+}

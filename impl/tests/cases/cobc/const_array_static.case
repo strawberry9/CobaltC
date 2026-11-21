@@ -1,0 +1,98 @@
+# The element read of an array constant whose elements are literals is read
+# from C static data laid out once (`const_array_read`), not from the array the
+# constant's call builds whole at every read; the output and the bounds fault
+# are the same under gcc and clang.
+platform unix
+file all.cb
+import std;
+
+const array<str, 4> NAMES = ["i32", "u8", "bool", ""];
+const array<f64, 3> SCALE = [0.5, 1.25, 1e10];
+const array<f32, 2> HALF = [0.5, 2.0];
+const array<array<u8, 3>, 2> GRID = [[1, 2, 3], [4, 5, 6]];
+const array<array<str, 2>, 2> PAIRS = [["a", "bc"], ["def", "ghij"]];
+const array<u32, 4> TABLE = [10, 20, 30, 40];
+const array<bool, 3> FLAGS = [true, false, true];
+
+fn known(StringView w) : bool
+{
+    for (usize i = 0; i < 4; i += 1)
+    {
+        if (w == NAMES[i])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn main() : u8
+{
+    usize total = 0;
+    for (usize i = 0; i < 4; i += 1)
+    {
+        total += str_len(NAMES[i]);
+    }
+    printf("%v %v %v %v\n", total, known("bool"), known("u16"), known(""));
+    f64 s = 0.0;
+    for (usize i = 0; i < 3; i += 1)
+    {
+        s += SCALE[i];
+    }
+    printf("%v %v\n", s, HALF[1] * HALF[0]);
+    u32 g = 0;
+    for (usize r = 0; r < 2; r += 1)
+    {
+        for (usize c = 0; c < 3; c += 1)
+        {
+            g = g * 10 + widen<u32>(GRID[r][c]);
+        }
+    }
+    array<u8, 3> row = GRID[1];
+    printf("%v %v\n", g, row[2]);
+    printf("%s %s %v\n", PAIRS[1][0], (PAIRS[0])[1], str_len(PAIRS[1][1]));
+    printf("%v %v %v\n", TABLE[3], FLAGS[1], (NAMES)[2]);
+    usize k = arg_count();
+    printf("%s\n", NAMES[k + 3]);
+    printf("%s\n", PAIRS[1][k + 1]);
+    0
+}
+end
+file oob.cb
+import std;
+
+const array<array<str, 2>, 2> PAIRS = [["a", "bc"], ["def", "ghij"]];
+
+fn main() : u8
+{
+    usize k = arg_count();
+    printf("%s\n", PAIRS[1][k + 1]);
+    0
+}
+end
+run $COBC --emit-c -o all.c all.cb
+status 0
+file-lacks all.c f_NAMES();
+file-lacks all.c f_SCALE();
+file-lacks all.c f_HALF();
+file-lacks all.c f_GRID();
+file-lacks all.c f_PAIRS();
+file-lacks all.c f_TABLE();
+file-lacks all.c f_FLAGS();
+file-has all.c static const cb_str k_[4]
+file-has all.c static const double k_[3]
+file-has all.c static const float k_[2]
+file-has all.c static const struct a_arr3_u8 k_[2]
+file-has all.c static const struct a_arr2_str k_[2]
+file-has all.c static const uint32_t k_[4]
+file-has all.c static const uint8_t k_[3]
+run $COBC --cc $CC -o all all.cb
+status 0
+run ./all
+stdout-is 9 true false true\n10000000001.75 1.0\n123456 6\ndef bc 4\n40 false bool\n\nghij\n
+run $COBC --cc $CC -o oob oob.cb
+status 0
+run ./oob
+stdout-is ghij\n
+run ./oob x
+stderr-starts fault[diag.index-out-of-bounds]

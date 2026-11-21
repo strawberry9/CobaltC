@@ -1,0 +1,48 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: spec/21 §1 [Retain] (D-0181) in a function compiled with a frozen and a checked body (CHG-0237, D-0188); conf.retain-in-frozen-body
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 350a
+//
+// `Vec::retain` with a closure inside a function whose shared reference
+// parameters are frozen (CHG-0237): the compiler emits the function twice,
+// a frozen and a checked body, and the fused `retain` helper of each must
+// have a name of its own (CHG-0337: both were named by a counter the
+// second body restarted, and the C compiler refused the two declarations).
+// Found by the overnight run of 2026-10-18 (round 10, pubsub.cb).
+
+import std;
+
+fn fan_out(ref<Channel<usize>, shared> gone_keys, ref<Vec<Channel<usize>>, shared> outs) : usize
+{
+    Vec<usize> subs = Vec::filled(3, 1: usize);
+    Vec::push(&mut subs, 2);
+    usize sent = 0;
+    while (Some(gone) = Channel::recv(gone_keys))
+    {
+        foreach (s in &subs)
+        {
+            if (Result::is_ok(&Channel::send(&outs[*s], gone)))
+            {
+                sent += 1;
+            }
+        }
+        Vec::retain(&mut subs, [gone](ref<usize, shared> s) : bool { *s != gone });
+    }
+    sent
+}
+
+fn main()
+{
+    Channel<usize> gone = Channel::new(4);
+    Vec<Channel<usize>> outs = Vec::new();
+    foreach (k in 0..3)
+    {
+        Vec::push(&mut outs, Channel::new(8));
+    }
+    _ = Channel::send(&gone, 1);
+    _ = Channel::send(&gone, 2);
+    Channel::close(&gone);
+    printf("%v\n", fan_out(&gone, &outs));
+}

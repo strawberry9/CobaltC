@@ -1,0 +1,81 @@
+# D-0289: a program whose threads are lent what they reach by handles its
+# frames hold is decided: it locks a mutex with no lock path, a thread lent an
+# exclusive reference is not contained (its fault ends the program, spec/18,
+# so `lent` prints nothing), a resource passes to and from a thread with no
+# object, and it ends as recorded here, under both C compilers.
+file ok.cb
+import std;
+
+fn add(ref<mutex<u64>, shared> m, u64 n) : u64
+{
+    foreach (i in 0..n)
+    {
+        auto g = lock(m);
+        *g += 1;
+    }
+    n
+}
+
+fn bump(ref<i32, exclusive> p)
+{
+    *p = *p + 1;
+}
+
+fn total(Vec<u64> v) : Vec<u64>
+{
+    Vec<u64> r = Vec::new();
+    Vec::push(&mut r, widen<u64>(Vec::len(&v)));
+    r
+}
+
+fn main()
+{
+    auto m = Mutex::new(0: u64);
+    i32 x = 1;
+    {
+        auto a = spawn(add, &m, 30);
+        auto b = spawn(add, &m, 12);
+        auto c = spawn(bump, &mut x);
+        join(c);
+        printf("%v ", join(a) + join(b));
+    }
+    Vec<u64> v = Vec::new();
+    Vec::push(&mut v, 7);
+    auto t = spawn(total, v);
+    Vec<u64> r = join(t);
+    printf("%v %v %v\n", *lock(&m), x, r[0]);
+}
+end
+file lent.cb
+import std;
+
+fn boom(ref<i32, exclusive> p) : i32
+{
+    *p = 2;
+    1 / (*p - 2)
+}
+
+fn main()
+{
+    i32 x = 1;
+    auto h = spawn(boom, &mut x);
+    match (try_join(h))
+    {
+        Ok(v) : printf("ok %v\n", v),
+        Err(f) : printf("contained\n"),
+    }
+    printf("after\n");
+}
+end
+run $COBC -v --cc $CC -o ok ok.cb
+status 0
+stderr-has lowered pathless and decided (D-0284, D-0285)
+run ./ok
+status 0
+stdout-is 42 42 2 1\n
+run $COBC -v --cc $CC -o lent lent.cb
+status 0
+stderr-has lowered pathless and decided (D-0284, D-0285)
+run ./lent
+status 1
+stdout-empty

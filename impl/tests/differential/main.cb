@@ -1,0 +1,686 @@
+// difftest: random, well-typed CobaltC programs (gen.cb), each run several
+// ways that must agree: exit status, standard output and standard error
+// (the diagnostic, location included). D-0326 phase D.
+//
+//   difftest --self [OPTIONS]
+//       the program compiled by cobc in the default form and with
+//       `--all-checks`, each run, and the default form run again with
+//       `COBALTC_RECORD=full` (every reference recorded), under each C
+//       compiler; a program with a thread is compiled once per C compiler
+//       and run as threads really run and under schedule seeds 1 to 3
+//       (`COBALTC_SCHEDULE_SEED`, as `cobc --explore` does). Every run
+//       must agree with the first.
+//   difftest --print SEED        the program of one seed, on standard output
+//   difftest --write DIR [--n N] [--seed S]
+//                                the programs alone, DIR/seed-<n>.cb
+//
+// OPTIONS: --cobc PATH (default `cobc`), --cc CC (repeatable; default gcc
+// and clang), --n N (default 100), --seed S (first seed, default 1),
+// --keep DIR (keep every program there), --failures DIR (where a
+// disagreeing program is kept, default `difftest-failures`), --work DIR
+// (default `difftest-work`), --jobs J (default 2).
+// Exit status 1 on any disagreement, 2 on a usage error.
+
+import std;
+
+module prelude "./prelude.cb";
+module gen "./gen.cb";
+module host "./host.cb";
+
+import gen;
+import host;
+
+// CPU seconds any one program under test may use; the wall-clock limit of
+// every run.
+const i64 CPU_LIMIT_SECS = 300;
+const i64 WALL_SECS = 60;
+
+struct Cfg
+{
+    String cobc;
+    Vec<String> ccs;
+    u64 n;
+    u64 first;
+    String keep;
+    String failures;
+    String work;
+    u64 jobs;
+}
+
+enum Verdict
+{
+    // How the program ended: ran to completion, or its diagnostic.
+    Same(String),
+    Skipped,
+    Differs(String),
+}
+
+struct Result1
+{
+    u64 seed;
+    Verdict v;
+}
+
+fn usage() : u8
+{
+    eprintf("usage: difftest --self [--cobc PATH] [--cc CC]... [--n N] [--seed S] [--keep DIR] [--failures DIR] [--work DIR] [--jobs J]\n       difftest --print SEED\n       difftest --write DIR [--n N] [--seed S]\n");
+    2
+}
+
+fn arg_at(usize i) : String
+{
+    match (arg(i))
+    {
+        Ok(s)  : s,
+        Err(_) : String::new(),
+    }
+}
+
+fn parse_u64(StringView s) : Option<u64>
+{
+    match (StringView::parse<u64>(s))
+    {
+        Ok(n)  : Some(n),
+        Err(_) : None,
+    }
+}
+
+fn join_path(StringView dir, StringView name) : String
+{
+    if (StringView::ends_with(dir, "/"))
+    {
+        return sprintf("%s%s", dir, name);
+    }
+    sprintf("%s/%s", dir, name)
+}
+
+fn bytes_text(ref<Vec<u8>, shared> b) : String
+{
+    match (StringView::from_utf8(b))
+    {
+        Ok(v)  : String::copy(v),
+        Err(_) :
+        {
+            // `from_utf8_lossy`, coarsely: every byte that is not ASCII
+            // becomes U+FFFD.
+            String o = String::new();
+            foreach (c in b)
+            {
+                if (*c < 0x80)
+                {
+                    String::push_ascii(&mut o, *c);
+                }
+                else
+                {
+                    String::push_code_point(&mut o, 0xFFFD);
+                }
+            }
+            o
+        },
+    }
+}
+
+fn spec(ref<Vec<String>, shared> argv, i64 cpu) : Spec
+{
+    Spec s = Spec::new();
+    foreach (a in argv)
+    {
+        Spec::arg(&mut s, a);
+    }
+    s.cpu_secs = cpu;
+    s.wall_secs = WALL_SECS;
+    s
+}
+
+// `cobc --cc CC`, ready for its remaining arguments, its compiled program
+// limited.
+fn cobc_argv(ref<Cfg, shared> cfg, StringView cc, bool all_checks) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, clone(&cfg.cobc));
+    Vec::push(&mut v, "--cc");
+    Vec::push(&mut v, String::copy(cc));
+    if (all_checks)
+    {
+        Vec::push(&mut v, "--all-checks");
+    }
+    v
+}
+
+fn cobc_spec(ref<Vec<String>, shared> argv) : Spec
+{
+    Spec s = spec(argv, CPU_LIMIT_SECS);
+    Vec::push(&mut s.env, sprintf("COBALTC_CPU_LIMIT=%d", CPU_LIMIT_SECS));
+    s
+}
+
+// The compiled program, run in the work directory.
+fn exe_spec(ref<Cfg, shared> cfg, StringView exe, Option<u64> sched, bool record_full) : Spec
+{
+    Vec<String> argv = Vec::new();
+    Vec::push(&mut argv, String::copy(exe));
+    Spec s = spec(&argv, CPU_LIMIT_SECS);
+    s.cwd = clone(&cfg.work);
+    Vec::push(&mut s.env, "COBALTC_CPU_LIMIT=60");
+    match (sched)
+    {
+        Some(k) : Vec::push(&mut s.env, sprintf("COBALTC_SCHEDULE_SEED=%d", k)),
+        None    : {},
+    }
+    if (record_full)
+    {
+        Vec::push(&mut s.env, "COBALTC_RECORD=full");
+    }
+    s
+}
+
+fn debug_code(ref<Run, shared> r) : String
+{
+    if (r.status < 0)
+    {
+        return "None";
+    }
+    if (r.status >= 128)
+    {
+        // Ended by a signal (host.c: 128 + the signal).
+        return sprintf("None (signal %d)", r.status - 128);
+    }
+    sprintf("Some(%d)", r.status)
+}
+
+// The first line's diagnostic, `diag.x (phase)`, as `first_line_id`.
+fn first_line_id(StringView line) : Option<String>
+{
+    str phase = "static";
+    StringView rest = line;
+    match (StringView::strip_prefix(line, "error["))
+    {
+        Some(r) : rest = r,
+        None    :
+        {
+            match (StringView::strip_prefix(line, "fault["))
+            {
+                Some(r) :
+                {
+                    rest = r;
+                    phase = "dynamic";
+                },
+                None    : return None,
+            }
+        },
+    }
+    usize k = match (StringView::find(rest, "]"))
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    StringView id = &rest[0..k];
+    if (!StringView::starts_with(id, "diag."))
+    {
+        return None;
+    }
+    Some(sprintf("%s (%s)", id, phase))
+}
+
+// Two runs against each other (`a` the reference, named `an`; `c` the
+// other, named `cn`).
+fn compare(ref<Run, shared> a, StringView an, ref<Run, shared> c, StringView cn) : Verdict
+{
+    String why = String::new();
+    if (a.status != c.status)
+    {
+        String::appendf(&mut why, "exit status: %s %s, %s %s\n", an, &debug_code(a), cn, &debug_code(c));
+    }
+    if (!Vec::eq(&a.out, &c.out))
+    {
+        String::appendf(&mut why, "stdout:\n--- %s\n%s--- %s\n%s\n", an, &bytes_text(&a.out), cn, &bytes_text(&c.out));
+    }
+    if (!Vec::eq(&a.err, &c.err))
+    {
+        String::appendf(&mut why, "stderr:\n--- %s\n%s--- %s\n%s\n", an, &bytes_text(&a.err), cn, &bytes_text(&c.err));
+    }
+    if (StringView::len(&why) > 0)
+    {
+        return Verdict::Differs(why);
+    }
+    if (a.status == 0)
+    {
+        return Verdict::Same("ran to completion");
+    }
+    String err = bytes_text(&a.err);
+    String first = String::new();
+    Vec<StringView> lines = StringView::lines(&err);
+    if (Vec::len(&lines) > 0)
+    {
+        first = String::copy(lines[0]);
+    }
+    match (first_line_id(&first))
+    {
+        Some(id) : Verdict::Same(id),
+        None     : Verdict::Same(first),
+    }
+}
+
+fn exists(StringView p) : bool
+{
+    match (path_kind(p))
+    {
+        Ok(_)  : true,
+        Err(_) : false,
+    }
+}
+
+fn cc_name(StringView cc) : String
+{
+    // The compiler may be named by a path (a sanitizer wrapper).
+    match (StringView::rfind(cc, "/"))
+    {
+        Some(k) : String::copy(&cc[k + 1..$]),
+        None    : String::copy(cc),
+    }
+}
+
+fn sched_text(Option<u64> s) : String
+{
+    match (s)
+    {
+        Some(k) : sprintf("Some(%d)", k),
+        None    : "None",
+    }
+}
+
+fn scheds() : array<Option<u64>, 4>
+{
+    [None, Some(1), Some(2), Some(3)]
+}
+
+// The reference: the first build's outcome, or its first
+// run's; every other build and run is compared with it.
+struct Ref
+{
+    bool set;
+    Run run;
+    String name;
+}
+
+// `r` against the reference, which it becomes when there is none yet.
+fn against(ref<Ref, exclusive> rf, Run r, StringView name, ref<Verdict, exclusive> result) : bool
+{
+    if (!rf.set)
+    {
+        rf.set = true;
+        rf.run = r;
+        rf.name = String::copy(name);
+        *result = compare(&rf.run, &rf.name, &rf.run, &rf.name);
+        return true;
+    }
+    match (compare(&rf.run, &rf.name, &r, name))
+    {
+        Verdict::Differs(why) :
+        {
+            *result = Verdict::Differs(why);
+            false
+        },
+        v                     :
+        {
+            *result = v;
+            true
+        },
+    }
+}
+
+fn empty_run() : Run
+{
+    Run { .status = 0, .out = Vec::new(), .err = Vec::new(), .timed_out = false }
+}
+
+// The check (D-0326 §3): the default form, the form
+// with every check, and the default form with every reference recorded,
+// under each C compiler, must all agree.
+fn check_self(ref<Cfg, shared> cfg, u64 seed) : Verdict
+{
+    String path = join_path(&cfg.work, &sprintf("seed-%d.cb", seed));
+    String src = program(seed);
+    _ = write_file(&path, &src);
+    bool threads = StringView::contains(&src, "spawn(");
+    Ref rf = Ref { .set = false, .run = empty_run(), .name = String::new() };
+    Ref built = Ref { .set = false, .run = empty_run(), .name = String::new() };
+    Verdict result = Verdict::Skipped;
+    Verdict bres = Verdict::Skipped;
+    foreach (cc in &cfg.ccs)
+    {
+        Vec<String> exes = Vec::new();
+        foreach (all in [false, true])
+        {
+            String form = "default";
+            if (all)
+            {
+                form = "all-checks";
+            }
+            String exe = join_path(&cfg.work, &sprintf("seed-%d-%s-%s", seed, &cc_name(cc), &form));
+            Vec<String> argv = cobc_argv(cfg, cc, all);
+            Vec::push(&mut argv, "-o");
+            Vec::push(&mut argv, clone(&exe));
+            Vec::push(&mut argv, clone(&path));
+            Run b = run(&cobc_spec(&argv));
+            String bname = sprintf("cobc [%s] %s build", cc, &form);
+            if (b.timed_out)
+            {
+                return Verdict::Differs(sprintf("%s timed out", &bname));
+            }
+            if (b.status == 3)
+            {
+                return Verdict::Skipped;
+            }
+            bool ok = b.status == 0 && exists(&exe);
+            // Every build ends as the first did: rejected with the same
+            // diagnostic, or built.
+            if (!against(&mut built, b, &bname, &mut bres))
+            {
+                return replace(&mut bres, Verdict::Skipped);
+            }
+            if (ok)
+            {
+                Vec::push(&mut exes, exe);
+            }
+        }
+        if (Vec::len(&exes) == 0)
+        {
+            result = clone(&bres);
+            continue;
+        }
+        Vec<Option<u64>> ss = Vec::new();
+        Vec::push(&mut ss, None);
+        if (threads)
+        {
+            Vec::push(&mut ss, Some(1));
+            Vec::push(&mut ss, Some(2));
+            Vec::push(&mut ss, Some(3));
+        }
+        for (usize e = 0; e < Vec::len(&exes); e += 1)
+        {
+            // The default form also runs with every reference recorded.
+            usize variants = 1;
+            if (e == 0)
+            {
+                variants = 2;
+            }
+            for (usize w = 0; w < variants; w += 1)
+            {
+                foreach (s in &ss)
+                {
+                    bool full = w == 1;
+                    Run c = run(&exe_spec(cfg, &exes[e], *s, full));
+                    str form = "default";
+                    if (e == 1)
+                    {
+                        form = "all-checks";
+                    }
+                    if (full)
+                    {
+                        form = "default, COBALTC_RECORD=full";
+                    }
+                    String name = sprintf("[%s] %s, schedule %s", cc, form, &sched_text(*s));
+                    if (c.timed_out)
+                    {
+                        return Verdict::Differs(sprintf("%s timed out", &name));
+                    }
+                    if (!against(&mut rf, c, &name, &mut result))
+                    {
+                        return replace(&mut result, Verdict::Skipped);
+                    }
+                }
+            }
+        }
+        foreach (x in &exes)
+        {
+            _ = remove_file(x);
+        }
+    }
+    result
+}
+
+struct Shared
+{
+    mutex<Vec<Result1>> results;
+}
+
+fn worker(ref<Cfg, shared> cfg, ref<Shared, shared> sh, u64 w)
+{
+    u64 seed = cfg.first + w;
+    while (seed < cfg.first + cfg.n)
+    {
+        Verdict v = check_self(cfg, seed);
+        {
+            auto r = lock(&sh.results);
+            Vec::push(&mut *r, Result1 { .seed = seed, .v = v });
+        }
+        seed += cfg.jobs;
+    }
+}
+
+struct Tally
+{
+    String how;
+    usize n;
+}
+
+fn run_all(Cfg cfg) : u8
+{
+    _ = make_dir_all(&cfg.work);
+    Shared sh = Shared { .results = Mutex::new(Vec::new()) };
+    Vec<handle<void>> hs = Vec::new();
+    for (u64 w = 0; w < cfg.jobs; w += 1)
+    {
+        Vec::push(&mut hs, spawn(worker, &cfg, &sh, w));
+    }
+    while (true)
+    {
+        match (Vec::pop(&mut hs))
+        {
+            Some(h) : join(h),
+            None    : break,
+        }
+    }
+    Vec<Result1> results = Vec::new();
+    {
+        auto r = lock(&sh.results);
+        results = replace(&mut *r, Vec::new());
+    }
+    Vec::sort_by(&mut results, [](ref<Result1, shared> a, ref<Result1, shared> b) : bool { a.seed < b.seed });
+    usize same = 0;
+    usize skipped = 0;
+    Vec<Tally> ends = Vec::new();
+    Vec<String> failures = Vec::new();
+    foreach (r in &results)
+    {
+        String name = sprintf("seed-%d.cb", r.seed);
+        match (&r.v)
+        {
+            Verdict::Same(how)    :
+            {
+                same += 1;
+                bool found = false;
+                foreach (t in &mut ends)
+                {
+                    if (t.how == *how)
+                    {
+                        t.n += 1;
+                        found = true;
+                    }
+                }
+                if (!found)
+                {
+                    Vec::push(&mut ends, Tally { .how = clone(how), .n = 1 });
+                }
+            },
+            Verdict::Skipped      : skipped += 1,
+            Verdict::Differs(why) :
+            {
+                _ = make_dir_all(&cfg.failures);
+                String kept = join_path(&cfg.failures, &name);
+                _ = copy_file(&join_path(&cfg.work, &name), &kept);
+                Vec::push(&mut failures, sprintf("seed %d (%s):\n%s", r.seed, &kept, why));
+            },
+        }
+    }
+    if (StringView::len(&cfg.keep) > 0)
+    {
+        _ = make_dir_all(&cfg.keep);
+        foreach (r in &results)
+        {
+            String name = sprintf("seed-%d.cb", r.seed);
+            _ = copy_file(&join_path(&cfg.work, &name), &join_path(&cfg.keep, &name));
+        }
+    }
+    foreach (r in &results)
+    {
+        _ = remove_file(&join_path(&cfg.work, &sprintf("seed-%d.cb", r.seed)));
+    }
+    eprintf("difftest (self): %d programs from seed %d: %d same, %d skipped, %d differ\n", cfg.n, cfg.first, same, skipped, Vec::len(&failures));
+    Vec::sort_by(&mut ends, [](ref<Tally, shared> a, ref<Tally, shared> b) : bool { a.n > b.n || (a.n == b.n && a.how < b.how) });
+    foreach (t in &ends)
+    {
+        eprintf("  %5d  %s\n", t.n, &t.how);
+    }
+    if (Vec::len(&failures) > 0)
+    {
+        eprintf("%d program(s) disagree:\n%s\n", Vec::len(&failures), &String::join(&failures, "\n"));
+        return 1;
+    }
+    0
+}
+
+fn main() : u8
+{
+    usize argc = arg_count();
+    if (argc == 0)
+    {
+        return usage();
+    }
+    Cfg cfg = Cfg
+    {
+        .cobc = "cobc",
+        .ccs = Vec::new(),
+        .n = 100,
+        .first = 1,
+        .keep = String::new(),
+        .failures = "difftest-failures",
+        .work = "difftest-work",
+        .jobs = 2,
+    };
+    bool mode_given = false;
+    String write_dir = String::new();
+    usize i = 0;
+    while (i < argc)
+    {
+        String a = arg_at(i);
+        String v = String::new();
+        if (i + 1 < argc)
+        {
+            v = arg_at(i + 1);
+        }
+        if (a == "--print")
+        {
+            match (parse_u64(&v))
+            {
+                Some(s) :
+                {
+                    printf("%s", &program(s));
+                    return 0;
+                },
+                None    : return usage(),
+            }
+        }
+        else if (a == "--self")
+        {
+            mode_given = true;
+            i += 1;
+            continue;
+        }
+        else if (a == "--write")
+        {
+            write_dir = v;
+        }
+        else if (a == "--cobc")
+        {
+            cfg.cobc = v;
+        }
+        else if (a == "--cc")
+        {
+            Vec::push(&mut cfg.ccs, v);
+        }
+        else if (a == "--keep")
+        {
+            cfg.keep = v;
+        }
+        else if (a == "--failures")
+        {
+            cfg.failures = v;
+        }
+        else if (a == "--work")
+        {
+            cfg.work = v;
+        }
+        else if (a == "--n" || a == "--seed" || a == "--jobs")
+        {
+            u64 k = match (parse_u64(&v))
+            {
+                Some(k) : k,
+                None    : return usage(),
+            };
+            if (a == "--n")
+            {
+                cfg.n = k;
+            }
+            else if (a == "--seed")
+            {
+                cfg.first = k;
+            }
+            else
+            {
+                cfg.jobs = k;
+                if (k == 0)
+                {
+                    return usage();
+                }
+            }
+        }
+        else
+        {
+            eprintf("difftest: unknown option %s\n", &a);
+            return usage();
+        }
+        i += 2;
+    }
+    if (StringView::len(&write_dir) > 0)
+    {
+        _ = make_dir_all(&write_dir);
+        for (u64 s = cfg.first; s < cfg.first + cfg.n; s += 1)
+        {
+            _ = write_file(&join_path(&write_dir, &sprintf("seed-%d.cb", s)), &program(s));
+        }
+        return 0;
+    }
+    if (!mode_given)
+    {
+        return usage();
+    }
+    if (Vec::len(&cfg.ccs) == 0)
+    {
+        Vec::push(&mut cfg.ccs, "gcc");
+        Vec::push(&mut cfg.ccs, "clang");
+    }
+    // The work directory by its full path: an executable runs there, and must find both itself
+    // and the program's source (a fault's excerpt) by the names it was
+    // given.
+    if (!StringView::starts_with(&cfg.work, "/"))
+    {
+        match (current_dir())
+        {
+            Ok(d)  : cfg.work = path_join(&d, &cfg.work),
+            Err(_) : {},
+        }
+    }
+    run_all(cfg)
+}

@@ -1,0 +1,587 @@
+// The file-based conformance suite compiled and run by `cobc --run`, once
+// under each C compiler: every case's outcome must be its header's
+// `expect:`, and its standard output and error (the diagnostic, its
+// location included) must be the reference's, the case's recorded
+// `NAME.expect` (D-0326, phase E). A case `cobc` cannot compile
+// (`unsupported: …`) is counted as skipped and listed; an internal error
+// fails it. A `cobc-only:` case (it links its own C code) is checked
+// against its header's `expect-stdout-hex:` instead.
+
+import std;
+import host;
+import cases;
+import store;
+
+export struct Ctx
+{
+    export String cobc;
+    export Vec<String> ccs;
+    export Store st;
+    export usize shard_i;
+    export usize shard_n;
+    export bool slow;
+    export bool on_windows;
+    export String tmp_base;
+    export i64 cpu_secs;
+    export i64 wall_secs;
+    // Where the recorded `.expect` files are when not beside their cases
+    // (the specification's inline rows: impl/tests/rows); empty: beside.
+    export String expect_dir;
+}
+
+// Every `.cb` file under `dir`, sorted by path.
+export fn find_cb_files(StringView dir, ref<Vec<String>, exclusive> out)
+{
+    Vec<String> names = match (list_dir(dir))
+    {
+        Ok(n)  : n,
+        Err(_) : return,
+    };
+    foreach (n in &names)
+    {
+        String p = path_join(dir, n);
+        match (path_kind(&p))
+        {
+            Ok(k)  :
+            {
+                match (k)
+                {
+                    PathKind::Dir     : find_cb_files(&p, out),
+                    PathKind::File(_) :
+                    {
+                        if (StringView::ends_with(n, ".cb"))
+                        {
+                            Vec::push(out, p);
+                        }
+                    },
+                    _                 : {},
+                }
+            },
+            Err(_) : {},
+        }
+    }
+}
+
+// A fresh, empty directory for a case's `$TMP`.
+fn fresh_dir(ref<Ctx, shared> c, usize n) : String
+{
+    String d = path_join(&c.tmp_base, &sprintf("cbtest-case-%v-%v", process_id(), n));
+    _ = remove_dir_all(&d);
+    _ = make_dir_all(&d);
+    d
+}
+
+// What a run came to: `ok`,
+// `exit N`, `diag.ID (static)` or `diag.ID (dynamic)`, `cobc failed: …`;
+// or skipped, with the reason (an `unsupported:` construct).
+export struct Outcome
+{
+    export bool skipped;
+    export String text;
+}
+
+export fn first_line_of(slice<u8, shared> err) : String
+{
+    usize k = 0;
+    while (k < slice_len(err) && err[k] != b'\n')
+    {
+        k += 1;
+    }
+    match (StringView::from_utf8(&err[0..k]))
+    {
+        Ok(v)  : String::copy(v),
+        Err(_) : "?",
+    }
+}
+
+// The id and phase of a diagnostic's first line: `error[diag.x]` is
+// static, `fault[diag.x]` dynamic.
+export fn diag_of(StringView line) : String
+{
+    StringView rest = line;
+    str phase = "?";
+    match (StringView::strip_prefix(line, "error["))
+    {
+        Some(r) :
+        {
+            rest = r;
+            phase = "static";
+        },
+        None    :
+        {
+            match (StringView::strip_prefix(line, "fault["))
+            {
+                Some(r) :
+                {
+                    rest = r;
+                    phase = "dynamic";
+                },
+                None    : return "? (?)",
+            }
+        },
+    }
+    match (StringView::find(rest, "]"))
+    {
+        Some(k) :
+        {
+            StringView id = &rest[0..k];
+            if (StringView::starts_with(id, "diag."))
+            {
+                sprintf("%s (%s)", id, phase)
+            }
+            else
+            {
+                "? (?)"
+            }
+        },
+        None    : "? (?)",
+    }
+}
+
+export fn classify(i64 status, slice<u8, shared> err) : Outcome
+{
+    String first = first_line_of(err);
+    if (status == 0)
+    {
+        return Outcome { .skipped = false, .text = "ok" };
+    }
+    if (slice_len(err) == 0)
+    {
+        return Outcome { .skipped = false, .text = sprintf("exit %v", status) };
+    }
+    if (status == 3)
+    {
+        if (StringView::contains(&first, "internal error in cobc"))
+        {
+            return Outcome { .skipped = false, .text = sprintf("cobc failed: %s", &first) };
+        }
+        String why = String::copy(Option::unwrap_or(StringView::strip_prefix(&first, "unsupported: "), &first));
+        return Outcome { .skipped = true, .text = why };
+    }
+    if (status == 2)
+    {
+        return Outcome { .skipped = false, .text = sprintf("cobc failed: %s", &first) };
+    }
+    Outcome { .skipped = false, .text = diag_of(&first) }
+}
+
+fn bytes_of(StringView t) : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    Vec::extend_from(&mut v, StringView::as_bytes(t));
+    v
+}
+
+// `cobc --cc CC [flags] --run PATH ARGS…` in the case's directory, or the
+// run the store kept for the same key.
+export fn cobc_run(ref<Ctx, shared> c, StringView cc, StringView path, ref<String, shared> src, ref<Option<Vec<u8>>, shared> input, usize n) : Kept
+{
+    Vec<Vec<u8>> extra = Vec::new();
+    Vec::push(&mut extra, bytes_of(cc));
+    match (input)
+    {
+        Some(i) : Vec::push(&mut extra, Vec::clone(i)),
+        None    : Vec::push(&mut extra, bytes_of("\u{0}none")),
+    }
+    String key = Store::key(&c.st, "cobc-run", path, StringView::as_bytes(src), &extra);
+    match (Store::get(&c.st, &key))
+    {
+        Some(k) : return k,
+        None    : {},
+    }
+    Spec s = Spec::new();
+    Spec::arg(&mut s, &c.cobc);
+    Spec::arg(&mut s, "--cc");
+    Spec::arg(&mut s, cc);
+    Vec<String> fl = flags(src);
+    foreach (f in &fl)
+    {
+        Spec::arg(&mut s, f);
+    }
+    Spec::arg(&mut s, "--run");
+    // By its name, in its own directory: what a diagnostic prints is then
+    // the same on every machine, so a recorded output can be compared.
+    Spec::arg(&mut s, &Option::unwrap_or(path_file_name(path), String::copy(path)));
+    String tmp = if (wants_tmp(src)) { fresh_dir(c, n) } else { "" };
+    Vec<Vec<u8>> a = args(src, &tmp);
+    foreach (x in &a)
+    {
+        Vec::push(&mut s.argv, Vec::clone(x));
+    }
+    s.cwd = Option::unwrap_or(path_parent(path), ".");
+    Vec::push(&mut s.env, sprintf("COBALTC_CPU_LIMIT=%v", c.cpu_secs));
+    match (input)
+    {
+        Some(i) : s.input = Vec::clone(i),
+        None    : {},
+    }
+    s.cpu_secs = c.cpu_secs;
+    s.wall_secs = c.wall_secs;
+    Run { status, out, err, timed_out } = run(&s);
+    Kept { .status = status, .out = out, .err = err }
+}
+
+// The reference's run of a case: its recorded `.expect` file's.
+export fn reference(ref<Ctx, shared> c, StringView path) : Option<Kept>
+{
+    if (StringView::len(&c.expect_dir) > 0)
+    {
+        String name = Option::unwrap_or(path_file_name(path), String::copy(path));
+        return read_expect(&path_join(&c.expect_dir, &name));
+    }
+    read_expect(path)
+}
+
+// D-0326, phase E: a case's recorded outcome, `NAME.expect` beside it: a
+// first line `status N`, then `stdout-hex HEX` and `stderr-hex HEX`.
+export fn read_expect(StringView path) : Option<Kept>
+{
+    String f = sprintf("%s.expect", Option::unwrap_or(StringView::strip_suffix(path, ".cb"), path));
+    String text = match (read_file(&f))
+    {
+        Ok(t)  : t,
+        Err(_) : return None,
+    };
+    i64 status = 0;
+    Vec<u8> out = Vec::new();
+    Vec<u8> err = Vec::new();
+    Vec<StringView> lines = StringView::lines(&text);
+    foreach (l in &lines)
+    {
+        match (StringView::strip_prefix(*l, "status "))
+        {
+            Some(v) : status = Result::unwrap_or(StringView::parse<i64>(v), -1),
+            None    : {},
+        }
+        match (StringView::strip_prefix(*l, "stdout-hex "))
+        {
+            Some(v) : out = unhex(v),
+            None    : {},
+        }
+        match (StringView::strip_prefix(*l, "stderr-hex "))
+        {
+            Some(v) : err = unhex(v),
+            None    : {},
+        }
+    }
+    Some(Kept { .status = status, .out = out, .err = err })
+}
+
+// Bytes shown as text: the text when they are UTF-8, else their hex.
+fn text_of(slice<u8, shared> b) : String
+{
+    match (StringView::from_utf8(b))
+    {
+        Ok(v)  : String::copy(v),
+        Err(_) : sprintf("(not UTF-8) %s", &hex(b)),
+    }
+}
+
+export fn same_bytes(ref<Vec<u8>, shared> a, ref<Vec<u8>, shared> b) : bool
+{
+    if (Vec::len(a) != Vec::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(a); i += 1)
+    {
+        if (a[i] != b[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// Two runs' standard error the same: byte for byte, but for a stack
+// exhaustion (`diag.stack-exhausted`), whose diagnostic line alone is
+// compared: which call finds no room depends on the frames' sizes, so the
+// location (and with mutual recursion the function) differs between C
+// compilers and implementations; the rule fixes only the fault.
+export fn same_err(ref<Vec<u8>, shared> a, ref<Vec<u8>, shared> b) : bool
+{
+    String ta = text_of(a);
+    String tb = text_of(b);
+    if (StringView::starts_with(&ta, "fault[diag.stack-exhausted]") && StringView::starts_with(&tb, "fault[diag.stack-exhausted]"))
+    {
+        usize ea = Option::unwrap_or(StringView::find(&ta, "\n"), StringView::len(&ta));
+        usize eb = Option::unwrap_or(StringView::find(&tb, "\n"), StringView::len(&tb));
+        return &ta[0..ea] == &tb[0..eb];
+    }
+    same_bytes(a, b)
+}
+
+// `None` when the output is the reference's; otherwise what differs.
+fn output_differs(ref<Kept, shared> got, ref<Kept, shared> want) : Option<String>
+{
+    if (!same_bytes(&got.out, &want.out))
+    {
+        return Some(sprintf("stdout differs from the reference's: %s", &text_of(&got.out)));
+    }
+    if (!same_err(&got.err, &want.err))
+    {
+        return Some(sprintf("stderr differs from the reference's:\n--- reference\n%s--- cobc\n%s",
+            &text_of(&want.err),
+            &text_of(&got.err)));
+    }
+    None
+}
+
+// A cobc-only case's output against its own header.
+fn output_differs_from_header(ref<String, shared> src, ref<Kept, shared> got) : Option<String>
+{
+    match (field(src, "expect-stdout-hex"))
+    {
+        Some(want) :
+        {
+            String h = hex(&got.out);
+            if (h != want)
+            {
+                return Some(sprintf("stdout %s differs from expect-stdout-hex %s", &h, &want));
+            }
+        },
+        None       : {},
+    }
+    if (Vec::len(&got.err) > 0)
+    {
+        return Some(sprintf("unexpected stderr: %s", &text_of(&got.err)));
+    }
+    None
+}
+
+// One compiler's run of the suite under `root`: the counts, and the
+// skipped and failed cases' lines.
+export struct Tally
+{
+    export usize passed;
+    export Vec<String> skipped;
+    export Vec<String> failed;
+}
+
+export fn conformance(ref<Ctx, shared> c, StringView root, StringView cc) : Tally
+{
+    Vec<String> files = Vec::new();
+    find_cb_files(root, &mut files);
+    Vec::sort(&mut files);
+    Tally t = Tally { .passed = 0, .skipped = Vec::new(), .failed = Vec::new() };
+    for (usize index = 0; index < Vec::len(&files); index += 1)
+    {
+        ref<String, shared> path = &files[index];
+        String src = match (read_file(path))
+        {
+            Ok(s)  : s,
+            Err(_) : continue,
+        };
+        if (is_fixture(&src))
+        {
+            continue;
+        }
+        if (index % c.shard_n != c.shard_i - 1)
+        {
+            continue;
+        }
+        String expect = match (field(&src, "expect"))
+        {
+            Some(e) : e,
+            None    : continue,
+        };
+        if (Option::is_none(&field(&src, "kind")))
+        {
+            continue;
+        }
+        StringView rel = Option::unwrap_or(StringView::strip_prefix(path, root), path);
+        if (platform_skipped(&src, c.on_windows))
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: its `platform:` header names another platform", rel));
+            continue;
+        }
+        if (!c.slow)
+        {
+            match (slow_reason(&src))
+            {
+                Some(why) :
+                {
+                    Vec::push(&mut t.skipped, sprintf("%s: slow (%s); --slow runs it", rel, &why));
+                    continue;
+                },
+                None      : {},
+            }
+        }
+        Option<Vec<u8>> input = stdin(&src);
+        if (Option::is_none(&input) && is_cobc_only(&src))
+        {
+            input = Some(Vec::new());
+        }
+        Kept got = cobc_run(c, cc, path, &src, &input, index);
+        Outcome o = classify(got.status, &got.err);
+        if (o.skipped)
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: %s", rel, &o.text));
+            continue;
+        }
+        if (o.text != expect)
+        {
+            Vec::push(&mut t.failed, sprintf("%s: expected `%s` but observed `%s`", path, &expect, &o.text));
+            continue;
+        }
+        match (check_output(c, path, &src, &got, index))
+        {
+            Some(d) : Vec::push(&mut t.failed, sprintf("%s: %s", path, &d)),
+            None    :
+            {
+                t.passed += 1;
+                keep_cobc_run(c, cc, path, &src, &input, &got);
+            },
+        }
+    }
+    t
+}
+
+// The output check of a run whose outcome agreed: a `cobc-only` case's
+// against its header, any other's against the reference's run; `None` when
+// it agrees.
+export fn check_output(ref<Ctx, shared> c, StringView path, ref<String, shared> src, ref<Kept, shared> got, usize index) : Option<String>
+{
+    if (is_cobc_only(src))
+    {
+        return output_differs_from_header(src, got);
+    }
+    match (reference(c, path))
+    {
+        Some(want) : output_differs(got, &want),
+        None       : Some("no reference: no recorded .expect file"),
+    }
+}
+
+// A `cobc` run that met its check, kept under its key.
+export fn keep_cobc_run(ref<Ctx, shared> c, StringView cc, StringView path, ref<String, shared> src, ref<Option<Vec<u8>>, shared> input, ref<Kept, shared> got)
+{
+    Vec<Vec<u8>> extra = Vec::new();
+    Vec::push(&mut extra, bytes_of(cc));
+    match (input)
+    {
+        Some(i) : Vec::push(&mut extra, Vec::clone(i)),
+        None    : Vec::push(&mut extra, bytes_of("\u{0}none")),
+    }
+    String key = Store::key(&c.st, "cobc-run", path, StringView::as_bytes(src), &extra);
+    if (Option::is_none(&Store::get(&c.st, &key)))
+    {
+        Store::put(&c.st, &key, got.status, &got.out, &got.err);
+    }
+}
+
+// D-0326, phase E: a case's run recorded as `NAME.expect` (the form
+// `read_expect` reads): its exit status, standard output and standard
+// error, each as hex.
+export fn expect_text(ref<Kept, shared> k) : String
+{
+    sprintf("status %v\nstdout-hex %s\nstderr-hex %s\n", k.status, &hex(&k.out), &hex(&k.err))
+}
+
+export fn same_run(ref<Kept, shared> a, ref<Kept, shared> b) : bool
+{
+    a.status == b.status && same_bytes(&a.out, &b.out) && same_err(&a.err, &b.err)
+}
+
+// Records each case under `root` (D-0326, phase E): run by `cobc` under
+// each C compiler; when every run's outcome
+// is the header's and every run's output is the same, the run is written
+// beside the case, at the same relative path under `out`, as
+// `NAME.expect`. Its recorded text is then reviewed against the rule it
+// states. Any disagreement is listed and nothing is written for that case.
+export fn record(ref<Ctx, shared> c, StringView root, StringView out) : Tally
+{
+    Vec<String> files = Vec::new();
+    find_cb_files(root, &mut files);
+    Vec::sort(&mut files);
+    Tally t = Tally { .passed = 0, .skipped = Vec::new(), .failed = Vec::new() };
+    for (usize index = 0; index < Vec::len(&files); index += 1)
+    {
+        if (index % c.shard_n != c.shard_i - 1)
+        {
+            continue;
+        }
+        ref<String, shared> path = &files[index];
+        String src = match (read_file(path))
+        {
+            Ok(s)  : s,
+            Err(_) : continue,
+        };
+        if (is_fixture(&src))
+        {
+            continue;
+        }
+        String expect = match (field(&src, "expect"))
+        {
+            Some(e) : e,
+            None    : continue,
+        };
+        StringView rel = Option::unwrap_or(StringView::strip_prefix(path, root), path);
+        if (platform_skipped(&src, c.on_windows) || (!c.slow && Option::is_some(&slow_reason(&src))))
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: not run here", rel));
+            continue;
+        }
+        Option<Vec<u8>> input = stdin(&src);
+        if (Option::is_none(&input) && is_cobc_only(&src))
+        {
+            input = Some(Vec::new());
+        }
+        Vec<Kept> runs = Vec::new();
+        Vec<String> who = Vec::new();
+        bool bad = false;
+        foreach (cc in &c.ccs)
+        {
+            Kept k = cobc_run(c, cc, path, &src, &input, index);
+            Outcome o = classify(k.status, &k.err);
+            if (o.skipped || o.text != expect)
+            {
+                Vec::push(&mut t.failed, sprintf("%s: [%s] expected `%s` but observed `%s`", rel, cc, &expect, &o.text));
+                bad = true;
+            }
+            Vec::push(&mut runs, k);
+            Vec::push(&mut who, String::clone(cc));
+        }
+        if (bad || Vec::len(&runs) == 0)
+        {
+            continue;
+        }
+        // The runs' outputs must agree, and their statuses.
+        for (usize k = 1; k < Vec::len(&runs); k += 1)
+        {
+            bool same_out = same_bytes(&runs[k].out, &runs[0].out) && same_err(&runs[k].err, &runs[0].err);
+            bool same_status = runs[k].status == runs[Vec::len(&runs) - 1].status;
+            if (!same_out || !same_status)
+            {
+                Vec::push(&mut t.failed, sprintf("%s: %s and %s disagree", rel, &who[0], &who[k]));
+                bad = true;
+            }
+        }
+        if (bad)
+        {
+            continue;
+        }
+        ref<Kept, shared> last = &runs[Vec::len(&runs) - 1];
+        StringView tail = rel;
+        while (StringView::starts_with(tail, "/") || StringView::starts_with(tail, "\\"))
+        {
+            tail = &tail[1..$];
+        }
+        String target = path_join(out, tail);
+        String stem = String::copy(Option::unwrap_or(StringView::strip_suffix(&target, ".cb"), &target));
+        match (path_parent(&target))
+        {
+            Some(p) :
+            {
+                _ = make_dir_all(&p);
+            },
+            None    : {},
+        }
+        match (write_file(&sprintf("%s.expect", &stem), &expect_text(last)))
+        {
+            Ok(_)  : t.passed += 1,
+            Err(_) : Vec::push(&mut t.failed, sprintf("%s: cannot write %s.expect", rel, &stem)),
+        }
+    }
+    t
+}

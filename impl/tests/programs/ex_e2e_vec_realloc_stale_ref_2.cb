@@ -1,0 +1,48 @@
+// CONFORMANCE-CASE
+// kind: negative
+// expect: diag.stale-binding (dynamic)
+//
+// Previously failed for a reason once recorded among the known
+// bugs: the dynamic `clash` scan's "ancestor"
+// exemption (spec/08 `ancestors`) was tracked only transiently, for
+// the single deref/field-access operation that formed a new
+// reference, not persistently for the rest of that reference's
+// lifetime -- so `&*v`'s sub-borrow forgot it descended from `v`'s
+// own still-live borrow. Fixed by keeping the ancestors: each
+// newly-minted token's ancestor set was recorded once, at formation,
+// and consulted by every later `clash`/`solitary` check made through
+// it, however many frames removed.
+// → `conf.e2e-vec-realloc-stale-ref`. Unlike `conf.vec-ref-then-
+// push-rejected` (same-function, caught statically by this pass's
+// `deriv` check), the element reference here is held across a
+// reallocating `push` reached through a reference *parameter* --
+// invisible to `rule.control.flow-analysis`/`rule.temporal.ref-
+// escape` (their facts are defined only over a plain binding's own
+// projections). D-0282 relates them at the call (`Vec::push` writes
+// `*v` while `r` borrows it), so the frame-held form is refuted before
+// the run; kept in a struct a call makes (D-0290: what it holds is
+// `?`), the reference is the run's to check, and the reallocation makes
+// it stale.
+
+import std;
+
+struct Held { ref<i32, shared> r; }
+fn hold(ref<i32, shared> r) : Held
+{
+    Held { .r = r }
+}
+fn hold_across_grow(ref<Vec<i32>, exclusive> v) : i32
+{
+    Held h = hold(Vec::index_shared(&*v, 0));
+    Vec::push(v, 20);
+    Vec::push(v, 30);
+    Vec::push(v, 40);
+    Vec::push(v, 50);
+    *h.r
+}
+fn main()
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 10);
+    hold_across_grow(&mut v);
+}

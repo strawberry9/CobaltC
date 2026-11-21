@@ -1,0 +1,67 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.waiting `Semaphore` (D-0260); [Atomic-Wait], [Atomic-Notify]; conf.semaphore-limits
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7065616b206174206d6f737420323a20747275652c207065726d697473206261636b3a20320a7472756520747275652066616c73650a636f6e73756d656420352c206c65667420300a
+//
+// Two permits among six threads: never more than two inside at once, and
+// every permit comes back. A semaphore made with no permits hands events
+// from main to a worker, one `release` per `acquire`. `try_acquire` takes
+// what is free without waiting.
+
+import std;
+
+fn bounded(ref<Semaphore, shared> limit, ref<Atomic<u32>, shared> inside, ref<Atomic<u32>, shared> peak)
+{
+    for (u32 i = 0; i < 20; i += 1)
+    {
+        Semaphore::acquire(limit);
+        u32 now = Atomic::fetch_add(inside, 1) + 1;
+        _ = Atomic::fetch_max(peak, now);
+        _ = Atomic::fetch_sub(inside, 1);
+        Semaphore::release(limit);
+    }
+}
+
+fn consumer(ref<Semaphore, shared> events) : u32
+{
+    u32 taken = 0;
+    while (taken < 5)
+    {
+        Semaphore::acquire(events);
+        taken += 1;
+    }
+    taken
+}
+
+fn main()
+{
+    Semaphore limit = Semaphore::new(2);
+    Atomic<u32> inside = Atomic::new(0: u32);
+    Atomic<u32> peak = Atomic::new(0: u32);
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 0; i < 6; i += 1)
+    {
+        Vec::push(&mut hs, spawn(bounded, &limit, &inside, &peak));
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    printf("peak at most 2: %v, permits back: %v\n", Atomic::load(&peak) <= 2, Semaphore::available(&limit));
+    printf(
+        "%v %v %v\n",
+        Semaphore::try_acquire(&limit),
+        Semaphore::try_acquire(&limit),
+        Semaphore::try_acquire(&limit),
+    );
+
+    Semaphore events = Semaphore::new(0);
+    handle<u32> c = spawn(consumer, &events);
+    for (u32 i = 0; i < 5; i += 1)
+    {
+        Semaphore::release(&events);
+    }
+    printf("consumed %v, left %v\n", join(c), Semaphore::available(&events));
+}

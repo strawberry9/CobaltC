@@ -1,0 +1,107 @@
+// `std::ffi` (spec/21 §3f, D-0252): text for C functions, and C's `NULL`.
+// Reading C's text back is `String::from_c` and `Vec::from_c_bytes`, in
+// the modules of the types they make.
+
+/// The error of text that holds a NUL byte, which C would take as its end.
+///
+/// `offset` is the position of the first NUL.
+export struct NulError
+{
+    export usize offset;
+}
+
+/// A short description of the error for messages: `"holds a NUL byte"`.
+export fn NulError::text(ref<NulError, shared> e) : str
+{
+    "holds a NUL byte"
+}
+
+/// Text followed by one NUL byte, for a C function that takes `const char *`.
+///
+/// Made by `CString::new` or `CString::from_bytes`, which refuse text that already holds a NUL. `CString::ptr` is
+/// the address to pass; it stays valid while the `CString` lives, even if the `CString` itself is moved, and
+/// dropping the `CString` frees the bytes. The C function must not write through the address or keep it.
+export struct CString
+{
+    Vec<u8> bytes;                      // the text, then one NUL
+}
+
+/// `b` with a NUL byte after it, or `Err` with the position of the first NUL already in `b`.
+///
+/// The bytes need not be UTF-8: a path or a name from another system is often not.
+export fn CString::from_bytes(slice<u8, shared> b) : Result<CString, NulError>
+{
+    usize n = slice_len(b);
+    Vec<u8> bytes = Vec::new();
+    Vec::reserve(&mut bytes, n + 1);
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (b[i] == 0)
+        {
+            return Err(NulError { .offset = i });
+        }
+        Vec::push(&mut bytes, b[i]);
+    }
+    Vec::push(&mut bytes, 0);
+    Ok(CString { .bytes = bytes })
+}
+
+/// `s` with a NUL byte after it, or `Err` with the position of the first NUL already in `s`.
+///
+/// A literal where a `StringView` is expected is made into one: `CString::new("HOME")`.
+export fn CString::new(StringView s) : Result<CString, NulError>
+{
+    CString::from_bytes(StringView::as_bytes(s))
+}
+
+/// The address of the first byte, to pass to C as a `const char *`.
+///
+/// Taking the address is safe; the call that uses it is inside `unsafe`. The address is valid until the
+/// `CString` is dropped.
+export fn CString::ptr(ref<CString, shared> c) : rawptr<u8>
+{
+    rawptr_of(&c.bytes[0])
+}
+
+/// The length of the text, without the NUL.
+export fn CString::len(ref<CString, shared> c) : usize
+{
+    Vec::len(&c.bytes) - 1
+}
+
+/// The text without the NUL, as bytes.
+export fn CString::as_bytes(ref<CString, shared> c) : slice<u8, shared>
+{
+    &c.bytes[0 .. Vec::len(&c.bytes) - 1]
+}
+
+/// The elements of `s`, plain data, copied to C memory at `p`: an output
+/// buffer a C caller owns (D-0257). Called inside `unsafe { }`
+/// (`[Trusted-Call]`): the caller vouches that `p` has room for them and
+/// that nothing else uses that memory for the call.
+export fn copy_to_raw<T: plain>(slice<T, shared> s, rawptr<T> p)
+{
+    usize n = slice_len(s);
+    if (n == 0)
+    {
+        return;
+    }
+    if (p == null_rawptr<T>())
+    {
+        fault(null_pointer);
+    }
+    // trusted: [Copy-Raw] of the slice's n * sizeof<T>() bytes (readable: the slice's own path covers them) to `p`, the caller's assertion in its `unsafe` that `p` has room for them and that no live object's cells lie there (a [Trusted-Call], spec/20 §1); T is `plain`, so the bytes are the elements.
+    unsafe
+    {
+        copy_raw(reinterpret_ptr<u8>(p), reinterpret_ptr<u8>(rawptr_of(&s[0])), n * sizeof<T>());
+    }
+}
+
+/// Whether `p` is C's `NULL`, the address `null_rawptr<T>()`.
+///
+/// C functions return `NULL` for "none": `getenv` of a name that is not set, `fopen` of a file that cannot be
+/// opened. Testing for it is safe; reading through `p` is not.
+export fn is_null<T>(rawptr<T> p) : bool
+{
+    p == null_rawptr<T>()
+}

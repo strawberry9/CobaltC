@@ -1,0 +1,222 @@
+// A conformance case's header (impl/conformance/README.md): the leading
+// `//` lines of the file, `key: value` each, and what a runner reads from
+// it, field for field.
+
+import std;
+
+// The value of the header field `key`, if the header has one.
+export fn field(StringView src, str key) : Option<String>
+{
+    Vec<StringView> lines = StringView::lines(src);
+    foreach (raw in &lines)
+    {
+        StringView line = StringView::trim_start(*raw);
+        if (!StringView::starts_with(line, "//"))
+        {
+            break;
+        }
+        StringView body = line;
+        while (StringView::starts_with(body, "/"))
+        {
+            body = &body[1..$];
+        }
+        body = StringView::trim(body);
+        match (StringView::find(body, ":"))
+        {
+            Some(k) :
+            {
+                if (StringView::trim(&body[0..k]) == key)
+                {
+                    return Some(String::copy(StringView::trim(&body[k + 1..$])));
+                }
+            },
+            None    : {},
+        }
+    }
+    None
+}
+
+// Whether the file is a fixture another case loads, not a case.
+export fn is_fixture(StringView src) : bool
+{
+    match (StringView::find(src, "\n"))
+    {
+        Some(k) : StringView::trim(&src[0..k]) == "// CONFORMANCE-FIXTURE",
+        None    : StringView::trim(src) == "// CONFORMANCE-FIXTURE",
+    }
+}
+
+fn hex_digit(u8 c) : Option<u8>
+{
+    if (c >= b'0' && c <= b'9')
+    {
+        return Some(c - b'0');
+    }
+    if (c >= b'a' && c <= b'f')
+    {
+        return Some(c - b'a' + 10);
+    }
+    if (c >= b'A' && c <= b'F')
+    {
+        return Some(c - b'A' + 10);
+    }
+    None
+}
+
+// The bytes a run of hex digits spells.
+export fn unhex(StringView h) : Vec<u8>
+{
+    slice<u8, shared> b = StringView::as_bytes(h);
+    Vec<u8> out = Vec::new();
+    usize i = 0;
+    while (i + 1 < slice_len(b))
+    {
+        match (hex_digit(b[i]))
+        {
+            Some(hi) :
+            {
+                match (hex_digit(b[i + 1]))
+                {
+                    Some(lo) : Vec::push(&mut out, hi * 16 + lo),
+                    None     : {},
+                }
+            },
+            None     : {},
+        }
+        i += 2;
+    }
+    out
+}
+
+export fn hex(slice<u8, shared> b) : String
+{
+    String out = String::new();
+    for (usize i = 0; i < slice_len(b); i += 1)
+    {
+        String::appendf(&mut out, "%02x", b[i]);
+    }
+    out
+}
+
+// The case's standard input (`stdin-hex:`), if it has one.
+export fn stdin(StringView src) : Option<Vec<u8>>
+{
+    match (field(src, "stdin-hex"))
+    {
+        Some(h) : Some(unhex(&h)),
+        None    : None,
+    }
+}
+
+// The tool's flags (`flags:`, D-0303), before the case's path.
+export fn flags(StringView src) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    match (field(src, "flags"))
+    {
+        Some(h) :
+        {
+            Vec<StringView> words = StringView::split_whitespace(&h);
+            foreach (w in &words)
+            {
+                Vec::push(&mut out, String::copy(*w));
+            }
+        },
+        None    : {},
+    }
+    out
+}
+
+// The program's arguments (`args:`, CHG-0040): separated by spaces, `\xHH`
+// for any byte, `""` for an empty argument, `$TMP` a fresh directory
+// (CHG-0043), the one `tmp` names.
+export fn args(StringView src, StringView tmp) : Vec<Vec<u8>>
+{
+    Vec<Vec<u8>> out = Vec::new();
+    String h = match (field(src, "args"))
+    {
+        Some(h) : h,
+        None    : return out,
+    };
+    Vec<StringView> words = StringView::split_whitespace(&h);
+    foreach (w in &words)
+    {
+        Vec<u8> a = Vec::new();
+        if (*w == "\"\"")
+        {
+            Vec::push(&mut out, a);
+            continue;
+        }
+        if (StringView::contains(*w, "$TMP"))
+        {
+            String r = StringView::replace(*w, "$TMP", tmp);
+            Vec::extend_from(&mut a, StringView::as_bytes(&r));
+            Vec::push(&mut out, a);
+            continue;
+        }
+        slice<u8, shared> b = StringView::as_bytes(*w);
+        usize i = 0;
+        usize n = slice_len(b);
+        while (i < n)
+        {
+            if (b[i] == b'\\' && i + 1 < n && b[i + 1] == b'x' && i + 4 <= n)
+            {
+                Vec<u8> v = unhex(&(*w)[i + 2..i + 4]);
+                if (Vec::len(&v) == 1)
+                {
+                    Vec::push(&mut a, v[0]);
+                }
+                i += 4;
+            }
+            else
+            {
+                Vec::push(&mut a, b[i]);
+                i += 1;
+            }
+        }
+        Vec::push(&mut out, a);
+    }
+    out
+}
+
+// Whether the case names `$TMP` in its arguments.
+export fn wants_tmp(StringView src) : bool
+{
+    match (field(src, "args"))
+    {
+        Some(h) : StringView::contains(&h, "$TMP"),
+        None    : false,
+    }
+}
+
+// Whether the case runs only elsewhere (`platform:`, D-0143): `unix` and
+// `linux` run here when this is Linux, `windows` on Windows.
+export fn platform_skipped(StringView src, bool on_windows) : bool
+{
+    match (field(src, "platform"))
+    {
+        Some(p) :
+        {
+            if (p == "windows")
+            {
+                !on_windows
+            }
+            else
+            {
+                on_windows
+            }
+        },
+        None    : false,
+    }
+}
+
+// The reason a `slow:` case is skipped unless slow cases are asked for.
+export fn slow_reason(StringView src) : Option<String>
+{
+    field(src, "slow")
+}
+
+export fn is_cobc_only(StringView src) : bool
+{
+    Option::is_some(&field(src, "cobc-only"))
+}

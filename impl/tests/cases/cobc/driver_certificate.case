@@ -1,0 +1,74 @@
+# D-0299: `--certificate FILE` writes what the static pass decided, body by
+# body, and the compiler's verdict (through the lowering: `--emit-c` compiles
+# nothing); with `--check`, the static pass's part alone, one program; for a
+# rejected program, the diagnostic is the verdict. (Each run writes a
+# certificate file of its own.)
+file decided.cb
+import std;
+
+fn bump(ref<i32, exclusive> p)
+{
+    *p = *p + 1;
+}
+
+fn main()
+{
+    i32 x = 1;
+    bump(&mut x);
+    printf("%v\n", x);
+}
+end
+file left.cb
+import std;
+
+fn main()
+{
+    i32 x = 1;
+    i32 y = 2;
+    auto r = &mut y;
+    i32 i = 0;
+    while (2 > i)
+    {
+        if (i > 0)
+        {
+            r = &mut x;
+            break;
+        }
+        i = i + 1;
+    }
+    x = 5;
+    *r = *r + 1;
+    printf("%v %v\n", x, y);
+}
+end
+file rejected.cb
+import std;
+
+fn main()
+{
+    i32 x = 1;
+    auto r = &mut x;
+    printf("%v\n", x);
+    *r = 2;
+}
+end
+run $COBC --certificate c1.txt --emit-c -o decided.c decided.cb
+status 0
+file-starts c1.txt CobaltC certificate 1\ntool: cobc\nprogram: decided.cb\nverdict: decided\n
+file-has c1.txt \nfn main: decided\n
+file-has c1.txt \nfn bump: decided\n
+run $COBC --certificate c2.txt --emit-c -o left.c left.cb
+status 0
+file-has c2.txt \nverdict: paths kept: `main`, left.cb:18: an access to `x` that a reference may reach on some paths\n
+file-has c2.txt \nfn main: left\n  left left.cb:18: an access to `x` that a reference may reach on some paths\n  dynamic left.cb:18: an access to `x` (exclusive), which `r` may reach on some paths\n
+run $COBC --certificate c3.txt --check decided.cb
+status 0
+file-has c3.txt \nverdict: static pass: every body decided (
+file-has c3.txt \nfn main: decided\n
+# Two programs for one certificate.
+run $COBC --certificate c4.txt --check decided.cb left.cb
+status 2
+run $COBC --certificate c5.txt -o rejected rejected.cb
+status 1
+file-has c5.txt \nverdict: rejected: diag.aliasing-conflict\n
+file-has c5.txt \nfn main: rejected\n  error diag.aliasing-conflict\n

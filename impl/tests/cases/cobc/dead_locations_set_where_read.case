@@ -1,0 +1,110 @@
+# The location a fault without one of its own reports (`cb_at`) is set only
+# where some path from it reaches a line that could read it before another
+# sets it (`drop_dead_locations`, over the body's flow of control): a loop
+# whose bounds checks and overflow checks carry their own locations, and
+# whose push sets its own where it can grow, keeps none (`count` and `fill`,
+# emitted in their forms for a confined argument, `_c1`: no `cb_at(` from the
+# definition's line to its closing brace), and a fault after a call, inside
+# `std` (`Option::unwrap`) or after an `if`-pattern's jump is reported at its
+# own line (the first two lines of its report, recorded here), under gcc and
+# clang.
+file d.cb
+import std;
+import std::env;
+
+fn pick(usize i) : usize
+{
+    i * 3
+}
+
+fn count(ref<Vec<bool>, shared> v) : u64
+{
+    u64 n = 0;
+    foreach (k in 0..Vec::len(v))
+    {
+        if (v[k])
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn fill(ref<Vec<bool>, exclusive> v, usize n)
+{
+    foreach (i in 0..n)
+    {
+        Vec::push(v, i % 3 == 0);
+    }
+}
+
+fn first_even(ref<Vec<u64>, shared> w) : Option<u64>
+{
+    foreach (x in w)
+    {
+        if (*x % 2 == 0)
+        {
+            return Some(*x);
+        }
+    }
+    None
+}
+
+fn main() : u8
+{
+    String m = Result::unwrap_or(arg(0), String::new());
+    Vec<bool> v = Vec::new();
+    fill(&mut v, 10);
+    Vec<u64> w = Vec::filled(5, 1);
+    u64 s = 0;
+    foreach (i in 0..4)
+    {
+        if (m == "call" && i == 2)
+        {
+            s += w[pick(i)];
+        }
+        else
+        {
+            s += w[i];
+        }
+    }
+    foreach (i in 0..3)
+    {
+        u64 t = s + 1;
+        if (m == "unwrap" && i == 1)
+        {
+            s += Option::unwrap(first_even(&w));
+        }
+        s = t;
+    }
+    foreach (i in 0..3)
+    {
+        if (Some(e) = first_even(&w))
+        {
+            s += e;
+        }
+        if (m == "after-if" && i == 2)
+        {
+            s += w[9];
+        }
+    }
+    printf("%d %d\n", count(&v), s);
+    0
+}
+end
+run $COBC --emit-c -o d.c d.cb
+status 0
+cut d.c count.c "\nstatic … f_count_c1(…)\n" "\n}\n"
+file-lacks count.c cb_at(
+cut d.c fill.c "\nstatic … f_fill_c1(…)\n" "\n}\n"
+file-lacks fill.c cb_at(
+run $COBC --cc $CC -o d d.cb
+status 0
+run ./d ok
+stdout-is 4 7\n
+run ./d call
+stderr-starts fault[diag.index-out-of-bounds]: index out of bounds\n  --> d.cb:53:13\n
+run ./d unwrap
+stderr-starts fault[diag.unwrap-failed]: `Option::unwrap` found `None`\n  --> d.cb:65:13\n
+run ./d after-if
+stderr-starts fault[diag.index-out-of-bounds]: index out of bounds\n  --> d.cb:77:13\n

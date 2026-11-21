@@ -1,0 +1,53 @@
+# Bug 037, the leftovers of Update 203. A program run under a runner
+# (COBALTC_RUNNER, for a program built for another platform) is sent the signal that comes to cobc, as one started
+# directly is (the runner here is a script that signals cobc, its parent, and
+# records what it gets), and the C compiler cobc started ends when cobc alone
+# is sent a signal (the "compiler" here signals cobc and waits).
+platform unix
+file p.cb
+import std;
+
+fn main() : u8
+{
+    printf("%v\n", arg_count());
+    3
+}
+end
+file runner.sh
+#!/bin/sh
+# usage: runner.sh PROGRAM ARGS...
+if [ -n "$SIGNAL_CASE" ]
+then
+    trap 'echo runner-got-TERM > got.txt; exit 9' TERM
+    kill -TERM $PPID
+    sleep 20 &
+    wait $!
+    exit 1
+fi
+echo "runner got: $# arguments, then $2 $3"
+exit 4
+end
+file slowcc.sh
+#!/bin/sh
+# A C compiler that signals cobc, its parent, and waits for the signal it is sent.
+trap 'echo compiler-got-TERM > cc-got.txt; exit 1' TERM
+kill -TERM $PPID
+sleep 20 &
+wait $!
+exit 1
+end
+run chmod +x runner.sh
+# A runner is the program and its words; the program's arguments follow, and
+# its status comes back.
+run sh -c "COBALTC_RUNNER=$(pwd)/runner.sh exec \"$0\" --target x86_64-pc-windows-gnu --run p.cb a b" $COBC
+status 4
+stdout-is runner got: 3 arguments, then a b\n
+# A signal to cobc during the run goes to the runner.
+run sh -c "SIGNAL_CASE=1 COBALTC_RUNNER=$(pwd)/runner.sh exec \"$0\" --target x86_64-pc-windows-gnu --run p.cb" $COBC
+status 143
+file-has got.txt runner-got-TERM
+# A signal to cobc during the compile goes to the C compiler too.
+run chmod +x slowcc.sh
+run sh -c "TMPDIR=$(pwd) exec \"$0\" --cc $(pwd)/slowcc.sh p.cb" $COBC
+status 143
+file-has cc-got.txt compiler-got-TERM

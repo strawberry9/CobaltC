@@ -1,0 +1,1956 @@
+// D-0326: `cobc --prelude-summary STD_DIR` writes impl/front/prelude.cb from
+// `std`'s files in STD_DIR (impl/std): the files assembled into one text, its
+// skeleton, declarations and bodies (`prelude_skeleton`,
+// `prelude_declarations`, `prelude_bodies`) and the documentation's records,
+// the toolchain's one generated view of `std`. Each part is checked as it is
+// made (the skeleton gives the prelude's pre-scan tables; the declarations
+// parse to the prelude's items; each body parses alone to the prelude's parse
+// of it).
+//
+// The tables of the language's own functions (`INTRINSIC_NAMES`, `FLOAT_FNS`)
+// are kept here: the summary carries them to the front end.
+
+import std;
+import lexer;
+import ast;
+import parser;
+import dump;
+import modres;
+import diags;
+
+// ---- the intrinsics ----
+
+// The intrinsics' names, in the order the summary lists them.
+const str INTRINSIC_NAMES =
+    "drop clone sizeof alignof dangling null_rawptr checked_narrow count_ones leading_zeros trailing_zeros "
+    "rotate_left rotate_right read_volatile write_volatile rawptr_of rawptr_from_address rawptr_address "
+    "reclaim release copy_raw allocate deallocate "
+    "lock spawn join join_status cancel std::Result::map_err std::print std::exit reinterpret_ptr widen "
+    "narrow narrow_wrapping reinterpret to_float "
+    "to_int wrapping_add wrapping_sub wrapping_mul saturating_add saturating_sub saturating_mul "
+    "checked_add checked_sub checked_mul checked_div checked_rem checked_neg fault stdout_write "
+    "std::sqrt std::floor std::ceil std::round std::trunc std::ln std::exp std::log2 std::log10 std::sin "
+    "std::cos std::tan "
+    "std::asin std::acos std::atan std::atan2 std::powf "
+    "str_len str_byte str_ptr str_slice slice_len min_value max_value "
+    "append_native text_write parse_check parse_value key_hash key_eq key_less key_less_at probe_key "
+    "probe_eq swap_places lend_places atomic_op atomic_wait_op cpu_op simd_load simd_store simd_eq simd_ne "
+    "simd_lt simd_le simd_gt simd_ge simd_select simd_any simd_all simd_min simd_max simd_sum "
+    "simd_reduce_min simd_reduce_max $fmt $assert_fail $require_fail "
+    "$each_drain $each_len $each_at $each_at_mut $each_key $each_take $each_take_key "
+    "static_assert "
+    "Mutex::new";
+
+// The floating-point functions of `std::math`: those of one argument, then
+// those of two.
+const str FLOAT_FNS =
+    "std::sqrt std::floor std::ceil std::round std::trunc std::ln std::exp std::log2 std::log10 std::sin "
+    "std::cos std::tan std::asin std::acos std::atan "
+    "std::atan2 std::powf";
+
+// ---- bytes ----
+
+fn is_ws(u8 c) : bool
+{
+    c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 11 || c == 12
+}
+
+fn is_word_byte(u8 c) : bool
+{
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
+}
+
+fn is_alpha_byte(u8 c) : bool
+{
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
+}
+
+fn is_digit_byte(u8 c) : bool
+{
+    c >= b'0' && c <= b'9'
+}
+
+fn find_byte(StringView v, u8 c) : Option<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(v);
+    for (usize i = 0; i < StringView::len(v); i += 1)
+    {
+        if (b[i] == c)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// The length of `v`'s leading white space, in bytes.
+fn lead_len(StringView v) : usize
+{
+    StringView::len(v) - StringView::len(StringView::trim_start(v))
+}
+
+// `s`'s words (`split_whitespace`) joined by single spaces.
+fn squeeze(StringView s) : String
+{
+    Vec<StringView> words = StringView::split_whitespace(s);
+    StringView::join(&words, " ")
+}
+
+// Two texts found together: a module's name and path, an attribute's kind
+// and message, an item's kind and name, a built-in's name and module.
+struct Pair
+{
+    String a;
+    String b;
+}
+
+fn pair(StringView a, StringView b) : Pair
+{
+    Pair { .a = String::copy(a), .b = String::copy(b) }
+}
+
+// ---- std's files, assembled ----
+
+// Where a line of the prelude came from: `std`'s file and its line (from 1);
+// `known` false for a line the assembly wrote, or one of `std.cb`'s own.
+struct Origin
+{
+    bool known;
+    String file;
+    usize line;
+}
+
+struct Std
+{
+    String dir;
+    // Each file read, by its path relative to `dir`.
+    HashMap<String, String> files;
+}
+
+// The text of `std`'s file `path` (relative to the directory), if there is one.
+fn std_file(ref<Std, exclusive> s, StringView path) : Option<String>
+{
+    String key = String::copy(path);
+    match (HashMap::get(&s.files, &key))
+    {
+        Some(t) : return Some(String::clone(t)),
+        None    : {},
+    }
+    String full = sprintf("%s/%s", &s.dir, path);
+    match (read_file(&full))
+    {
+        Ok(t)  :
+        {
+            HashMap::insert(&mut s.files, key, String::clone(&t));
+            Some(t)
+        },
+        Err(_) : None,
+    }
+}
+
+// `export module NAME "PATH";` at the start of a line: the name and the path.
+fn nested_module(StringView line) : Option<Pair>
+{
+    StringView rest = match (StringView::strip_prefix(line, "export module "))
+    {
+        Some(r) : r,
+        None    : return None,
+    };
+    usize sp = match (find_byte(rest, b' '))
+    {
+        Some(k) : k,
+        None    : return None,
+    };
+    StringView after = &rest[sp + 1..$];
+    StringView quoted = match (StringView::strip_prefix(after, "\""))
+    {
+        Some(q) : q,
+        None    : return None,
+    };
+    match (StringView::strip_suffix(quoted, "\";"))
+    {
+        Some(p) : Some(pair(&rest[0..sp], p)),
+        None    : None,
+    }
+}
+
+// `text` appended to `out`, each `export module m "path";` line replaced by
+// that file's items inside `export module m { … }`, recursively; `origin`
+// gets one entry for each line appended.
+fn splice(
+    ref<Std, exclusive> s,
+    StringView text,
+    StringView file,
+    bool known,
+    ref<String, exclusive> out,
+    ref<Vec<Origin>, exclusive> origin,
+)
+{
+    Vec<StringView> lines = StringView::lines(text);
+    for (usize i = 0; i < Vec::len(&lines); i += 1)
+    {
+        StringView line = lines[i];
+        bool done = false;
+        match (nested_module(line))
+        {
+            Some(np) :
+            {
+                match (std_file(s, &np.b))
+                {
+                    Some(inner) :
+                    {
+                        String::appendf(out, "export module %s\n{\n", &np.a);
+                        Vec::push(origin, Origin { .known = false, .file = String::new(), .line = 0 });
+                        Vec::push(origin, Origin { .known = false, .file = String::new(), .line = 0 });
+                        splice(s, &inner, &np.b, true, out, origin);
+                        String::append(out, "}\n");
+                        Vec::push(origin, Origin { .known = false, .file = String::new(), .line = 0 });
+                        done = true;
+                    },
+                    None        : {},
+                }
+            },
+            None     : {},
+        }
+        if (!done)
+        {
+            String::append(out, line);
+            String::append(out, "\n");
+            Vec::push(origin, Origin { .known = known, .file = String::copy(file), .line = i + 1 });
+        }
+    }
+}
+
+// The prelude's source and where each of its lines came from.
+struct Prelude
+{
+    String src;
+    Vec<Origin> origin;
+}
+
+fn assemble(ref<Std, exclusive> s) : Result<Prelude, String>
+{
+    String root = match (std_file(s, "std.cb"))
+    {
+        Some(t) : t,
+        None    : return Err(sprintf("no file std.cb in %s", &s.dir)),
+    };
+    Vec<Origin> origin = Vec::new();
+    for (usize i = 0; i < 3; i += 1)
+    {
+        Vec::push(&mut origin, Origin { .known = false, .file = String::new(), .line = 0 });
+    }
+    String out = "\nexport module std\n{\n";
+    splice(s, &root, "", false, &mut out, &mut origin);
+    String::append(&mut out, "}\n");
+    Vec::push(&mut origin, Origin { .known = false, .file = String::new(), .line = 0 });
+    Ok(Prelude { .src = out, .origin = origin })
+}
+
+fn count_newlines(StringView v) : usize
+{
+    slice<u8, shared> b = StringView::as_bytes(v);
+    usize n = 0;
+    for (usize i = 0; i < StringView::len(v); i += 1)
+    {
+        if (b[i] == b'\n')
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// One record a run of lines from one file: `first_line file file_line count`.
+fn origins_text(ref<Prelude, shared> pre) : String
+{
+    usize line_count = count_newlines(&pre.src) + 1;
+    String out = String::new();
+    bool have = false;
+    usize first = 0;
+    String file = String::new();
+    usize at = 0;
+    usize count = 0;
+    for (usize n = 1; n <= line_count; n += 1)
+    {
+        bool known = n - 1 < Vec::len(&pre.origin) && pre.origin[n - 1].known;
+        if (known && have && file == pre.origin[n - 1].file && at + count == pre.origin[n - 1].line)
+        {
+            count += 1;
+            continue;
+        }
+        if (have)
+        {
+            String::appendf(&mut out, "%v %s %v %v\n", first, &file, at, count);
+            have = false;
+        }
+        if (known)
+        {
+            have = true;
+            first = n;
+            file = String::clone(&pre.origin[n - 1].file);
+            at = pre.origin[n - 1].line;
+            count = 1;
+        }
+    }
+    if (have)
+    {
+        String::appendf(&mut out, "%v %s %v %v\n", first, &file, at, count);
+    }
+    out
+}
+
+// ---- the prelude's tokens ----
+
+fn tok_text(ref<String, shared> src, ref<Token, shared> t) : StringView from src
+{
+    &(*src)[t.pos..t.pos + t.len]
+}
+
+// Each `{`'s matching `}` (`usize::MAX` for any other token).
+fn closes(ref<Vec<Token>, shared> toks) : Result<Vec<usize>, String>
+{
+    usize n = Vec::len(toks);
+    Vec<usize> close = Vec::filled(n, 18446744073709551615);
+    Vec<usize> open = Vec::new();
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (toks[k].tok == Tok::LBrace)
+        {
+            Vec::push(&mut open, k);
+        }
+        else if (toks[k].tok == Tok::RBrace)
+        {
+            match (Vec::pop(&mut open))
+            {
+                Some(o) : close[o] = k,
+                None    : return Err("an unmatched `}` in the prelude"),
+            }
+        }
+    }
+    Ok(close)
+}
+
+fn tok_is(ref<Vec<Token>, shared> toks, usize i, Tok t) : bool
+{
+    i < Vec::len(toks) && toks[i].tok == t
+}
+
+// `prelude_skeleton`'s text, unchecked (`skeleton_text`): every brace,
+// `module NAME {`, each `const` declaration through its `;` (with an
+// `export` before it), and `struct`/`enum`/`bitstruct` with the two tokens
+// after it.
+fn skeleton_text(ref<String, shared> src) : Result<String, String>
+{
+    Lexed lx = match (lex(src))
+    {
+        Ok(l)  : l,
+        Err(e) : return Err(String::clone(&e.msg)),
+    };
+    ref<Vec<Token>, shared> toks = &lx.toks;
+    usize n = Vec::len(toks);
+    Vec<bool> keep = Vec::filled(n, false);
+    for (usize i = 0; i < n; i += 1)
+    {
+        Tok t = toks[i].tok;
+        if (t == Tok::LBrace || t == Tok::RBrace)
+        {
+            keep[i] = true;
+        }
+        else if (t == Tok::Module && tok_is(toks, i + 1, Tok::Ident) && tok_is(toks, i + 2, Tok::LBrace))
+        {
+            keep[i] = true;
+            keep[i + 1] = true;
+        }
+        else if (t == Tok::Const)
+        {
+            if (i > 0 && toks[i - 1].tok == Tok::Export)
+            {
+                keep[i - 1] = true;
+            }
+            usize k = i;
+            while (k < n && toks[k].tok != Tok::Semi && toks[k].tok != Tok::Eof)
+            {
+                keep[k] = true;
+                k += 1;
+            }
+            if (k < n && toks[k].tok == Tok::Semi)
+            {
+                keep[k] = true;
+            }
+        }
+        else if (t == Tok::Struct || t == Tok::Enum || t == Tok::Bitstruct)
+        {
+            usize end = if (i + 3 < n) { i + 3 } else { n };
+            for (usize k = i; k < end; k += 1)
+            {
+                if (toks[k].tok != Tok::Eof)
+                {
+                    keep[k] = true;
+                }
+            }
+        }
+    }
+    String out = String::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (keep[i])
+        {
+            if (StringView::len(&out) > 0)
+            {
+                String::append(&mut out, " ");
+            }
+            String::append(&mut out, tok_text(src, &toks[i]));
+        }
+    }
+    String::append(&mut out, "\n");
+    Ok(out)
+}
+
+// The skeleton, checked: pre-scanned, it gives the tables the prelude gives.
+fn prelude_skeleton(ref<String, shared> src) : Result<String, String>
+{
+    String out = skeleton_text(src)?;
+    if (prescan_tables(src)? != prescan_tables(&out)?)
+    {
+        return Err("the skeleton's pre-scan differs from the prelude's");
+    }
+    Ok(out)
+}
+
+// Where a function's declaration ends: the index of its body's `{` or its
+// `;` (a `requires` block, D-0317, is the declaration's), from token `from`.
+fn fn_head_end(
+    ref<String, shared> src,
+    ref<Vec<Token>, shared> toks,
+    ref<Vec<usize>, shared> close,
+    usize from,
+    usize end,
+    bool requires_is_ident,
+) : usize
+{
+    usize k = from;
+    usize paren = 0;
+    while (k < end)
+    {
+        Tok t = toks[k].tok;
+        if (t == Tok::LParen)
+        {
+            paren += 1;
+        }
+        else if (t == Tok::RParen)
+        {
+            paren -= 1;
+        }
+        else if (t == Tok::LBrace && paren == 0
+            && (!requires_is_ident || toks[k - 1].tok == Tok::Ident)
+            && tok_text(src, &toks[k - 1]) == "requires")
+        {
+            k = close[k];
+        }
+        else if ((t == Tok::Semi || t == Tok::LBrace) && paren == 0)
+        {
+            break;
+        }
+        k += 1;
+    }
+    k
+}
+
+fn scan_decls(
+    ref<String, shared> src,
+    ref<Vec<Token>, shared> toks,
+    ref<Vec<usize>, shared> close,
+    ref<Vec<bool>, exclusive> keep,
+    usize from,
+    usize end,
+)
+{
+    usize i = from;
+    while (i < end)
+    {
+        Tok t = toks[i].tok;
+        if (t == Tok::Module && tok_is(toks, i + 1, Tok::Ident) && tok_is(toks, i + 2, Tok::LBrace))
+        {
+            usize c = close[i + 2];
+            scan_decls(src, toks, close, keep, i + 3, c);
+            i = c + 1;
+        }
+        else if (t == Tok::Fn)
+        {
+            usize k = fn_head_end(src, toks, close, i + 1, end, true);
+            if (k < end && toks[k].tok == Tok::LBrace)
+            {
+                usize c = close[k];
+                for (usize j = k + 1; j < c; j += 1)
+                {
+                    keep[j] = false;
+                }
+                i = c + 1;
+            }
+            else
+            {
+                i = k + 1;
+            }
+        }
+        else if (t == Tok::Unittest)
+        {
+            // A test is kept, its body emptied: the declarations make the
+            // prelude's `__unittest_N` functions (D-0230).
+            usize k = i;
+            while (toks[k].tok != Tok::LBrace)
+            {
+                k += 1;
+            }
+            usize c = close[k];
+            for (usize j = k + 1; j < c; j += 1)
+            {
+                keep[j] = false;
+            }
+            i = c + 1;
+        }
+        else if (t == Tok::LBrace)
+        {
+            i = close[i] + 1;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+}
+
+// The program's items without its tests, every function's body and
+// requirements emptied, as text: what the declarations must parse to.
+fn strip_items(ref<Vec<Item>, exclusive> items)
+{
+    usize i = 0;
+    while (i < Vec::len(items))
+    {
+        bool drop_it = false;
+        match (&mut items[i])
+        {
+            Item::IFn(f)     :
+            {
+                ref<FnDecl, exclusive> d = Box::get_mut(f);
+                if (StringView::starts_with(&d.name, "__unittest_"))
+                {
+                    drop_it = true;
+                }
+                else
+                {
+                    d.body = Block { .stmts = Vec::new(), .tail = None };
+                    Vec::clear(&mut d.requires);
+                }
+            },
+            Item::IModule(m) :
+            {
+                ref<ModuleItem, exclusive> mi = Box::get_mut(m);
+                strip_items(&mut mi.items);
+            },
+            _                : {},
+        }
+        if (drop_it)
+        {
+            _ = Vec::remove(items, i);
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+}
+
+fn shape(ref<String, shared> text) : Result<String, String>
+{
+    Program p = parse_alone(text)?;
+    strip_items(&mut p.items);
+    Vec::clear(&mut p.tests);
+    Ok(dump_program(&p, 0, 0))
+}
+
+// The prelude's text with every function's and every test's body emptied,
+// each line where it was (`prelude_declarations`, CHG-0352).
+fn prelude_declarations(ref<String, shared> src) : Result<String, String>
+{
+    Lexed lx = match (lex(src))
+    {
+        Ok(l)  : l,
+        Err(e) : return Err(String::clone(&e.msg)),
+    };
+    ref<Vec<Token>, shared> toks = &lx.toks;
+    usize n = Vec::len(toks);
+    Vec<usize> close = closes(toks)?;
+    Vec<bool> keep = Vec::filled(n, true);
+    scan_decls(src, toks, &close, &mut keep, 0, n);
+    String out = String::new();
+    for (usize k = 0; k < n; k += 1)
+    {
+        for (usize r = toks[k].tr_lo; r < toks[k].tr_hi; r += 1)
+        {
+            ref<Trivia, shared> tr = &lx.trivia[r];
+            usize breaks = if (tr.kind == TRIVIA_NEWLINE)
+            {
+                1
+            }
+            else if (tr.kind == TRIVIA_BLOCK)
+            {
+                count_newlines(&(*src)[tr.pos..tr.pos + tr.len])
+            }
+            else
+            {
+                0
+            };
+            for (usize b = 0; b < breaks; b += 1)
+            {
+                String::append(&mut out, "\n");
+            }
+        }
+        if (keep[k] && toks[k].tok != Tok::Eof)
+        {
+            if (StringView::len(&out) > 0 && !StringView::ends_with(&out, "\n"))
+            {
+                String::append(&mut out, " ");
+            }
+            String::append(&mut out, tok_text(src, &toks[k]));
+        }
+    }
+    String::append(&mut out, "\n");
+    if (shape(src)? != shape(&out)?)
+    {
+        return Err("the prelude's declarations differ from the prelude's items");
+    }
+    Ok(out)
+}
+
+// One function of the prelude found by the scan: its first and last token,
+// its key, its module, and a test's place among the prelude's (from 1;
+// 0 for a function).
+struct Found
+{
+    usize start;
+    usize end;
+    String key;
+    String module_;
+    usize test;
+}
+
+fn path_joined(ref<Vec<String>, shared> path) : String
+{
+    String::join(path, "::")
+}
+
+fn scan_bodies(
+    ref<String, shared> src,
+    ref<Vec<Token>, shared> toks,
+    ref<Vec<usize>, shared> close,
+    ref<Vec<String>, exclusive> path,
+    ref<Vec<Found>, exclusive> out,
+    usize from,
+    usize end,
+)
+{
+    usize i = from;
+    while (i < end)
+    {
+        Tok t = toks[i].tok;
+        if (t == Tok::Module && tok_is(toks, i + 1, Tok::Ident) && tok_is(toks, i + 2, Tok::LBrace))
+        {
+            usize c = close[i + 2];
+            Vec::push(path, String::copy(tok_text(src, &toks[i + 1])));
+            scan_bodies(src, toks, close, path, out, i + 3, c);
+            _ = Vec::pop(path);
+            i = c + 1;
+        }
+        else if (t == Tok::Unittest)
+        {
+            // D-0230: a test is the function `__unittest_N`.
+            usize k = i;
+            while (toks[k].tok != Tok::LBrace)
+            {
+                k += 1;
+            }
+            usize test = 1;
+            foreach (f in out)
+            {
+                if (f.test > 0)
+                {
+                    test += 1;
+                }
+            }
+            String simple = sprintf("__unittest_%v", test);
+            Vec::push(out, Found { .start = i, .end = close[k], .key = qualify(path, &simple), .module_ = path_joined(path), .test = test });
+            i = close[k] + 1;
+        }
+        else if (t == Tok::Fn)
+        {
+            usize start = if (i > 0 && toks[i - 1].tok == Tok::Export) { i - 1 } else { i };
+            // D-0303: the function's attribute is part of its text.
+            if (start >= 2 && toks[start - 1].tok == Tok::RBracket && toks[start - 2].tok == Tok::RBracket)
+            {
+                usize k = start - 2;
+                while (k >= 1 && !(toks[k].tok == Tok::LBracket && toks[k - 1].tok == Tok::LBracket))
+                {
+                    k -= 1;
+                }
+                start = k - 1;
+            }
+            String simple = if (toks[i + 2].tok == Tok::ColonColon)
+            {
+                sprintf("%s::%s", tok_text(src, &toks[i + 1]), tok_text(src, &toks[i + 3]))
+            }
+            else
+            {
+                String::copy(tok_text(src, &toks[i + 1]))
+            };
+            usize k = fn_head_end(src, toks, close, i + 1, end, false);
+            if (k < end && toks[k].tok == Tok::LBrace)
+            {
+                Vec::push(out, Found { .start = start, .end = close[k], .key = qualify(path, &simple), .module_ = path_joined(path), .test = 0 });
+                i = close[k] + 1;
+            }
+            else
+            {
+                i = k + 1;
+            }
+        }
+        else if (t == Tok::LBrace)
+        {
+            i = close[i] + 1;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+}
+
+// The prelude's own parse of each function, by key.
+fn collect_parsed(ref<Vec<Item>, shared> items, ref<Vec<String>, exclusive> path, ref<HashMap<String, String>, exclusive> out)
+{
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(f)     :
+            {
+                ref<FnDecl, shared> d = Box::get(f);
+                String simple = match (&d.assoc_type)
+                {
+                    Some(t) : sprintf("%s::%s", t, &d.name),
+                    None    : String::clone(&d.name),
+                };
+                Vec<Item> one_items = Vec::new();
+                Vec::push(&mut one_items, clone(&items[i]));
+                Program one = Program { .items = one_items, .tests = Vec::new() };
+                HashMap::insert(out, qualify(path, &simple), dump_program(&one, 0, 0));
+            },
+            Item::IModule(m) :
+            {
+                ref<ModuleItem, shared> mi = Box::get(m);
+                Vec::push(path, String::clone(&mi.name));
+                collect_parsed(&mi.items, path, out);
+                _ = Vec::pop(path);
+            },
+            _                : {},
+        }
+    }
+}
+
+// One function of `std` with a body, for a parse of its own (CHG-0355).
+struct Body
+{
+    String key;
+    String module_;
+    usize line;
+    usize col;
+    usize fresh;
+    usize local_consts;
+    StringView text;
+}
+
+// The counters the prelude leaves, and its bodies' records and texts.
+struct Bodies
+{
+    usize fresh;
+    usize local_consts;
+    usize tests;
+    String index;
+    String texts;
+}
+
+fn prelude_bodies(ref<String, shared> src) : Result<Bodies, String>
+{
+    Lexed lx = match (lex(src))
+    {
+        Ok(l)  : l,
+        Err(e) : return Err(String::clone(&e.msg)),
+    };
+    ref<Vec<Token>, shared> toks = &lx.toks;
+    usize n = Vec::len(toks);
+    Vec<usize> close = closes(toks)?;
+    Vec<Found> found = Vec::new();
+    Vec<String> path = Vec::new();
+    scan_bodies(src, toks, &close, &mut path, &mut found, 0, n);
+    WholeParse whole = parse_whole(src)?;
+    HashMap<String, String> parsed = HashMap::new();
+    Vec<String> at = Vec::new();
+    collect_parsed(&whole.program.items, &mut at, &mut parsed);
+    String skel_text = prelude_skeleton(src)?;
+    Vec<PTok> skeleton = match (lex_tokens(&skel_text))
+    {
+        Ok(t)  : t,
+        Err(e) : return Err(String::clone(&e.msg)),
+    };
+    _ = Vec::pop(&mut skeleton);
+    // Where each line begins, for a token's line and column (in bytes).
+    Vec<usize> line_starts = Vec::new();
+    Vec::push(&mut line_starts, 0);
+    slice<u8, shared> sb = StringView::as_bytes(src);
+    for (usize i = 0; i < StringView::len(src); i += 1)
+    {
+        if (sb[i] == b'\n')
+        {
+            Vec::push(&mut line_starts, i + 1);
+        }
+    }
+    String index = String::new();
+    String texts = String::new();
+    usize line_ix = 0;
+    foreach (f in &found)
+    {
+        usize pos = toks[f.start].pos;
+        while (line_ix + 1 < Vec::len(&line_starts) && line_starts[line_ix + 1] <= pos)
+        {
+            line_ix += 1;
+        }
+        usize line = line_ix + 1;
+        usize col = pos - line_starts[line_ix] + 1;
+        StringView text = &(*src)[pos..toks[f.end].pos + 1];
+        ItemCounters c = match (HashMap::get(&whole.counters, line))
+        {
+            Some(c) : ItemCounters { .fresh = c.fresh, .local_consts = c.local_consts },
+            None    : return Err(sprintf("no item begins at line %v of the prelude", line)),
+        };
+        Vec<UnitTest> tests = Vec::new();
+        if (f.test > 0)
+        {
+            for (usize t = 0; t + 1 < f.test; t += 1)
+            {
+                Vec::push(&mut tests, clone(&whole.program.tests[t]));
+            }
+        }
+        Item item = match (parse_item_after(&skeleton, text, line, col, c.fresh, c.local_consts, tests))
+        {
+            Ok(it) : it,
+            Err(e) : return Err(sprintf("`%s` does not parse alone: %s", &f.key, &e)),
+        };
+        Vec<Item> one_items = Vec::new();
+        Vec::push(&mut one_items, item);
+        Program one = Program { .items = one_items, .tests = Vec::new() };
+        bool same = match (HashMap::get(&parsed, &f.key))
+        {
+            Some(d) : *d == dump_program(&one, 0, 0),
+            None    : false,
+        };
+        if (!same)
+        {
+            return Err(sprintf("`%s` parsed alone differs from the prelude's parse of it", &f.key));
+        }
+        String::appendf(
+            &mut index,
+            "%s %s %v %v %v %v %v %v\n",
+            &f.key,
+            &f.module_,
+            line,
+            col,
+            c.fresh,
+            c.local_consts,
+            StringView::len(&texts),
+            StringView::len(text),
+        );
+        String::append(&mut texts, text);
+    }
+    Ok(Bodies {
+        .fresh = whole.fresh,
+        .local_consts = whole.local_consts,
+        .tests = Vec::len(&whole.program.tests),
+        .index = index,
+        .texts = texts,
+    })
+}
+
+// ---- std's documentation ----
+
+// An item as `cobdoc.py` reads it, before it is laid out.
+struct DocItem
+{
+    String module_;
+    String item;
+    String kind;
+    String signature;
+    Vec<String> requires;
+    Option<String> doc;
+    String file;
+    Vec<DocExample> examples;
+    String retired_kind;
+    String retired_msg;
+}
+
+struct DocExample
+{
+    Option<String> name;
+    String code;
+}
+
+// The documentation's first sentence: up to the first `. ` outside
+// backticks (or the end of the first paragraph).
+fn summary(StringView doc) : String
+{
+    StringView first = match (StringView::find(doc, "\n\n"))
+    {
+        Some(k) : &doc[0..k],
+        None    : doc,
+    };
+    String joined = StringView::replace(first, "\n", " ");
+    StringView para = StringView::trim(&joined);
+    slice<u8, shared> b = StringView::as_bytes(para);
+    usize n = StringView::len(para);
+    bool code = false;
+    for (usize i = 0; i < n; i += 1)
+    {
+        u8 c = b[i];
+        if (c == b'`')
+        {
+            code = !code;
+        }
+        else if (c == b'.' && !code && (i + 1 == n || is_ws(b[i + 1])))
+        {
+            return String::copy(&para[0..i + 1]);
+        }
+    }
+    String::copy(para)
+}
+
+// An item's declaration from line `i`, up to its body or its `;`.
+fn signature(ref<Vec<StringView>, shared> lines, usize i) : String
+{
+    Vec<String> out = Vec::new();
+    usize stop = if (i + 40 < Vec::len(lines)) { i + 40 } else { Vec::len(lines) };
+    for (usize j = i; j < stop; j += 1)
+    {
+        StringView line = lines[j];
+        usize cut = StringView::len(line);
+        match (find_byte(line, b'{'))
+        {
+            Some(k) : if (k < cut) { cut = k; },
+            None    : {},
+        }
+        match (find_byte(line, b';'))
+        {
+            Some(k) : if (k + 1 < cut) { cut = k + 1; },
+            None    : {},
+        }
+        Vec::push(&mut out, String::copy(StringView::trim(&line[0..cut])));
+        StringView r = StringView::trim_end(line);
+        if (cut < StringView::len(line) || StringView::ends_with(r, ";") || StringView::ends_with(r, "{"))
+        {
+            break;
+        }
+    }
+    Vec<String> parts = Vec::new();
+    foreach (p in &out)
+    {
+        if (StringView::len(p) > 0)
+        {
+            Vec::push(&mut parts, String::clone(p));
+        }
+    }
+    String sig = String::join(&parts, " ");
+    // D-0317: a `requires` block is not part of the signature.
+    Option<String> without = match (StringView::strip_suffix(StringView::trim_end(&sig), "requires"))
+    {
+        Some(head) :
+        {
+            usize hl = StringView::len(head);
+            if (hl == 0 || !is_word_byte(StringView::as_bytes(head)[hl - 1]))
+            {
+                Some(String::copy(StringView::trim_end(head)))
+            }
+            else
+            {
+                None
+            }
+        },
+        None       : None,
+    };
+    match (without)
+    {
+        Some(w) : sig = w,
+        None    : {},
+    }
+    // `(\s+` → `(`, `\s+)` → `)`, `,\s*)` → `)`.
+    slice<u8, shared> c = StringView::as_bytes(&sig);
+    usize n = StringView::len(&sig);
+    Vec<u8> s = Vec::new();
+    usize k = 0;
+    while (k < n)
+    {
+        u8 ch = c[k];
+        if (ch == b'(')
+        {
+            Vec::push(&mut s, ch);
+            k += 1;
+            while (k < n && is_ws(c[k]))
+            {
+                k += 1;
+            }
+            continue;
+        }
+        if (is_ws(ch))
+        {
+            usize j = k;
+            while (j < n && is_ws(c[j]))
+            {
+                j += 1;
+            }
+            if (j < n && c[j] == b')')
+            {
+                k = j;
+                continue;
+            }
+        }
+        if (ch == b',')
+        {
+            usize j = k + 1;
+            while (j < n && is_ws(c[j]))
+            {
+                j += 1;
+            }
+            if (j < n && c[j] == b')')
+            {
+                k = j;
+                continue;
+            }
+        }
+        Vec::push(&mut s, ch);
+        k += 1;
+    }
+    String cleaned = Result::expect(String::from_utf8(s), "a signature stays UTF-8");
+    String squeezed = squeeze(&cleaned);
+    StringView v = &squeezed;
+    while (StringView::ends_with(v, ";"))
+    {
+        v = &v[0..StringView::len(v) - 1];
+    }
+    String::copy(StringView::trim(v))
+}
+
+// D-0317: the requirements of the `fn` declared from line `i`, each as
+// written (`cond, diag, "message", args`), in order; none without a
+// `requires` block.
+fn requires_of(ref<Vec<StringView>, shared> lines, usize i) : Vec<String>
+{
+    Vec<StringView> take = Vec::new();
+    usize stop = if (i + 200 < Vec::len(lines)) { i + 200 } else { Vec::len(lines) };
+    for (usize j = i; j < stop; j += 1)
+    {
+        Vec::push(&mut take, lines[j]);
+    }
+    String text = StringView::join(&take, "\n");
+    slice<u8, shared> b = StringView::as_bytes(&text);
+    usize n = StringView::len(&text);
+    // `\brequires\s*\{`
+    Option<usize> at = None;
+    usize from = 0;
+    while (true)
+    {
+        usize k = match (StringView::find(&text[from..$], "requires"))
+        {
+            Some(k) : k,
+            None    : break,
+        };
+        usize s = from + k;
+        usize e = s + 8;
+        bool word_start = s == 0 || !is_word_byte(b[s - 1]);
+        usize j = e;
+        while (j < n && is_ws(b[j]))
+        {
+            j += 1;
+        }
+        if (word_start && j < n && b[j] == b'{')
+        {
+            at = Some(j + 1);
+            break;
+        }
+        from = e;
+    }
+    Vec<String> none = Vec::new();
+    usize open = match (at)
+    {
+        Some(o) : o,
+        None    : return none,
+    };
+    for (usize h = 0; h < n; h += 1)
+    {
+        if (b[h] == b'{' || b[h] == b';')
+        {
+            if (h < open - 1)
+            {
+                return none;
+            }
+            break;
+        }
+    }
+    Vec<String> parts = Vec::new();
+    Vec<u8> part = Vec::new();
+    i64 depth = 0;
+    bool quote = false;
+    usize k = open;
+    while (k < n)
+    {
+        u8 c = b[k];
+        if (quote)
+        {
+            Vec::push(&mut part, c);
+            if (c == b'\\' && k + 1 < n)
+            {
+                Vec::push(&mut part, b[k + 1]);
+                k += 1;
+            }
+            else if (c == b'"')
+            {
+                quote = false;
+            }
+        }
+        else if (c == b'"')
+        {
+            quote = true;
+            Vec::push(&mut part, c);
+        }
+        else if (c == b'(' || c == b'[' || c == b'{')
+        {
+            depth += 1;
+            Vec::push(&mut part, c);
+        }
+        else if (c == b')' || c == b']' || c == b'}')
+        {
+            if (depth == 0)
+            {
+                break;
+            }
+            depth -= 1;
+            Vec::push(&mut part, c);
+        }
+        else if (c == b';' && depth == 0)
+        {
+            Vec::push(&mut parts, Result::expect(String::from_utf8(replace(&mut part, Vec::new())), "a requirement stays UTF-8"));
+        }
+        else
+        {
+            Vec::push(&mut part, c);
+        }
+        k += 1;
+    }
+    Vec<String> out = Vec::new();
+    foreach (p in &parts)
+    {
+        String q = squeeze(p);
+        if (StringView::len(&q) > 0)
+        {
+            Vec::push(&mut out, q);
+        }
+    }
+    out
+}
+
+// `[[deprecated("m")]]` or `[[removed("m")]]` alone on a line: the kind and
+// the message.
+fn attr(StringView line) : Option<Pair>
+{
+    StringView s = StringView::trim(line);
+    StringView a = StringView::strip_prefix(s, "[[")?;
+    StringView rest = StringView::strip_suffix(a, "]]")?;
+    str kind = "deprecated";
+    StringView after = match (StringView::strip_prefix(rest, "deprecated"))
+    {
+        Some(r) : r,
+        None    :
+        {
+            kind = "removed";
+            StringView::strip_prefix(rest, "removed")?
+        },
+    };
+    StringView m1 = StringView::strip_prefix(after, "(\"")?;
+    StringView msg = StringView::strip_suffix(m1, "\")")?;
+    Some(pair(kind, msg))
+}
+
+fn ident_end(StringView s) : usize
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    usize n = StringView::len(s);
+    if (n == 0 || !(is_alpha_byte(b[0]) || b[0] == b'_'))
+    {
+        return 0;
+    }
+    usize k = 1;
+    while (k < n && is_word_byte(b[k]))
+    {
+        k += 1;
+    }
+    k
+}
+
+// `w` and white space after it: what follows; none without the space.
+fn eat_word(StringView s, str w) : Option<StringView> from s
+{
+    StringView r = StringView::strip_prefix(s, w)?;
+    StringView t = StringView::trim_start(r);
+    if (StringView::len(t) == StringView::len(r))
+    {
+        return None;
+    }
+    Some(t)
+}
+
+// `export [unsafe] [extern] fn NAME`: the kind and the name.
+fn fn_head(StringView line) : Option<Pair>
+{
+    StringView r = eat_word(line, "export")?;
+    match (eat_word(r, "unsafe"))
+    {
+        Some(t) : r = t,
+        None    : {},
+    }
+    str kind = "fn";
+    match (eat_word(r, "extern"))
+    {
+        Some(t) :
+        {
+            r = t;
+            kind = "extern fn";
+        },
+        None    : {},
+    }
+    StringView f = eat_word(r, "fn")?;
+    usize e = ident_end(f);
+    if (e == 0)
+    {
+        return None;
+    }
+    String name = String::copy(&f[0..e]);
+    match (StringView::strip_prefix(&f[e..$], "::"))
+    {
+        Some(t) :
+        {
+            usize e2 = ident_end(t);
+            if (e2 > 0)
+            {
+                name = sprintf("%s::%s", &name, &t[0..e2]);
+            }
+        },
+        None    : {},
+    }
+    Some(Pair { .a = String::copy(kind), .b = name })
+}
+
+// `export [resource|quiet]* (struct|enum|bitstruct) NAME`.
+fn type_head(StringView line) : Option<Pair>
+{
+    StringView r = eat_word(line, "export")?;
+    while (true)
+    {
+        match (eat_word(r, "resource"))
+        {
+            Some(t) :
+            {
+                r = t;
+                continue;
+            },
+            None    : {},
+        }
+        match (eat_word(r, "quiet"))
+        {
+            Some(t) : r = t,
+            None    : break,
+        }
+    }
+    Vec<str> kinds = Vec::new();
+    Vec::push(&mut kinds, "struct");
+    Vec::push(&mut kinds, "enum");
+    Vec::push(&mut kinds, "bitstruct");
+    foreach (k in &kinds)
+    {
+        match (eat_word(r, *k))
+        {
+            Some(t) :
+            {
+                usize e = ident_end(t);
+                if (e > 0)
+                {
+                    return Some(pair(*k, &t[0..e]));
+                }
+            },
+            None    : {},
+        }
+    }
+    None
+}
+
+// `export const … NAME =`.
+fn const_head(StringView line) : Option<String>
+{
+    StringView r0 = eat_word(line, "export")?;
+    StringView r = eat_word(r0, "const")?;
+    slice<u8, shared> b = StringView::as_bytes(r);
+    for (usize k = 0; k < StringView::len(r); k += 1)
+    {
+        if (b[k] != b'=')
+        {
+            continue;
+        }
+        usize e = k;
+        while (e > 0 && is_ws(b[e - 1]))
+        {
+            e -= 1;
+        }
+        usize s = e;
+        while (s > 0 && is_word_byte(b[s - 1]))
+        {
+            s -= 1;
+        }
+        while (s < e && is_digit_byte(b[s]))
+        {
+            s += 1;
+        }
+        if (s < e)
+        {
+            return Some(String::copy(&r[s..e]));
+        }
+    }
+    None
+}
+
+// `[export] module NAME "PATH";`.
+fn module_line(StringView line) : Option<Pair>
+{
+    StringView r0 = match (eat_word(line, "export"))
+    {
+        Some(t) : t,
+        None    : line,
+    };
+    StringView r = eat_word(r0, "module")?;
+    usize e = ident_end(r);
+    if (e == 0)
+    {
+        return None;
+    }
+    StringView rest0 = StringView::trim_start(&r[e..$]);
+    StringView rest = StringView::strip_prefix(rest0, "\"")?;
+    usize q = find_byte(rest, b'"')?;
+    if (StringView::trim(&rest[q + 1..$]) != ";")
+    {
+        return None;
+    }
+    Some(pair(&r[0..e], &rest[0..q]))
+}
+
+// `unittest ["NAME"] [{]`: the indent and the name.
+struct TestLine
+{
+    String indent;
+    Option<String> name;
+}
+
+fn test_line(StringView line) : Option<TestLine>
+{
+    usize indent_len = lead_len(line);
+    StringView r0 = StringView::strip_prefix(&line[indent_len..$], "unittest")?;
+    StringView r = StringView::trim_start(r0);
+    Option<String> name = None;
+    StringView rest = r;
+    match (StringView::strip_prefix(r, "\""))
+    {
+        Some(q) :
+        {
+            slice<u8, shared> b = StringView::as_bytes(q);
+            usize n = StringView::len(q);
+            Option<usize> end = None;
+            usize k = 0;
+            while (k < n)
+            {
+                if (b[k] == b'\\')
+                {
+                    k += 2;
+                    continue;
+                }
+                if (b[k] == b'"')
+                {
+                    end = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            usize e = end?;
+            name = Some(String::copy(&q[0..e]));
+            rest = &q[e + 1..$];
+        },
+        None    : {},
+    }
+    StringView tail = StringView::trim(rest);
+    if (!(StringView::len(tail) == 0 || tail == "{"))
+    {
+        return None;
+    }
+    Some(TestLine { .indent = String::copy(&line[0..indent_len]), .name = name })
+}
+
+fn items_of(
+    ref<Std, exclusive> s,
+    StringView path,
+    StringView module_,
+    ref<Vec<DocItem>, exclusive> out,
+    ref<Vec<String>, exclusive> seen,
+)
+{
+    foreach (p in seen)
+    {
+        if (*p == path)
+        {
+            return;
+        }
+    }
+    Vec::push(seen, String::copy(path));
+    String text = match (std_file(s, path))
+    {
+        Some(t) : t,
+        None    : return,
+    };
+    Vec<StringView> lines = StringView::split(&text, "\n");
+    StringView dir = match (StringView::rfind(path, "/"))
+    {
+        Some(k) : &path[0..k + 1],
+        None    : "",
+    };
+    Vec<String> doc = Vec::new();
+    bool has_retired = false;
+    String retired_kind = String::new();
+    String retired_msg = String::new();
+    for (usize i = 0; i < Vec::len(&lines); i += 1)
+    {
+        StringView line = lines[i];
+        match (attr(line))
+        {
+            Some(a) :
+            {
+                has_retired = true;
+                retired_kind = String::clone(&a.a);
+                retired_msg = String::clone(&a.b);
+                continue;
+            },
+            None    : {},
+        }
+        match (StringView::strip_prefix(line, "///"))
+        {
+            Some(t) :
+            {
+                StringView d = Option::unwrap_or(StringView::strip_prefix(t, " "), t);
+                Vec::push(&mut doc, String::copy(d));
+                continue;
+            },
+            None    : {},
+        }
+        match (module_line(line))
+        {
+            Some(ml) :
+            {
+                String p = sprintf("%s%s", dir, &ml.b);
+                String m = sprintf("%s::%s", module_, &ml.a);
+                items_of(s, &p, &m, out, seen);
+                Vec::clear(&mut doc);
+                continue;
+            },
+            None     : {},
+        }
+        match (test_line(line))
+        {
+            Some(tl) :
+            {
+                usize last = Vec::len(out);
+                if (Vec::len(&doc) > 0 && last > 0 && out[last - 1].file == path)
+                {
+                    Vec<StringView> body = Vec::new();
+                    for (usize j = i + 1; j < Vec::len(&lines); j += 1)
+                    {
+                        StringView later = lines[j];
+                        usize lead = lead_len(later);
+                        if (StringView::trim(later) == "}" && &later[0..lead] == &tl.indent)
+                        {
+                            break;
+                        }
+                        Vec::push(&mut body, later);
+                    }
+                    if (Vec::len(&body) > 0 && StringView::trim(body[0]) == "{")
+                    {
+                        _ = Vec::remove(&mut body, 0);
+                    }
+                    bool any = false;
+                    usize width = 0;
+                    foreach (bl in &body)
+                    {
+                        if (StringView::len(StringView::trim(*bl)) > 0)
+                        {
+                            usize w = lead_len(*bl);
+                            if (!any || w < width)
+                            {
+                                width = w;
+                            }
+                            any = true;
+                        }
+                    }
+                    Vec<StringView> code_lines = Vec::new();
+                    foreach (bl in &body)
+                    {
+                        if (StringView::len(*bl) >= width)
+                        {
+                            Vec::push(&mut code_lines, &(*bl)[width..$]);
+                        }
+                        else
+                        {
+                            Vec::push(&mut code_lines, "");
+                        }
+                    }
+                    String code = StringView::join(&code_lines, "\n");
+                    StringView cv = &code;
+                    while (StringView::starts_with(cv, "\n"))
+                    {
+                        cv = &cv[1..$];
+                    }
+                    while (StringView::ends_with(cv, "\n"))
+                    {
+                        cv = &cv[0..StringView::len(cv) - 1];
+                    }
+                    Vec::push(&mut out[last - 1].examples, DocExample { .name = clone(&tl.name), .code = String::copy(cv) });
+                }
+                Vec::clear(&mut doc);
+                continue;
+            },
+            None     : {},
+        }
+        Option<Pair> head = fn_head(line);
+        if (Option::is_none(&head))
+        {
+            head = type_head(line);
+        }
+        if (Option::is_none(&head))
+        {
+            match (const_head(line))
+            {
+                Some(nm) : head = Some(Pair { .a = "const", .b = nm }),
+                None     : {},
+            }
+        }
+        match (head)
+        {
+            Some(h) :
+            {
+                Option<String> text_doc = if (Vec::len(&doc) == 0)
+                {
+                    None
+                }
+                else
+                {
+                    String joined = String::join(&doc, "\n");
+                    Some(String::copy(StringView::trim(&joined)))
+                };
+                Vec<String> reqs = if (StringView::ends_with(&h.a, "fn")) { requires_of(&lines, i) } else { Vec::new() };
+                Vec::push(out, DocItem {
+                    .module_ = String::copy(module_),
+                    .item = String::clone(&h.b),
+                    .kind = String::clone(&h.a),
+                    .signature = signature(&lines, i),
+                    .requires = reqs,
+                    .doc = text_doc,
+                    .file = String::copy(path),
+                    .examples = Vec::new(),
+                    .retired_kind = if (has_retired) { String::clone(&retired_kind) } else { String::new() },
+                    .retired_msg = if (has_retired) { String::clone(&retired_msg) } else { String::new() },
+                });
+            },
+            None    : {},
+        }
+        Vec::clear(&mut doc);
+        has_retired = false;
+    }
+}
+
+// The entries of `impl/std/builtins.md` or `impl/std/intrinsics.md`.
+fn entry_head(StringView l) : Option<Pair>
+{
+    StringView r = StringView::strip_prefix(l, "## `")?;
+    usize k = StringView::find(r, "` in `")?;
+    StringView item = &r[0..k];
+    StringView rest = &r[k + 6..$];
+    StringView module_ = StringView::strip_suffix(StringView::trim_end(rest), "`")?;
+    Some(pair(item, module_))
+}
+
+fn entries(StringView source, StringView file, ref<Vec<DocItem>, exclusive> out)
+{
+    Vec<StringView> lines = StringView::split(source, "\n");
+    usize i = 0;
+    usize n = Vec::len(&lines);
+    while (i < n)
+    {
+        Pair h = match (entry_head(lines[i]))
+        {
+            Some(h) : h,
+            None    :
+            {
+                i += 1;
+                continue;
+            },
+        };
+        String sig = String::new();
+        Vec<StringView> body = Vec::new();
+        i += 1;
+        while (i < n && Option::is_none(&entry_head(lines[i])))
+        {
+            bool taken = false;
+            match (StringView::strip_prefix(lines[i], "Signature:"))
+            {
+                Some(s) :
+                {
+                    StringView st = StringView::trim(s);
+                    if (StringView::len(&sig) == 0 && StringView::starts_with(st, "`") && StringView::ends_with(st, "`"))
+                    {
+                        String plain = StringView::replace(st, "`", "");
+                        sig = String::copy(StringView::trim(&plain));
+                        taken = true;
+                    }
+                },
+                None    : {},
+            }
+            if (!taken)
+            {
+                Vec::push(&mut body, lines[i]);
+            }
+            i += 1;
+        }
+        String joined = StringView::join(&body, "\n");
+        StringView text = StringView::trim(&joined);
+        Vec::push(out, DocItem {
+            .module_ = String::clone(&h.b),
+            .item = String::clone(&h.a),
+            .kind = "built in fn",
+            .signature = sig,
+            .requires = Vec::new(),
+            .doc = if (StringView::len(text) == 0) { None } else { Some(String::copy(text)) },
+            .file = String::copy(file),
+            .examples = Vec::new(),
+            .retired_kind = String::new(),
+            .retired_msg = String::new(),
+        });
+    }
+}
+
+fn indent(StringView text, str by) : String
+{
+    Vec<StringView> lines = StringView::split(text, "\n");
+    Vec<String> out = Vec::new();
+    foreach (l in &lines)
+    {
+        if (StringView::len(*l) == 0)
+        {
+            Vec::push(&mut out, String::new());
+        }
+        else
+        {
+            Vec::push(&mut out, sprintf("%s%s", by, *l));
+        }
+    }
+    String::join(&out, "\n")
+}
+
+// An item's record, encoded: its module, name, kind, signature, summary,
+// standing and entry, each ended by U+001F, the record by U+001E.
+fn encode_record(ref<String, exclusive> s, ref<DocItem, shared> x)
+{
+    String text = sprintf("%s\n    in `%s`", &x.signature, &x.module_);
+    if (StringView::len(&x.retired_kind) > 0)
+    {
+        String::appendf(&mut text, "\n    %s: %s", &x.retired_kind, &x.retired_msg);
+    }
+    if (Vec::len(&x.requires) > 0)
+    {
+        String::append(&mut text, "\n    requires");
+        foreach (r in &x.requires)
+        {
+            String::appendf(&mut text, "\n        %s", r);
+        }
+    }
+    match (&x.doc)
+    {
+        Some(d) :
+        {
+            String::append(&mut text, "\n\n");
+            String::append(&mut text, &indent(d, "    "));
+        },
+        None    : {},
+    }
+    foreach (ex in &x.examples)
+    {
+        match (&ex.name)
+        {
+            Some(nm) : String::appendf(&mut text, "\n\n    Example, \"%s\":\n", nm),
+            None     : String::append(&mut text, "\n\n    Example:\n"),
+        }
+        String::append(&mut text, &indent(&ex.code, "        "));
+    }
+    String::append(&mut text, "\n");
+    String sum = match (&x.doc)
+    {
+        Some(d) : summary(d),
+        None    : String::new(),
+    };
+    String::append(s, &x.module_);
+    String::append(s, "\u{1f}");
+    String::append(s, &x.item);
+    String::append(s, "\u{1f}");
+    String::append(s, &x.kind);
+    String::append(s, "\u{1f}");
+    String::append(s, &x.signature);
+    String::append(s, "\u{1f}");
+    String::append(s, &sum);
+    String::append(s, "\u{1f}");
+    String::append(s, &x.retired_kind);
+    String::append(s, "\u{1f}");
+    String::append(s, &text);
+    String::append(s, "\u{1f}\u{1e}");
+}
+
+// Every exported item of `std` in `cobdoc.py`'s order, the built-ins after
+// them and the intrinsics last, encoded.
+fn docs(ref<Std, exclusive> s) : Result<String, String>
+{
+    Vec<DocItem> items = Vec::new();
+    Vec<String> seen = Vec::new();
+    items_of(s, "std.cb", "std", &mut items, &mut seen);
+    String builtins = match (std_file(s, "builtins.md"))
+    {
+        Some(t) : t,
+        None    : return Err("no file builtins.md"),
+    };
+    entries(&builtins, "builtins.md", &mut items);
+    String intrinsics = match (std_file(s, "intrinsics.md"))
+    {
+        Some(t) : t,
+        None    : return Err("no file intrinsics.md"),
+    };
+    entries(&intrinsics, "intrinsics.md", &mut items);
+    String out = String::new();
+    foreach (x in &items)
+    {
+        encode_record(&mut out, x);
+    }
+    Ok(out)
+}
+
+// ---- the summary ----
+
+// `text` as a CobaltC string literal, in pieces of about 100 bytes, each
+// ending at a character's end.
+fn literal(StringView text) : String
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize n = StringView::len(text);
+    String lit = String::new();
+    usize piece = 0;
+    usize i = 0;
+    while (i < n)
+    {
+        u8 c = b[i];
+        usize len = if (c < 128) { 1 } else if (c >= 240) { 4 } else if (c >= 224) { 3 } else { 2 };
+        if (piece == 0)
+        {
+            String::append(&mut lit, "    \"");
+        }
+        if (c == b'"')
+        {
+            String::append(&mut lit, "\\\"");
+        }
+        else if (c == b'\\')
+        {
+            String::append(&mut lit, "\\\\");
+        }
+        else if (c == b'\n')
+        {
+            String::append(&mut lit, "\\n");
+        }
+        else if (c == b'\t')
+        {
+            String::append(&mut lit, "\\t");
+        }
+        else if (c == b'\r')
+        {
+            String::append(&mut lit, "\\r");
+        }
+        else if (c == 30)
+        {
+            String::append(&mut lit, "\\u{1e}");
+        }
+        else if (c == 31)
+        {
+            String::append(&mut lit, "\\u{1f}");
+        }
+        else
+        {
+            String::append(&mut lit, &text[i..i + len]);
+        }
+        piece += len;
+        i += len;
+        if (piece >= 100)
+        {
+            String::append(&mut lit, "\"\n");
+            piece = 0;
+        }
+    }
+    if (piece > 0)
+    {
+        String::append(&mut lit, "\"\n");
+    }
+    StringView v = &lit;
+    while (StringView::ends_with(v, "\n"))
+    {
+        v = &v[0..StringView::len(v) - 1];
+    }
+    String::copy(v)
+}
+
+// The diagnostics `fault` may name: phase `dynamic` or `both`, sorted, each
+// between spaces.
+fn dynamic_diags(StringView registry_text) : String
+{
+    HashMap<String, DiagInfo> reg = parse_registry(registry_text);
+    Vec<String> ids = Vec::new();
+    foreach (id, info in &reg)
+    {
+        match (&info.phase)
+        {
+            Some(ph) :
+            {
+                if (*ph == "dynamic" || *ph == "both")
+                {
+                    Vec::push(&mut ids, String::clone(id));
+                }
+            },
+            None     : {},
+        }
+    }
+    Vec::sort(&mut ids);
+    sprintf(" %s ", &String::join(&ids, " "))
+}
+
+fn summary_text(StringView std_dir) : Result<String, String>
+{
+    Std s = Std { .dir = String::copy(std_dir), .files = HashMap::new() };
+    Prelude pre = assemble(&mut s)?;
+    ref<String, shared> src = &pre.src;
+    String skel = prelude_skeleton(src)?;
+    String decls = prelude_declarations(src)?;
+    Bodies bodies = prelude_bodies(src)?;
+    Vec<StringView> names = StringView::split_whitespace(INTRINSIC_NAMES);
+    String intrinsics = " ";
+    String all_intrinsics = " ";
+    foreach (nm in &names)
+    {
+        if (!StringView::contains(*nm, "::") && !StringView::starts_with(*nm, "$"))
+        {
+            String::append(&mut intrinsics, *nm);
+            String::append(&mut intrinsics, " ");
+        }
+        String::append(&mut all_intrinsics, *nm);
+        String::append(&mut all_intrinsics, " ");
+    }
+    Vec<StringView> fl = StringView::split_whitespace(FLOAT_FNS);
+    Vec<StringView> bare = Vec::new();
+    foreach (f in &fl)
+    {
+        Vec::push(&mut bare, Option::unwrap_or(StringView::strip_prefix(*f, "std::"), *f));
+    }
+    String float_fns = StringView::join(&bare, " ");
+    String registry_path = sprintf("%s/../../spec/registry/diagnostics.md", std_dir);
+    String registry_text = match (read_file(&registry_path))
+    {
+        Ok(t)  : t,
+        Err(_) : return Err(sprintf("cannot read %s", &registry_path)),
+    };
+    String dynamic = dynamic_diags(&registry_text);
+    String origins = origins_text(&pre);
+    String doc_text = docs(&mut s)?;
+    String o = String::new();
+    String::append(&mut o, "// Generated by `cobc --prelude-summary impl/std` (CHG-0350, CHG-0352, D-0326); do not edit.\n");
+    String::append(&mut o, "// What the front end needs of the prelude (`std`): the\n");
+    String::append(&mut o, "// tokens the parser's pre-scans read (`prelude_skeleton`), the counters\n");
+    String::append(&mut o, "// parsing it leaves, from which a program's hidden names continue, and its\n");
+    String::append(&mut o, "// declarations, every function's body empty (`prelude_declarations`), for\n");
+    String::append(&mut o, "// name resolution. the gate's build unit checks it is current.\n");
+    String::append(&mut o, "\n");
+    String::appendf(&mut o, "export const str PRELUDE_SKELETON =\n%s;\n", &literal(&skel));
+    String::append(&mut o, "\n");
+    String::appendf(&mut o, "export const usize PRELUDE_FRESH = %v;\n", bodies.fresh);
+    String::appendf(&mut o, "export const usize PRELUDE_LOCAL_CONSTS = %v;\n", bodies.local_consts);
+    String::appendf(&mut o, "export const usize PRELUDE_TESTS = %v;\n", bodies.tests);
+    String::append(&mut o, "\n");
+    String::appendf(&mut o, "export const str PRELUDE_DECLS =\n%s;\n", &literal(&decls));
+    String::append(&mut o, "\n");
+    String::append(&mut o, "// The intrinsics' unqualified names (`modres::is_intrinsic_name`), each\n");
+    String::append(&mut o, "// between spaces, and the floating-point functions of `std::math`.\n");
+    String::appendf(&mut o, "export const str PRELUDE_INTRINSICS =\n%s;\n", &literal(&intrinsics));
+    String::appendf(&mut o, "export const str PRELUDE_FLOAT_FNS =\n%s;\n", &literal(&float_fns));
+    String::append(&mut o, "// Every intrinsic's name, qualified and `$` names too\n");
+    String::append(&mut o, "// (summary.cb's `INTRINSIC_NAMES`), each between spaces.\n");
+    String::appendf(&mut o, "export const str PRELUDE_ALL_INTRINSICS =\n%s;\n", &literal(&all_intrinsics));
+    String::append(&mut o, "// The diagnostics that happen at run time (phase `dynamic` or `both`\n");
+    String::append(&mut o, "// in spec/registry/diagnostics.md), each between spaces, for `fault`.\n");
+    String::appendf(&mut o, "export const str PRELUDE_DYNAMIC_DIAGS =\n%s;\n", &literal(&dynamic));
+    String::append(&mut o, "\n");
+    String::append(&mut o, "// Every function of `std` with a body, for a parse of its own when the\n");
+    String::append(&mut o, "// type checker first reaches it (`prelude_bodies`, CHG-0355): one record a\n");
+    String::append(&mut o, "// line, `key module line col fresh local_consts offset length`, into the\n");
+    String::append(&mut o, "// texts.\n");
+    String::appendf(&mut o, "export const str PRELUDE_BODY_INDEX =\n%s;\n", &literal(&bodies.index));
+    String::appendf(&mut o, "export const str PRELUDE_BODIES =\n%s;\n", &literal(&bodies.texts));
+    String::append(&mut o, "\n");
+    String::append(&mut o, "// Where the prelude's lines came from in `std`'s files\n");
+    String::append(&mut o, "// (`prelude::std_location`): one record a line, `first_line file\n");
+    String::append(&mut o, "// file_line count`.\n");
+    String::appendf(&mut o, "export const str PRELUDE_STD_ORIGINS =\n%s;\n", &literal(&origins));
+    String::append(&mut o, "\n");
+    String::append(&mut o, "// `std`'s documentation as `--doc` shows it (CHG-0446, `encode_record`): per\n");
+    String::append(&mut o, "// exported item, its module, name, kind, signature, summary, standing\n");
+    String::append(&mut o, "// and entry, each ended by U+001F, the item by U+001E.\n");
+    String::appendf(&mut o, "export const str PRELUDE_DOCS =\n%s;\n", &literal(&doc_text));
+    Ok(o)
+}
+
+// `cobc --prelude-summary STD_DIR`: the summary on standard output; status 2
+// and a line on standard error when `std`'s files cannot be read or a check
+// fails.
+export fn run_prelude_summary(StringView std_dir) : u8
+{
+    match (summary_text(std_dir))
+    {
+        Ok(text) :
+        {
+            printf("%s", &text);
+            0
+        },
+        Err(e)   :
+        {
+            eprintf("cobc: %s\n", &e);
+            2
+        },
+    }
+}

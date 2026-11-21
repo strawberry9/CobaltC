@@ -1,0 +1,262 @@
+// The platform functions cobc's driver needs and `std` does not offer, in
+// impl/cobc/host.c (Linux and Windows): whether a stream is a terminal, the
+// console's ANSI mode (`enable_ansi`), standard input gathered by a thread
+// nothing waits for (`explore_runs`' reader), and a started program's guard
+// (`guard_child`, `run_raw`), and cobc's temporary directories removed when
+// an interrupt ends it (`watch_dir`).
+
+import std;
+
+extern "./host.c";
+
+unsafe extern fn cobc_host_isatty(i64 fd) : i64;
+unsafe extern fn cobc_host_enable_ansi() : i64;
+unsafe extern fn cobc_host_stdout_closed() : i64;
+unsafe extern fn cobc_host_input_start();
+unsafe extern fn cobc_host_input_wait(u64 have, u64 ms) : u64;
+unsafe extern fn cobc_host_input_byte(u64 i) : i64;
+unsafe extern fn cobc_host_guard(u64 pid, i64 secs) : u64;
+unsafe extern fn cobc_host_unguard(u64 h);
+unsafe extern fn cobc_host_run_path_byte(i64 b);
+unsafe extern fn cobc_host_run(u64 first, i64 secs, i64 seed, i64 flags) : i64;
+unsafe extern fn cobc_host_stop_signal() : i64;
+unsafe extern fn cobc_host_end_by(i64 sig);
+unsafe extern fn cobc_host_watch_byte(i64 b);
+unsafe extern fn cobc_host_watch_commit();
+unsafe extern fn cobc_host_watch_child(u64 pid);
+unsafe extern fn cobc_host_join_job(i64 secs);
+unsafe extern fn cobc_host_leave_job() : i64;
+unsafe extern fn cobc_host_run_pre_byte(i64 b);
+
+// Whether the stream `fd` (0, 1 or 2) is a terminal.
+// trusted: [Extern-Call] cobc_host_isatty reads no memory of the program.
+export fn is_terminal(i64 fd) : bool
+{
+    unsafe
+    {
+        cobc_host_isatty(fd) != 0
+    }
+}
+
+// trusted: [Extern-Call] cobc_host_enable_ansi reads no memory of the program.
+export fn enable_ansi() : bool
+{
+    unsafe
+    {
+        cobc_host_enable_ansi() != 0
+    }
+}
+
+// Whether standard output is a pipe nobody reads any more (Linux; never known
+// elsewhere), where cobc ends with status 1.
+// trusted: [Extern-Call] cobc_host_stdout_closed reads no memory of the program.
+export fn stdout_closed() : bool
+{
+    unsafe
+    {
+        cobc_host_stdout_closed() != 0
+    }
+}
+
+// Starts gathering standard input as it arrives (once); a terminal's is
+// taken as ended at once.
+// trusted: [Extern-Call] cobc_host_input_start reads no memory of the program.
+export fn input_start()
+{
+    unsafe
+    {
+        cobc_host_input_start();
+    }
+}
+
+// What has arrived of standard input: its length, and whether it has ended.
+export struct InputState
+{
+    export usize len;
+    export bool ended;
+}
+
+// Waits up to `ms` milliseconds for more than `have` bytes, or the end.
+// trusted: [Extern-Call] cobc_host_input_wait reads no memory of the program.
+export fn input_wait(usize have, u64 ms) : InputState
+{
+    u64 r = unsafe
+    {
+        cobc_host_input_wait(widen<u64>(have), ms)
+    };
+    u64 top = 1: u64 << 63;
+    InputState { .len = narrow<usize>(r & (top - 1)), .ended = (r & top) != 0 }
+}
+
+// The input's bytes `[from, to)`, all arrived (`input_wait`).
+// trusted: [Extern-Call] cobc_host_input_byte reads no memory of the program.
+export fn input_bytes(usize from, usize to) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    for (usize i = from; i < to; i += 1)
+    {
+        i64 b = unsafe
+        {
+            cobc_host_input_byte(widen<u64>(i))
+        };
+        if (b < 0)
+        {
+            break;
+        }
+        Vec::push(&mut out, narrow<u8>(b));
+    }
+    out
+}
+
+// The guard on a started program `pid` (std has no hook between fork and
+// exec): its CPU time limited to `secs` when set (Linux), or a job that ends
+// it when cobc ends, with that much processor time if set (Windows). The
+// guard to release, or 0.
+// trusted: [Extern-Call] cobc_host_guard reads no memory of the program.
+export fn guard_child(u64 pid, Option<i64> secs) : u64
+{
+    i64 s = match (secs)
+    {
+        Some(v) : v,
+        None    : -1,
+    };
+    unsafe
+    {
+        cobc_host_guard(pid, s)
+    }
+}
+
+// trusted: [Extern-Call] cobc_host_unguard reads no memory of the program.
+export fn unguard_child(u64 h)
+{
+    unsafe
+    {
+        cobc_host_unguard(h);
+    }
+}
+
+// `--run` on Unix: the program at `exe` (a runner's name, with `pre` the
+// arguments between it and cobc's own: the runner's own and the built
+// program), with cobc's own arguments from `first` on (`arg` numbering) as its arguments byte for byte, so that one
+// that is not UTF-8 reaches it as it came (std's commands take text), and
+// under its guard (ended when cobc ends, `secs` of CPU time when set,
+// `COBALTC_SCHEDULE_SEED` when `seed` is set), and with the variables the
+// options set (`flags`, driverbase.cb's `env_flags`) set to `1`. Its exit
+// status, minus its signal when a signal ended it; None when it could not
+// be started.
+// trusted: [Extern-Call] cobc_host_run_path_byte, cobc_host_run_pre_byte and cobc_host_run read no memory of the program.
+export fn run_raw(StringView exe, ref<Vec<String>, shared> pre, usize first, Option<i64> secs, Option<u64> seed, i64 flags) : Option<i32>
+{
+    slice<u8, shared> b = StringView::as_bytes(exe);
+    i64 s = match (secs)
+    {
+        Some(v) : v,
+        None    : -1,
+    };
+    i64 sd = match (seed)
+    {
+        Some(v) : reinterpret<i64>(v),
+        None    : -1,
+    };
+    unsafe
+    {
+        cobc_host_run_path_byte(-1);
+        for (usize i = 0; i < slice_len(b); i += 1)
+        {
+            cobc_host_run_path_byte(widen<i64>(b[i]));
+        }
+        cobc_host_run_pre_byte(-1);
+        foreach (a in pre)
+        {
+            slice<u8, shared> ab = StringView::as_bytes(a);
+            for (usize i = 0; i < slice_len(ab); i += 1)
+            {
+                cobc_host_run_pre_byte(widen<i64>(ab[i]));
+            }
+            cobc_host_run_pre_byte(-2);
+        }
+        i64 st = cobc_host_run(widen<u64>(first), s, sd, flags);
+        if (st == -1000) { None } else { Some(narrow<i32>(st)) }
+    }
+}
+
+// The signal (SIGINT, SIGTERM, SIGHUP) that came to cobc while `run_raw`'s
+// program ran, which passed it on; 0 when none came (and on Windows).
+// trusted: [Extern-Call] cobc_host_stop_signal reads no memory of the program.
+export fn stop_signal() : i64
+{
+    unsafe
+    {
+        cobc_host_stop_signal()
+    }
+}
+
+// Ends cobc by the signal `sig`, as it would have ended it had cobc not caught
+// it (`stop_signal`), once `--run`'s directory is deleted.
+// trusted: [Extern-Call] cobc_host_end_by reads no memory of the program.
+export fn end_by(i64 sig)
+{
+    unsafe
+    {
+        cobc_host_end_by(sig);
+    }
+}
+
+// Bug 037: the directory `dir`, which cobc has just made, is removed if an
+// interrupt ends cobc from now on (Unix: SIGINT, SIGTERM, SIGHUP; Windows:
+// Ctrl-C, Ctrl-Break, the console closed), once the programs cobc started
+// have had the interrupt (`watch_child`) and, on Windows, have ended.
+// trusted: [Extern-Call] cobc_host_watch_byte and cobc_host_watch_commit read no memory of the program.
+export fn watch_dir(StringView dir)
+{
+    slice<u8, shared> b = StringView::as_bytes(dir);
+    unsafe
+    {
+        cobc_host_watch_byte(-1);
+        for (usize i = 0; i < slice_len(b); i += 1)
+        {
+            cobc_host_watch_byte(widen<i64>(b[i]));
+        }
+        cobc_host_watch_commit();
+    }
+}
+
+// The program `--explore` runs now (0 when none), to which an interrupt to
+// cobc is passed on (Unix; on Windows the console gives it the event).
+// trusted: [Extern-Call] cobc_host_watch_child reads no memory of the program.
+export fn watch_child(u64 pid)
+{
+    unsafe
+    {
+        cobc_host_watch_child(pid);
+    }
+}
+
+// `--run` on Windows: the program it starts next, and what that starts, ended
+// when cobc ends (std's `Command::status` gives no number for the program to
+// guard): cobc in a job, or, with a processor time limit `secs`
+// (COBALTC_CPU_LIMIT), a thread that puts the program in a job with that
+// limit; nothing elsewhere, or where it cannot be done. `leave_job` after
+// the run ends the thread, and says whether the limit ended the program.
+// trusted: [Extern-Call] cobc_host_join_job reads no memory of the program.
+export fn join_job(Option<i64> secs)
+{
+    i64 s = match (secs)
+    {
+        Some(v) : v,
+        None    : -1,
+    };
+    unsafe
+    {
+        cobc_host_join_job(s);
+    }
+}
+
+// trusted: [Extern-Call] cobc_host_leave_job reads no memory of the program.
+export fn leave_job() : bool
+{
+    unsafe
+    {
+        cobc_host_leave_job() != 0
+    }
+}

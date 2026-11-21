@@ -1,0 +1,87 @@
+# D-0309 (1b): the stack check (`cb_stack_check`, D-0077) is kept in a
+# function on a cycle of calls, one whose address is taken, and one whose
+# frame alone is over the budget, and dropped elsewhere -- `main` included,
+# the first frame of its thread (a function's body: from its definition's
+# line to its closing brace). A recursion direct, mutual or through a `fn`
+# value still faults `diag.stack-exhausted` under gcc and clang.
+file r.cb
+import std;
+import std::env;
+
+fn direct(u64 n) : u64
+{
+    if (n == 0) { 0 } else { 1 + direct(n - 1) }
+}
+
+fn ping(u64 n) : u64
+{
+    if (n == 0) { 0 } else { 1 + pong(n - 1) }
+}
+
+fn pong(u64 n) : u64
+{
+    if (n == 0) { 0 } else { 1 + ping(n - 1) }
+}
+
+fn via_value(fn(u64) : u64 f, u64 n) : u64
+{
+    if (n == 0) { 0 } else { 1 + f(n - 1) }
+}
+
+fn through(u64 n) : u64
+{
+    via_value(through, n)
+}
+
+fn big_helper(u64 n) : u64
+{
+    array<u64, 12500> a = [0; 12500];
+    a[widen<usize>(n % 12500)] = n;
+    a[0] + a[widen<usize>(n % 12500)]
+}
+
+fn with_big(u64 n) : u64
+{
+    if (n == 0) { 0 } else { big_helper(n) + with_big(n - 1) }
+}
+
+fn main() : u8
+{
+    String m = Result::unwrap_or(arg(0), String::new());
+    u64 n = 100000000;
+    if (m == "direct") { printf("%v\n", direct(n)); }
+    if (m == "mutual") { printf("%v\n", ping(n)); }
+    if (m == "value") { printf("%v\n", through(n)); }
+    if (m == "big") { printf("%v\n", with_big(n)); }
+    if (m == "ok") { printf("%v %v\n", direct(1000), with_big(100)); }
+    0
+}
+end
+run $COBC --emit-c -o r.c r.cb
+status 0
+cut r.c direct.c "\n… f_direct(…)\n" "\n}\n"
+file-has direct.c \n    cb_stack_check();\n
+cut r.c ping.c "\n… f_ping(…)\n" "\n}\n"
+file-has ping.c \n    cb_stack_check();\n
+cut r.c pong.c "\n… f_pong(…)\n" "\n}\n"
+file-has pong.c \n    cb_stack_check();\n
+cut r.c through.c "\n… f_through(…)\n" "\n}\n"
+file-has through.c \n    cb_stack_check();\n
+cut r.c with_big.c "\n… f_with_big(…)\n" "\n}\n"
+file-has with_big.c \n    cb_stack_check();\n
+cut r.c big_helper.c "\n… f_big_helper(…)\n" "\n}\n"
+file-has big_helper.c \n    cb_stack_check();\n
+cut r.c main.c "\n… f_main(…)\n" "\n}\n"
+file-lacks main.c \n    cb_stack_check();\n
+cut r.c via_value.c "\n… f_via_value(…)\n" "\n}\n"
+file-lacks via_value.c \n    cb_stack_check();\n
+run $COBC --cc $CC -o r r.cb
+status 0
+run ./r ok
+stdout-is 1000 5050\n
+run ./r direct
+stderr-starts fault[diag.stack-exhausted]
+run ./r mutual
+stderr-starts fault[diag.stack-exhausted]
+run ./r value
+stderr-starts fault[diag.stack-exhausted]

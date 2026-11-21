@@ -1,0 +1,76 @@
+// CONFORMANCE-CASE
+// spec: 14-control-flow
+// facility: rule.control.block [Block-Exit], [Fault-Contain] (D-0315); conf.noted-locals-end-in-order
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 5b635d5b625d5b615d310a5b645d5b625d5b615d300a5b6172675d5b64726f707065645d5b6c6173745d5b7365636f6e645d5b6b6570745d5b66697273745d20380a5b6172675d5b64726f707065645d5b6c6173745d5b7365636f6e645d5b6b6570745d5b66697273745d206f6b20380a5b6172675d5b64726f707065645d5b6c6173745d5b7365636f6e645d5b6b6570745d5b66697273745d206661696c65640a5b6172675d5b64726f707065645d5b6c6173745d5b7365636f6e645d5b6b6570745d5b66697273745d206f6b2031300a
+//
+// Locals whose type has a destructor of its own, some used, some unused, one
+// dropped early, one moved into a call, among locals the compiler keeps
+// differently (one borrowed by a closure): each ends once, last bound first,
+// at a block's end, at a `return` and in a thread whose fault is contained,
+// in `[Block-Exit]`'s order; the program goes on.
+
+import std;
+
+resource struct Noisy
+{
+    String name;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[%v]", &self.name);
+}
+
+fn make(StringView name) : Noisy
+{
+    Noisy { .name = String::copy(name) }
+}
+
+fn take(Noisy n) : usize
+{
+    StringView::len(&n.name)
+}
+
+fn early(i64 k) : i64
+{
+    Noisy a = make("a");
+    Noisy b = make("b");
+    if (k > 0)
+    {
+        Noisy c = make("c");
+        return k;
+    }
+    Noisy d = make("d");
+    0
+}
+
+fn mixed(usize n) : usize
+{
+    Noisy first = make("first");
+    Noisy kept = make("kept");
+    fn() : usize peek = [kept]() : usize { StringView::len(&kept.name) };
+    Noisy second = make("second");
+    usize t = peek() + take(make("arg"));
+    Noisy dropped = make("dropped");
+    drop(dropped);
+    Noisy last = make("last");
+    assert(n != 2, "refused %v", n);
+    t + n
+}
+
+fn main()
+{
+    printf("%v\n", early(1));
+    printf("%v\n", early(0));
+    printf(" %v\n", mixed(1));
+    foreach (n in 1..4)
+    {
+        match (try_join(spawn(mixed, n)))
+        {
+            Ok(v)  : printf(" ok %v\n", v),
+            Err(_) : printf(" failed\n"),
+        }
+    }
+}

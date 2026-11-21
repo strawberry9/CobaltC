@@ -1,0 +1,376 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.derived-clone [Derived-Clone] (D-0116); conf.clone-deep-tree
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 646565702074727565207472756520747275650a6f726465722074727565207472756520747275650a7472692074727565207472756520747275650a6465657020656e756d207472756520747275650a65787072207472756520747275650a
+//
+// The derived `clone` of a tree (a struct with two or more links to itself
+// through `Option<Box<…>>`, or with fields that own something on both
+// sides of its one link; an enum whose variant with fields holds links)
+// copies a tree two million levels deep, a left spine whose right
+// children are leaves, to an equal tree. Each field is copied by `clone`
+// once and in the order spec/16 §4a gives: a value's fields in
+// declaration order, each link's whole copy where the link is, also past
+// the depth where the compiler's copy leaves recursion for a loop; a
+// generic tree of three links too.
+
+import std;
+
+static Atomic<u64> HASH = 0;
+static Atomic<u64> COUNT = 0;
+
+// A `Tag` owns its text, so `clone` of one calls `Tag::clone`, which notes
+// the call.
+struct Tag
+{
+    u64 id;
+    String text;
+}
+
+fn tag(u64 id) : Tag
+{
+    Tag { .id = id, .text = String::new() }
+}
+
+fn Tag::clone(ref<Tag, shared> self) : Tag
+{
+    u64 h = Atomic::load(&HASH);
+    Atomic::store(&HASH, mix(h, 31, self.id + 1));
+    _ = Atomic::fetch_add(&COUNT, 1);
+    tag(self.id)
+}
+
+fn mix(u64 h, u64 k, u64 v) : u64
+{
+    wrapping_add(wrapping_mul(h, k), v)
+}
+
+fn reset()
+{
+    Atomic::store(&HASH, 0);
+    Atomic::store(&COUNT, 0);
+}
+
+// The tree of the bug report: plain values and two links.
+struct Node
+{
+    u64 value;
+    Option<Box<Node>> left;
+    Option<Box<Node>> right;
+}
+
+// Fields that own something before, between and after the links.
+struct Ordered
+{
+    Tag a;
+    Option<Box<Ordered>> left;
+    Tag b;
+    u32 plain;
+    Option<Box<Ordered>> right;
+    Tag c;
+}
+
+module m
+{
+    import std;
+
+    export struct Tri<T>
+    {
+        export Option<Box<Tri<T>>> one;
+        export T value;
+        export Option<Box<Tri<T>>> two;
+        export Option<Box<Tri<T>>> three;
+    }
+}
+
+// An enum tree: a variant with fields holds the links.
+enum Deep
+{
+    Leaf(u64),
+    Two { Box<Deep> l; u64 w; Box<Deep> r; },
+}
+
+// Fields that own something around the links of a variant with fields,
+// and a payload link.
+enum Expr
+{
+    Num(Tag),
+    Neg(Box<Expr>),
+    Add { Tag op; Box<Expr> a; Tag mid; Option<Box<Expr>> b; Tag end; },
+}
+
+fn deep_sum(ref<Deep, shared> t) : u64
+{
+    u64 s = 0;
+    Vec<ref<Deep, shared>> todo = Vec::new();
+    Vec::push(&mut todo, t);
+    while (true)
+    {
+        match (Vec::pop(&mut todo))
+        {
+            Some(d) :
+            {
+                match (d)
+                {
+                    Leaf(v)               : s = mix(s, 7, *v),
+                    Deep::Two { l, w, r } :
+                    {
+                        s = mix(s, 11, *w);
+                        Vec::push(&mut todo, Box::get(r));
+                        Vec::push(&mut todo, Box::get(l));
+                    },
+                }
+            },
+            None    : break,
+        }
+    }
+    s
+}
+
+// The hash §4a's order of `Tag::clone` calls makes.
+fn expr_hash(ref<Expr, shared> e, u64 h) : u64
+{
+    match (e)
+    {
+        Num(t)                           : mix(h, 31, t.id + 1),
+        Neg(b)                           : expr_hash(Box::get(b), h),
+        Expr::Add { op, a, mid, b, end } :
+        {
+            u64 x = expr_hash(Box::get(a), mix(h, 31, op.id + 1));
+            x = mix(x, 31, mid.id + 1);
+            match (b)
+            {
+                Some(r) : x = expr_hash(Box::get(r), x),
+                None    : {},
+            }
+            mix(x, 31, end.id + 1)
+        },
+    }
+}
+
+// Count and a hash of the values, left before right, without recursion.
+fn node_sum(ref<Node, shared> t) : u64
+{
+    u64 s = 0;
+    Vec<ref<Node, shared>> todo = Vec::new();
+    Vec::push(&mut todo, t);
+    while (true)
+    {
+        match (Vec::pop(&mut todo))
+        {
+            Some(n) :
+            {
+                s = mix(s, 7, n.value);
+                match (&n.right)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+                match (&n.left)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+            },
+            None    : break,
+        }
+    }
+    s
+}
+
+fn node_count(ref<Node, shared> t) : u64
+{
+    u64 c = 0;
+    Vec<ref<Node, shared>> todo = Vec::new();
+    Vec::push(&mut todo, t);
+    while (true)
+    {
+        match (Vec::pop(&mut todo))
+        {
+            Some(n) :
+            {
+                c += 1;
+                match (&n.left)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+                match (&n.right)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+            },
+            None    : break,
+        }
+    }
+    c
+}
+
+// The hash §4a's order of `Tag::clone` calls makes: `a`, the left tree,
+// `b`, the right tree, `c`.
+fn ordered_hash(ref<Ordered, shared> t, u64 h) : u64
+{
+    u64 x = mix(h, 31, t.a.id + 1);
+    match (&t.left)
+    {
+        Some(l) : x = ordered_hash(Box::get(l), x),
+        None    : {},
+    }
+    x = mix(x, 31, t.b.id + 1);
+    match (&t.right)
+    {
+        Some(r) : x = ordered_hash(Box::get(r), x),
+        None    : {},
+    }
+    mix(x, 31, t.c.id + 1)
+}
+
+fn ordered_ids(ref<Ordered, shared> t, u64 h) : u64
+{
+    u64 x = mix(h, 5, t.a.id * 3 + t.b.id * 7 + t.c.id + widen<u64>(t.plain));
+    match (&t.left)
+    {
+        Some(l) : x = ordered_ids(Box::get(l), x),
+        None    : {},
+    }
+    match (&t.right)
+    {
+        Some(r) : x = ordered_ids(Box::get(r), x),
+        None    : {},
+    }
+    x
+}
+
+fn tri_hash(ref<m::Tri<Tag>, shared> t, u64 h) : u64
+{
+    u64 x = h;
+    match (&t.one)
+    {
+        Some(b) : x = tri_hash(Box::get(b), x),
+        None    : {},
+    }
+    x = mix(x, 31, t.value.id + 1);
+    match (&t.two)
+    {
+        Some(b) : x = tri_hash(Box::get(b), x),
+        None    : {},
+    }
+    match (&t.three)
+    {
+        Some(b) : x = tri_hash(Box::get(b), x),
+        None    : {},
+    }
+    x
+}
+
+fn small(u64 id) : Ordered
+{
+    Ordered { .a = tag(id), .left = None, .b = tag(id + 1), .plain = 3, .right = None, .c = tag(id + 2) }
+}
+
+fn tri(u64 id) : m::Tri<Tag>
+{
+    m::Tri { .one = None, .value = tag(id), .two = None, .three = None }
+}
+
+fn main()
+{
+    // Two million levels: a left spine, each right child a leaf.
+    u64 n = 2000000;
+    Node t = Node { .value = 0, .left = None, .right = None };
+    foreach (i in 1..n)
+    {
+        Node leaf = Node { .value = i + n, .left = None, .right = None };
+        t = Node { .value = i, .left = Some(Box::new(t)), .right = Some(Box::new(leaf)) };
+    }
+    Node t2 = clone(&t);
+    printf("deep %v %v %v\n", node_sum(&t) == node_sum(&t2), node_count(&t2) == 2 * n - 1, t2.value == n - 1);
+
+    // Three thousand levels, the deeper side alternating, each other child a
+    // small tree: the order of the copies is §4a's.
+    u64 id = 0;
+    Ordered o = small(id);
+    id += 3;
+    foreach (i in 0..3000)
+    {
+        Ordered side = small(id);
+        id += 3;
+        Ordered top = if (i % 2 == 0)
+        {
+            Ordered { .a = tag(id), .left = Some(Box::new(o)), .b = tag(id + 1), .plain = 1, .right = Some(Box::new(side)), .c = tag(id + 2) }
+        }
+        else
+        {
+            Ordered { .a = tag(id), .left = Some(Box::new(side)), .b = tag(id + 1), .plain = 2, .right = Some(Box::new(o)), .c = tag(id + 2) }
+        };
+        id += 3;
+        o = top;
+    }
+    reset();
+    Ordered o2 = clone(&o);
+    printf(
+        "order %v %v %v\n",
+        Atomic::load(&HASH) == ordered_hash(&o, 0),
+        Atomic::load(&COUNT) == id,
+        ordered_ids(&o, 0) == ordered_ids(&o2, 0),
+    );
+
+    // A generic tree of three links, the deep one the last, then the first.
+    m::Tri<Tag> r = tri(0);
+    u64 levels = 2500;
+    foreach (i in 1..levels)
+    {
+        m::Tri<Tag> up = tri(i * 4);
+        if (i < levels / 2)
+        {
+            up.three = Some(Box::new(r));
+            up.one = Some(Box::new(tri(i * 4 + 1)));
+        }
+        else
+        {
+            up.one = Some(Box::new(r));
+            up.two = Some(Box::new(tri(i * 4 + 2)));
+        }
+        r = up;
+    }
+    reset();
+    m::Tri<Tag> r2 = clone(&r);
+    u64 h = Atomic::load(&HASH);
+    reset();
+    u64 h2 = tri_hash(&r2, 0);
+    printf("tri %v %v %v\n", h == tri_hash(&r, 0), h == h2, Atomic::load(&COUNT) == 0);
+
+    // The enum trees: two million levels, then the order of the copies.
+    Deep d = Deep::Leaf(0);
+    foreach (i in 1..n)
+    {
+        d = Deep::Two { .l = Box::new(d), .w = i, .r = Box::new(Deep::Leaf(i + n)) };
+    }
+    Deep d2 = clone(&d);
+    printf("deep enum %v %v\n", deep_sum(&d) == deep_sum(&d2), deep_sum(&d2) != 0);
+    u64 eid = 0;
+    Expr x = Expr::Num(tag(eid));
+    foreach (i in 0..3000)
+    {
+        eid += 4;
+        x = if (i % 3 == 0)
+        {
+            Expr::Neg(Box::new(x))
+        }
+        else if (i % 3 == 1)
+        {
+            Expr::Add { .op = tag(eid), .a = Box::new(x), .mid = tag(eid + 1), .b = None, .end = tag(eid + 2) }
+        }
+        else
+        {
+            Expr side = Expr::Num(tag(eid + 3));
+            Expr::Add { .op = tag(eid), .a = Box::new(side), .mid = tag(eid + 1), .b = Some(Box::new(x)), .end = tag(eid + 2) }
+        };
+    }
+    reset();
+    Expr x2 = clone(&x);
+    u64 hx = Atomic::load(&HASH);
+    printf("expr %v %v\n", hx == expr_hash(&x, 0), expr_hash(&x2, 0) == hx);
+}

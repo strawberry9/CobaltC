@@ -1,0 +1,792 @@
+// Whether a text parses, and why not: its file-backed modules expanded
+// (relative to `origin`), then parsed after the prelude; a program the
+// parser builds but rejects for a reason other than its syntax parses.
+// The error is `PLACE: MESSAGE (column C)`, PLACE a `FILE:LINE` or
+// `line N`; or `PLACE: ID` for a diagnostic.
+
+import std;
+import ast;
+import parser;
+import loader;
+import dump;
+import derive;
+import modres;
+import consts;
+import items;
+import typecheck;
+import consteval;
+
+// `s` without the byte-order marks it begins with.
+fn strip_bom(StringView s) : StringView
+{
+    StringView r = s;
+    while (StringView::starts_with(r, "\u{feff}"))
+    {
+        r = &r[3..$];
+    }
+    r
+}
+
+fn place(ref<Expansion, shared> ex, usize l) : String
+{
+    // A line inside `std` (`STD_LINE`): shown as before the program's lines.
+    if (l >= STD_LINE)
+    {
+        return "line 0";
+    }
+    if (Option::is_none(&ex.error))
+    {
+        match (resolve_line(ex, l))
+        {
+            Some(o) : return sprintf("%s:%v", &o.file, o.line),
+            None    : {},
+        }
+    }
+    sprintf("line %v", l)
+}
+
+// `parse error at 3:13: expected …` as `3: expected … (column 13)`, and a
+// diagnostic `diag.x@N` as `N: diag.x`, each line placed.
+fn describe(ref<String, shared> e, ref<Expansion, shared> ex) : String
+{
+    foreach (prefix in ["parse error at ", "lex error at "])
+    {
+        match (StringView::strip_prefix(e, prefix))
+        {
+            Some(rest) :
+            {
+                match (StringView::find(rest, ": "))
+                {
+                    Some(k) :
+                    {
+                        StringView pos = &rest[0..k];
+                        StringView msg = &rest[k + 2..$];
+                        match (StringView::find(pos, ":"))
+                        {
+                            Some(m) :
+                            {
+                                match (StringView::parse<usize>(&pos[0..m]))
+                                {
+                                    Ok(l)  :
+                                    {
+                                        return sprintf(
+                                            "%s: %v (column %v)",
+                                            &place(ex, l),
+                                            msg,
+                                            &pos[m + 1..$],
+                                        );
+                                    },
+                                    Err(_) : {},
+                                }
+                            },
+                            None    : {},
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            None       : {},
+        }
+    }
+    Diag { id, detail, line } = split_diag(e);
+    match (line)
+    {
+        Some(l) : sprintf("%s: %s", &place(ex, l), &id),
+        None    : id,
+    }
+}
+
+// A diagnostic `diag.x\u{1}detail@N` (or `@N:C`) in its parts, as
+// `split_location` takes it apart: the id before the last `@N`, the
+// detail after `\u{1}`.
+struct Diag
+{
+    String id;
+    Option<String> detail;
+    Option<usize> line;
+}
+
+fn split_diag(ref<String, shared> e) : Diag
+{
+    StringView raw = e;
+    StringView body = raw;
+    Option<usize> at_line = None;
+    match (last_at(raw))
+    {
+        Some(k) :
+        {
+            StringView n = &raw[k + 1..$];
+            StringView lpart = match (StringView::find(n, ":"))
+            {
+                Some(m) : &n[0..m],
+                None    : n,
+            };
+            bool col_ok = match (StringView::find(n, ":"))
+            {
+                Some(m) : Result::is_ok(&StringView::parse<usize>(&n[m + 1..$])),
+                None    : true,
+            };
+            match (StringView::parse<usize>(lpart))
+            {
+                Ok(l)  :
+                {
+                    if (col_ok)
+                    {
+                        body = &raw[0..k];
+                        at_line = Some(l);
+                    }
+                },
+                Err(_) : {},
+            }
+        },
+        None    : {},
+    }
+    match (StringView::find(body, "\u{1}"))
+    {
+        Some(k) : Diag {
+            .id = String::copy(&body[0..k]),
+            .detail = Some(String::copy(&body[k + 1..$])),
+            .line = at_line,
+        },
+        None : Diag { .id = String::copy(body), .detail = None, .line = at_line },
+    }
+}
+
+// `diag.x\u{1}message@N` as `PLACE: diag.x: message` (`--dump-resolved`,
+// which compares the messages too); a module file's error is placed by
+// the expansion's own lines.
+fn describe_diagnostic(ref<String, shared> e, ref<Expansion, shared> ex, bool loading) : String
+{
+    Diag d = split_diag(e);
+    String shown = match (&d.detail)
+    {
+        Some(t) : sprintf("%s: %s", &d.id, &unhide_binders(t)),
+        None    : String::clone(&d.id),
+    };
+    match (d.line)
+    {
+        Some(l) :
+        {
+            String at = if (loading)
+            {
+                match (resolve_line(ex, l))
+                {
+                    Some(o) : sprintf("%s:%v", &o.file, o.line),
+                    None    : sprintf("line %v", if (l >= STD_LINE) { 0 } else { l }),
+                }
+            }
+            else
+            {
+                place(ex, l)
+            };
+            sprintf("%s: %s", &at, &shown)
+        },
+        None    : shown,
+    }
+}
+
+fn last_at(StringView s) : Option<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    usize k = StringView::len(s);
+    while (k > 0)
+    {
+        k -= 1;
+        if (b[k] == b'@')
+        {
+            return Some(k);
+        }
+    }
+    None
+}
+
+// The text the parser reads, and how its lines map back.
+fn prepared(StringView src, StringView origin) : Expansion
+{
+    StringView body = strip_bom(src);
+    Expansion ex = expand(body, origin);
+    if (Option::is_some(&ex.error))
+    {
+        // A module file that cannot be read is the other files' problem,
+        // not this one's syntax: the file is parsed on its own instead,
+        // its file-backed modules empty.
+        ex.text = stub_modules(body);
+    }
+    ex
+}
+
+// Whether `src` parses: `None`, or why not.
+export fn syntax(StringView src, StringView origin) : Option<String>
+{
+    Expansion ex = prepared(src, origin);
+    match (parse_program_text(&ex.text))
+    {
+        Ok(_)  : None,
+        Err(e) :
+        {
+            if (StringView::starts_with(&e, "diag.") && !StringView::starts_with(&e, "diag.syntax-error"))
+            {
+                return None;
+            }
+            Some(describe(&e, &ex))
+        },
+    }
+}
+
+// `--dump-resolved`'s text of `src` (CHG-0352): the program's own
+// part once `[Item-Duplicate]`, the derived functions and name resolution
+// have run over it and the prelude's declarations, or the error; with
+// `folded` (`--dump-folded`, CHG-0354), once the constants are folded and
+// the text literals viewed too: what the type checker reads.
+export fn dump_resolved_text(StringView src, StringView origin, bool folded) : Result<String, String>
+{
+    Expansion ex = expand(strip_bom(src), origin);
+    match (&ex.error)
+    {
+        Some(e) : return Err(describe_diagnostic(e, &ex, true)),
+        None    : {},
+    }
+    Program user = match (parse_program_text(&ex.text))
+    {
+        Ok(p)  : p,
+        Err(e) : return Err(failure(&e, &ex)),
+    };
+    Program program = parse_prelude();
+    Program { items, tests } = user;
+    Vec::append(&mut program.items, items);
+    program.tests = tests;
+    match (check_duplicates(&program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(failure(&e, &ex)),
+    }
+    add_derived(&mut program);
+    match (resolve_program(&mut program))
+    {
+        Ok(_)  : {},
+        // D-0321: a dump shows the first error.
+        Err(e) : return Err(failure(&first_error(&e), &ex)),
+    }
+    if (folded)
+    {
+        match (consts::process(&mut program))
+        {
+            Ok(_)  : {},
+            Err(e) : return Err(failure(&e, &ex)),
+        }
+    }
+    Ok(dump_program(&program, 1, 0))
+}
+
+// `--dump-checked`'s text of `src` (CHG-0355): `ok` once the whole
+// static pass accepts the program, or its error.
+// What the back end lowers: the checked program's items and the facts the
+// type checker recorded about them, and the map from its lines to files.
+export struct Checked
+{
+    export Items table;
+    export Facts facts;
+    export Expansion ex;
+    // What `check_more` needs to load and check a `std` body later.
+    export Front front;
+}
+
+// `--dump-checked`'s text: `ok` once the whole static pass accepts the
+// program, or the diagnostic.
+export fn checked_text(StringView src, StringView origin) : Result<String, String>
+{
+    match (check_text(src, origin))
+    {
+        Ok(_)  : Ok("ok\n"),
+        Err(e) : Err(e),
+    }
+}
+
+// The whole static pass over `src`: the checked program, or the diagnostic
+// as `shown` gives it.
+export fn check_text(StringView src, StringView origin) : Result<Checked, String>
+{
+    match (check_text_certified(src, origin, None))
+    {
+        Ok(c)  : Ok(c),
+        Err(r) : Err(shown(&r)),
+    }
+}
+
+// `check_text` with the rejection raw (D-0299: cobc's `--emit-c` under
+// `--certificate` writes the verdict from it); `certificate` is the file the
+// type checker appends each body's record to.
+export fn check_text_certified(
+    StringView src,
+    StringView origin,
+    Option<String> certificate,
+) : Result<Checked, Rejected>
+{
+    Parsed p = parse_user(src, origin)?;
+    check_parsed(p, false, certificate)
+}
+
+// A rejection as `check_text` shows it.
+export fn rejection_text(ref<Rejected, shared> r) : String
+{
+    shown(r)
+}
+
+// A rejection, raw (`diag.x\u{1}detail@N`, `parse error at L:C: …`, its
+// lines the expansion's), with the expansion that places it: what cobc's
+// driver renders (`render_located`). `loading` for the loader's own.
+export struct Rejected
+{
+    export String raw;
+    export Expansion ex;
+    export bool loading;
+    // D-0321: the other static errors of the phase that rejected the
+    // program, in source order.
+    export Vec<String> more;
+}
+
+// The program's own text expanded and parsed (after the prelude's tokens),
+// before the rest of the static pass (`check_parsed`): cobc's `--unittest`
+// adds its runner here.
+export struct Parsed
+{
+    export Program user;
+    export Expansion ex;
+    // Bug 013: the array lengths computed once the items were known, by
+    // their first token (`parse_program_lengths`), for a text that extends
+    // this one (`--unittest`'s runner after it).
+    export HashMap<usize, u128> lengths;
+}
+
+fn shown(ref<Rejected, shared> r) : String
+{
+    if (r.loading)
+    {
+        return describe_diagnostic(&r.raw, &r.ex, true);
+    }
+    failure(&r.raw, &r.ex)
+}
+
+// D-0321: the first of several errors joined by `modres::join_more`.
+fn first_error(StringView e) : String
+{
+    match (StringView::find(e, "\u{2}"))
+    {
+        Some(k) : String::copy(&e[0..k]),
+        None    : String::copy(e),
+    }
+}
+
+// D-0321: `raw` is the first error, then each other after `\u{2}`
+// (`modres::join_more`).
+fn rejected(String raw, Expansion ex) : Rejected
+{
+    Vec<String> parts = Vec::new();
+    foreach (part in StringView::split(&raw, "\u{2}"))
+    {
+        Vec::push(&mut parts, String::copy(part));
+    }
+    String first = Vec::remove(&mut parts, 0);
+    Rejected { .raw = first, .ex = ex, .loading = false, .more = parts }
+}
+
+// A rejection with no other errors, as `cobc` builds one around `--unittest`'s
+// runner.
+export fn rejected_one(String raw, Expansion ex) : Rejected
+{
+    Rejected { .raw = raw, .ex = ex, .loading = false, .more = Vec::new() }
+}
+
+export fn parse_user(StringView src, StringView origin) : Result<Parsed, Rejected>
+{
+    Expansion ex = expand(strip_bom(src), origin);
+    Option<String> error = clone(&ex.error);
+    match (error)
+    {
+        Some(raw) : return Err(Rejected { .raw = raw, .ex = ex, .loading = true, .more = Vec::new() }),
+        None      : {},
+    }
+    match (parse_program_lengths(&ex.text))
+    {
+        Ok(pl) :
+        {
+            ProgramLengths { program, lengths } = pl;
+            Ok(Parsed { .user = program, .ex = ex, .lengths = lengths })
+        },
+        Err(e) : Err(rejected(e, ex)),
+    }
+}
+
+// A program's text parsed, and the array lengths computed for it
+// (`parse_program_lengths`).
+export struct ProgramLengths
+{
+    export Program program;
+    export HashMap<usize, u128> lengths;
+}
+
+export fn parse_program_text(ref<String, shared> text) : Result<Program, String>
+{
+    ProgramLengths { program, .. } = parse_program_lengths(text)?;
+    Ok(program)
+}
+
+// Bug 013 (D-0333): the program's text parsed as `parse_text_all` does, an
+// array length that uses the size of a type the parser does not lay out
+// computed once the program's items are known. The parser hoists each such
+// length as a constant (`alen$N`, 1 its value meanwhile); the items are
+// built as `check_parsed` builds them and each constant computed; the text
+// is parsed again with those values, until they no longer change (at most
+// eight rounds). Settled once from 1 and once from one more than the values
+// found, the lengths must agree: a length that depends on the size of a type
+// holding it either never settles or settles at whatever it starts from. A
+// program with no such length is parsed once, as before.
+export fn parse_program_lengths(ref<String, shared> text) : Result<ProgramLengths, String>
+{
+    LengthParse lp = parse_text_lengths(text, HashMap::new(), true)?;
+    if (Vec::len(&lp.sites) == 0)
+    {
+        LengthParse { program, .. } = lp;
+        return Ok(ProgramLengths { .program = program, .lengths = HashMap::new() });
+    }
+    Settled one = settle(text, lp, HashMap::new())?;
+    HashMap<usize, u128> other = HashMap::new();
+    foreach (s in &one.sites)
+    {
+        match (HashMap::get(&one.values, s.at))
+        {
+            Some(v) :
+            {
+                HashMap::insert(&mut other, s.at, *v + 1);
+            },
+            None    : {},
+        }
+    }
+    LengthParse again = parse_text_lengths(text, HashMap::clone(&other), true)?;
+    Settled two = settle(text, again, other)?;
+    foreach (s in &one.sites)
+    {
+        if (!same_value(&one.values, &two.values, s.at))
+        {
+            return Err(unsettled(s));
+        }
+    }
+    Settled { values, .. } = one;
+    LengthParse { program, .. } = parse_text_lengths(text, HashMap::clone(&values), false)?;
+    Ok(ProgramLengths { .program = program, .lengths = values })
+}
+
+// Whether `a` and `b` give `at` the same value.
+fn same_value(ref<HashMap<usize, u128>, shared> a, ref<HashMap<usize, u128>, shared> b, usize at) : bool
+{
+    match (HashMap::get(a, at))
+    {
+        Some(x) : match (HashMap::get(b, at))
+        {
+            Some(y) : *x == *y,
+            None    : false,
+        },
+        None : Option::is_none(&HashMap::get(b, at)),
+    }
+}
+
+struct Settled
+{
+    HashMap<usize, u128> values;
+    Vec<LengthSite> sites;
+}
+
+fn unsettled(ref<LengthSite, shared> s) : String
+{
+    sprintf(
+        "parse error at %v:%v: this array length does not settle: it uses the size of a type whose size depends on the length itself",
+        s.line,
+        s.col,
+    )
+}
+
+// The deferred lengths computed from `known` until they no longer change.
+fn settle(ref<String, shared> text, LengthParse first, HashMap<usize, u128> known) : Result<Settled, String>
+{
+    LengthParse lp = first;
+    for (usize round = 0; round < 8; round += 1)
+    {
+        LengthParse { program, sites } = lp;
+        HashMap<usize, u128> values = length_values(program, &sites)?;
+        Option<usize> moved = None;
+        for (usize i = 0; i < Vec::len(&sites) && Option::is_none(&moved); i += 1)
+        {
+            if (!same_value(&values, &known, sites[i].at))
+            {
+                moved = Some(i);
+            }
+        }
+        match (moved)
+        {
+            None    : return Ok(Settled { .values = values, .sites = sites }),
+            Some(i) :
+            {
+                if (round == 7)
+                {
+                    return Err(unsettled(&sites[i]));
+                }
+            },
+        }
+        known = values;
+        lp = parse_text_lengths(text, HashMap::clone(&known), true)?;
+    }
+    Err(String::copy("parse error: an array length does not settle"))
+}
+
+// The value of each deferred length of `user`, by its first token.
+fn length_values(Program user, ref<Vec<LengthSite>, shared> sites) : Result<HashMap<usize, u128>, String>
+{
+    Program program = parse_prelude();
+    Program { items, tests } = user;
+    Vec::append(&mut program.items, items);
+    program.tests = tests;
+    check_duplicates(&program)?;
+    add_derived(&mut program);
+    match (resolve_program(&mut program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(e),
+    }
+    match (consts::process(&mut program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(e),
+    }
+    Items table = build_items(program);
+    HashMap<usize, u128> values = HashMap::new();
+    foreach (s in sites)
+    {
+        // The constant's name in the items: its module's path before it.
+        String key = String::clone(&s.name);
+        String tail = sprintf("::%s", &s.name);
+        for (usize i = 0; i < HashMap::len(&table.fns); i += 1)
+        {
+            ref<String, shared> k = HashMap::key_at(&table.fns, i);
+            if (StringView::ends_with(k, &tail))
+            {
+                key = String::clone(k);
+                break;
+            }
+        }
+        match (const_usize(&table, &key))
+        {
+            Ok(v)  :
+            {
+                HashMap::insert(&mut values, s.at, v);
+            },
+            Err(d) :
+            {
+                if (d == "diag.const-not-constant" || d == "diag.unsupported-in-selfhost" || d == "diag.type-mismatch")
+                {
+                    return Err(sprintf(
+                        "parse error at %v:%v: %s; once the program's items are known it still cannot be computed: `sizeof` and `alignof` take a type the compiler lays out (not an opaque `extern` type or a closure's), and the constants it names are constant expressions of `usize`",
+                        s.line,
+                        s.col,
+                        &s.problem,
+                    ));
+                }
+                return Err(sprintf("parse error at %v:%v: this array length fails before the program runs (%s)", s.line, s.col, &d));
+            },
+        }
+    }
+    Ok(values)
+}
+
+// The rest of the static pass over a parsed program. `warn_shadow`
+// (`--warn-shadow`, CHG-0333): once its names are resolved, a note on
+// standard error for each item of the program that hides an imported one.
+export fn check_parsed(Parsed parsed, bool warn_shadow, Option<String> certificate) : Result<Checked, Rejected>
+{
+    Parsed { user, ex, .. } = parsed;
+    Program program = parse_prelude();
+    Program { items, tests } = user;
+    Vec::append(&mut program.items, items);
+    program.tests = tests;
+    match (check_duplicates(&program))
+    {
+        Ok(_)  : {},
+        Err(e) : return Err(rejected(e, ex)),
+    }
+    add_derived(&mut program);
+    Resolver resolver = match (resolve_program(&mut program))
+    {
+        Ok(r)  : r,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    if (warn_shadow)
+    {
+        Vec<ShadowNote> notes = shadow_notes(&resolver, &program);
+        foreach (n in &notes)
+        {
+            match (resolve_line(&ex, n.line))
+            {
+                Some(o) : eprintf("%s\n  --> %s:%v\n", &n.text, &o.file, o.line),
+                None    : eprintf("%s\n", &n.text),
+            }
+        }
+    }
+    Folded folded = match (consts::process(&mut program))
+    {
+        Ok(l)  : l,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    // D-0312: text fits its declaration by `[Coerce-Text]`, which the type
+    // checker applies where a position's type is known (its rewrites).
+    Front front = Front { .resolver = resolver, .folded = folded, .std_base = std_base() };
+    Items table = build_items(program);
+    table.certificate = certificate;
+    table.retired = clone(&front.resolver.retired);
+    table.retired_exempt = HashSet::clone(&front.resolver.exempt);
+    table.any_retired = front.resolver.any_retired;
+    number(&mut table);
+    Facts facts = new_facts();
+    Vec<StaticAssert> asserts = match (check_program(&mut table, &front, &mut facts))
+    {
+        Ok(a)  : a,
+        Err(e) : return Err(rejected(e, ex)),
+    };
+    match (rewrite_disagreed(&facts))
+    {
+        Some(at) :
+        {
+            String m = sprintf(
+                "diag.type-mismatch\u{1}this text is a `StringView` in one instantiation of the generic function around it and another type in another (`[Coerce-Text]`); write the view where one is meant, `StringView::of(…)` or `&s[0..$]`, and to look a key up in generic code take its probe, a `probe<K>` parameter (D-0312)%s",
+                &at,
+            );
+            return Err(rejected(m, ex));
+        },
+        None     : {},
+    }
+    // D-0162: the literals typed `String` through a generic, and the other
+    // rewrites, applied; the program is then checked again. A body first
+    // reached through a rewrite (`==` between a `String` and a view becomes
+    // a call of `String::eq_view`, D-0164) is checked only then, and its own
+    // rewrites are applied in turn, until a check records none (at most
+    // eight rounds).
+    // D-0314: a `[Coerce-Slice-Literal]` node two instantiations typed apart.
+    match (slice_literal_disagreed(&facts))
+    {
+        Some(m) : return Err(rejected(m, ex)),
+        None    : {},
+    }
+    usize rounds = 0;
+    while (rounds <= 8 && apply_rewrites(&mut table, &mut facts))
+    {
+        rounds += 1;
+        number(&mut table);
+        // The rewritten program is checked as if with a new `Items`: the
+        // tier facts of the first pass are dropped (D-0282, D-0283).
+        table.tier_summaries = None;
+        HashMap::clear(&mut table.point_checks);
+        table.any_point_checks = false;
+        HashMap::clear(&mut table.tracking_needed);
+        HashSet::clear(&mut table.point_check_fns);
+        Facts again = new_facts();
+        asserts = match (check_program(&mut table, &front, &mut again))
+        {
+            Ok(a)  : a,
+            Err(e) : return Err(rejected(e, ex)),
+        };
+        match (slice_literal_disagreed(&again))
+        {
+            Some(m) : return Err(rejected(m, ex)),
+            None    : {},
+        }
+        if (literal_still_string(&again))
+        {
+            String m = "diag.type-mismatch\u{1}a text literal here is a `String` in one instantiation of the generic function around it and another type in another; write `String::copy(\"…\")` where a `String` is meant";
+            return Err(rejected(m, ex));
+        }
+        // The notes of every round are kept across them (the lints of
+        // D-0312 §4 are met before the rewrites).
+        Vec::append(&mut again.retired_notes, replace(&mut facts.retired_notes, Vec::new()));
+        facts = again;
+    }
+    match (and_const_items(check_static_asserts(&table, &asserts), &table))
+    {
+        Ok(_)  :
+        {
+            // D-0303: under `--allow-deprecated`, each use of a deprecated
+            // name, once the program is accepted, in source order, once.
+            Vec<RetiredNote> notes = clone(&front.resolver.notes);
+            Vec::append(&mut notes, replace(&mut facts.retired_notes, Vec::new()));
+            print_retired_notes(&mut notes, &ex);
+            Ok(Checked { .table = table, .facts = facts, .ex = ex, .front = front })
+        },
+        Err(e) : Err(rejected(e, ex)),
+    }
+}
+
+// `[Const-Checked-Failure]` after the assertions (`consteval::check_const_items`).
+fn and_const_items(Result<void, String> r, ref<Items, shared> it) : Result<void, String>
+{
+    r?;
+    check_const_items(it)
+}
+
+fn print_retired_notes(ref<Vec<RetiredNote>, exclusive> notes, ref<Expansion, shared> ex)
+{
+    Vec::sort(notes);
+    Vec::dedup(notes);
+    foreach (n in notes)
+    {
+        match (resolve_line(ex, n.line))
+        {
+            Some(o) :
+            {
+                if (n.col > 0)
+                {
+                    eprintf("%s\n  --> %s:%v:%v\n", &n.text, &o.file, o.line, n.col);
+                }
+                else
+                {
+                    eprintf("%s\n  --> %s:%v\n", &n.text, &o.file, o.line);
+                }
+            },
+            None    : eprintf("%s\n", &n.text),
+        }
+    }
+}
+
+fn failure(ref<String, shared> e, ref<Expansion, shared> ex) : String
+{
+    if (StringView::starts_with(e, "diag."))
+    {
+        return describe_diagnostic(e, ex, false);
+    }
+    describe(e, ex)
+}
+
+// `--dump-ast`'s text of `src`, or the error it prints.
+export fn dump_text(StringView src, StringView origin) : Result<String, String>
+{
+    Expansion ex = prepared(src, origin);
+    match (parse_program_text(&ex.text))
+    {
+        Ok(p)  : Ok(dump_program(&p, 0, 0)),
+        Err(e) : Err(describe(&e, &ex)),
+    }
+}
+
+// D-0312 §4: `--check`'s text lints, for cobc's driver.
+export fn check_text_lints()
+{
+    report_text_lints();
+}
+
+// `COBALTC_TEXT_LINTS=all`: the lints in `std`'s own bodies too.
+export fn check_text_lints_in_std()
+{
+    report_text_lints_in_std();
+}
+
+// D-0303: `--allow-deprecated`, for cobc's driver.
+export fn allow_deprecated_uses()
+{
+    allow_deprecated();
+}

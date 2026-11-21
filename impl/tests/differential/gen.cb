@@ -1,0 +1,1194 @@
+// The random generator: well-typed CobaltC programs that lean on what the compiler
+// proves things about (`Vec` pushes, element reads and writes, element
+// references held across pushes, reference parameters, moves, resources
+// ending in nested blocks, arithmetic that may overflow, divide by zero or
+// narrow badly) and, since WI-2, threads, mutexes, channels, closures,
+// `match` and views. A seed names one program: the order of the random
+// generator's draws is part of what a seed means, and is not to change.
+
+import std;
+import prelude;
+
+// xorshift64*: deterministic across platforms.
+export struct Rng
+{
+    u64 x;
+}
+
+export fn Rng::new(u64 seed) : Rng
+{
+    Rng { .x = wrapping_mul(seed, 0x9E3779B97F4A7C15) | 1 }
+}
+
+export fn Rng::next(ref<Rng, exclusive> r) : u64
+{
+    u64 x = r.x;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    r.x = x;
+    wrapping_mul(x, 0x2545F4914F6CDD1D)
+}
+
+fn Rng::below(ref<Rng, exclusive> r, u64 n) : u64
+{
+    Rng::next(r) % n
+}
+
+fn Rng::chance(ref<Rng, exclusive> r, u64 pct) : bool
+{
+    Rng::below(r, 100) < pct
+}
+
+fn Rng::pick_index(ref<Rng, exclusive> r, usize n) : usize
+{
+    narrow<usize>(Rng::below(r, narrow<u64>(n)))
+}
+
+// `pick` of a list of names: a copy of the one drawn.
+fn Rng::pick(ref<Rng, exclusive> r, ref<Vec<String>, shared> xs) : String
+{
+    usize i = Rng::pick_index(r, Vec::len(xs));
+    clone(&xs[i])
+}
+
+// `pick` of a list of texts.
+fn Rng::pick_str(ref<Rng, exclusive> r, slice<str, shared> xs) : str
+{
+    usize i = Rng::pick_index(r, slice_len(xs));
+    xs[i]
+}
+
+enum Ty
+{
+    I32,
+    Usize,
+    Vec,
+    LocalVec,  // used only through push, len and element access: confinable
+    HelperVec, // also passed to the confining helpers: confinable across calls
+    Tracer,
+    Stash,     // Vec<ref<i32, shared>>: element references held across statements
+    Map,       // HashMap<i64, i64>, driven through the tally/mget helpers
+    Str,       // a String of space-separated numbers, split and re-parsed
+    PtVec,     // Vec<Pt>: elements updated field by field
+}
+
+struct Bound
+{
+    String name;
+    Ty ty;
+}
+
+struct Gen
+{
+    Rng rng;
+    String out;
+    usize ind;
+    Vec<Vec<Bound>> scopes;
+    u32 next;
+}
+
+fn Gen::line(ref<Gen, exclusive> g, StringView s)
+{
+    for (usize i = 0; i < g.ind; i += 1)
+    {
+        String::append(&mut g.out, "    ");
+    }
+    String::append(&mut g.out, s);
+    String::push_ascii(&mut g.out, b'\n');
+}
+
+fn Gen::fresh(ref<Gen, exclusive> g, str p) : String
+{
+    g.next += 1;
+    sprintf("%s%d", p, g.next)
+}
+
+fn Gen::vars(ref<Gen, shared> g, Ty ty) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    foreach (s in &g.scopes)
+    {
+        foreach (b in s)
+        {
+            if (b.ty == ty)
+            {
+                Vec::push(&mut v, clone(&b.name));
+            }
+        }
+    }
+    v
+}
+
+// Every vector, for the uses both kinds allow.
+fn Gen::any_vecs(ref<Gen, shared> g) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    foreach (s in &g.scopes)
+    {
+        foreach (b in s)
+        {
+            if (b.ty == Ty::Vec || b.ty == Ty::LocalVec || b.ty == Ty::HelperVec)
+            {
+                Vec::push(&mut v, clone(&b.name));
+            }
+        }
+    }
+    v
+}
+
+// The vectors the confining helpers (`sum`, `fill`, `set`,
+// `fill_twice`, `sum_from`, `copy_first` on two) may be given.
+fn Gen::helper_vecs(ref<Gen, shared> g) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    foreach (s in &g.scopes)
+    {
+        foreach (b in s)
+        {
+            if (b.ty == Ty::Vec || b.ty == Ty::HelperVec)
+            {
+                Vec::push(&mut v, clone(&b.name));
+            }
+        }
+    }
+    v
+}
+
+fn Gen::bind(ref<Gen, exclusive> g, StringView name, Ty ty)
+{
+    usize n = Vec::len(&g.scopes);
+    Vec::push(&mut g.scopes[n - 1], Bound { .name = String::copy(name), .ty = ty });
+}
+
+fn Gen::forget(ref<Gen, exclusive> g, StringView name)
+{
+    foreach (s in &mut g.scopes)
+    {
+        Vec::retain(s, [name](ref<Bound, shared> b) : bool { b.name != name });
+    }
+}
+
+fn has(ref<Vec<String>, shared> v, StringView n) : bool
+{
+    foreach (x in v)
+    {
+        if (*x == n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn Gen::int_lit(ref<Gen, exclusive> g) : String
+{
+    match (Rng::below(&mut g.rng, 10))
+    {
+        0 : sprintf("%d", 2147483000 + Rng::below(&mut g.rng, 647)),
+        1 : sprintf("-%d", Rng::below(&mut g.rng, 50)),
+        _ : sprintf("%d", Rng::below(&mut g.rng, 20)),
+    }
+}
+
+// An `i32` expression.
+fn Gen::iexpr(ref<Gen, exclusive> g, u32 depth) : String
+{
+    Vec<String> vars = Gen::vars(g, Ty::I32);
+    Vec<String> vecs = Gen::any_vecs(g);
+    Vec<String> shared_vecs = Gen::helper_vecs(g);
+    u64 k = 0;
+    if (depth == 0)
+    {
+        k = Rng::below(&mut g.rng, 3);
+    }
+    else
+    {
+        k = Rng::below(&mut g.rng, 9);
+    }
+    if (k == 0)
+    {
+        return Gen::int_lit(g);
+    }
+    if ((k == 1 || k == 2) && Vec::len(&vars) > 0)
+    {
+        return Rng::pick(&mut g.rng, &vars);
+    }
+    if (k == 3 || k == 4)
+    {
+        str op = Rng::pick_str(&mut g.rng, &["+", "-", "*", "+", "-", "/", "%"]);
+        String a = Gen::iexpr(g, depth - 1);
+        String b = Gen::iexpr(g, depth - 1);
+        return sprintf("(%s %s %s)", &a, op, &b);
+    }
+    if ((k == 5 || k == 6) && Vec::len(&vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, &vecs);
+        String i = Gen::uexpr(g, depth - 1, Some(clone(&v)));
+        return sprintf("*Vec::index_shared(&%s, %s)", &v, &i);
+    }
+    if (k == 7 && Vec::len(&vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, &vecs);
+        return sprintf("narrow<i32>(Vec::len(&%s))", &v);
+    }
+    if (k == 8 && Vec::len(&shared_vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, &shared_vecs);
+        return sprintf("narrow<i32>(sum(&%s))", &v);
+    }
+    Gen::int_lit(g)
+}
+
+// A `usize` expression, usually an index into `v` when one is given.
+fn Gen::uexpr(ref<Gen, exclusive> g, u32 depth, Option<String> v) : String
+{
+    Vec<String> vars = Gen::vars(g, Ty::Usize);
+    u64 k = Rng::below(&mut g.rng, 6);
+    if ((k == 0 || k == 1) && Vec::len(&vars) > 0)
+    {
+        return Rng::pick(&mut g.rng, &vars);
+    }
+    if (k == 2)
+    {
+        match (&v)
+        {
+            Some(name) : return sprintf("Vec::len(&%s) - 1", name),
+            None       : {},
+        }
+    }
+    if (k == 3 && depth > 0)
+    {
+        String e = Gen::iexpr(g, depth - 1);
+        return sprintf("narrow<usize>(%s)", &e);
+    }
+    sprintf("%d", Rng::below(&mut g.rng, 4))
+}
+
+fn Gen::bexpr(ref<Gen, exclusive> g, u32 depth) : String
+{
+    str op = Rng::pick_str(&mut g.rng, &["<", "<=", "==", "!=", ">", ">="]);
+    String a = Gen::iexpr(g, depth);
+    String b = Gen::iexpr(g, depth);
+    sprintf("%s %s %s", &a, op, &b)
+}
+
+fn Gen::block(ref<Gen, exclusive> g, u64 n, u32 depth)
+{
+    Vec::push(&mut g.scopes, Vec::new());
+    for (u64 i = 0; i < n; i += 1)
+    {
+        Gen::stmt(g, depth);
+    }
+    _ = Vec::pop(&mut g.scopes);
+}
+
+// One statement, one of 66 draws, a guard that does not hold falling
+// through to the last arm.
+fn Gen::stmt(ref<Gen, exclusive> g, u32 depth)
+{
+    Vec<String> vecs = Gen::vars(g, Ty::Vec);
+    Vec<String> helper = Gen::helper_vecs(g);
+    Vec<String> all_vecs = Gen::any_vecs(g);
+    Vec<String> ints = Gen::vars(g, Ty::I32);
+    Vec<String> tracers = Gen::vars(g, Ty::Tracer);
+    Vec<String> stashes = Gen::vars(g, Ty::Stash);
+    Vec<String> maps = Gen::vars(g, Ty::Map);
+    Vec<String> strs = Gen::vars(g, Ty::Str);
+    Vec<String> pts = Gen::vars(g, Ty::PtVec);
+    u64 k = Rng::below(&mut g.rng, 66);
+    bool done = Gen::stmt_a(g, k, depth, &vecs, &helper, &all_vecs, &ints, &tracers, &stashes);
+    if (!done)
+    {
+        done = Gen::stmt_b(g, k, depth, &vecs, &helper, &all_vecs, &ints, &stashes, &maps, &strs, &pts);
+    }
+    if (!done)
+    {
+        done = Gen::stmt_c(g, k, depth, &vecs, &helper, &all_vecs, &ints, &stashes, &maps, &strs);
+    }
+    if (!done)
+    {
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("show(widen<i64>(%s));", &e));
+    }
+}
+
+// Arms 0 to 26.
+fn Gen::stmt_a(ref<Gen, exclusive> g, u64 k, u32 depth, ref<Vec<String>, shared> vecs, ref<Vec<String>, shared> helper, ref<Vec<String>, shared> all_vecs, ref<Vec<String>, shared> ints, ref<Vec<String>, shared> tracers, ref<Vec<String>, shared> stashes) : bool
+{
+    if (k == 0 || k == 1)
+    {
+        String x = Gen::fresh(g, "x");
+        String e = Gen::iexpr(g, 2);
+        Gen::line(g, &sprintf("i32 %s = %s;", &x, &e));
+        Gen::bind(g, &x, Ty::I32);
+        return true;
+    }
+    if (k == 2 && Vec::len(ints) > 0)
+    {
+        String x = Rng::pick(&mut g.rng, ints);
+        String e = Gen::iexpr(g, 2);
+        Gen::line(g, &sprintf("%s = %s;", &x, &e));
+        return true;
+    }
+    if (k == 3)
+    {
+        String v = Gen::fresh(g, "v");
+        Gen::line(g, &sprintf("Vec<i32> %s = Vec::new();", &v));
+        array<Ty, 4> kinds = [Ty::LocalVec, Ty::HelperVec, Ty::HelperVec, Ty::Vec];
+        usize i = Rng::pick_index(&mut g.rng, 4);
+        Gen::bind(g, &v, kinds[i]);
+        return true;
+    }
+    if ((k == 4 || k == 5 || k == 6) && Vec::len(all_vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, all_vecs);
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("Vec::push(&mut %s, %s);", &v, &e));
+        return true;
+    }
+    if ((k == 7 || k == 8) && Vec::len(all_vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, all_vecs);
+        String i = Gen::uexpr(g, 1, Some(clone(&v)));
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("*Vec::index_exclusive(&mut %s, %s) = %s;", &v, &i, &e));
+        return true;
+    }
+    if (k == 9 || k == 10)
+    {
+        String e = Gen::iexpr(g, 2);
+        Gen::line(g, &sprintf("show(widen<i64>(%s));", &e));
+        return true;
+    }
+    if (k == 11 && Vec::len(all_vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, all_vecs);
+        if (Rng::chance(&mut g.rng, 50) || !has(helper, &v))
+        {
+            Gen::line(g, &sprintf("showu(widen<u64>(Vec::len(&%s)));", &v));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("show(sum(&%s));", &v));
+        }
+        return true;
+    }
+    if (k == 12 && Vec::len(helper) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, helper);
+        u64 n = Rng::below(&mut g.rng, 12);
+        Gen::line(g, &sprintf("fill(&mut %s, %d);", &v, n));
+        return true;
+    }
+    if (k == 13 && Vec::len(helper) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, helper);
+        String i = Gen::uexpr(g, 1, Some(clone(&v)));
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("set(&mut %s, %s, %s);", &v, &i, &e));
+        return true;
+    }
+    if (k == 14 && depth > 0)
+    {
+        String kk = Gen::fresh(g, "k");
+        u64 n = Rng::below(&mut g.rng, 5);
+        Gen::line(g, &sprintf("usize %s = 0;", &kk));
+        Gen::line(g, &sprintf("while (%s < %d)", &kk, n));
+        Gen::line(g, "{");
+        g.ind += 1;
+        Vec<Bound> sc = Vec::new();
+        Vec::push(&mut sc, Bound { .name = clone(&kk), .ty = Ty::Usize });
+        Vec::push(&mut g.scopes, sc);
+        u64 m = 1 + Rng::below(&mut g.rng, 4);
+        for (u64 j = 0; j < m; j += 1)
+        {
+            Gen::stmt(g, depth - 1);
+        }
+        _ = Vec::pop(&mut g.scopes);
+        Gen::line(g, &sprintf("%s = %s + 1;", &kk, &kk));
+        g.ind -= 1;
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 15 && depth > 0)
+    {
+        String c = Gen::bexpr(g, 1);
+        Gen::line(g, &sprintf("if (%s)", &c));
+        Gen::line(g, "{");
+        g.ind += 1;
+        u64 m = 1 + Rng::below(&mut g.rng, 3);
+        Gen::block(g, m, depth - 1);
+        g.ind -= 1;
+        Gen::line(g, "}");
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            Gen::line(g, "else");
+            Gen::line(g, "{");
+            g.ind += 1;
+            u64 m2 = 1 + Rng::below(&mut g.rng, 3);
+            Gen::block(g, m2, depth - 1);
+            g.ind -= 1;
+            Gen::line(g, "}");
+        }
+        return true;
+    }
+    if (k == 16 && depth > 0)
+    {
+        // A resource that ends with its block, after what the
+        // block does (or during the unwind, if that faults).
+        String t = Gen::fresh(g, "t");
+        u64 id = Rng::below(&mut g.rng, 100);
+        Gen::line(g, "{");
+        g.ind += 1;
+        Vec::push(&mut g.scopes, Vec::new());
+        Gen::line(g, &sprintf("auto %s = make(%d);", &t, id));
+        Gen::bind(g, &t, Ty::Tracer);
+        u64 m = 1 + Rng::below(&mut g.rng, 3);
+        for (u64 j = 0; j < m; j += 1)
+        {
+            Gen::stmt(g, depth - 1);
+        }
+        _ = Vec::pop(&mut g.scopes);
+        g.ind -= 1;
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 17 && Vec::len(tracers) > 0)
+    {
+        String t = Rng::pick(&mut g.rng, tracers);
+        Gen::line(g, &sprintf("drop(%s);", &t));
+        Gen::forget(g, &t);
+        return true;
+    }
+    if (k == 18 && Vec::len(vecs) > 0)
+    {
+        // A move: later uses of the vector are rejected statically,
+        // or fault at run time inside a loop.
+        String v = Rng::pick(&mut g.rng, vecs);
+        Gen::line(g, &sprintf("showu(widen<u64>(takes(%s)));", &v));
+        Gen::forget(g, &v);
+        return true;
+    }
+    if (k == 19 && Vec::len(vecs) > 0)
+    {
+        // Hold a reference to an element in another vector, so the
+        // static pass cannot see it: a push that reallocates makes
+        // it stale.
+        String v = Rng::pick(&mut g.rng, vecs);
+        String h = Gen::fresh(g, "h");
+        String i = Gen::uexpr(g, 0, Some(clone(&v)));
+        Gen::line(g, &sprintf("Vec<ref<i32, shared>> %s = Vec::new();", &h));
+        Gen::line(g, &sprintf("Vec::push(&mut %s, Vec::index_shared(&%s, %s));", &h, &v, &i));
+        Gen::bind(g, &h, Ty::Stash);
+        return true;
+    }
+    if (k == 20 && Vec::len(stashes) > 0)
+    {
+        String h = Rng::pick(&mut g.rng, stashes);
+        Gen::line(g, &sprintf("show(widen<i64>(**Vec::index_shared(&%s, 0)));", &h));
+        return true;
+    }
+    if (k == 21 && Vec::len(helper) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, helper);
+        u64 n = Rng::below(&mut g.rng, 6);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            // A plain variable beside the vector, used for the last
+            // time in the call: the vector stays confined.
+            String c = Gen::fresh(g, "c");
+            Gen::line(g, &sprintf("i32 %s = %d;", &c, n));
+            Gen::line(g, &sprintf("fill_twice(&mut %s, %s);", &v, &c));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("fill_twice(&mut %s, %d);", &v, n));
+        }
+        return true;
+    }
+    if (k == 22 && Vec::len(helper) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, helper);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            String c = Gen::fresh(g, "c");
+            Gen::line(g, &sprintf("usize %s = 0;", &c));
+            Gen::line(g, &sprintf("show(sum_from(&%s, %s));", &v, &c));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("show(sum_from(&%s, 0));", &v));
+        }
+        return true;
+    }
+    if (k == 23 && Vec::len(vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, vecs);
+        Gen::line(g, &sprintf("show(widen<i64>(*first_ref(&%s)));", &v));
+        return true;
+    }
+    if (k == 24 && Vec::len(vecs) > 0)
+    {
+        // Two vectors, or one passed twice (a conflict at the push).
+        String a = Rng::pick(&mut g.rng, vecs);
+        String b = String::new();
+        if (Rng::chance(&mut g.rng, 30))
+        {
+            b = clone(&a);
+        }
+        else
+        {
+            b = Rng::pick(&mut g.rng, vecs);
+        }
+        Gen::line(g, &sprintf("copy_first(&mut %s, &%s);", &a, &b));
+        return true;
+    }
+    if (k == 25 && Vec::len(helper) >= 2)
+    {
+        // Two distinct confinable vectors: both confined in the call.
+        String a = Rng::pick(&mut g.rng, helper);
+        String b = Rng::pick(&mut g.rng, helper);
+        if (a != b)
+        {
+            Gen::line(g, &sprintf("copy_first(&mut %s, &%s);", &a, &b));
+        }
+        return true;
+    }
+    false
+}
+
+// Arms 27 to 45.
+fn Gen::stmt_b(ref<Gen, exclusive> g, u64 k, u32 depth, ref<Vec<String>, shared> vecs, ref<Vec<String>, shared> helper, ref<Vec<String>, shared> all_vecs, ref<Vec<String>, shared> ints, ref<Vec<String>, shared> stashes, ref<Vec<String>, shared> maps, ref<Vec<String>, shared> strs, ref<Vec<String>, shared> pts) : bool
+{
+    if (k == 27)
+    {
+        String m = Gen::fresh(g, "m");
+        Gen::line(g, &sprintf("HashMap<i64, i64> %s = HashMap::new();", &m));
+        Gen::bind(g, &m, Ty::Map);
+        return true;
+    }
+    if ((k == 28 || k == 29) && Vec::len(maps) > 0)
+    {
+        String m = Rng::pick(&mut g.rng, maps);
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("tally(&mut %s, widen<i64>(%s));", &m, &e));
+        return true;
+    }
+    if (k == 30 && Vec::len(maps) > 0)
+    {
+        String m = Rng::pick(&mut g.rng, maps);
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("show(mget(&%s, widen<i64>(%s)));", &m, &e));
+        return true;
+    }
+    if (k == 31 && Vec::len(maps) > 0)
+    {
+        String m = Rng::pick(&mut g.rng, maps);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            // In or out of bounds: index parity through the map's
+            // public insertion order.
+            String i = Gen::uexpr(g, 1, None);
+            Gen::line(g, &sprintf("show(*HashMap::value_at(&%s, %s));", &m, &i));
+        }
+        else
+        {
+            String e = Gen::iexpr(g, 1);
+            Gen::line(g, &sprintf("show(Option::unwrap_or(HashMap::swap_remove(&mut %s, widen<i64>(%s)), 0 - 7));", &m, &e));
+        }
+        return true;
+    }
+    if (k == 32)
+    {
+        String s = Gen::fresh(g, "s");
+        String a = Gen::iexpr(g, 1);
+        String b = Gen::iexpr(g, 1);
+        String c = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("String %s = sprintf(\"%%v %%v %%v\", %s, %s, %s);", &s, &a, &b, &c));
+        Gen::bind(g, &s, Ty::Str);
+        return true;
+    }
+    if (k == 33 && Vec::len(strs) > 0)
+    {
+        String s = Rng::pick(&mut g.rng, strs);
+        String i = Gen::uexpr(g, 1, None);
+        Gen::line(g, &sprintf("show(mword(&%s, %s));", &s, &i));
+        return true;
+    }
+    if (k == 34 && depth > 0)
+    {
+        // A counter closure in its own scope, so the exclusive
+        // capture never collides with later statements.
+        String x = Gen::fresh(g, "x");
+        String c = Gen::fresh(g, "c");
+        String e = Gen::iexpr(g, 1);
+        u64 n = 1 + Rng::below(&mut g.rng, 3);
+        Gen::line(g, "{");
+        g.ind += 1;
+        Gen::line(g, &sprintf("i32 %s = %s;", &x, &e));
+        Gen::line(g, &sprintf("auto %s = [%s]() : i64 { %s += 1; widen<i64>(%s) };", &c, &x, &x, &x));
+        for (u64 j = 0; j < n; j += 1)
+        {
+            Gen::line(g, &sprintf("show(%s());", &c));
+        }
+        g.ind -= 1;
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 35)
+    {
+        String p = Gen::fresh(g, "p");
+        Gen::line(g, &sprintf("Vec<Pt> %s = Vec::new();", &p));
+        u64 n = 1 + Rng::below(&mut g.rng, 5);
+        for (u64 j = 0; j < n; j += 1)
+        {
+            String a = Gen::iexpr(g, 1);
+            String b = Gen::iexpr(g, 1);
+            Gen::line(g, &sprintf("Vec::push(&mut %s, Pt { .x = %s, .y = %s });", &p, &a, &b));
+        }
+        Gen::bind(g, &p, Ty::PtVec);
+        return true;
+    }
+    if ((k == 36 || k == 37) && Vec::len(pts) > 0)
+    {
+        String p = Rng::pick(&mut g.rng, pts);
+        String i = Gen::uexpr(g, 1, Some(clone(&p)));
+        str f = Rng::pick_str(&mut g.rng, &["x", "y"]);
+        str op = Rng::pick_str(&mut g.rng, &["=", "+=", "-=", "*="]);
+        String e = String::new();
+        if (Rng::chance(&mut g.rng, 30))
+        {
+            String j = Gen::uexpr(g, 0, Some(clone(&p)));
+            str f2 = Rng::pick_str(&mut g.rng, &["x", "y"]);
+            e = sprintf("%s[%s].%s", &p, &j, f2);
+        }
+        else
+        {
+            e = Gen::iexpr(g, 1);
+        }
+        Gen::line(g, &sprintf("%s[%s].%s %s %s;", &p, &i, f, op, &e));
+        return true;
+    }
+    if (k == 38 && Vec::len(pts) > 0)
+    {
+        String p = Rng::pick(&mut g.rng, pts);
+        String q = Gen::fresh(g, "q");
+        String e = Gen::iexpr(g, 1);
+        Gen::line(g, &sprintf("foreach (%s in &mut %s)", &q, &p));
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    %s.x = %s.y + %s;", &q, &q, &e));
+        Gen::line(g, &sprintf("    %s.y -= 1;", &q));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 39 && Vec::len(pts) > 0)
+    {
+        String p = Rng::pick(&mut g.rng, pts);
+        String r = Gen::fresh(g, "r");
+        String i = Gen::uexpr(g, 1, Some(clone(&p)));
+        String e = Gen::iexpr(g, 0);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    ref<Pt, exclusive> %s = &mut %s[%s];", &r, &p, &i));
+        Gen::line(g, &sprintf("    %s.y = %s.x * 2 + %s;", &r, &r, &e));
+        Gen::line(g, &sprintf("    (*%s).x += 1;", &r));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 40 && Vec::len(pts) > 0)
+    {
+        String p = Rng::pick(&mut g.rng, pts);
+        String i = Gen::uexpr(g, 0, Some(clone(&p)));
+        String line = sprintf("show(widen<i64>(%s[%s].x) + widen<i64>(%s[%s].y));", &p, &i, &p, &i);
+        if (Rng::chance(&mut g.rng, 15))
+        {
+            // The vector grows under the element the write reached:
+            // stale, in both tools.
+            line = sprintf("%s[%s].x = grow_pts(&mut %s);", &p, &i, &p);
+        }
+        Gen::line(g, &line);
+        return true;
+    }
+    if (k == 41 && Vec::len(ints) > 0)
+    {
+        String x = Rng::pick(&mut g.rng, ints);
+        String e = Gen::iexpr(g, 1);
+        String e2 = Gen::iexpr(g, 0);
+        Gen::line(g, &sprintf("show(two(%s, { %s = %s; %s }));", &x, &x, &e, &e2));
+        return true;
+    }
+    if (k == 42 && Vec::len(all_vecs) > 0 && depth > 0)
+    {
+        String v = Rng::pick(&mut g.rng, all_vecs);
+        String i = Gen::uexpr(g, 0, Some(clone(&v)));
+        String e = Gen::iexpr(g, 0);
+        Gen::line(g, &sprintf("show(two(*Vec::index_shared(&%s, %s), { *Vec::index_exclusive(&mut %s, %s) = %s; 1 }));", &v, &i, &v, &i, &e));
+        return true;
+    }
+    if (k == 43 && Vec::len(strs) > 0)
+    {
+        String s = Rng::pick(&mut g.rng, strs);
+        str t = Rng::pick_str(&mut g.rng, &["\" \"", "\"1\"", "\"-\"", "\"0\""]);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            Gen::line(g, &sprintf("show(vcount(&%s, %s));", &s, t));
+        }
+        else
+        {
+            String w = Gen::fresh(g, "w");
+            Gen::line(g, "{");
+            Gen::line(g, &sprintf("    StringView %s = &%s;", &w, &s));
+            Gen::line(g, &sprintf("    show(vcount(%s, %s) + vcount(StringView::trim(%s), %s));", &w, t, &w, t));
+            Gen::line(g, "}");
+        }
+        return true;
+    }
+    if (k == 44 && Vec::len(helper) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, helper);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            String i = Gen::uexpr(g, 0, Some(clone(&v)));
+            Gen::line(g, &sprintf("show(widen<i64>(Vec::remove(&mut %s, %s)));", &v, &i));
+        }
+        else
+        {
+            String e = Gen::iexpr(g, 0);
+            Gen::line(g, &sprintf("if (Vec::contains(&%s, %s)) { show(1); } else { show(0); }", &v, &e));
+        }
+        return true;
+    }
+    if (k == 45 && Vec::len(vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, vecs);
+        String w = Gen::fresh(g, "v");
+        Gen::line(g, &sprintf("Vec<i32> %s = owned_total(%s);", &w, &v));
+        Gen::forget(g, &v);
+        Gen::bind(g, &w, Ty::Vec);
+        return true;
+    }
+    false
+}
+
+// Arms 46 to 65: threads, closures, `match`, channels, maps and views
+// (WI-2, 2026-10-12). Only shapes with one outcome whatever the
+// schedule: a racy shape belongs to the model (`impl/model`), which knows
+// every outcome the rules allow.
+fn Gen::stmt_c(ref<Gen, exclusive> g, u64 k, u32 depth, ref<Vec<String>, shared> vecs, ref<Vec<String>, shared> helper, ref<Vec<String>, shared> all_vecs, ref<Vec<String>, shared> ints, ref<Vec<String>, shared> stashes, ref<Vec<String>, shared> maps, ref<Vec<String>, shared> strs) : bool
+{
+    if ((k == 46 || k == 47) && Vec::len(ints) > 0)
+    {
+        // A thread lent a borrow made in the call, joined at once.
+        String x = Rng::pick(&mut g.rng, ints);
+        String e = Gen::iexpr(g, 0);
+        Gen::line(g, &sprintf("{ auto t = spawn(bump, &mut %s, %s); join(t); }", &x, &e));
+        return true;
+    }
+    if (k == 48 && Vec::len(ints) > 0)
+    {
+        // A reference held in a local, lent to a thread: the
+        // spawner's copy is usable again after the join. Used
+        // before it, or lent twice, is rejected statically.
+        String x = Rng::pick(&mut g.rng, ints);
+        String r = Gen::fresh(g, "r");
+        String t = Gen::fresh(g, "t");
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    auto %s = &mut %s;", &r, &x));
+        Gen::line(g, &sprintf("    auto %s = spawn(bump, %s, 2);", &t, &r));
+        u64 w = Rng::below(&mut g.rng, 10);
+        if (w == 0)
+        {
+            Gen::line(g, &sprintf("    *%s = 3;", &r));
+        }
+        else if (w == 1)
+        {
+            Gen::line(g, &sprintf("    join(spawn(bump, %s, 1));", &r));
+        }
+        Gen::line(g, &sprintf("    join(%s);", &t));
+        Gen::line(g, &sprintf("    *%s = *%s + 1;", &r, &r));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 49 && Vec::len(ints) > 0)
+    {
+        // An exclusive reference inside a struct passed by value:
+        // the copy a thread receives is lent (D-0213); read
+        // through a shared reference to the struct (D-0218).
+        String x = Rng::pick(&mut g.rng, ints);
+        String h = Gen::fresh(g, "h");
+        String t = Gen::fresh(g, "t");
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    Hold %s = Hold { .r = &mut %s };", &h, &x));
+        Gen::line(g, &sprintf("    show(widen<i64>(read_hold(&%s)));", &h));
+        Gen::line(g, &sprintf("    auto %s = spawn(bump_hold, %s);", &t, &h));
+        Gen::line(g, &sprintf("    join(%s);", &t));
+        Gen::line(g, &sprintf("    *%s.r = *%s.r + 1;", &h, &h));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 50)
+    {
+        // Threads adding under one mutex: the sum is the same in
+        // every order.
+        String m = Gen::fresh(g, "m");
+        u64 n = 1 + Rng::below(&mut g.rng, 3);
+        Gen::line(g, "{");
+        Gen::line(g, "    i64 z = 0;");
+        Gen::line(g, &sprintf("    mutex<i64> %s = Mutex::new(z);", &m));
+        Vec<String> ts = Vec::new();
+        for (u64 j = 0; j < n; j += 1)
+        {
+            String t = Gen::fresh(g, "t");
+            u64 kk = Rng::below(&mut g.rng, 50);
+            Gen::line(g, &sprintf("    auto %s = spawn(add_locked, &%s, %d);", &t, &m, kk));
+            Vec::push(&mut ts, t);
+        }
+        foreach (t in &ts)
+        {
+            Gen::line(g, &sprintf("    join(%s);", t));
+        }
+        Gen::line(g, &sprintf("    auto g = lock(&%s);", &m));
+        Gen::line(g, "    show(*g);");
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 51)
+    {
+        // A channel to one receiving thread, closed, its sum joined.
+        String c = Gen::fresh(g, "ch");
+        u64 cap = 1 + Rng::below(&mut g.rng, 3);
+        u64 n = Rng::below(&mut g.rng, 5);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    Channel<i64> %s = Channel::new(%d);", &c, cap));
+        Gen::line(g, &sprintf("    auto t = spawn(sum_chan, &%s);", &c));
+        for (u64 j = 0; j < n; j += 1)
+        {
+            String e = Gen::iexpr(g, 0);
+            Gen::line(g, &sprintf("    _ = Channel::send(&%s, widen<i64>(%s));", &c, &e));
+        }
+        Gen::line(g, &sprintf("    Channel::close(&%s);", &c));
+        Gen::line(g, "    show(join(t));");
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 52 && Vec::len(ints) > 0)
+    {
+        // An exclusive reference sent through a channel: lent to the
+        // receiver, which writes through it; read after the join.
+        String x = Rng::pick(&mut g.rng, ints);
+        String c = Gen::fresh(g, "ch");
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    Channel<ref<i32, exclusive>> %s = Channel::new(1);", &c));
+        Gen::line(g, &sprintf("    auto t = spawn(take_refs, &%s);", &c));
+        Gen::line(g, &sprintf("    _ = Channel::send(&%s, &mut %s);", &c, &x));
+        Gen::line(g, &sprintf("    Channel::close(&%s);", &c));
+        Gen::line(g, "    join(t);");
+        Gen::line(g, "}");
+        Gen::line(g, &sprintf("show(widen<i64>(%s));", &x));
+        return true;
+    }
+    if (k == 53 || k == 54)
+    {
+        // A closure writing its capture, called directly and through
+        // an exclusive reference; through a shared one it faults
+        // (D-0218). One that only reads may go through either.
+        String n = Gen::fresh(g, "n");
+        String c = Gen::fresh(g, "c");
+        String e0 = Gen::iexpr(g, 0);
+        String e1 = Gen::iexpr(g, 0);
+        String e2 = Gen::iexpr(g, 0);
+        bool writes = Rng::chance(&mut g.rng, 70);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    i32 %s = %s;", &n, &e0));
+        if (writes)
+        {
+            Gen::line(g, &sprintf("    auto %s = [%s](i32 k) : i32 { %s += k; %s };", &c, &n, &n, &n));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("    auto %s = [%s](i32 k) : i32 { %s - k };", &c, &n, &n));
+        }
+        Gen::line(g, &sprintf("    show(widen<i64>(%s(%s)));", &c, &e1));
+        str through = "apply_mut(&mut ";
+        if (Rng::chance(&mut g.rng, 25))
+        {
+            through = "apply_shared(&";
+        }
+        Gen::line(g, &sprintf("    show(widen<i64>(%s%s, %s)));", through, &c, &e2));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 55 && Vec::len(ints) > 0)
+    {
+        // A closure borrowing an outer variable: using the variable
+        // while the closure lives is rejected statically.
+        String x = Rng::pick(&mut g.rng, ints);
+        String c = Gen::fresh(g, "c");
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    auto %s = [%s](i32 k) : i32 { %s += k; %s };", &c, &x, &x, &x));
+        Gen::line(g, &sprintf("    show(widen<i64>(%s(1)));", &c));
+        if (Rng::chance(&mut g.rng, 20))
+        {
+            Gen::line(g, &sprintf("    show(widen<i64>(%s));", &x));
+            Gen::line(g, &sprintf("    show(widen<i64>(%s(2)));", &c));
+        }
+        Gen::line(g, "}");
+        Gen::line(g, &sprintf("show(widen<i64>(%s));", &x));
+        return true;
+    }
+    if (k == 56 && Vec::len(maps) > 0)
+    {
+        // `match` on a map lookup's reference; the map used while the
+        // binder lives is rejected statically.
+        String m = Rng::pick(&mut g.rng, maps);
+        String e = Gen::iexpr(g, 0);
+        String kk = Gen::fresh(g, "k");
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    i64 %s = widen<i64>(%s);", &kk, &e));
+        Gen::line(g, &sprintf("    match (HashMap::get_mut(&mut %s, %s))", &m, &kk));
+        Gen::line(g, "    {");
+        if (Rng::chance(&mut g.rng, 15))
+        {
+            Gen::line(g, &sprintf("        Some(c) : { tally(&mut %s, 5); *c += 1; },", &m));
+        }
+        else
+        {
+            Gen::line(g, "        Some(c) : *c += 5,");
+        }
+        Gen::line(g, &sprintf("        None    : tally(&mut %s, %s),", &m, &kk));
+        Gen::line(g, "    }");
+        Gen::line(g, &sprintf("    show(mget(&%s, %s));", &m, &kk));
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 57 && Vec::len(all_vecs) > 0)
+    {
+        String v = Rng::pick(&mut g.rng, all_vecs);
+        Gen::line(g, &sprintf("match (Vec::pop(&mut %s))", &v));
+        Gen::line(g, "{");
+        Gen::line(g, "    Some(a) : show(widen<i64>(a)),");
+        Gen::line(g, "    None    : show(0 - 9),");
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 58 && Vec::len(strs) > 0)
+    {
+        // A view of a String, then the String appended to: fine
+        // after the view's last use, rejected while it lives.
+        String s = Rng::pick(&mut g.rng, strs);
+        String w = Gen::fresh(g, "w");
+        bool late = Rng::chance(&mut g.rng, 20);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    StringView %s = &%s;", &w, &s));
+        Gen::line(g, &sprintf("    show(vcount(%s, \" \"));", &w));
+        Gen::line(g, &sprintf("    String::append(&mut %s, \" 7\");", &s));
+        if (late)
+        {
+            Gen::line(g, &sprintf("    show(vcount(%s, \"7\"));", &w));
+        }
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 59 && Vec::len(ints) > 0)
+    {
+        // Two threads lent borrows of two different variables.
+        String a = Rng::pick(&mut g.rng, ints);
+        String b = Rng::pick(&mut g.rng, ints);
+        if (a != b)
+        {
+            Gen::line(g, &sprintf("{ auto t1 = spawn(bump, &mut %s, 1); auto t2 = spawn(bump, &mut %s, 2); join(t1); join(t2); }", &a, &b));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("{ auto t1 = spawn(bump, &mut %s, 1); join(t1); auto t2 = spawn(bump, &mut %s, 2); join(t2); }", &a, &b));
+        }
+        return true;
+    }
+    if (k == 60 && Vec::len(helper) > 0)
+    {
+        // A vector lent shared to one or two reading threads; a
+        // push before the join is rejected statically.
+        String v = Rng::pick(&mut g.rng, helper);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    auto t = spawn(sum, &%s);", &v));
+        if (Rng::chance(&mut g.rng, 30))
+        {
+            Gen::line(g, &sprintf("    auto u = spawn(sum, &%s);", &v));
+            Gen::line(g, "    show(join(u));");
+        }
+        if (Rng::chance(&mut g.rng, 10))
+        {
+            Gen::line(g, &sprintf("    Vec::push(&mut %s, 1);", &v));
+        }
+        Gen::line(g, "    show(join(t));");
+        Gen::line(g, "}");
+        return true;
+    }
+    if (k == 61 && Vec::len(helper) > 0)
+    {
+        // A vector lent exclusive to a thread that pushes; read
+        // after the join, or (rejected) before it.
+        String v = Rng::pick(&mut g.rng, helper);
+        u64 n = Rng::below(&mut g.rng, 5);
+        bool early = Rng::chance(&mut g.rng, 10);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    auto t = spawn(fill, &mut %s, %d);", &v, n));
+        if (early)
+        {
+            Gen::line(g, &sprintf("    show(sum(&%s));", &v));
+        }
+        Gen::line(g, "    join(t);");
+        Gen::line(g, "}");
+        Gen::line(g, &sprintf("show(sum(&%s));", &v));
+        return true;
+    }
+    if (k == 62 && (Vec::len(stashes) > 0 || Vec::len(vecs) > 0))
+    {
+        // A `Vec<ref>` lent to a thread that reads through each
+        // reference: one made stale by a push faults in the thread.
+        bool use_stash = Vec::len(vecs) == 0;
+        if (!use_stash && Vec::len(stashes) > 0)
+        {
+            use_stash = Rng::chance(&mut g.rng, 50);
+        }
+        if (use_stash)
+        {
+            String h = Rng::pick(&mut g.rng, stashes);
+            Gen::line(g, &sprintf("{ auto t = spawn(sum_refs, &%s); show(join(t)); }", &h));
+        }
+        else
+        {
+            String v = Rng::pick(&mut g.rng, vecs);
+            String h = Gen::fresh(g, "h");
+            String i = Gen::uexpr(g, 0, Some(clone(&v)));
+            String j = Gen::uexpr(g, 0, Some(clone(&v)));
+            Gen::line(g, "{");
+            Gen::line(g, &sprintf("    Vec<ref<i32, shared>> %s = Vec::new();", &h));
+            Gen::line(g, &sprintf("    Vec::push(&mut %s, Vec::index_shared(&%s, %s));", &h, &v, &i));
+            Gen::line(g, &sprintf("    Vec::push(&mut %s, Vec::index_shared(&%s, %s));", &h, &v, &j));
+            if (Rng::chance(&mut g.rng, 20))
+            {
+                Gen::line(g, &sprintf("    fill(&mut %s, 20);", &v));
+            }
+            Gen::line(g, &sprintf("    auto t = spawn(sum_refs, &%s);", &h));
+            Gen::line(g, "    show(join(t));");
+            Gen::line(g, "}");
+        }
+        return true;
+    }
+    if (k == 63 && Vec::len(ints) > 0)
+    {
+        // Values holding exclusive references sent through a channel.
+        // Sent before the receiver exists, they wait in the channel:
+        // reading the variable then is a conflict at run time, and a
+        // second send to a full channel a deadlock. (Read once the
+        // receiver runs, the outcome depends on the schedule.)
+        String a = Rng::pick(&mut g.rng, ints);
+        String b = Rng::pick(&mut g.rng, ints);
+        String c = Gen::fresh(g, "ch");
+        u64 cap = 1 + Rng::below(&mut g.rng, 2);
+        bool early = Rng::chance(&mut g.rng, 25);
+        Gen::line(g, "{");
+        Gen::line(g, &sprintf("    Channel<Hold> %s = Channel::new(%d);", &c, cap));
+        if (!early)
+        {
+            Gen::line(g, &sprintf("    auto t = spawn(take_holds, &%s);", &c));
+        }
+        Gen::line(g, &sprintf("    _ = Channel::send(&%s, Hold { .r = &mut %s });", &c, &a));
+        if (a != b)
+        {
+            Gen::line(g, &sprintf("    _ = Channel::send(&%s, Hold { .r = &mut %s });", &c, &b));
+        }
+        if (early)
+        {
+            if (Rng::chance(&mut g.rng, 40))
+            {
+                Gen::line(g, &sprintf("    show(widen<i64>(%s));", &a));
+            }
+            Gen::line(g, &sprintf("    auto t = spawn(take_holds, &%s);", &c));
+        }
+        Gen::line(g, &sprintf("    Channel::close(&%s);", &c));
+        Gen::line(g, "    join(t);");
+        Gen::line(g, "}");
+        Gen::line(g, &sprintf("show(widen<i64>(%s) + widen<i64>(%s));", &a, &b));
+        return true;
+    }
+    if (k == 64)
+    {
+        // `move` closures: an integer copied in, or a vector moved
+        // in (using it afterwards is rejected statically); the
+        // closure keeps its state between calls.
+        String c = Gen::fresh(g, "c");
+        String e0 = Gen::iexpr(g, 0);
+        String e1 = Gen::iexpr(g, 0);
+        String e2 = Gen::iexpr(g, 0);
+        bool vec_in = Vec::len(vecs) > 0;
+        if (vec_in)
+        {
+            vec_in = Rng::chance(&mut g.rng, 50);
+        }
+        if (vec_in)
+        {
+            String v = Rng::pick(&mut g.rng, vecs);
+            Gen::line(g, "{");
+            Gen::line(g, &sprintf("    auto %s = move [%s](i32 k) : i32 { Vec::push(&mut %s, k); narrow<i32>(Vec::len(&%s)) };", &c, &v, &v, &v));
+            Gen::line(g, &sprintf("    show(widen<i64>(%s(%s)));", &c, &e1));
+            Gen::line(g, &sprintf("    show(widen<i64>(apply_mut(&mut %s, %s)));", &c, &e2));
+            if (Rng::chance(&mut g.rng, 15))
+            {
+                Gen::line(g, &sprintf("    show(sum(&%s));", &v));
+            }
+            Gen::line(g, "}");
+            Gen::forget(g, &v);
+        }
+        else
+        {
+            String n = Gen::fresh(g, "n");
+            Gen::line(g, "{");
+            Gen::line(g, &sprintf("    i32 %s = %s;", &n, &e0));
+            Gen::line(g, &sprintf("    auto %s = move [%s](i32 k) : i32 { %s += k; %s };", &c, &n, &n, &n));
+            Gen::line(g, &sprintf("    show(widen<i64>(%s(%s)));", &c, &e1));
+            Gen::line(g, &sprintf("    show(widen<i64>(apply_mut(&mut %s, %s)));", &c, &e2));
+            Gen::line(g, &sprintf("    show(widen<i64>(%s));", &n));
+            Gen::line(g, "}");
+        }
+        return true;
+    }
+    if (k == 65 && Vec::len(maps) > 0)
+    {
+        // `HashMap::insert` and `HashMap::remove`, each returning
+        // the value it displaced.
+        String m = Rng::pick(&mut g.rng, maps);
+        String kk = Gen::iexpr(g, 0);
+        if (Rng::chance(&mut g.rng, 50))
+        {
+            String e = Gen::iexpr(g, 1);
+            Gen::line(g, &sprintf("show(Option::unwrap_or(HashMap::insert(&mut %s, widen<i64>(%s), widen<i64>(%s)), 0 - 3));", &m, &kk, &e));
+        }
+        else
+        {
+            Gen::line(g, &sprintf("show(Option::unwrap_or(HashMap::remove(&mut %s, widen<i64>(%s)), 0 - 4));", &m, &kk));
+        }
+        return true;
+    }
+    false
+}
+
+// The program of one seed.
+export fn program(u64 seed) : String
+{
+    Vec<Vec<Bound>> scopes = Vec::new();
+    Vec::push(&mut scopes, Vec::new());
+    Gen g = Gen { .rng = Rng::new(seed), .out = String::new(), .ind = 1, .scopes = scopes, .next = 0 };
+    String::append(&mut g.out, &prelude());
+    String::appendf(&mut g.out, "// seed %d\n", seed);
+    String::append(&mut g.out, "fn main()\n{\n");
+    u64 n = 6 + Rng::below(&mut g.rng, 20);
+    for (u64 i = 0; i < n; i += 1)
+    {
+        Gen::stmt(&mut g, 2);
+    }
+    String::append(&mut g.out, "}\n");
+    Gen { rng, out, ind, scopes: sc, next } = g;
+    out
+}

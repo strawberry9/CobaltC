@@ -1,0 +1,150 @@
+import std;
+
+enum Tok { Num(f64), Plus, Minus, Star, Slash, LParen, RParen, End }
+
+enum Expr
+{
+    Num(f64),
+    Neg(Box<Expr>),
+    Bin(u8, Box<Expr>, Box<Expr>),
+}
+
+struct Parser
+{
+    Vec<Tok> toks;
+    usize pos;
+}
+
+fn tokenize(StringView s) : Result<Vec<Tok>, String>
+{
+    Vec<Tok> out = Vec::new();
+    usize i = 0;
+    usize n = StringView::len(&s);
+    while (i < n)
+    {
+        u8 c = s[i];
+        if (c == b' ') { i += 1; continue; }
+        if (c >= b'0' && c <= b'9')
+        {
+            usize start = i;
+            while (i < n && ((s[i] >= b'0' && s[i] <= b'9') || s[i] == b'.')) { i += 1; }
+            f64 v = parse_f64(StringView::slice(&s, start, i))?;
+            Vec::push(&mut out, Tok::Num(v));
+            continue;
+        }
+        Tok t = match (c)
+        {
+            b'+' : Tok::Plus,
+            b'-' : Tok::Minus,
+            b'*' : Tok::Star,
+            b'/' : Tok::Slash,
+            b'(' : Tok::LParen,
+            b')' : Tok::RParen,
+            _ : return Err(sprintf("unexpected character '%c' at %d", c, i)),
+        };
+        Vec::push(&mut out, t);
+        i += 1;
+    }
+    Vec::push(&mut out, Tok::End);
+    Ok(out)
+}
+
+fn Parser::peek(ref<Parser, shared> p) : Tok
+{
+    p.toks[p.pos]
+}
+
+fn Parser::expr(ref<Parser, exclusive> p) : Result<Box<Expr>, String>
+{
+    Box<Expr> lhs = Parser::term(p)?;
+    while (true)
+    {
+        match (Parser::peek(p))
+        {
+            Tok::Plus : { p.pos += 1; Box<Expr> r = Parser::term(p)?; lhs = Box::new(Expr::Bin(b'+', lhs, r)); },
+            Tok::Minus : { p.pos += 1; Box<Expr> r = Parser::term(p)?; lhs = Box::new(Expr::Bin(b'-', lhs, r)); },
+            _ : { break; },
+        }
+    }
+    Ok(lhs)
+}
+
+fn Parser::term(ref<Parser, exclusive> p) : Result<Box<Expr>, String>
+{
+    Box<Expr> lhs = Parser::atom(p)?;
+    while (true)
+    {
+        match (Parser::peek(p))
+        {
+            Tok::Star : { p.pos += 1; Box<Expr> r = Parser::atom(p)?; lhs = Box::new(Expr::Bin(b'*', lhs, r)); },
+            Tok::Slash : { p.pos += 1; Box<Expr> r = Parser::atom(p)?; lhs = Box::new(Expr::Bin(b'/', lhs, r)); },
+            _ : { break; },
+        }
+    }
+    Ok(lhs)
+}
+
+fn Parser::atom(ref<Parser, exclusive> p) : Result<Box<Expr>, String>
+{
+    Tok t = Parser::peek(p);
+    p.pos += 1;
+    match (t)
+    {
+        Tok::Num(v) : Ok(Box::new(Expr::Num(v))),
+        Tok::Minus : { Box<Expr> e = Parser::atom(p)?; Ok(Box::new(Expr::Neg(e))) },
+        Tok::LParen :
+        {
+            Box<Expr> e = Parser::expr(p)?;
+            if (Tok::RParen = Parser::peek(p)) { p.pos += 1; Ok(e) }
+            else { Err(String::from("expected )")) }
+        },
+        _ : Err(String::from("expected a number")),
+    }
+}
+
+fn eval(ref<Expr, shared> e) : Result<f64, String>
+{
+    match (e)
+    {
+        Expr::Num(v) : Ok(*v),
+        Expr::Neg(x) : Ok(-eval(x)?),
+        Expr::Bin(op, a, b) :
+        {
+            f64 x = eval(a)?;
+            f64 y = eval(b)?;
+            match (*op)
+            {
+                b'+' : Ok(x + y),
+                b'-' : Ok(x - y),
+                b'*' : Ok(x * y),
+                _ : if (y == 0.0) { Err(String::from("division by zero")) } else { Ok(x / y) },
+            }
+        },
+    }
+}
+
+fn main() : i32
+{
+    array<str, 4> inputs = ["1 + 2 * 3", "(1 + 2) * 3", "-4 / (2 - 2)", "2 * (3 + "];
+    foreach (s in &inputs)
+    {
+        match (tokenize(*s))
+        {
+            Err(m) : printf("%s: error: %s\n", *s, &m),
+            Ok(toks) :
+            {
+                Parser p = Parser { .toks = toks, .pos = 0 };
+                match (Parser::expr(&mut p))
+                {
+                    Err(m) : printf("%s: error: %s\n", *s, &m),
+                    Ok(e) : match (eval(&e))
+                    {
+                        Ok(v) : printf("%s = %g\n", *s, v),
+                        Err(m) : printf("%s: error: %s\n", *s, &m),
+                    },
+                }
+            },
+        }
+    }
+    0
+}

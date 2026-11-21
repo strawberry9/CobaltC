@@ -1,0 +1,809 @@
+// Runs each program the enumerator wrote under the tools and compares what
+// they do with the outcome set the model gives it (`// MODEL:` lines):
+//
+//   cobmodel compare DIR --cobc PATH [--explore N] [--cc CC]...
+//                        [--jobs J] [--report FILE]
+//
+// `cobc` compiles each program once per C compiler and runs it under N
+// schedules (`--explore N`). Every outcome it
+// shows must be in the model's set; a model outcome it never showed is
+// listed as unobserved (advisory: the compiler explores a few schedules, the
+// model all of them). Exit status 1 when any outcome is outside the set.
+
+import std;
+import maps;
+import explore;
+import parse;
+
+// How a run ended: its status (`None`: ended by a signal) and what it
+// wrote.
+struct RunOut
+{
+    Option<i32> code;
+    Vec<u8> stdout;
+    Vec<u8> stderr;
+}
+
+struct Reaped
+{
+    i32 status;
+    Vec<u8> err;
+}
+
+// The child's standard output, read to its end on a thread of its own.
+fn read_all_out(ChildOutput o) : Vec<u8>
+{
+    ChildOutput p = o;
+    Vec<u8> v = Vec::new();
+    while (true)
+    {
+        match (ChildOutput::read(&mut p, &mut v, 1048576))
+        {
+            Ok(0)  : break,
+            Ok(_)  : {},
+            Err(_) : break,
+        }
+    }
+    v
+}
+
+// The child's standard error, read to its end, then its status; `done`
+// set when it has ended.
+fn reap(Child c, ref<Atomic<i32>, shared> done) : Reaped
+{
+    Child ch = c;
+    Vec<u8> v = Vec::new();
+    while (true)
+    {
+        match (Child::read_error(&mut ch, &mut v, 1048576))
+        {
+            Ok(0)  : break,
+            Ok(_)  : {},
+            Err(_) : break,
+        }
+    }
+    i32 status = match (Child::wait(&mut ch))
+    {
+        Ok(s)  : s,
+        Err(_) : -1,
+    };
+    Atomic::store(done, 1);
+    Reaped { .status = status, .err = v }
+}
+
+fn run(ref<Command, shared> cmd, StringView program, u64 limit_ms) : Option<RunOut>
+{
+    Child child = match (Command::spawn(cmd))
+    {
+        Ok(c)  : c,
+        Err(e) :
+        {
+            eprintf("compare: cannot start %s: %s\n", &debug_path(program), &start_error(&e));
+            return None;
+        },
+    };
+    // The child's standard input is closed: it reads its end, at once.
+    Child::close_input(&mut child);
+    u64 pid = Child::id(&child);
+    u64 start = monotonic_ns();
+    Atomic<i32> done = Atomic::new(0);
+    // Drain the pipes on threads so a chatty program cannot block.
+    ChildOutput so = Option::unwrap(Child::take_output(&mut child));
+    handle<Vec<u8>> ho = spawn(read_all_out, so);
+    handle<Reaped> he = spawn(reap, child, &done);
+    bool timed_out = false;
+    while (Atomic::load(&done) == 0)
+    {
+        if (monotonic_ns() - start > limit_ms * 1000000)
+        {
+            Command k = Command::new("kill");
+            Command::arg(&mut k, "-9");
+            Command::arg(&mut k, &sprintf("%d", pid));
+            _ = Command::output(&k);
+            timed_out = true;
+            break;
+        }
+        sleep_ms(5);
+    }
+    Vec<u8> out = join(ho);
+    Reaped r = join(he);
+    if (timed_out)
+    {
+        return None;
+    }
+    Option<i32> code = None;
+    if (r.status >= 0)
+    {
+        code = Some(r.status);
+    }
+    Reaped { status, err } = r;
+    Some(RunOut { .code = code, .stdout = out, .stderr = err })
+}
+
+// Rust's `{:?}` of a program's name: quoted.
+fn debug_path(StringView p) : String
+{
+    String o = "\"";
+    foreach (c in StringView::as_bytes(p))
+    {
+        if (*c == b'"' || *c == b'\\')
+        {
+            String::push_ascii(&mut o, b'\\');
+        }
+        String::push_ascii(&mut o, *c);
+    }
+    String::push_ascii(&mut o, b'"');
+    o
+}
+
+fn start_error(ref<FileError, shared> e) : String
+{
+    match (e)
+    {
+        FileError::NotFound : "No such file or directory (os error 2)",
+        FileError::Denied   : "Permission denied (os error 13)",
+        _                   : String::copy(FileError::text(e)),
+    }
+}
+
+// `String::from_utf8_lossy`: the bytes as text, each run of bytes that
+// is not UTF-8 replaced by U+FFFD.
+fn lossy(ref<Vec<u8>, shared> b) : String
+{
+    match (StringView::from_utf8(b))
+    {
+        Ok(v)  : return String::copy(v),
+        Err(_) : {},
+    }
+    String o = String::new();
+    usize i = 0;
+    usize n = Vec::len(b);
+    while (i < n)
+    {
+        u8 c = b[i];
+        usize w = 0;
+        if (c < 0x80)
+        {
+            w = 1;
+        }
+        else if (c >= 0xC2 && c < 0xE0)
+        {
+            w = 2;
+        }
+        else if (c >= 0xE0 && c < 0xF0)
+        {
+            w = 3;
+        }
+        else if (c >= 0xF0 && c < 0xF5)
+        {
+            w = 4;
+        }
+        bool ok = w > 0 && i + w <= n;
+        if (ok && w > 1)
+        {
+            match (StringView::from_utf8(&b[i..i + w]))
+            {
+                Ok(_)  : {},
+                Err(_) : ok = false,
+            }
+        }
+        if (ok)
+        {
+            match (StringView::from_utf8(&b[i..i + w]))
+            {
+                Ok(v)  : String::append(&mut o, v),
+                Err(_) : {},
+            }
+            i += w;
+        }
+        else
+        {
+            String::push_code_point(&mut o, 0xFFFD);
+            i += 1;
+        }
+    }
+    o
+}
+
+// Rust's `str::trim_start_matches` with a text pattern.
+fn trim_start_all(StringView s, StringView p) : StringView from s
+{
+    StringView r = s;
+    if (StringView::len(p) == 0)
+    {
+        return r;
+    }
+    while (true)
+    {
+        match (StringView::strip_prefix(r, p))
+        {
+            Some(x) : r = x,
+            None    : break,
+        }
+    }
+    r
+}
+
+fn is_usize(StringView s) : bool
+{
+    match (StringView::parse<usize>(s))
+    {
+        Ok(_)  : true,
+        Err(_) : false,
+    }
+}
+
+fn debug_code(Option<i32> code) : String
+{
+    match (code)
+    {
+        Some(c) : sprintf("Some(%d)", c),
+        None    : "None",
+    }
+}
+
+// One run's outcome from its stdout lines and its first two stderr lines.
+fn outcome(Option<i32> code, StringView stdout, ref<Vec<String>, shared> err) : String
+{
+    Vec<String> out = Vec::new();
+    foreach (l in StringView::lines(stdout))
+    {
+        StringView t = StringView::trim(l);
+        if (StringView::len(t) > 0)
+        {
+            Vec::push(&mut out, String::copy(t));
+        }
+    }
+    String end = String::new();
+    bool ok = match (code)
+    {
+        Some(0) : true,
+        _       : false,
+    };
+    if (ok)
+    {
+        end = "ok";
+    }
+    else
+    {
+        String first = String::new();
+        String second = String::new();
+        if (Vec::len(err) > 0)
+        {
+            first = String::copy(StringView::trim(&err[0]));
+        }
+        if (Vec::len(err) > 1)
+        {
+            second = String::copy(StringView::trim(&err[1]));
+        }
+        // D-0228: `error[diag.x]: …` (static) or `fault[diag.x]: …`
+        // (dynamic), then `--> file:line:col` (`file:line` without a column).
+        String diag = String::new();
+        match (StringView::strip_prefix(&first, "error["))
+        {
+            Some(r) :
+            {
+                usize k = match (StringView::find(r, "]"))
+                {
+                    Some(k) : k,
+                    None    : StringView::len(r),
+                };
+                diag = sprintf("%s (static)", &r[0..k]);
+            },
+            None : match (StringView::strip_prefix(&first, "fault["))
+            {
+                Some(r) :
+                {
+                    usize k = match (StringView::find(r, "]"))
+                    {
+                        Some(k) : k,
+                        None    : StringView::len(r),
+                    };
+                    diag = sprintf("%s (dynamic)", &r[0..k]);
+                },
+                None    : diag = String::copy(trim_start_all(&first, "error: ")),
+            },
+        }
+        StringView place = trim_start_all(&second, "--> ");
+        // `rsplitn(3, ':')`: the last piece, the one before it, the rest.
+        String line = String::new();
+        Option<usize> c1 = StringView::rfind(place, ":");
+        match (c1)
+        {
+            Some(i1) :
+            {
+                StringView last = &place[i1 + 1..StringView::len(place)];
+                StringView before = &place[0..i1];
+                match (StringView::rfind(before, ":"))
+                {
+                    Some(i2) :
+                    {
+                        StringView mid = &before[i2 + 1..StringView::len(before)];
+                        if (is_usize(last) && is_usize(mid))
+                        {
+                            line = String::copy(mid);
+                        }
+                        else
+                        {
+                            line = String::copy(last);
+                        }
+                    },
+                    None     : line = String::copy(last),
+                }
+            },
+            None     : line = String::copy(place),
+        }
+        if (StringView::len(&diag) == 0)
+        {
+            end = sprintf("exit %s", &debug_code(code));
+        }
+        else
+        {
+            end = sprintf("%s line %s", &diag, &line);
+        }
+    }
+    if (Vec::len(&out) == 0)
+    {
+        return end;
+    }
+    sprintf("[%s] %s", &String::join(&out, " "), &end)
+}
+
+fn text_lines(StringView s) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    foreach (l in StringView::lines(s))
+    {
+        Vec::push(&mut v, String::copy(l));
+    }
+    v
+}
+
+fn plain(ref<RunOut, shared> o) : String
+{
+    String err = lossy(&o.stderr);
+    Vec<String> lines = text_lines(&err);
+    outcome(o.code, &lossy(&o.stdout), &lines)
+}
+
+fn flush(ref<Vec<String>, exclusive> res, Option<i32> code, StringView out, ref<Vec<String>, shared> err)
+{
+    Vec::push(res, outcome(code, out, err));
+}
+
+// `cobc --explore` groups its runs by outcome: a header line
+// `N run(s), exit S -- replay: …`, then `  | ` lines of output and `  ! `
+// lines of errors.
+fn explored(ref<RunOut, shared> o) : Vec<String>
+{
+    String text = sprintf("%s%s", &lossy(&o.stdout), &lossy(&o.stderr));
+    if (!StringView::starts_with(&text, "explored"))
+    {
+        Vec<String> one = Vec::new();
+        Vec::push(&mut one, plain(o));
+        return one;
+    }
+    Vec<String> res = Vec::new();
+    Option<i32> code = None;
+    String out = String::new();
+    Vec<String> err = Vec::new();
+    bool open = false;
+    bool first = true;
+    foreach (l0 in StringView::lines(&text))
+    {
+        StringView l = l0;
+        if (first)
+        {
+            first = false;
+            continue;
+        }
+        if (StringView::contains(l, " -- replay:"))
+        {
+            if (open)
+            {
+                flush(&mut res, code, &out, &err);
+            }
+            open = true;
+            String::clear(&mut out);
+            Vec::clear(&mut err);
+            code = None;
+            match (StringView::find(l, "exit "))
+            {
+                Some(k) :
+                {
+                    StringView rest = &l[k + 5..StringView::len(l)];
+                    Vec<StringView> ws = StringView::split_whitespace(rest);
+                    if (Vec::len(&ws) > 0)
+                    {
+                        match (StringView::parse<i32>(ws[0]))
+                        {
+                            Ok(n)  : code = Some(n),
+                            Err(_) : {},
+                        }
+                    }
+                },
+                None    : {},
+            }
+        }
+        else
+        {
+            match (StringView::strip_prefix(l, "  | "))
+            {
+                Some(x) :
+                {
+                    String::append(&mut out, x);
+                    String::push_ascii(&mut out, b'\n');
+                },
+                None    :
+                {
+                    if (l == "  |")
+                    {
+                        String::push_ascii(&mut out, b'\n');
+                    }
+                    else
+                    {
+                        match (StringView::strip_prefix(l, "  ! "))
+                        {
+                            Some(x) : Vec::push(&mut err, String::copy(x)),
+                            None    : {},
+                        }
+                    }
+                },
+            }
+        }
+    }
+    if (open)
+    {
+        flush(&mut res, code, &out, &err);
+    }
+    res
+}
+
+struct Cfg
+{
+    String cobc;
+    usize explore;
+    Vec<String> ccs;
+}
+
+struct Seen
+{
+    String tool;
+    String outcome;
+}
+
+struct Verdict
+{
+    String file;
+    SSet<String> model;
+    Vec<Seen> seen; // (tool, outcome)
+    bool stale_header;
+}
+
+fn parent_dir(StringView p) : String
+{
+    match (StringView::rfind(p, "/"))
+    {
+        Some(k) : String::copy(&p[0..k]),
+        None    : String::new(),
+    }
+}
+
+fn file_name(StringView p) : String
+{
+    match (StringView::rfind(p, "/"))
+    {
+        Some(k) : String::copy(&p[k + 1..StringView::len(p)]),
+        None    : String::copy(p),
+    }
+}
+
+fn tool_command(StringView program, StringView dir) : Command
+{
+    Command c = Command::new(program);
+    if (StringView::len(dir) > 0)
+    {
+        Command::current_dir(&mut c, dir);
+    }
+    Command::env(&mut c, "COBALTC_CPU_LIMIT", "60");
+    Command::env(&mut c, "NO_COLOR", "1");
+    c
+}
+
+fn check_one(ref<Cfg, shared> cfg, StringView path) : Verdict
+{
+    String src = match (read_file(path))
+    {
+        Ok(s)  : s,
+        Err(_) : String::new(),
+    };
+    // The model's outcomes are computed afresh, so a sample never goes stale;
+    // a header that disagrees is reported.
+    SSet<String> header = SSet::new();
+    foreach (l in StringView::lines(&src))
+    {
+        match (StringView::strip_prefix(l, "// MODEL: "))
+        {
+            Some(s) : { _ = SSet::insert(&mut header, strip_phase(s)); },
+            None    : {},
+        }
+    }
+    SSet<String> model = SSet::new();
+    match (parse::parse(&src))
+    {
+        Ok(p)  :
+        {
+            Report r = explore::run(&p, true);
+            foreach (o in &r.outcomes.keys)
+            {
+                _ = SSet::insert(&mut model, Outcome::text(o));
+            }
+        },
+        Err(e) : { _ = SSet::insert(&mut model, sprintf("model cannot read it: %s", &e)); },
+    }
+    bool stale_header = SSet::len(&header) > 0 && !SSet::eq(&header, &model);
+    String dir = parent_dir(path);
+    String name = file_name(path);
+    u64 limit = 120000;
+    Vec<Seen> seen = Vec::new();
+    foreach (cc in &cfg.ccs)
+    {
+        Command c2 = tool_command(&cfg.cobc, &dir);
+        Command::arg(&mut c2, "--cc");
+        Command::arg(&mut c2, cc);
+        if (cfg.explore > 0)
+        {
+            Command::arg(&mut c2, "--explore");
+            Command::arg(&mut c2, &sprintf("%d", cfg.explore));
+        }
+        else
+        {
+            Command::arg(&mut c2, "--run");
+        }
+        Command::arg(&mut c2, &name);
+        String tool = sprintf("cobc[%s]", cc);
+        match (run(&c2, &cfg.cobc, limit))
+        {
+            Some(o) :
+            {
+                foreach (x in explored(&o))
+                {
+                    Vec::push(&mut seen, Seen { .tool = clone(&tool), .outcome = x });
+                }
+            },
+            None    : Vec::push(&mut seen, Seen { .tool = clone(&tool), .outcome = "timeout" }),
+        }
+    }
+    Verdict { .file = String::copy(path), .model = model, .seen = seen, .stale_header = stale_header }
+}
+
+// The model writes `diag.x (phase) line N`; the tools `diag.x (phase)` and
+// the line from `at FILE:N`: both normalised to `diag.x (phase) line N`.
+fn strip_phase(StringView s) : String
+{
+    String::copy(StringView::trim(s))
+}
+
+struct Shared
+{
+    mutex<Vec<String>> queue;
+    mutex<Vec<Verdict>> results;
+    Atomic<i32> done;
+    usize total;
+}
+
+fn worker(ref<Cfg, shared> cfg, ref<Shared, shared> sh)
+{
+    while (true)
+    {
+        Option<String> next = None;
+        {
+            auto q = lock(&sh.queue);
+            next = Vec::pop(&mut *q);
+        }
+        String p = match (next)
+        {
+            Some(p) : p,
+            None    : break,
+        };
+        Verdict v = check_one(cfg, &p);
+        {
+            auto r = lock(&sh.results);
+            Vec::push(&mut *r, v);
+        }
+        i32 d = Atomic::fetch_add(&sh.done, 1) + 1;
+        if (d % 100 == 0)
+        {
+            eprintf("compare: %d / %d\n", d, sh.total);
+        }
+    }
+}
+
+fn parse_usize_or(StringView v, usize dflt) : usize
+{
+    match (StringView::parse<usize>(v))
+    {
+        Ok(n)  : n,
+        Err(_) : dflt,
+    }
+}
+
+fn joined_seen(ref<Vec<Seen>, shared> v) : String
+{
+    Vec<String> parts = Vec::new();
+    foreach (s in v)
+    {
+        Vec::push(&mut parts, sprintf("%s: %s", &s.tool, &s.outcome));
+    }
+    String::join(&parts, " | ")
+}
+
+export fn main(ref<Vec<String>, shared> args) : u8
+{
+    if (Vec::len(args) < 2)
+    {
+        eprintf("compare: DIR required\n");
+        return 2;
+    }
+    ref<String, shared> dir = &args[1];
+    Cfg cfg = Cfg { .cobc = "cobc", .explore = 0, .ccs = Vec::new() };
+    usize jobs = 2;
+    Option<String> report_path = None;
+    usize i = 2;
+    while (i < Vec::len(args))
+    {
+        String v = String::new();
+        if (i + 1 < Vec::len(args))
+        {
+            v = clone(&args[i + 1]);
+        }
+        StringView a = &args[i];
+        if (a == "--cobc")
+        {
+            cfg.cobc = v;
+        }
+        else if (a == "--explore")
+        {
+            cfg.explore = parse_usize_or(&v, 0);
+        }
+        else if (a == "--cc")
+        {
+            Vec::push(&mut cfg.ccs, v);
+        }
+        else if (a == "--jobs")
+        {
+            jobs = parse_usize_or(&v, 2);
+        }
+        else if (a == "--report")
+        {
+            report_path = Some(v);
+        }
+        else
+        {
+            eprintf("compare: unknown option %s\n", a);
+            return 2;
+        }
+        i += 2;
+    }
+    if (Vec::len(&cfg.ccs) == 0)
+    {
+        Vec::push(&mut cfg.ccs, "gcc");
+        Vec::push(&mut cfg.ccs, "clang");
+    }
+    // Each tool runs in its program's directory: a relative path given here
+    // is made absolute first.
+    if (StringView::contains(&cfg.cobc, "/"))
+    {
+        match (path_canonical(&cfg.cobc))
+        {
+            Ok(a)  : cfg.cobc = a,
+            Err(_) : {},
+        }
+    }
+    Vec<String> names = Result::expect(list_dir(dir), "dir");
+    Vec<String> files = Vec::new();
+    foreach (n in &names)
+    {
+        if (StringView::ends_with(n, ".cb") && StringView::len(n) > 3)
+        {
+            if (StringView::ends_with(dir, "/"))
+            {
+                Vec::push(&mut files, sprintf("%s%s", dir, n));
+            }
+            else
+            {
+                Vec::push(&mut files, sprintf("%s/%s", dir, n));
+            }
+        }
+    }
+    Vec::sort(&mut files);
+    usize total = Vec::len(&files);
+    Shared sh = Shared { .queue = Mutex::new(clone(&files)), .results = Mutex::new(Vec::new()), .done = Atomic::new(0), .total = total };
+    Vec<handle<void>> hs = Vec::new();
+    for (usize j = 0; j < jobs; j += 1)
+    {
+        Vec::push(&mut hs, spawn(worker, &cfg, &sh));
+    }
+    while (true)
+    {
+        match (Vec::pop(&mut hs))
+        {
+            Some(h) : join(h),
+            None    : break,
+        }
+    }
+    Vec<Verdict> results = Vec::new();
+    {
+        auto r = lock(&sh.results);
+        results = replace(&mut *r, Vec::new());
+    }
+    Vec::sort_by(&mut results, [](ref<Verdict, shared> a, ref<Verdict, shared> b) : bool { a.file < b.file });
+    String rep = String::new();
+    usize bad = 0;
+    usize truncated = 0;
+    usize unobserved = 0;
+    foreach (v in &results)
+    {
+        Vec<Seen> outside = Vec::new();
+        SSet<String> observed = SSet::new();
+        foreach (s in &v.seen)
+        {
+            if (!sset_has(&v.model, &s.outcome))
+            {
+                Vec::push(&mut outside, clone(s));
+            }
+            _ = SSet::insert(&mut observed, clone(&s.outcome));
+        }
+        Vec<String> missing = Vec::new();
+        foreach (m in &v.model.keys)
+        {
+            if (!sset_has(&observed, m))
+            {
+                Vec::push(&mut missing, clone(m));
+            }
+        }
+        if (v.stale_header)
+        {
+            String::appendf(&mut rep, "header-stale %s (the // MODEL: lines differ from the model's set now)\n", &v.file);
+        }
+        // A set the explorer cut short at its state limit (`too-big`) is
+        // incomplete: an outcome beyond it is not a disagreement, only an
+        // outcome the model did not reach. Reported apart, as advisory.
+        bool cut_short = sset_has(&v.model, "too-big");
+        if (Vec::len(&outside) > 0 && cut_short)
+        {
+            truncated += 1;
+            String::appendf(&mut rep, "truncated %s: %s\n", &v.file, &joined_seen(&outside));
+        }
+        else if (Vec::len(&outside) > 0)
+        {
+            bad += 1;
+            String::appendf(&mut rep, "OUTSIDE %s\n", &v.file);
+            foreach (m in &v.model.keys)
+            {
+                String::appendf(&mut rep, "    model: %s\n", m);
+            }
+            foreach (s in &outside)
+            {
+                String::appendf(&mut rep, "    %s: %s\n", &s.tool, &s.outcome);
+            }
+        }
+        else if (Vec::len(&missing) > 0)
+        {
+            unobserved += 1;
+            String::appendf(&mut rep, "unobserved %s: %s\n", &v.file, &String::join(&missing, " | "));
+        }
+    }
+    String::appendf(&mut rep, "compare: %d programs, %d with an outcome outside the model's set, %d beyond a set cut short at the state limit, %d with a model outcome no tool showed\n", Vec::len(&results), bad, truncated, unobserved);
+    match (&report_path)
+    {
+        Some(p) : { _ = Result::expect(write_file(p, &rep), "report"); },
+        None    : printf("%s", &rep),
+    }
+    eprintf("compare: %d programs, %d outside, %d truncated, %d unobserved\n", Vec::len(&results), bad, truncated, unobserved);
+    if (bad > 0)
+    {
+        return 1;
+    }
+    0
+}

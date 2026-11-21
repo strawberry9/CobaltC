@@ -1,0 +1,54 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.tls [Tls-Client] [Tls-Error] (D-0161); conf.tls-not-tls, conf.tls-closed
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 544c532070726f746f636f6c2076696f6c6174696f6e0a636c6f7365640a
+//
+// A full TLS handshake needs a TLS server, which `std` does not have, so
+// the handshake itself is tested outside the suite (stress/crypto, and
+// public DNS-over-TLS resolvers). Here, hermetically: a loopback peer that
+// answers in plain text instead of TLS is a `ProtocolError` (its first
+// bytes make an impossible record length), and one that closes at once is
+// the network's `Closed`. Neither leaks or hangs.
+
+import std;
+
+fn serve(TcpListener l, str reply)
+{
+    match (TcpListener::accept(&mut l))
+    {
+        Ok(s)  :
+        {
+            Vec<u8> hello = Vec::new();
+            _ = TcpStream::read(&mut s, &mut hello, 4096);
+            _ = TcpStream::write_text(&mut s, StringView::of(reply));
+        },
+        Err(_) : {},
+    }
+}
+
+fn attempt(str reply)
+{
+    TcpListener l = match (TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)))
+    {
+        Ok(l)  : l,
+        Err(_) : return,
+    };
+    SocketAddr at = TcpListener::local_addr(&l);
+    auto server = spawn(serve, l, reply);
+    TrustStore roots = TrustStore::new();
+    match (TlsStream::connect(at, "test.example", &roots))
+    {
+        Ok(_)  : printf("connected?\n"),
+        Err(e) : printf("%s\n", TlsError::text(&e)),
+    }
+    join(server);
+}
+
+fn main() : u8
+{
+    attempt("HTTP/1.0 400 Bad Request\r\n\r\n");
+    attempt("");
+    0
+}

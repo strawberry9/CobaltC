@@ -1,0 +1,96 @@
+# D-0309: a loop whose one use of a vector is a confined push, and which calls
+# nothing else and can fault nowhere, keeps the vector's header in locals
+# (`keep_push_headers`, a `uint64_t kh…` in the function's body: from its
+# definition's line to its closing brace): the length is stored back before
+# `grow` and after the loop, its end or a `break`. A loop that calls
+# `printf`, or whose pushed value can overflow, keeps the push as a call. The
+# program's output, and the overflow's report (its first two lines, at the
+# `k * narrow<i64>(i)` line, recorded here), are the same under gcc and clang.
+file p.cb
+import std;
+import std::env;
+
+fn fill(ref<Vec<u8>, exclusive> v, usize n)
+{
+    foreach (i in 0..n)
+    {
+        Vec::push(v, narrow_wrapping<u8>(i));
+    }
+}
+
+fn fill_until(ref<Vec<u8>, exclusive> v, usize n, usize stop)
+{
+    foreach (i in 0..n)
+    {
+        if (i == stop)
+        {
+            break;
+        }
+        Vec::push(v, 7);
+    }
+}
+
+fn fill_logged(ref<Vec<i64>, exclusive> v, usize n)
+{
+    foreach (i in 0..n)
+    {
+        if (i == 3)
+        {
+            printf("at %v\n", i);
+        }
+        Vec::push(v, 1);
+    }
+}
+
+fn fill_scaled(ref<Vec<i64>, exclusive> v, usize n, i64 k)
+{
+    foreach (i in 0..n)
+    {
+        Vec::push(v, k * narrow<i64>(i));
+    }
+}
+
+fn main() : u8
+{
+    String m = Result::unwrap_or(arg(0), String::new());
+    Vec<u8> a = Vec::new();
+    fill(&mut a, 100000);
+    u64 s = 0;
+    foreach (x in &a)
+    {
+        s += widen<u64>(*x);
+    }
+    Vec<u8> b = Vec::new();
+    fill_until(&mut b, 5000, 1234);
+    Vec<i64> c = Vec::new();
+    fill_logged(&mut c, 10);
+    Vec<i64> d = Vec::new();
+    i64 k = if (m == "over") { 4611686018427387904 } else { 3 };
+    fill_scaled(&mut d, 10, k);
+    Vec<i64> w = Vec::new();
+    foreach (i in 0..70000: i64)
+    {
+        Vec::push(&mut w, i);
+    }
+    printf("%v %v %v %v %v %v %v\n", Vec::len(&a), s, Vec::len(&b), Vec::len(&c), d[9], Vec::len(&w), w[69999]);
+    0
+}
+end
+run $COBC --emit-c -o p.c p.cb
+status 0
+cut p.c fill.c "\n… f_fill_c1(…)\n" "\n}\n"
+file-has fill.c uint64_t kh
+cut p.c fill_until.c "\n… f_fill_until_c1(…)\n" "\n}\n"
+file-has fill_until.c uint64_t kh
+cut p.c main.c "\n… f_main(…)\n" "\n}\n"
+file-has main.c uint64_t kh
+cut p.c fill_logged.c "\n… f_fill_logged_c1(…)\n" "\n}\n"
+file-lacks fill_logged.c uint64_t kh
+cut p.c fill_scaled.c "\n… f_fill_scaled_c1(…)\n" "\n}\n"
+file-lacks fill_scaled.c uint64_t kh
+run $COBC --cc $CC -o p p.cb
+status 0
+run ./p ok
+stdout-is at 3\n100000 12742320 1234 10 27 70000 69999\n
+run ./p over
+stderr-starts fault[diag.arith-overflow]: arithmetic overflow\n  --> p.cb:40:9\n

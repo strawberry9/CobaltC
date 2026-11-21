@@ -1,0 +1,635 @@
+// cobmodel: an independent executable model of CobaltC's alias and thread
+// rules (D-0219). See impl/model/README.md.
+//
+//   cobmodel check FILE...            the outcome set of each program
+//   cobmodel enum --size N --out DIR  write the fragment's programs up to size N
+//   cobmodel compare DIR --cobc P [--explore N] [--cc CC]...
+//                                     run the tools and report disagreements
+//
+// Written in CobaltC (D-0326, item 7). It imports `std` only, never the
+// tools' front end or code generator, so that it shares no code with them.
+
+import std;
+
+module maps "./maps.cb";
+module ast "./ast.cb";
+module parse "./parse.cb";
+module print "./print.cb";
+module frames "./frames.cb";
+module statics "./statics.cb";
+module machine "./machine.cb";
+module explore "./explore.cb";
+module enumerate "./enumerate.cb";
+module compare "./compare.cb";
+
+import maps;
+import ast;
+import statics;
+import machine;
+import explore;
+
+fn usage() : u8
+{
+    eprintf("usage: cobmodel check [--literal-dead] [--as-licensed [--pre-d0236] [--pre-d0243]] [--pre-d0282] [--witness] FILE...\n       cobmodel certify [--witness] CERT FILE\n       cobmodel statics [--pre-d0282] FILE...\n       cobmodel enum --size N --out DIR [--max K]\n       cobmodel compare DIR --cobc PATH [--explore N] [--cc CC]... [--jobs J]\n");
+    2
+}
+
+// The program's arguments after its name.
+fn args() : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    for (usize i = 0; i < arg_count(); i += 1)
+    {
+        match (arg(i))
+        {
+            Ok(s)  : Vec::push(&mut v, s),
+            Err(_) : Vec::push(&mut v, String::new()),
+        }
+    }
+    v
+}
+
+// What Rust's `io::Error` says for a file that cannot be read as text.
+export fn io_error_text(ref<FileError, shared> e) : String
+{
+    match (e)
+    {
+        FileError::NotFound : "No such file or directory (os error 2)",
+        FileError::Denied   : "Permission denied (os error 13)",
+        FileError::Utf8(_)  : "stream did not contain valid UTF-8",
+        _                   : "Is a directory (os error 21)",
+    }
+}
+
+fn read_text(StringView f) : Result<String, String>
+{
+    match (read_file(f))
+    {
+        Ok(s)  : Ok(s),
+        Err(e) : Err(io_error_text(&e)),
+    }
+}
+
+fn print_witness(ref<Program, shared> p, ref<Report, shared> r, ref<Outcome, shared> o)
+{
+    match (SMap::find(&r.witness, o))
+    {
+        Some(wi) :
+        {
+            Statics st = statics::check(p);
+            Code code = compile(p, &st.ends);
+            foreach (w in &r.witness.vals[wi])
+            {
+                if (w.t == NO_THREAD)
+                {
+                    printf("      [every thread waits: the ends of the chains of waits fault]\n");
+                    continue;
+                }
+                ref<InsL, shared> il = &code.funcs[w.func].code[w.pc];
+                printf("      t%d %s:%d line %d %s\n", w.t, &code.funcs[w.func].f.name, w.pc, il.line, &Ins::debug(&il.ins));
+            }
+        },
+        None     : {},
+    }
+}
+
+fn check_main(ref<Vec<String>, shared> args) : u8
+{
+    bool literal = false;
+    bool show_witness = false;
+    bool licensed = false;
+    u8 status = 0;
+    usize false_proofs = 0;
+    for (usize i = 1; i < Vec::len(args); i += 1)
+    {
+        ref<String, shared> f = &args[i];
+        if (*f == "--literal-dead")
+        {
+            literal = true;
+            continue;
+        }
+        if (*f == "--as-licensed")
+        {
+            licensed = true;
+            continue;
+        }
+        if (*f == "--pre-d0236")
+        {
+            Atomic::store(&PRE_D0236, 1);
+            continue;
+        }
+        if (*f == "--pre-d0282")
+        {
+            Atomic::store(&PRE_D0282, 1);
+            continue;
+        }
+        if (*f == "--pre-d0243")
+        {
+            Atomic::store(&PRE_D0243, 1);
+            continue;
+        }
+        if (*f == "--witness")
+        {
+            show_witness = true;
+            continue;
+        }
+        String src = match (read_text(f))
+        {
+            Ok(s)  : s,
+            Err(e) :
+            {
+                eprintf("%s: %s\n", f, &e);
+                status = 2;
+                continue;
+            },
+        };
+        match (parse::parse(&src))
+        {
+            Ok(p)  :
+            {
+                Report r = run_with(&p, !literal, licensed);
+                printf("%s: %d outcome(s), %d states\n", f, SSet::len(&r.outcomes), r.states);
+                bool proven_false = false;
+                foreach (o in &r.outcomes.keys)
+                {
+                    if (StringView::contains(&Outcome::text(o), "model.proven-but-false"))
+                    {
+                        proven_false = true;
+                    }
+                }
+                if (proven_false)
+                {
+                    false_proofs += 1;
+                    status = 1;
+                }
+                foreach (o in &r.outcomes.keys)
+                {
+                    printf("  %s\n", &Outcome::text(o));
+                    if (show_witness)
+                    {
+                        print_witness(&p, &r, o);
+                    }
+                }
+            },
+            Err(e) :
+            {
+                eprintf("%s: %s\n", f, &e);
+                status = 2;
+            },
+        }
+    }
+    if (licensed)
+    {
+        printf("as licensed: %d program(s) with an access the flow table proves while clash refutes it\n", false_proofs);
+    }
+    status
+}
+
+fn main() : u8
+{
+    Vec<String> a = args();
+    if (Vec::len(&a) == 0)
+    {
+        return usage();
+    }
+    StringView cmd = &a[0];
+    if (cmd == "check")
+    {
+        return check_main(&a);
+    }
+    if (cmd == "certify")
+    {
+        return certify_main(&a);
+    }
+    if (cmd == "trace")
+    {
+        return trace_main(&a);
+    }
+    if (cmd == "statics")
+    {
+        return statics_main(&a);
+    }
+    if (cmd == "enum")
+    {
+        return enumerate::main(&a);
+    }
+    if (cmd == "compare")
+    {
+        return compare::main(&a);
+    }
+    usage()
+}
+
+// Where the last occurrence of `: ` is: the text before it and the text
+// after it are the two parts.
+fn rsplit_colon(StringView s) : Option<usize>
+{
+    StringView::rfind(s, ": ")
+}
+
+// D-0299: `cobmodel certify [--witness] CERT FILE`: the certificate `cobc
+// --certificate CERT FILE` (or `cobc --certificate CERT --check FILE`)
+// wrote, checked against every interleaving of FILE. Each body the
+// certificate calls decided is run as a compiler runs it, keeping no record
+// of its references: an alias or temporal fault the rules find at one of
+// its steps is the outcome `model.decided-but-false`, and the exit status
+// is 1. The static verdicts must agree too: a program the certificate calls
+// rejected is one the model's statics reject with the same diagnostic, and
+// a program it accepts is one they accept. The certificate's bodies are
+// matched by name; `std`'s bodies, which the fragment has as rules, and a
+// generic instantiation's arguments are left out.
+fn certify_main(ref<Vec<String>, shared> args) : u8
+{
+    bool show_witness = false;
+    Vec<String> files = Vec::new();
+    for (usize i = 1; i < Vec::len(args); i += 1)
+    {
+        if (args[i] == "--witness")
+        {
+            show_witness = true;
+        }
+        else
+        {
+            Vec::push(&mut files, clone(&args[i]));
+        }
+    }
+    if (Vec::len(&files) != 2)
+    {
+        return usage();
+    }
+    ref<String, shared> cert = &files[0];
+    ref<String, shared> file = &files[1];
+    String text = match (read_text(cert))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("%s: %s\n", cert, &e);
+            return 2;
+        },
+    };
+    if (!StringView::starts_with(&text, "CobaltC certificate 1\n"))
+    {
+        eprintf("%s: not a CobaltC certificate (version 1)\n", cert);
+        return 2;
+    }
+    SSet<String> decided = SSet::new();
+    usize user_bodies = 0;
+    bool all = false;
+    Option<String> rejected = None;
+    foreach (line0 in StringView::lines(&text))
+    {
+        StringView line = line0;
+        match (StringView::strip_prefix(line, "verdict: "))
+        {
+            Some(v) :
+            {
+                if (v == "decided")
+                {
+                    all = true;
+                }
+                else
+                {
+                    match (StringView::strip_prefix(v, "rejected: "))
+                    {
+                        Some(d) : rejected = Some(String::copy(d)),
+                        None    : {},
+                    }
+                }
+                continue;
+            },
+            None    : {},
+        }
+        match (StringView::strip_prefix(line, "fn "))
+        {
+            Some(rest) :
+            {
+                usize k = match (rsplit_colon(rest))
+                {
+                    Some(k) : k,
+                    None    : continue,
+                };
+                StringView name = &rest[0..k];
+                StringView verdict = &rest[k + 2..StringView::len(rest)];
+                if (StringView::contains(name, "::"))
+                {
+                    continue;
+                }
+                user_bodies += 1;
+                if (verdict == "decided")
+                {
+                    StringView base = name;
+                    match (StringView::find(name, "<"))
+                    {
+                        Some(j) : base = &name[0..j],
+                        None    : {},
+                    }
+                    _ = SSet::insert(&mut decided, String::copy(base));
+                }
+            },
+            None       : {},
+        }
+    }
+    String src = match (read_text(file))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("%s: %s\n", file, &e);
+            return 2;
+        },
+    };
+    Program prog = match (parse::parse(&src))
+    {
+        Ok(p)  : p,
+        Err(e) :
+        {
+            eprintf("%s: %s\n", file, &e);
+            return 2;
+        },
+    };
+    Statics st = statics::check(&prog);
+    match (Statics::first(&st))
+    {
+        Some(k) :
+        {
+            ref<StaticErr, shared> e = &st.errors[k];
+            match (&rejected)
+            {
+                Some(d) :
+                {
+                    if (e.diag == *d)
+                    {
+                        printf("%s: rejected by both the certificate and the model (%s (static) line %d); nothing runs\n", file, e.diag, e.line);
+                        return 0;
+                    }
+                    printf("%s: NOT certified: the static verdicts differ: the certificate says %s, the model %s (static) line %d\n", file, d, e.diag, e.line);
+                    return 1;
+                },
+                None    :
+                {
+                    printf("%s: NOT certified: the static verdicts differ: the certificate accepts the program, the model rejects it (%s (static) line %d)\n", file, e.diag, e.line);
+                    return 1;
+                },
+            }
+        },
+        None    :
+        {
+            match (&rejected)
+            {
+                Some(d) :
+                {
+                    printf("%s: NOT certified: the static verdicts differ: the certificate says %s, the model accepts the program\n", file, d);
+                    return 1;
+                },
+                None    : {},
+            }
+        },
+    }
+    Report r = run_certified(&prog, true, &decided, all);
+    bool bad = false;
+    foreach (o in &r.outcomes.keys)
+    {
+        if (StringView::contains(&Outcome::text(o), "model.decided-but-false"))
+        {
+            bad = true;
+        }
+    }
+    String scope = "the whole program";
+    if (!all)
+    {
+        scope = sprintf("%d of %d bodies", SSet::len(&decided), user_bodies);
+    }
+    str verdict = "certified";
+    if (bad)
+    {
+        verdict = "NOT certified";
+    }
+    printf("%s: %s: %s decided, %d outcome(s), %d states\n", file, verdict, &scope, SSet::len(&r.outcomes), r.states);
+    foreach (o in &r.outcomes.keys)
+    {
+        printf("  %s\n", &Outcome::text(o));
+        if (show_witness)
+        {
+            print_witness(&prog, &r, o);
+        }
+    }
+    if (bad)
+    {
+        return 1;
+    }
+    0
+}
+
+// `cobmodel statics [--pre-d0282] FILE...`: each program's static verdict
+// alone, `ok` or the first finding (`diag (static) line N`), without the
+// exploration -- for comparing with `cobc --check` over a large corpus.
+fn statics_main(ref<Vec<String>, shared> args) : u8
+{
+    u8 status = 0;
+    for (usize i = 1; i < Vec::len(args); i += 1)
+    {
+        ref<String, shared> f = &args[i];
+        if (*f == "--pre-d0282")
+        {
+            Atomic::store(&PRE_D0282, 1);
+            continue;
+        }
+        Result<Program, String> parsed = match (read_text(f))
+        {
+            Ok(s)  : parse::parse(&s),
+            Err(e) : Err(e),
+        };
+        Program prog = match (parsed)
+        {
+            Ok(p)  : p,
+            Err(e) :
+            {
+                eprintf("%s: %s\n", f, &e);
+                status = 2;
+                continue;
+            },
+        };
+        Statics st = statics::check(&prog);
+        match (Statics::first(&st))
+        {
+            Some(k) : printf("%s: %s (static) line %d\n", f, st.errors[k].diag, st.errors[k].line),
+            None    : printf("%s: ok\n", f),
+        }
+    }
+    status
+}
+
+// D-0270: `cobmodel trace FILE [--out TRACE] [--max N]`: one run of the
+// program, the lowest-numbered enabled thread stepping each time, its steps
+// written as the mechanised fragment's actions (`proofs/Replay.lean`
+// replays them through the proven machine). A statically rejected program
+// has no run and writes an empty trace.
+fn trace_main(ref<Vec<String>, shared> args) : u8
+{
+    Option<String> file_arg = None;
+    Option<String> out = None;
+    usize max = 200000;
+    usize i = 1;
+    while (i < Vec::len(args))
+    {
+        if (args[i] == "--out")
+        {
+            if (i + 1 < Vec::len(args))
+            {
+                out = Some(clone(&args[i + 1]));
+            }
+            else
+            {
+                out = None;
+            }
+            i += 2;
+        }
+        else if (args[i] == "--max")
+        {
+            if (i + 1 < Vec::len(args))
+            {
+                match (StringView::parse<usize>(&args[i + 1]))
+                {
+                    Ok(n)  : max = n,
+                    Err(_) : {},
+                }
+            }
+            i += 2;
+        }
+        else
+        {
+            file_arg = Some(clone(&args[i]));
+            i += 1;
+        }
+    }
+    String file = match (file_arg)
+    {
+        Some(f) : f,
+        None    :
+        {
+            eprintf("usage: cobmodel trace FILE [--out TRACE] [--max N]\n");
+            return 2;
+        },
+    };
+    String src = match (read_text(&file))
+    {
+        Ok(s)  : s,
+        Err(e) :
+        {
+            eprintf("%s: %s\n", &file, &e);
+            return 2;
+        },
+    };
+    Program prog = match (parse::parse(&src))
+    {
+        Ok(p)  : p,
+        Err(e) :
+        {
+            eprintf("%s: %s\n", &file, &e);
+            return 2;
+        },
+    };
+    Statics st = statics::check(&prog);
+    Vec<String> lines = Vec::new();
+    String outcome = String::new();
+    match (Statics::first(&st))
+    {
+        Some(k) : outcome = sprintf("%s (static) line %d", st.errors[k].diag, st.errors[k].line),
+        None    :
+        {
+            Code code = compile(&prog, &st.ends);
+            Machine m = Machine { .code = &code, .spare_result = true };
+            State s = State::new(&code);
+            s.tracing = true;
+            u32 pf = State::act_of(&s, 0).param_frame;
+            State::tr(&mut s, sprintf("ben 0 %d", pf));
+            usize steps = 0;
+            while (true)
+            {
+                if (steps >= max)
+                {
+                    outcome = "too-long";
+                    lines = replace(&mut s.trace, Vec::new());
+                    break;
+                }
+                steps += 1;
+                Option<u32> first = None;
+                foreach (t in &s.threads.keys)
+                {
+                    if (Machine::enabled(&m, &s, *t))
+                    {
+                        first = Some(*t);
+                        break;
+                    }
+                }
+                u32 t = match (first)
+                {
+                    Some(t) : t,
+                    None    :
+                    {
+                        outcome = "deadlock (every thread waits)";
+                        lines = replace(&mut s.trace, Vec::new());
+                        break;
+                    },
+                };
+                match (Machine::step(&m, clone(&s), t))
+                {
+                    Step::Next(s2)           : s = s2,
+                    Step::Blocked            : {},
+                    Step::Fault { s: s2, f } :
+                    {
+                        outcome = sprintf("%s (dynamic) line %d", f.diag, f.line);
+                        State s3 = s2;
+                        State::tr(&mut s3, "end");
+                        lines = replace(&mut s3.trace, Vec::new());
+                        break;
+                    },
+                    Step::Exit(s2)           :
+                    {
+                        if (Vec::len(&s2.out) == 0)
+                        {
+                            outcome = "ok";
+                        }
+                        else
+                        {
+                            String o = "[";
+                            for (usize k = 0; k < Vec::len(&s2.out); k += 1)
+                            {
+                                if (k > 0)
+                                {
+                                    String::push_ascii(&mut o, b' ');
+                                }
+                                String::appendf(&mut o, "%d", s2.out[k]);
+                            }
+                            String::append(&mut o, "] ok");
+                            outcome = o;
+                        }
+                        State s3 = s2;
+                        lines = replace(&mut s3.trace, Vec::new());
+                        break;
+                    },
+                }
+            }
+        },
+    }
+    String text = sprintf("# %s: %s\n%s\n", &file, &outcome, &String::join(&lines, "\n"));
+    match (&out)
+    {
+        Some(path) :
+        {
+            match (write_file(path, &text))
+            {
+                Ok(_)  : {},
+                Err(e) :
+                {
+                    eprintf("%s: %s\n", path, &io_error_text(&e));
+                    return 2;
+                },
+            }
+        },
+        None       : printf("%s", &text),
+    }
+    printf("%s: %s (%d action(s))\n", &file, &outcome, Vec::len(&lines));
+    0
+}

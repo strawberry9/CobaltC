@@ -1,0 +1,46 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.rc `Weak<T>` (D-0125); conf.weak-upgrade-while-alive, conf.weak-upgrade-after-end, conf.weak-keeps-box
+// kind: positive
+// expect: ok
+//
+// `upgrade` gives a strong handle while one exists and `None` after; the
+// value ends with the last strong handle (its destructor runs then) while
+// weak handles still hold the box; a parent pointer through `Weak`.
+
+import std;
+
+resource struct Noisy { u32 id; }
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("drop %d\n", self.id);
+}
+struct Node { u32 id; Option<Weak<Node>> parent; }
+
+fn main()
+{
+    Rc<Noisy> a = Rc::new(Noisy { .id = 1 });
+    Weak<Noisy> w = Rc::downgrade(&a);
+    Weak<Noisy> w2 = clone(&w);
+    match (Weak::upgrade(&w)) { Some(b) : assert(Rc::get(&b).id == 1), None : assert(false), }
+    Rc<Noisy> a2 = Rc::clone(&a);
+    drop(a);
+    assert(Option::is_some(&Weak::upgrade(&w2)));       // a2 still holds it
+    drop(a2);                                            // drop 1: the value ends now
+    assert(Option::is_none(&Weak::upgrade(&w)) && Option::is_none(&Weak::upgrade(&w2)));
+    drop(w);
+    drop(w2);                                            // the box goes with the last weak handle
+
+    Rc<Node> root = Rc::new(Node { .id = 10, .parent = None });
+    Rc<Node> leaf = Rc::new(Node { .id = 11, .parent = Some(Rc::downgrade(&root)) });
+    if (Some(p) = &Rc::get(&leaf).parent)
+    {
+        if (Some(r) = Weak::upgrade(p)) { assert(Rc::get(&r).id == 10); } else { assert(false); }
+    }
+    drop(root);
+    if (Some(p) = &Rc::get(&leaf).parent)
+    {
+        assert(Option::is_none(&Weak::upgrade(p)));
+    }
+    printf("ok\n");                                      // then drop of nothing noisy
+}

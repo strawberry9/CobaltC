@@ -1,0 +1,88 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.lock [Lock] [Guard-Deref] [Guard-Drop]; D-0202; conf.mutex-bare-guard
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6869747320313630302073756d203739363030206561726c79203430206c6f676765642038300a
+//
+// Guards of every shape, from several threads at once: a block that uses
+// its guard only as `*g` or `g.f` (which `cobc` locks and unlocks without
+// a guard object), one that returns early while holding it, one that
+// hands the guard's interior to a function by reference, and a mutex
+// holding a resource. Every lock is released at its block's end, so
+// every count is exact.
+
+import std;
+
+struct Tally
+{
+    u64 hits;
+    u64 sum;
+}
+
+fn add(ref<Tally, exclusive> t, u64 v)
+{
+    t.hits += 1;
+    t.sum += v;
+}
+
+fn worker(ref<mutex<Tally>, shared> m, ref<mutex<Vec<u64>>, shared> log, u64 id, u64 n) : u64
+{
+    u64 early = 0;
+    foreach (i in 0..n)
+    {
+        {
+            auto g = lock(m);
+            g.hits += 1;
+            g.sum += i;
+        }
+        {
+            auto g = lock(m);
+            add(&mut *g, 0);
+        }
+        if (i % 10 == 0)
+        {
+            early += first_even(m, i);
+            auto v = lock(log);
+            Vec::push(&mut *v, id);
+        }
+    }
+    early
+}
+
+fn first_even(ref<mutex<Tally>, shared> m, u64 i) : u64
+{
+    auto g = lock(m);
+    if (i % 20 == 0)
+    {
+        return 1;
+    }
+    g.hits += 0;
+    0
+}
+
+fn main()
+{
+    auto m = Mutex::new(Tally { .hits = 0, .sum = 0 });
+    Vec<u64> empty = Vec::new();
+    auto log = Mutex::new(empty);
+    u64 early = 0;
+    {
+        Vec<handle<u64>> hs = Vec::new();
+        foreach (id in 0..4: u64)
+        {
+            Vec::push(&mut hs, spawn(worker, &m, &log, id, 200));
+        }
+        while (Vec::len(&hs) > 0)
+        {
+            early += join(Option::unwrap(Vec::pop(&mut hs)));
+        }
+    }
+    auto g = lock(&m);
+    u64 logged = 0;
+    {
+        auto v = lock(&log);
+        logged = narrow<u64>(Vec::len(&*v));
+    }
+    printf("hits %v sum %v early %v logged %v\n", g.hits, g.sum, early, logged);
+}

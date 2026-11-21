@@ -1,0 +1,92 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.enum a variant with named fields (D-0324); conf.variant-fields, conf.variant-fields-nested, conf.variant-fields-generic, conf.variant-fields-if-pattern, conf.variant-fields-eq-clone-key, conf.variant-fields-resource-field
+// kind: positive
+// expect: ok
+//
+// A variant written with named fields is made by naming them,
+// `Expr::Bin { .op = …, .a = …, .b = … }`, and matched by naming them,
+// `Expr::Bin { op, a, b }`, with `..` for the rest and `f: x` to rename;
+// inside a chain (`Some(Shape::Rect { w, .. })`), in an `if` pattern, in a
+// generic enum, and by value, where a `String` field is moved out. Such an
+// enum is compared with `==`, copied with `clone` and used as a key, as
+// one whose payload is a struct is.
+import std;
+
+enum Expr
+{
+    Num(i64),
+    Bin { u8 op; Box<Expr> a; Box<Expr> b; },
+}
+
+fn eval(ref<Expr, shared> e) : i64
+{
+    match (e)
+    {
+        Expr::Num(v)           : *v,
+        Expr::Bin { op, a, b } :
+        {
+            i64 x = eval(Box::get(a));
+            i64 y = eval(Box::get(b));
+            if (*op == b'+') { x + y } else { x * y }
+        },
+    }
+}
+
+enum Shape
+{
+    Rect { u32 w; u32 h; },
+    Dot,
+}
+
+enum Pair<T>
+{
+    Both { T left; T right; },
+    Neither,
+}
+
+enum Named
+{
+    Person { String name; u32 age; },
+    Nobody,
+}
+
+fn main()
+{
+    Expr e = Expr::Bin {
+        .op = b'+',
+        .a = Box::new(Expr::Num(2)),
+        .b = Box::new(Expr::Bin { .op = b'*', .a = Box::new(Expr::Num(3)), .b = Box::new(Expr::Num(4)) }),
+    };
+    assert(eval(&e) == 14);
+
+    Option<Shape> s = Some(Shape::Rect { .w = 3, .h = 5 });
+    u32 width = match (s)
+    {
+        Some(Shape::Rect { w, .. }) : w,
+        Some(Shape::Dot)            : 0,
+        None                        : 0,
+    };
+    assert(width == 3);
+
+    Pair<i32> p = Pair::Both { .left = 7, .right = 8 };
+    if (Pair::Both { left, right: r } = p)
+    {
+        assert(left + r == 15);
+    }
+
+    Shape a = Shape::Rect { .w = 1, .h = 2 };
+    Shape b = clone(&a);
+    assert(a == b);
+    HashMap<Shape, u32> seen = HashMap::new();
+    _ = HashMap::insert(&mut seen, a, 1);
+    assert(HashMap::contains(&seen, &b));
+
+    Named n = Named::Person { .name = "Ada", .age = 36 };
+    String who = match (n)
+    {
+        Named::Person { name, .. } : name,
+        Named::Nobody              : "nobody",
+    };
+    printf("%s %v\n", &who, eval(&e));
+}

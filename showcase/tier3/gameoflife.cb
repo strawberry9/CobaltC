@@ -1,0 +1,466 @@
+// gameoflife.cb: Conway's Game of Life on a 512 x 512 grid whose edges wrap, from the seed file beside
+// it (gameoflife_seed.txt), for 200 generations, ending with 18885 living cells.
+// A u64 holds 64 cells, and `simd<u64, 2>` vectors count the neighbours of 128 cells at once with
+// bitwise adders; the loader checks the file 64 characters at a time with `simd<u8, 64>`. The loops'
+// bounds are constants, so the compiler tests each slice's length once, before the loop (D-0320), and
+// from that test the C compiler drops nearly all the bounds checks inside it: no `assert` is needed.
+// The unit tests hold the fast step to the rule written out cell by cell.
+
+import std;
+
+const usize SIZE = 512;
+const usize LANES = SIZE / 64; // the words of a row that hold cells
+const usize STRIDE = LANES + 2; // a row's words, with a ghost word at each end
+const usize WORDS = (SIZE + 2) * STRIDE; // a ghost row above and below
+
+// ---- the grid
+
+fn empty_grid() : Vec<u64>
+{
+    Vec::filled(WORDS, 0: u64)
+}
+
+// The index of the word that holds cell (row, column).
+fn word_of(usize row, usize column) : usize
+{
+    (row + 1) * STRIDE + 1 + column / 64
+}
+
+fn set(slice<u64, exclusive> grid, usize row, usize column)
+{
+    u64 one = 1;
+    grid[word_of(row, column)] |= one << narrow<u32>(column % 64);
+}
+
+fn get(slice<u64, shared> grid, usize row, usize column) : bool
+{
+    (grid[word_of(row, column)] >> narrow<u32>(column % 64)) & 1 == 1
+}
+
+fn population(slice<u64, shared> grid) : usize
+{
+    usize alive = 0;
+    for (usize row = 0; row < SIZE; row += 1)
+    {
+        usize at = word_of(row, 0);
+        for (usize k = 0; k < LANES; k += 1)
+        {
+            alive += widen<usize>(count_ones(grid[at + k]));
+        }
+    }
+    alive
+}
+
+// Fills the ghosts from the cells: each row's two ghost words, then the two ghost rows.
+// Both loops' bounds are constants, so the compiler tests the length once before each (D-0320), and
+// the C compiler drops every bounds check inside them.
+fn wrap(slice<u64, exclusive> grid)
+{
+    // `left` is a row's left ghost word; its cells are the LANES words after it.
+    for (usize left = STRIDE; left < (SIZE + 1) * STRIDE; left += STRIDE)
+    {
+        grid[left] = grid[left + LANES];
+        grid[left + LANES + 1] = grid[left + 1];
+    }
+    usize top = STRIDE;
+    usize bottom = SIZE * STRIDE;
+    for (usize k = 0; k < STRIDE; k += 1)
+    {
+        grid[k] = grid[bottom + k];
+        grid[bottom + STRIDE + k] = grid[top + k];
+    }
+}
+
+// ---- one generation
+
+// Writes the generation after `now` into `next`.
+// `now`'s ghosts must be filled; `next`'s are filled on return.
+// The loop bound `at < WORDS - 2` (the same turns as `at < WORDS`, since at is k, k + 10, ... with
+// k odd and at most 7) makes WORDS - 1 the largest index the loads reach, so the compiler's length test
+// before the loops (D-0320) is `slice_len(now) >= WORDS && slice_len(next) >= WORDS - 11`, which the
+// grids pass. From it the C compiler drops the bounds checks inside: GCC all four, Clang all but two.
+// With `at < WORDS` the test would ask for two words more than a grid has, and fail every time.
+fn step(slice<u64, shared> now, slice<u64, exclusive> next)
+{
+    // Two words (128 columns) at a time, down the rows, so the vectors that roll from row to row
+    // stay in registers: the triples of the row above (a), the row itself (b) and the row below (c),
+    // and the row's own cells (centre).
+    for (usize k = 1; k <= LANES; k += 2)
+    {
+        simd<u64, 2> a_ones = [0; 2];
+        simd<u64, 2> a_twos = [0; 2];
+        simd<u64, 2> b_ones = [0; 2];
+        simd<u64, 2> b_twos = [0; 2];
+        simd<u64, 2> centre = [0; 2];
+        // `at` is the row below: from the ghost row above the grid to the ghost row under it.
+        for (usize at = k; at < WORDS - 2; at += STRIDE)
+        {
+            // c = west + v + east of the row below, a 2-bit number per cell. The ghost words make
+            // the carries between words two more loads, one word to the left and one to the right.
+            simd<u64, 2> v = simd_load<simd<u64, 2>>(now, at);
+            simd<u64, 2> w = (v << [1; 2]) | (simd_load<simd<u64, 2>>(now, at - 1) >> [63; 2]);
+            simd<u64, 2> e = (v >> [1; 2]) | (simd_load<simd<u64, 2>>(now, at + 1) << [63; 2]);
+            simd<u64, 2> wv = w ^ v;
+            simd<u64, 2> c_ones = wv ^ e;
+            simd<u64, 2> c_twos = (w & v) | (e & wv);
+            if (at >= 2 * STRIDE)
+            {
+                // S = a + b + c, bit by bit: s1 (ones), s2 (twos), s4 (fours). S is at most 9.
+                simd<u64, 2> ab = a_ones ^ b_ones;
+                simd<u64, 2> s1 = ab ^ c_ones;
+                simd<u64, 2> carry1 = (a_ones & b_ones) | (c_ones & ab);
+                simd<u64, 2> ab2 = a_twos ^ b_twos;
+                simd<u64, 2> t = ab2 ^ c_twos;
+                simd<u64, 2> carry2 = (a_twos & b_twos) | (c_twos & ab2);
+                simd<u64, 2> s2 = t ^ carry1;
+                simd<u64, 2> s4 = carry2 ^ (t & carry1);
+                // S == 3 is s1 and s2 without s4; S == 4 is s4 alone (8 and 9 have neither).
+                simd<u64, 2> result = (s1 & s2 & ~s4) | (s4 & ~(s1 | s2) & centre);
+                simd_store(next, at - STRIDE, result);
+            }
+            a_ones = b_ones;
+            a_twos = b_twos;
+            b_ones = c_ones;
+            b_twos = c_twos;
+            centre = v;
+        }
+    }
+    wrap(next);
+}
+
+// The seed file: SIZE lines of SIZE characters, b'0' or b'1', each line ended by b'\n'
+// (the last line's b'\n' may be missing). It is read CHUNK_ROWS lines at a time into one small
+// buffer that is used again for every chunk.
+const usize LINE = SIZE + 1; // a line's cells and its b'\n'
+const usize CHUNK_ROWS = 64;
+const usize CHUNK = CHUNK_ROWS * LINE;
+
+// Sets rows first_row .. first_row + CHUNK_ROWS - 1 of the grid from a chunk of the file; false
+// if the chunk is not CHUNK_ROWS lines of SIZE cells.
+// The chunk's indices are bounded by constants, so the compiler tests its length once, before the
+// loop (D-0320), and the C compiler drops their bounds checks; the grid's index depends on first_row,
+// so each word stored keeps its check. Each simd_load takes a word's 64 characters at once.
+fn load_rows(slice<u8, shared> chunk, slice<u64, exclusive> grid, usize first_row) : bool
+{
+    // b'0' is 0x30 and b'1' is 0x31: the cell is the character's lowest bit, and a character is
+    // one of the two exactly when (character ^ 0x30) is 0 or 1. `other` gathers the bits that say
+    // it is neither, `ends` those that say a line does not end with b'\n'.
+    simd<u8, 64> other = [0; 64];
+    u8 ends = 0;
+    for (usize row = 0; row < CHUNK_ROWS; row += 1)
+    {
+        for (usize k = 0; k < LANES; k += 1)
+        {
+            simd<u8, 64> v = simd_load<simd<u8, 64>>(chunk, row * LINE + k * 64);
+            other = other | (v ^ [0x30; 64]);
+            // Each lane keeps its lowest bit; eight lanes at a time make one byte of the word.
+            simd<u8, 64> c = v & [1; 64];
+            u64 word = 0;
+            for (usize j = 0; j < 64; j += 8)
+            {
+                u8 cells = c[j] | c[j + 1] << 1 | c[j + 2] << 2 | c[j + 3] << 3 | c[j + 4] << 4 | c[j + 5] << 5 | c[j + 6] << 6 | c[j + 7] << 7;
+                word |= widen<u64>(cells) << narrow<u32>(j);
+            }
+            grid[(first_row + row + 1) * STRIDE + 1 + k] = word;
+        }
+        ends |= chunk[row * LINE + SIZE] ^ b'\n';
+    }
+    simd_reduce_max(other) <= 1 && ends == 0
+}
+
+// What reading the seed file gave.
+enum Seed
+{
+    Grid(Vec<u64>),
+    Unreadable,
+    Malformed,
+}
+
+// The grid in the seed file at `path`, its ghosts filled.
+fn read_seed(StringView path) : Seed
+{
+    File f = match (File::open(path)) { Ok(f) : f, Err(_) : { return Seed::Unreadable; } };
+    Vec<u64> grid = empty_grid();
+    Vec<u8> chunk = Vec::new();
+    Vec::reserve(&mut chunk, CHUNK);
+    for (usize first_row = 0; first_row < SIZE; first_row += CHUNK_ROWS)
+    {
+        Vec::clear(&mut chunk);
+        while (Vec::len(&chunk) < CHUNK)
+        {
+            usize n = match (File::read(&mut f, &mut chunk, CHUNK - Vec::len(&chunk))) { Ok(n) : n, Err(_) : { return Seed::Unreadable; } };
+            if (n == 0)
+            {
+                break;
+            }
+        }
+        // A last line without its b'\n' gets one.
+        if (first_row == SIZE - CHUNK_ROWS && Vec::len(&chunk) == CHUNK - 1)
+        {
+            Vec::push(&mut chunk, b'\n');
+        }
+        if (Vec::len(&chunk) != CHUNK || !load_rows(&chunk, &mut grid, first_row))
+        {
+            return Seed::Malformed;
+        }
+    }
+    // Nothing may follow the last line.
+    Vec::clear(&mut chunk);
+    usize more = match (File::read(&mut f, &mut chunk, 1)) { Ok(n) : n, Err(_) : { return Seed::Unreadable; } };
+    if (more != 0)
+    {
+        return Seed::Malformed;
+    }
+    wrap(&mut grid);
+    Seed::Grid(grid)
+}
+
+// The seed's population, then the population after 1, 10, 100 and 200 generations.
+fn main() : u8
+{
+    Vec<u64> now = match (read_seed("gameoflife_seed.txt"))
+    {
+        Seed::Grid(g)    : g,
+        Seed::Unreadable : { eprintf("gameoflife: cannot read gameoflife_seed.txt\n"); return 2; },
+        Seed::Malformed  : { eprintf("gameoflife: gameoflife_seed.txt is not 512 lines of 512 cells, 0 or 1\n"); return 2; },
+    };
+    Vec<u64> next = empty_grid();
+    printf("generation 0: %v alive\n", population(&now));
+    for (usize g = 1; g <= 200; g += 1)
+    {
+        step(&now, &mut next);
+        // The new generation becomes `now`; the old one's words are overwritten by the next step.
+        swap(&mut now, &mut next);
+        if (g == 1 || g == 10 || g == 100 || g == 200)
+        {
+            printf("generation %v: %v alive\n", g, population(&now));
+        }
+    }
+    0
+}
+
+// ---- tests: the fast step against the rule written out cell by cell, and the loader
+
+// One generation by the plain rule, cell by cell, with wrapping edges; ghosts filled.
+fn slow_step(slice<u64, shared> now) : Vec<u64>
+{
+    Vec<u64> next = empty_grid();
+    for (usize row = 0; row < SIZE; row += 1)
+    {
+        for (usize column = 0; column < SIZE; column += 1)
+        {
+            usize neighbours = 0;
+            foreach (dr in [SIZE - 1, 0, 1])
+            {
+                foreach (dc in [SIZE - 1, 0, 1])
+                {
+                    if ((dr != 0 || dc != 0) && get(now, (row + dr) % SIZE, (column + dc) % SIZE))
+                    {
+                        neighbours += 1;
+                    }
+                }
+            }
+            if (neighbours == 3 || (neighbours == 2 && get(now, row, column)))
+            {
+                set(&mut next, row, column);
+            }
+        }
+    }
+    wrap(&mut next);
+    next
+}
+
+// Every word equal, ghosts included.
+fn same(slice<u64, shared> x, slice<u64, shared> y) : bool
+{
+    for (usize i = 0; i < WORDS; i += 1)
+    {
+        if (x[i] != y[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn random_grid(u64 start, u64 percent) : Vec<u64>
+{
+    u64 state = start;
+    Vec<u64> grid = empty_grid();
+    for (usize row = 0; row < SIZE; row += 1)
+    {
+        for (usize column = 0; column < SIZE; column += 1)
+        {
+            state = wrapping_add(wrapping_mul(state, 6364136223846793005), 1442695040888963407);
+            if ((state >> 33) % 100 < percent)
+            {
+                set(&mut grid, row, column);
+            }
+        }
+    }
+    wrap(&mut grid);
+    grid
+}
+
+// A chunk of the seed file whose cell (row, column) is alive when (row * 7 + column * 3) % 5 == 0.
+fn pattern_chunk() : Vec<u8>
+{
+    Vec<u8> chunk = Vec::new();
+    for (usize row = 0; row < CHUNK_ROWS; row += 1)
+    {
+        for (usize column = 0; column < SIZE; column += 1)
+        {
+            if ((row * 7 + column * 3) % 5 == 0)
+            {
+                Vec::push(&mut chunk, b'1');
+            }
+            else
+            {
+                Vec::push(&mut chunk, b'0');
+            }
+        }
+        Vec::push(&mut chunk, b'\n');
+    }
+    chunk
+}
+
+unittest "wrap copies the opposite edges into the ghosts"
+{
+    Vec<u64> g = empty_grid();
+    set(&mut g, 0, 0);
+    set(&mut g, 0, 511);
+    set(&mut g, 511, 5);
+    set(&mut g, 300, 448);
+    wrap(&mut g);
+    u64 one = 1;
+    // Row 0: its last word before its first, its first after its last.
+    assert(g[word_of(0, 0) - 1] == one << 63 && g[word_of(0, 0) + LANES] == 1);
+    assert(g[word_of(300, 0) - 1] == 1 && g[word_of(300, 0) + LANES] == 0);
+    // The ghost row above is row 511, the one below is row 0, with their ghost words.
+    assert(g[1] == one << 5);
+    assert(g[(SIZE + 1) * STRIDE + 1] == 1 && g[(SIZE + 1) * STRIDE + LANES] == one << 63);
+    assert(g[(SIZE + 1) * STRIDE] == one << 63 && g[(SIZE + 1) * STRIDE + LANES + 1] == 1);
+    assert(population(&g) == 4);
+}
+
+unittest "fast step equals the cell-by-cell step on random grids, generation after generation"
+{
+    u64 percent = 10;
+    foreach (start in [1: u64, 2, 3])
+    {
+        Vec<u64> grid = random_grid(start, percent);
+        Vec<u64> next = empty_grid();
+        for (usize g = 0; g < 4; g += 1)
+        {
+            step(&grid, &mut next);
+            Vec<u64> expected = slow_step(&grid);
+            assert(same(&next, &expected), "start %v generation %v", start, g);
+            grid = expected;
+        }
+        percent += 30;
+    }
+}
+
+unittest "gliders cross every edge and corner and come back: 2048 generations move one 512 cells"
+{
+    Vec<u64> a = empty_grid();
+    // One glider at the corner (it straddles all four edges at once), one in the middle.
+    foreach (at in [[SIZE - 1, SIZE - 1], [200, 300]])
+    {
+        set(&mut a, at[0] % SIZE, (at[1] + 1) % SIZE);
+        set(&mut a, (at[0] + 1) % SIZE, (at[1] + 2) % SIZE);
+        set(&mut a, (at[0] + 2) % SIZE, at[1] % SIZE);
+        set(&mut a, (at[0] + 2) % SIZE, (at[1] + 1) % SIZE);
+        set(&mut a, (at[0] + 2) % SIZE, (at[1] + 2) % SIZE);
+    }
+    wrap(&mut a);
+    Vec<u64> start = Vec::clone(&a);
+    Vec<u64> b = empty_grid();
+    for (usize g = 0; g < 1024; g += 1)
+    {
+        step(&a, &mut b);
+        step(&b, &mut a);
+        assert(population(&a) == 10);
+        assert(g == 1023 || !same(&a, &start));
+    }
+    assert(same(&a, &start));
+}
+
+unittest "still lifes stay: a block at a corner (across all four edges) and a boat"
+{
+    Vec<u64> a = empty_grid();
+    set(&mut a, 0, 0);
+    set(&mut a, 0, 511);
+    set(&mut a, 511, 0);
+    set(&mut a, 511, 511);
+    set(&mut a, 100, 63);
+    set(&mut a, 100, 64);
+    set(&mut a, 101, 63);
+    set(&mut a, 101, 65);
+    set(&mut a, 102, 64);
+    wrap(&mut a);
+    Vec<u64> b = empty_grid();
+    step(&a, &mut b);
+    assert(same(&a, &b));
+    assert(population(&b) == 9);
+}
+
+unittest "load_rows reads a chunk's cells into the right rows and words"
+{
+    Vec<u8> chunk = pattern_chunk();
+    Vec<u64> g = empty_grid();
+    assert(load_rows(&chunk, &mut g, 128));
+    usize expected = 0;
+    for (usize row = 0; row < CHUNK_ROWS; row += 1)
+    {
+        for (usize column = 0; column < SIZE; column += 1)
+        {
+            bool alive = (row * 7 + column * 3) % 5 == 0;
+            assert(get(&g, 128 + row, column) == alive, "row %v column %v", row, column);
+            if (alive)
+            {
+                expected += 1;
+            }
+        }
+    }
+    // Nothing outside rows 128 .. 191 was written.
+    assert(population(&g) == expected);
+}
+
+unittest "load_rows refuses a character that is not 0 or 1, and a line that does not end with a newline"
+{
+    Vec<u64> g = empty_grid();
+    Vec<u8> good = pattern_chunk();
+    assert(load_rows(&good, &mut g, 0));
+    foreach (wrong in [b'2', b' ', b'a', 0x00, 0xb1])
+    {
+        Vec<u8> bad = pattern_chunk();
+        bad[40 * LINE + 77] = wrong;
+        assert(!load_rows(&bad, &mut g, 0), "character %v", wrong);
+    }
+    Vec<u8> no_end = pattern_chunk();
+    no_end[63 * LINE + SIZE] = b'0';
+    assert(!load_rows(&no_end, &mut g, 0));
+    Vec<u8> shifted = pattern_chunk();
+    shifted[10 * LINE + SIZE] = b'1';
+    shifted[10 * LINE + SIZE - 1] = b'\n';
+    assert(!load_rows(&shifted, &mut g, 0));
+}
+
+unittest "the seed (gameoflife_seed.txt beside the program): 78459 cells, 18885 after 200 generations"
+{
+    Vec<u64> a = match (read_seed("gameoflife_seed.txt"))
+    {
+        Seed::Grid(g)    : g,
+        Seed::Unreadable : { assert(false, "gameoflife_seed.txt cannot be read: run the tests from the program's directory"); empty_grid() },
+        Seed::Malformed  : { assert(false, "gameoflife_seed.txt is not 512 lines of 512 cells"); empty_grid() },
+    };
+    assert(population(&a) == 78459);
+    Vec<u64> b = empty_grid();
+    for (usize g = 0; g < 100; g += 1)
+    {
+        step(&a, &mut b);
+        step(&b, &mut a);
+    }
+    assert(population(&a) == 18885);
+}
