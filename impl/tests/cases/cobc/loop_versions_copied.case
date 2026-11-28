@@ -1,0 +1,61 @@
+# D-0309: a loop whose test keeps its variable below a bound fixed for the
+# loop (`loop_bound`), and whose body indexes a vector of fixed length with
+# that variable, is two in the C (`version_loops`): a copy without those
+# bounds checks where the bound is at most the length (one test
+# `if (… <= hl…) {` for each loop), its labels renamed (the `for`'s
+# `continue` sent to its copy's label), and the loop as it was otherwise; no
+# mark is left in the C. Both a `for` with a `continue` and a `foreach` over a
+# range are copied; the program's output, and its bounds fault where the
+# bound is over the length (the first two lines of its report, at the
+# `if (v[k])` line, recorded here), are the same under gcc and clang.
+file v.cb
+import std;
+import std::env;
+
+fn mark(ref<Vec<bool>, exclusive> v, usize limit)
+{
+    for (usize m = 0; m < limit; m += 3)
+    {
+        if (m % 2 == 0)
+        {
+            continue;
+        }
+        v[m] = true;
+    }
+}
+
+fn count(ref<Vec<bool>, shared> v, usize n) : u64
+{
+    u64 c = 0;
+    foreach (k in 0..n)
+    {
+        if (v[k])
+        {
+            c += 1;
+        }
+    }
+    c
+}
+
+fn main() : u8
+{
+    String m = Result::unwrap_or(arg(0), String::new());
+    Vec<bool> v = Vec::filled(30, false);
+    usize lim = if (m == "over") { 40 } else { 30 };
+    mark(&mut v, 30);
+    printf("%d\n", count(&v, lim));
+    0
+}
+end
+run $COBC --emit-c -o v.c v.cb
+status 0
+file-count v.c 2 "if (… <= hl…) {\n"
+file-like v.c goto cont…_v
+file-lacks v.c /*@ver
+file-lacks v.c /*@vck
+run $COBC --cc $CC -o v v.cb
+status 0
+run ./v ok
+stdout-is 5\n
+run ./v over
+stderr-starts fault[diag.index-out-of-bounds]: index 30 is out of bounds for length 30\n  --> v.cb:21:13\n

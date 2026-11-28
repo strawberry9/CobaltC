@@ -1,0 +1,119 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Request] [Http-Send] [Http-Redirect] (reports 298, 299, 310); conf.http-server-idle-timeout, conf.http-client-framing-headers, conf.http-no-redirects
+// kind: positive
+// expect: ok
+//
+// Hermetic, on 127.0.0.1. A keep-alive connection left idle past the
+// server's timeout ends `request` with `Ok(None)`, and the server sends no
+// `400` the client would read as the answer to its next request. A request
+// whose own headers carry `Transfer-Encoding: chunked` is framed by `send`
+// alone (its `Content-Length`), and the std server reads it. With
+// `max_redirects` 0 the client gives the 302 itself, its `Location` and
+// `Set-Cookie` there to read.
+
+import std;
+
+fn idle_server(HttpServer s) : u8
+{
+    HttpConnection c = match (HttpServer::accept(&mut s))
+    {
+        Ok(c)  : c,
+        Err(_) : return 1,
+    };
+    Vec<Header> h = Vec::new();
+    while (true)
+    {
+        match (HttpConnection::request(&mut c))
+        {
+            Ok(Some(r)) :
+            {
+                _ = HttpConnection::respond(&mut c, 200, &h, &r.body);
+            },
+            Ok(None)    : return 0,
+            Err(_)      :
+            {
+                _ = HttpConnection::respond(&mut c, 400, &h, b"bad request\n");
+                return 2;
+            },
+        }
+    }
+    0
+}
+
+fn redirect_server(TcpListener l) : u8
+{
+    TcpStream s = match (TcpListener::accept(&mut l))
+    {
+        Ok(s)  : s,
+        Err(_) : return 1,
+    };
+    while (true)
+    {
+        match (TcpStream::read_line(&mut s))
+        {
+            Ok(Some(line)) : if (StringView::len(&line) == 0) { break; },
+            _              : break,
+        }
+    }
+    _ = TcpStream::write_text(&mut s, "HTTP/1.1 302 Found\r\nLocation: /home\r\nSet-Cookie: session=abc\r\nContent-Length: 0\r\n\r\n");
+    _ = TcpStream::shutdown_write(&mut s);
+    0
+}
+
+fn main() : u8
+{
+    // Report 298: idle past the timeout.
+    HttpServer srv = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    srv.timeout_ms = 300;
+    SocketAddr at = HttpServer::local_addr(&srv);
+    auto server = spawn(idle_server, srv);
+    TcpStream t = Result::unwrap(TcpStream::connect(at));
+    _ = TcpStream::write_text(&mut t, "GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi");
+    Vec<u8> got = Vec::new();
+    _ = TcpStream::read(&mut t, &mut got, 4096);
+    String first = Result::unwrap_or(String::from_utf8(Vec::clone(&got)), String::new());
+    StringView line = match (StringView::find(&first, "\r"))
+    {
+        Some(k) : &first[0..k],
+        None    : &first,
+    };
+    printf("first answer: %s\n", &String::copy(line));
+    sleep_ms(800);
+    Vec::clear(&mut got);
+    usize n = Result::unwrap_or(TcpStream::read(&mut t, &mut got, 4096), 0);
+    printf("after the idle time: %v bytes, the server's request gave %v\n", n, join(server));
+    // Report 299: the request's own framing headers are not sent.
+    HttpServer echo = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u/", HttpServer::local_addr(&echo).port);
+    auto server2 = spawn(idle_server, echo);
+    HttpClient c = HttpClient::new();
+    Request r = Request::new("POST", &base);
+    Vec::push(&mut r.headers, Header::new("Transfer-Encoding", "chunked"));
+    Vec::push(&mut r.headers, Header::new("Content-Length", "99"));
+    Vec::extend_from(&mut r.body, b"hello");
+    match (HttpClient::send(&mut c, &r))
+    {
+        Ok(resp) : printf("client: %u [%s]\n", resp.status, &Result::unwrap_or(String::from_utf8(Vec::clone(&resp.body)), String::new())),
+        Err(e)   : printf("client: %s\n", HttpError::text(&e)),
+    }
+    printf("server: %v\n", join(server2));
+    // Report 310: no redirect followed.
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String url = sprintf("http://127.0.0.1:%u/login", TcpListener::local_addr(&l).port);
+    auto server3 = spawn(redirect_server, l);
+    HttpClient nofollow = HttpClient::new();
+    nofollow.max_redirects = 0;
+    match (HttpClient::send(&mut nofollow, &Request::new("GET", &url)))
+    {
+        Ok(resp) : printf(
+            "redirect: %u, location %s, cookie %s\n",
+            resp.status,
+            Option::unwrap_or(Response::header(&resp, "location"), StringView::of("-")),
+            Option::unwrap_or(Response::header(&resp, "set-cookie"), StringView::of("-")),
+        ),
+        Err(e) : printf("redirect: %s\n", HttpError::text(&e)),
+    }
+    join(server3);
+    0
+}

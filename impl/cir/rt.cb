@@ -1,0 +1,844 @@
+// Protocol CIR (step T4, stage C): the runtime-entry table. One row for each
+// `cb_…` name the lowering writes in its C or a pass asks about, in the order
+// of the names' bytes; a row's id is its place in that order from 1 (0: no
+// runtime entry), and its properties are what the passes ask today by name
+// lists and string tests, one bit each. A call node carries its callee's id
+// (`PNode::rt`): set by the constructor that built it, or looked up by
+// `classify` (`rt_lookup`).
+//
+// Written by `impl/cir/tools/gen_rt.py` from `passes.cb`'s lists, `gen.cb`'s
+// `quiet_cells` and the lowering's string literals: change those, then run
+// it again (the passes' name sets are made of the same lists).
+
+import std;
+
+// The entry records nothing in a scope or a frame (`passes::FREE_NAMES`).
+export const u32 RP_FREE = 1;
+// The entry records in the innermost statement scope (`passes::SCOPE_NAMES`).
+export const u32 RP_SCOPE = 2;
+// The entry records nothing in a decided program (`passes::DECIDED_FREE_NAMES`).
+export const u32 RP_DECIDED_FREE = 4;
+// The entry is a check that goes when its token is known 0 (`passes::ZERO_DROP`).
+export const u32 RP_ZERO_DROP = 8;
+// The entry leaves what `elide_implied_checks_nodes` knows as it is (`passes::IMPLIED_PURE`).
+export const u32 RP_IMPLIED_PURE = 16;
+// The entry cannot call back into the program (`passes::LEAF_NAMES`).
+export const u32 RP_LEAF = 32;
+// The entry reads no location (`passes::LOCATION_PURE`).
+export const u32 RP_LOC_PURE = 64;
+// The entry carries its own location as its last arguments (`passes::reads_location`).
+export const u32 RP_OWN_LOC = 128;
+// The entry binds into, stamps or ends something in a frame (`passes::FRAME_USE_NAMES`).
+export const u32 RP_FRAME_USE = 256;
+// The entry can put an object over raw cells or start a thread (`gen::quiet_cells`).
+export const u32 RP_MAKER = 512;
+// The entry is an element's borrow, a maker where paths are kept (`gen::quiet_cells`).
+export const u32 RP_MAKER_KEPT = 1024;
+// The entry is a path check: `cb_read`, `cb_borrow_unminted`, `cb_borrow_check`.
+export const u32 RP_PATH_CHECK = 2048;
+// The entry is a frame's push or pop as `elide_empty_frames_nodes` takes it out.
+export const u32 RP_FRAME_LINE = 4096;
+// The entry is a push or pop `resolve_scopes_nodes` writes for a scope marker.
+export const u32 RP_SCOPE_LINE = 8192;
+// The entry puts a value in flight or takes one (`pprog::ground_native_nodes`).
+export const u32 RP_FLIGHT = 16384;
+
+// No runtime entry.
+export const u16 RT_NONE = 0;
+export const u16 RT_ABSORB = 1;
+export const u16 RT_ABSORB_REFS = 2;
+export const u16 RT_ALLOCATE = 3;
+export const u16 RT_ARG_BYTES = 4;
+export const u16 RT_AT = 5;
+export const u16 RT_ATOMIC_POINT = 6;
+export const u16 RT_ATOMIC_WAIT = 7;
+export const u16 RT_BIND = 8;
+export const u16 RT_BLOCK_FREE = 9;
+export const u16 RT_BORROW = 10;
+export const u16 RT_BORROW_CHECK = 11;
+export const u16 RT_BORROW_RANGE = 12;
+export const u16 RT_BORROW_RANGE_UNMINTED = 13;
+export const u16 RT_BORROW_UNMINTED = 14;
+export const u16 RT_BORROW_UNSTAMPED = 15;
+export const u16 RT_BYTES_CMP = 16;
+export const u16 RT_BYTES_EQ = 17;
+export const u16 RT_BYTES_LESS = 18;
+export const u16 RT_BYTES_LT = 19;
+export const u16 RT_CALL_DONE = 20;
+export const u16 RT_CALL_SELF_FN = 21;
+export const u16 RT_CANCEL = 22;
+export const u16 RT_CELLS_BUSY = 23;
+export const u16 RT_CHAR_BOUNDARY = 24;
+export const u16 RT_CLOCK_READ = 25;
+export const u16 RT_CLSELF = 26;
+export const u16 RT_CLZ = 27;
+export const u16 RT_CLZ128 = 28;
+export const u16 RT_CONSUME = 29;
+export const u16 RT_COPY_DATUM = 30;
+export const u16 RT_COPY_RAW = 31;
+export const u16 RT_CTZ = 32;
+export const u16 RT_CTZ128 = 33;
+export const u16 RT_DEALLOCATE = 34;
+export const u16 RT_DEALLOCATE_PLAIN = 35;
+export const u16 RT_DESTROY = 36;
+export const u16 RT_DESTROY_VIA = 37;
+export const u16 RT_DIRECT_OK = 38;
+export const u16 RT_DROP_FN = 39;
+export const u16 RT_DROP_LOCAL = 40;
+export const u16 RT_DROP_PLAIN_BUF = 41;
+export const u16 RT_DROP_VALUE = 42;
+export const u16 RT_ELEM_ACCESS = 43;
+export const u16 RT_ELEM_ACCESS_IF = 44;
+export const u16 RT_ELEM_BORROW = 45;
+export const u16 RT_ELEM_BORROW_DATUM = 46;
+export const u16 RT_ELEM_BORROW_HERE = 47;
+export const u16 RT_END_BINDING = 48;
+export const u16 RT_END_MOVED_OUT = 49;
+export const u16 RT_ENTRIES_ON = 50;
+export const u16 RT_ENTRY_ENTER = 51;
+export const u16 RT_ENV_ALLOC = 52;
+export const u16 RT_ENV_FORGET = 53;
+export const u16 RT_EVENT_OP = 54;
+export const u16 RT_EXIT = 55;
+export const u16 RT_FAULT = 56;
+export const u16 RT_FAULT_ARITH = 57;
+export const u16 RT_FAULT_ARITH_C = 58;
+export const u16 RT_FAULT_ARITH_R = 59;
+export const u16 RT_FAULT_INDEX = 60;
+export const u16 RT_FAULT_MSG = 61;
+export const u16 RT_FAULT_NARROW = 62;
+export const u16 RT_FAULT_OP = 63;
+export const u16 RT_FAULT_RANGE = 64;
+export const u16 RT_FAULT_TO_INT = 65;
+export const u16 RT_FILE_AT = 66;
+export const u16 RT_FILE_OP = 67;
+export const u16 RT_FILE_READ = 68;
+export const u16 RT_FILE_WRITE = 69;
+export const u16 RT_FIND_BYTES = 70;
+export const u16 RT_FMT_ARG = 71;
+export const u16 RT_FMT_HEX = 72;
+export const u16 RT_FMT_I64 = 73;
+export const u16 RT_FMT_PAD = 74;
+export const u16 RT_FMT_SPACE = 75;
+export const u16 RT_FMT_U64 = 76;
+export const u16 RT_FN_BOX = 77;
+export const u16 RT_FN_ITEM = 78;
+export const u16 RT_FN_ITEM_PURE = 79;
+export const u16 RT_FN_MARK_PURE = 80;
+export const u16 RT_FN_MOVED = 81;
+export const u16 RT_FN_MOVED_OUT = 82;
+export const u16 RT_FN_PURE = 83;
+export const u16 RT_FN_READ = 84;
+export const u16 RT_FN_SHARED = 85;
+export const u16 RT_FN_SHARED_VALUE = 86;
+export const u16 RT_FN_SPLIT = 87;
+export const u16 RT_FNBOX = 88;
+export const u16 RT_FORGET_OBJ = 89;
+export const u16 RT_FORMAT = 90;
+export const u16 RT_FRAME_HERE = 91;
+export const u16 RT_FRAME_HOLD = 92;
+export const u16 RT_FRAME_POP = 93;
+export const u16 RT_FRAME_PUSH = 94;
+export const u16 RT_FRAME_PUSH_AT = 95;
+export const u16 RT_FRAME_PUSH_FN = 96;
+export const u16 RT_FRAME_PUSH_REC = 97;
+export const u16 RT_FRAME_UNHOLD = 98;
+export const u16 RT_FROZEN_OK = 99;
+export const u16 RT_FS_OP = 100;
+export const u16 RT_FS_QUERY = 101;
+export const u16 RT_HASH_BYTES = 102;
+export const u16 RT_HASH_BYTES_DRAWN = 103;
+export const u16 RT_HASH_MORE = 104;
+export const u16 RT_HASH_START = 105;
+export const u16 RT_HOLD = 106;
+export const u16 RT_HOLD_REF = 107;
+export const u16 RT_I128 = 108;
+export const u16 RT_INDEX_CHECK = 109;
+export const u16 RT_INIT = 110;
+export const u16 RT_JOIN = 111;
+export const u16 RT_JOIN_PLAIN = 112;
+export const u16 RT_JOIN_STATUS = 113;
+export const u16 RT_LEND = 114;
+export const u16 RT_LEND_FN = 115;
+export const u16 RT_LF = 116;
+export const u16 RT_LIB_ENTER = 117;
+export const u16 RT_LIB_FAULT_CODE = 118;
+export const u16 RT_LIB_JMP = 119;
+export const u16 RT_LIB_LAST_FAULT = 120;
+export const u16 RT_LIB_LEAVE = 121;
+export const u16 RT_LIB_SHUTDOWN = 122;
+export const u16 RT_LIVE_AT = 123;
+export const u16 RT_LIVE_IN = 124;
+export const u16 RT_LIVE_IN2 = 125;
+export const u16 RT_LOAD_REF = 126;
+export const u16 RT_LOCK = 127;
+export const u16 RT_LOCK_BARE = 128;
+export const u16 RT_LOCK_PATHLESS = 129;
+export const u16 RT_MOVE_TO = 130;
+export const u16 RT_NET_OP = 131;
+export const u16 RT_NEW = 132;
+export const u16 RT_NEW_UNINIT = 133;
+export const u16 RT_NOTE = 134;
+export const u16 RT_NOTES_DROP = 135;
+export const u16 RT_NOTES_POP = 136;
+export const u16 RT_NOTES_PUSH = 137;
+export const u16 RT_NT = 138;
+export const u16 RT_NT_ON = 139;
+export const u16 RT_OS_RANDOM = 140;
+export const u16 RT_OWNS = 141;
+export const u16 RT_PARSE_BOOL = 142;
+export const u16 RT_PARSE_FLOAT = 143;
+export const u16 RT_PARSE_INT = 144;
+export const u16 RT_PATH_OP = 145;
+export const u16 RT_PATHS_ARRIVE = 146;
+export const u16 RT_PATHS_DISJOINT = 147;
+export const u16 RT_PEEK_DATUM_TOK = 148;
+export const u16 RT_POINT_CHECK = 149;
+export const u16 RT_POPCOUNT128 = 150;
+export const u16 RT_POPCOUNT64 = 151;
+export const u16 RT_PRINT_BOOL = 152;
+export const u16 RT_PRINT_F32 = 153;
+export const u16 RT_PRINT_F64 = 154;
+export const u16 RT_PRINT_INT = 155;
+export const u16 RT_PROC_OP = 156;
+export const u16 RT_PROJ = 157;
+export const u16 RT_RAW_MOVE_IN = 158;
+export const u16 RT_RAW_MOVE_OUT = 159;
+export const u16 RT_READ = 160;
+export const u16 RT_READ_IN = 161;
+export const u16 RT_READ_LINE_IN = 162;
+export const u16 RT_REALLOCATE_PLAIN = 163;
+export const u16 RT_REBIND = 164;
+export const u16 RT_REC_REF = 165;
+export const u16 RT_RECLAIM = 166;
+export const u16 RT_RECV = 167;
+export const u16 RT_RECV_DATUM = 168;
+export const u16 RT_RECV_DATUM_TOK = 169;
+export const u16 RT_RECV_REF = 170;
+export const u16 RT_REF = 171;
+export const u16 RT_RELEASE = 172;
+export const u16 RT_RELEASE_PLAIN = 173;
+export const u16 RT_RESULT = 174;
+export const u16 RT_RESULT_REF = 175;
+export const u16 RT_ROTL = 176;
+export const u16 RT_ROTL128 = 177;
+export const u16 RT_ROTL16 = 178;
+export const u16 RT_ROTL32 = 179;
+export const u16 RT_ROTL64 = 180;
+export const u16 RT_ROTL8 = 181;
+export const u16 RT_ROTR = 182;
+export const u16 RT_ROTR128 = 183;
+export const u16 RT_ROTR16 = 184;
+export const u16 RT_ROTR32 = 185;
+export const u16 RT_ROTR64 = 186;
+export const u16 RT_ROTR8 = 187;
+export const u16 RT_RUN_MAIN = 188;
+export const u16 RT_SCHED_FLAG = 189;
+export const u16 RT_SEND = 190;
+export const u16 RT_SEND_DATUM = 191;
+export const u16 RT_SEND_DATUM_NONE = 192;
+export const u16 RT_SEND_REF = 193;
+export const u16 RT_SEND_TOK_DATUM = 194;
+export const u16 RT_SET_ARGS = 195;
+export const u16 RT_SET_STACK_FLOOR = 196;
+export const u16 RT_SET_WHERE = 197;
+export const u16 RT_SLEEP_NS = 198;
+export const u16 RT_SORT_PLAIN = 199;
+export const u16 RT_SORT_TEXT = 200;
+export const u16 RT_SPAWN = 201;
+export const u16 RT_SPIN_HINT = 202;
+export const u16 RT_STACK_CHECK = 203;
+export const u16 RT_STMT_POP = 204;
+export const u16 RT_STMT_PUSH = 205;
+export const u16 RT_STMT_PUSH_AT = 206;
+export const u16 RT_STORE_REF = 207;
+export const u16 RT_STR = 208;
+export const u16 RT_STR_EQ = 209;
+export const u16 RT_TAKE = 210;
+export const u16 RT_TASK_OP = 211;
+export const u16 RT_TEMP_PATH = 212;
+export const u16 RT_TERMINATE_OK = 213;
+export const u16 RT_TEXT_BOOL = 214;
+export const u16 RT_TEXT_F32 = 215;
+export const u16 RT_TEXT_F64 = 216;
+export const u16 RT_TEXT_INT = 217;
+export const u16 RT_THREAD_DONE = 218;
+export const u16 RT_THREAD_FAILED = 219;
+export const u16 RT_THREAD_HERE = 220;
+export const u16 RT_THREAD_ID = 221;
+export const u16 RT_THREAD_JMP = 222;
+export const u16 RT_THREAD_LENT = 223;
+export const u16 RT_THREAD_START = 224;
+export const u16 RT_THREADED = 225;
+export const u16 RT_TL = 226;
+export const u16 RT_TZ_OFFSET = 227;
+export const u16 RT_U128 = 228;
+export const u16 RT_UNIT = 229;
+export const u16 RT_UNLOCK_BARE = 230;
+export const u16 RT_UNLOCK_SIGNAL = 231;
+export const u16 RT_VALID = 232;
+export const u16 RT_VEC_DROP_PLAIN = 233;
+export const u16 RT_WHERE = 234;
+export const u16 RT_WRITE = 235;
+export const u16 RT_WRITE_ERR = 236;
+export const u16 RT_WRITE_OUT = 237;
+export const u16 RT_WRITE_QUIET = 238;
+
+export const usize RT_COUNT = 238;
+
+const array<str, 238> RT_NAMES = [
+    "cb_absorb",
+    "cb_absorb_refs",
+    "cb_allocate",
+    "cb_arg_bytes",
+    "cb_at",
+    "cb_atomic_point",
+    "cb_atomic_wait",
+    "cb_bind",
+    "cb_block_free",
+    "cb_borrow",
+    "cb_borrow_check",
+    "cb_borrow_range",
+    "cb_borrow_range_unminted",
+    "cb_borrow_unminted",
+    "cb_borrow_unstamped",
+    "cb_bytes_cmp",
+    "cb_bytes_eq",
+    "cb_bytes_less",
+    "cb_bytes_lt",
+    "cb_call_done",
+    "cb_call_self_fn",
+    "cb_cancel",
+    "cb_cells_busy",
+    "cb_char_boundary",
+    "cb_clock_read",
+    "cb_clself",
+    "cb_clz",
+    "cb_clz128",
+    "cb_consume",
+    "cb_copy_datum",
+    "cb_copy_raw",
+    "cb_ctz",
+    "cb_ctz128",
+    "cb_deallocate",
+    "cb_deallocate_plain",
+    "cb_destroy",
+    "cb_destroy_via",
+    "cb_direct_ok",
+    "cb_drop_fn",
+    "cb_drop_local",
+    "cb_drop_plain_buf",
+    "cb_drop_value",
+    "cb_elem_access",
+    "cb_elem_access_if",
+    "cb_elem_borrow",
+    "cb_elem_borrow_datum",
+    "cb_elem_borrow_here",
+    "cb_end_binding",
+    "cb_end_moved_out",
+    "cb_entries_on",
+    "cb_entry_enter",
+    "cb_env_alloc",
+    "cb_env_forget",
+    "cb_event_op",
+    "cb_exit",
+    "cb_fault",
+    "cb_fault_arith",
+    "cb_fault_arith_c",
+    "cb_fault_arith_r",
+    "cb_fault_index",
+    "cb_fault_msg",
+    "cb_fault_narrow",
+    "cb_fault_op",
+    "cb_fault_range",
+    "cb_fault_to_int",
+    "cb_file_at",
+    "cb_file_op",
+    "cb_file_read",
+    "cb_file_write",
+    "cb_find_bytes",
+    "cb_fmt_arg",
+    "cb_fmt_hex",
+    "cb_fmt_i64",
+    "cb_fmt_pad",
+    "cb_fmt_space",
+    "cb_fmt_u64",
+    "cb_fn_box",
+    "cb_fn_item",
+    "cb_fn_item_pure",
+    "cb_fn_mark_pure",
+    "cb_fn_moved",
+    "cb_fn_moved_out",
+    "cb_fn_pure",
+    "cb_fn_read",
+    "cb_fn_shared",
+    "cb_fn_shared_value",
+    "cb_fn_split",
+    "cb_fnbox",
+    "cb_forget_obj",
+    "cb_format",
+    "cb_frame_here",
+    "cb_frame_hold",
+    "cb_frame_pop",
+    "cb_frame_push",
+    "cb_frame_push_at",
+    "cb_frame_push_fn",
+    "cb_frame_push_rec",
+    "cb_frame_unhold",
+    "cb_frozen_ok",
+    "cb_fs_op",
+    "cb_fs_query",
+    "cb_hash_bytes",
+    "cb_hash_bytes_drawn",
+    "cb_hash_more",
+    "cb_hash_start",
+    "cb_hold",
+    "cb_hold_ref",
+    "cb_i128",
+    "cb_index_check",
+    "cb_init",
+    "cb_join",
+    "cb_join_plain",
+    "cb_join_status",
+    "cb_lend",
+    "cb_lend_fn",
+    "cb_lf",
+    "cb_lib_enter",
+    "cb_lib_fault_code",
+    "cb_lib_jmp",
+    "cb_lib_last_fault",
+    "cb_lib_leave",
+    "cb_lib_shutdown",
+    "cb_live_at",
+    "cb_live_in",
+    "cb_live_in2",
+    "cb_load_ref",
+    "cb_lock",
+    "cb_lock_bare",
+    "cb_lock_pathless",
+    "cb_move_to",
+    "cb_net_op",
+    "cb_new",
+    "cb_new_uninit",
+    "cb_note",
+    "cb_notes_drop",
+    "cb_notes_pop",
+    "cb_notes_push",
+    "cb_nt",
+    "cb_nt_on",
+    "cb_os_random",
+    "cb_owns",
+    "cb_parse_bool",
+    "cb_parse_float",
+    "cb_parse_int",
+    "cb_path_op",
+    "cb_paths_arrive",
+    "cb_paths_disjoint",
+    "cb_peek_datum_tok",
+    "cb_point_check",
+    "cb_popcount128",
+    "cb_popcount64",
+    "cb_print_bool",
+    "cb_print_f32",
+    "cb_print_f64",
+    "cb_print_int",
+    "cb_proc_op",
+    "cb_proj",
+    "cb_raw_move_in",
+    "cb_raw_move_out",
+    "cb_read",
+    "cb_read_in",
+    "cb_read_line_in",
+    "cb_reallocate_plain",
+    "cb_rebind",
+    "cb_rec_ref",
+    "cb_reclaim",
+    "cb_recv",
+    "cb_recv_datum",
+    "cb_recv_datum_tok",
+    "cb_recv_ref",
+    "cb_ref",
+    "cb_release",
+    "cb_release_plain",
+    "cb_result",
+    "cb_result_ref",
+    "cb_rotl",
+    "cb_rotl128",
+    "cb_rotl16",
+    "cb_rotl32",
+    "cb_rotl64",
+    "cb_rotl8",
+    "cb_rotr",
+    "cb_rotr128",
+    "cb_rotr16",
+    "cb_rotr32",
+    "cb_rotr64",
+    "cb_rotr8",
+    "cb_run_main",
+    "cb_sched_flag",
+    "cb_send",
+    "cb_send_datum",
+    "cb_send_datum_none",
+    "cb_send_ref",
+    "cb_send_tok_datum",
+    "cb_set_args",
+    "cb_set_stack_floor",
+    "cb_set_where",
+    "cb_sleep_ns",
+    "cb_sort_plain",
+    "cb_sort_text",
+    "cb_spawn",
+    "cb_spin_hint",
+    "cb_stack_check",
+    "cb_stmt_pop",
+    "cb_stmt_push",
+    "cb_stmt_push_at",
+    "cb_store_ref",
+    "cb_str",
+    "cb_str_eq",
+    "cb_take",
+    "cb_task_op",
+    "cb_temp_path",
+    "cb_terminate_ok",
+    "cb_text_bool",
+    "cb_text_f32",
+    "cb_text_f64",
+    "cb_text_int",
+    "cb_thread_done",
+    "cb_thread_failed",
+    "cb_thread_here",
+    "cb_thread_id",
+    "cb_thread_jmp",
+    "cb_thread_lent",
+    "cb_thread_start",
+    "cb_threaded",
+    "cb_tl",
+    "cb_tz_offset",
+    "cb_u128",
+    "cb_unit",
+    "cb_unlock_bare",
+    "cb_unlock_signal",
+    "cb_valid",
+    "cb_vec_drop_plain",
+    "cb_where",
+    "cb_write",
+    "cb_write_err",
+    "cb_write_out",
+    "cb_write_quiet",
+];
+
+const array<u32, 238> RT_PROPS = [
+    258,
+    2,
+    1,
+    1,
+    113,
+    1,
+    1,
+    256,
+    0,
+    6,
+    2073,
+    6,
+    9,
+    2073,
+    1,
+    1,
+    17,
+    1,
+    17,
+    1,
+    0,
+    4,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    256,
+    1,
+    4,
+    1,
+    1,
+    4,
+    4,
+    256,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    129,
+    129,
+    1030,
+    1028,
+    1028,
+    0,
+    0,
+    512,
+    0,
+    4,
+    0,
+    1,
+    4,
+    177,
+    177,
+    177,
+    177,
+    177,
+    1,
+    177,
+    177,
+    177,
+    177,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    17,
+    17,
+    17,
+    17,
+    17,
+    0,
+    4,
+    4,
+    4,
+    0,
+    0,
+    0,
+    0,
+    4,
+    0,
+    0,
+    1,
+    258,
+    1,
+    257,
+    268,
+    12288,
+    12288,
+    12288,
+    12288,
+    8448,
+    12,
+    4,
+    1,
+    1,
+    17,
+    17,
+    17,
+    17,
+    0,
+    1,
+    1,
+    145,
+    0,
+    0,
+    4,
+    4,
+    4,
+    4,
+    1,
+    512,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    65,
+    0,
+    17,
+    4,
+    4,
+    4,
+    1,
+    4,
+    258,
+    258,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    4,
+    1,
+    1,
+    1,
+    1,
+    4,
+    0,
+    0,
+    4,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    4,
+    1,
+    514,
+    0,
+    2073,
+    1,
+    0,
+    4,
+    256,
+    2,
+    768,
+    16642,
+    6,
+    6,
+    70,
+    1,
+    4,
+    0,
+    256,
+    4,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    1,
+    16385,
+    1,
+    4,
+    65,
+    4,
+    1,
+    0,
+    0,
+    4,
+    0,
+    0,
+    516,
+    1,
+    1,
+    8192,
+    8208,
+    8208,
+    1,
+    1,
+    65,
+    258,
+    4,
+    256,
+    0,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    0,
+    1,
+    1,
+    0,
+    1,
+    1,
+    4,
+    0,
+    4,
+    0,
+    0,
+    9,
+    1,
+    1,
+    1,
+];
+
+// The entry's name as C writes it (`id` from 1).
+export fn rt_name(u16 id) : str
+{
+    RT_NAMES[widen<usize>(id) - 1]
+}
+
+// The entry's properties, a set of `RP_…` bits; none for `RT_NONE`.
+export fn rt_props(u16 id) : u32
+{
+    if (id == 0)
+    {
+        return 0;
+    }
+    RT_PROPS[widen<usize>(id) - 1]
+}
+
+// Whether the entry `id` has the property `prop`.
+export fn rt_is(u16 id, u32 prop) : bool
+{
+    (rt_props(id) & prop) != 0
+}
+
+// How `a` stands to the name `b` in the order of their bytes: below (0), the
+// same (1), above (2).
+fn name_order(slice<u8, shared> a, str b) : u8
+{
+    slice<u8, shared> bb = StringView::as_bytes(b);
+    usize n = slice_len(a);
+    usize m = slice_len(bb);
+    usize k = 0;
+    while (k < n && k < m)
+    {
+        if (a[k] != bb[k])
+        {
+            return if (a[k] < bb[k]) { 0 } else { 2 };
+        }
+        k += 1;
+    }
+    if (n == m)
+    {
+        return 1;
+    }
+    if (n < m) { 0 } else { 2 }
+}
+
+// The id of the runtime entry named `name`, `RT_NONE` when there is none.
+export fn rt_lookup(StringView name) : u16
+{
+    slice<u8, shared> nb = StringView::as_bytes(name);
+    if (slice_len(nb) < 4 || nb[0] != b'c' || nb[1] != b'b' || nb[2] != b'_')
+    {
+        return RT_NONE;
+    }
+    usize lo = 0;
+    usize hi = RT_COUNT;
+    while (lo < hi)
+    {
+        usize mid = (lo + hi) / 2;
+        u8 o = name_order(nb, RT_NAMES[mid]);
+        if (o == 1)
+        {
+            return narrow<u16>(mid + 1);
+        }
+        if (o == 0)
+        {
+            hi = mid;
+        }
+        else
+        {
+            lo = mid + 1;
+        }
+    }
+    RT_NONE
+}

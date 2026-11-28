@@ -1,0 +1,120 @@
+# D-0289, CHG-0384: a worker pool's handles kept in a local `Vec` hold what
+# their threads were lent, as a handle binding does: pushed by
+# `Vec::push(&mut hs, spawn(…))`, taken out by a consuming `foreach`, the
+# program is decided. A handle left lending on some paths when the lent place
+# is written (`popped`: one taken out, the rest still running; `branch`:
+# dropped on one branch only), or the `Vec` given away (`given`), leave the
+# function to the run (checked with gcc).
+file pool.cb
+import std;
+
+fn look(ref<i64, shared> x) : i64
+{
+    *x
+}
+
+fn main()
+{
+    i64 x = 3;
+    Vec<handle<i64>> hs = Vec::new();
+    for (i64 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(look, &x));
+    }
+    i64 t = 0;
+    foreach (h in hs)
+    {
+        t += join(h);
+    }
+    x = 10;
+    printf("%v %v\n", t, x);
+}
+end
+file popped.cb
+import std;
+
+fn look(ref<i64, shared> x) : i64
+{
+    *x
+}
+
+fn main()
+{
+    i64 x = 3;
+    Vec<handle<i64>> hs = Vec::new();
+    for (i64 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(look, &x));
+    }
+    i64 t = 0;
+    if (Some(w) = Vec::pop(&mut hs))
+    {
+        t += join(w);
+    }
+    x = 10;
+    printf("%v %v\n", t, x);
+}
+end
+file branch.cb
+import std;
+
+fn look(ref<i64, shared> x) : i64
+{
+    *x
+}
+
+fn main()
+{
+    i64 x = 3;
+    handle<i64> h = spawn(look, &x);
+    if (x == 3)
+    {
+        drop(h);
+    }
+    x = 10;
+    printf("%v\n", x);
+}
+end
+file given.cb
+import std;
+
+fn look(ref<i64, shared> x) : i64
+{
+    *x
+}
+
+fn give(ref<Vec<handle<i64>>, exclusive> hs, ref<Vec<handle<i64>>, exclusive> out)
+{
+    Vec::push(out, Option::unwrap(Vec::pop(hs)));
+}
+
+fn main()
+{
+    Vec<handle<i64>> keep = Vec::new();
+    {
+        i64 x = 3;
+        Vec<handle<i64>> hs = Vec::new();
+        Vec::push(&mut hs, spawn(look, &x));
+        give(&mut hs, &mut keep);
+    }
+    printf("%v\n", join(Option::unwrap(Vec::pop(&mut keep))));
+}
+end
+run $COBC -v --cc $CC -o pool pool.cb
+status 0
+stderr-has lowered pathless and decided (D-0284, D-0285)
+run ./pool
+status 0
+stdout-is 12 10\n
+run $COBC -v --cc gcc -o popped popped.cb
+status 0
+stderr-has kept paths
+stderr-has may reach on some paths
+run $COBC -v --cc gcc -o branch branch.cb
+status 0
+stderr-has kept paths
+stderr-has may reach on some paths
+run $COBC -v --cc gcc -o given given.cb
+status 0
+stderr-has kept paths
+stderr-has is borrowed exclusively while it holds what its threads were lent

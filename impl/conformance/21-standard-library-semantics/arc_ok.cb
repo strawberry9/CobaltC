@@ -1,0 +1,61 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.arc `Arc<T>`, `ArcWeak<T>` (D-0259); conf.arc-shared-by-threads, conf.arc-last-drop-frees, conf.arc-weak
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 74616c6c7920656e64732061742031300a676f6e650a757067726164656420370a747275650a
+//
+// Four threads each own a handle to one value, a mutex they all add to;
+// main drops its handle before joining, so the last drop, and the value's
+// destructor, happen on a worker, once. An `ArcWeak` upgrades while a
+// strong handle remains and gives `None` after the last one ends.
+
+import std;
+
+resource struct Tally
+{
+    mutex<u32> total;
+}
+
+fn Tally::drop(ref<Tally, exclusive> self)
+{
+    printf("tally ends at %v\n", *lock(&self.total));
+}
+
+fn add(Arc<Tally> t, u32 n)
+{
+    auto g = lock(&Arc::get(&t).total);
+    *g += n;
+}
+
+fn main()
+{
+    Arc<Tally> t = Arc::new(Tally { .total = Mutex::new(0: u32) });
+    ArcWeak<Tally> w = Arc::downgrade(&t);
+    ArcWeak<Tally> w2 = ArcWeak::clone(&w);
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 1; i <= 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(add, Arc::clone(&t), i));
+    }
+    drop(t);                                     // the workers' handles keep the value
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    match (ArcWeak::upgrade(&w2))
+    {
+        Some(_) : printf("still alive\n"),
+        None    : printf("gone\n"),
+    }
+    Arc<u32> a = Arc::new(7);
+    ArcWeak<u32> wa = Arc::downgrade(&a);
+    Arc<u32> b = clone(&a);
+    drop(a);
+    if (Some(c) = ArcWeak::upgrade(&wa))
+    {
+        printf("upgraded %v\n", *Arc::get(&c));
+    }
+    drop(b);
+    printf("%v\n", Option::is_none(&ArcWeak::upgrade(&wa)));
+}

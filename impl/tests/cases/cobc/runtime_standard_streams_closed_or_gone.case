@@ -1,0 +1,85 @@
+# Reports 167, 102, 171 (`[Print-Failure]`). A program started with standard
+# output (or error) closed opens a file: the file does not receive the
+# descriptor, so what the program prints never lands in it; a write to the
+# standard output closed at start is reported at the end, status 1. A
+# program printing forever into a pipe whose reader has gone ends at once,
+# status 1, quietly. A program that ends by a fault with its standard output
+# on a full device prints the fault's report and then the lost-output line.
+# Under each C compiler.
+platform unix
+file cs.cb
+import std;
+
+fn main() : u8
+{
+    File log = Result::unwrap(File::create("data.txt"));
+    Result::unwrap(File::write_text(&mut log, "record 1\n"));
+    Result::unwrap(File::flush(&mut log));
+    printf("progress: 1 record written\n");
+    flush_stdout();
+    eprintf("warning: low disk\n");
+    Result::unwrap(File::close(log));
+    0
+}
+end
+file forever.cb
+import std;
+
+resource struct Note
+{
+    i32 n;
+}
+
+fn Note::drop(ref<Note, exclusive> self)
+{
+    eprintf("destructor ran\n");
+}
+
+fn main()
+{
+    Note n = Note { .n = 1 };
+    u64 i = 0;
+    while (true)
+    {
+        printf("%v\n", i);
+        i += 1;
+    }
+}
+end
+file pf.cb
+import std;
+
+fn main()
+{
+    printf("report line\n");
+    String mode = Result::unwrap(arg(0));
+    if (mode == "fault")
+    {
+        Vec<i32> v = Vec::new();
+        printf("%v\n", v[0]);
+    }
+}
+end
+run $COBC --cc $CC -o cs cs.cb
+status 0
+run sh -c "./cs >&-"
+status 1
+stderr-has warning: low disk
+stderr-has error: standard output could not be written (it was closed when the program started)
+file-is data.txt record 1\n
+run sh -c "./cs 2>&- > out.txt"
+status 0
+file-is data.txt record 1\n
+file-is out.txt progress: 1 record written\n
+run $COBC --cc $CC -o forever forever.cb
+status 0
+run sh -c "{ timeout 20 ./forever; echo $? > st.txt; } 2> err.txt | head -1"
+stdout-is 0\n
+file-is st.txt 1\n
+file-is err.txt destructor ran\n
+run $COBC --cc $CC -o pf pf.cb
+status 0
+run sh -c "./pf fault > /dev/full"
+status 1
+stderr-has fault[diag.index-out-of-bounds]: index 0 is out of bounds for length 0
+stderr-ends error: standard output could not be written (no space left on the device): the program's output is incomplete\n

@@ -1,0 +1,79 @@
+# D-0290: a local that keeps references in data is a holder of the frame. A
+# program whose `Vec<StringView>` of a line's fields, struct of views and
+# `Vec<ref<…>>` stay in their frames is decided, under both C compilers; one
+# that stores a reference through a parameter where the caller does not see
+# it leaves the function to the run, and one that returns a `Vec` of views of
+# a local is refused (report 291, D-0337) (checked with gcc).
+file held.cb
+import std;
+
+struct Pair
+{
+    StringView key;
+    StringView value;
+}
+
+fn pair(ref<String, shared> line) : Pair
+{
+    Vec<StringView> f = StringView::split(line, "=");
+    Pair { .key = f[0], .value = f[Vec::len(&f) - 1] }
+}
+
+fn main()
+{
+    String s = "a=1";
+    Pair p = pair(&s);
+    i64 x = 3;
+    Vec<ref<i64, shared>> rs = Vec::new();
+    Vec::push(&mut rs, &x);
+    Vec::push(&mut rs, &x);
+    i64 t = 0;
+    foreach (r in &rs)
+    {
+        t += **r;
+    }
+    printf("%v %v %v\n", p.key, p.value, t);
+}
+end
+file dangling.cb
+import std;
+
+fn words() : Vec<StringView>
+{
+    String s = "a b";
+    StringView::split(&s, " ")
+}
+
+fn main()
+{
+    printf("%v\n", Vec::len(&words()));
+}
+end
+file stored.cb
+import std;
+
+fn keep(ref<Vec<ref<i64, shared>>, exclusive> out)
+{
+    i64 y = 2;
+    Vec::push(out, &y);
+}
+
+fn main()
+{
+    Vec<ref<i64, shared>> rs = Vec::new();
+    keep(&mut rs);
+    printf("%v\n", Vec::len(&rs));
+}
+end
+run $COBC -v --cc $CC -o held held.cb
+status 0
+stderr-has lowered pathless and decided (D-0284, D-0285)
+run ./held
+status 0
+stdout-is a 1 6\n
+run $COBC -v --cc gcc -o dangling dangling.cb
+status 1
+stderr-has diag.reference-escapes-scope
+run $COBC -v --cc gcc -o stored stored.cb
+stderr-has kept paths
+stderr-has a reference may be stored where this frame does not hold it

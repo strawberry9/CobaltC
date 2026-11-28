@@ -1,0 +1,142 @@
+// Benchmark: a hash table's own operations. A `HashMap<u64, u64>` of a
+// million entries, too large for the processor's caches, is filled,
+// looked up (keys that are there, twice over, and keys that are not),
+// updated through `entry`, half emptied and summed; then a
+// `HashMap<String, u64>` of 200,000 keys is filled and looked up. The
+// same workload as hashmap.rs, written the same way.
+
+import std;
+
+fn shuffle_u64(ref<Vec<u64>, exclusive> v, ref<Rng, exclusive> rng)
+{
+    usize i = Vec::len(&*v);
+    while (i > 1)
+    {
+        usize j = narrow<usize>(Rng::below(rng, widen<u64>(i)));
+        i = i - 1;
+        Vec::swap(v, i, j);
+    }
+}
+
+fn shuffle_text(ref<Vec<String>, exclusive> v, ref<Rng, exclusive> rng)
+{
+    usize i = Vec::len(&*v);
+    while (i > 1)
+    {
+        usize j = narrow<usize>(Rng::below(rng, widen<u64>(i)));
+        i = i - 1;
+        Vec::swap(v, i, j);
+    }
+}
+
+fn texts(usize n, u64 seed, str prefix) : Vec<String>
+{
+    Rng rng = Rng::new(seed);
+    Vec<String> out = Vec::new();
+    foreach (i in 0..n)
+    {
+        Vec::push(&mut out, sprintf("%v%v", prefix, Rng::next_u64(&mut rng) >> 20));
+    }
+    out
+}
+
+fn numbers() : u64
+{
+    usize n = 1000000;
+    Rng rng = Rng::new(2026);
+    Vec<u64> keys = Vec::new();
+    Vec<u64> absent = Vec::new();
+    foreach (i in 0..n)
+    {
+        Vec::push(&mut keys, Rng::next_u64(&mut rng) | 1);
+        Vec::push(&mut absent, (Rng::next_u64(&mut rng) >> 1) << 1);
+    }
+    Vec<u64> order = Vec::clone(&keys);
+    shuffle_u64(&mut order, &mut rng);
+
+    HashMap<u64, u64> m = HashMap::new();
+    u64 next = 0;
+    foreach (k in &keys)
+    {
+        HashMap::insert(&mut m, *k, next);
+        next = next + 1;
+    }
+    u64 sum = 0;
+    foreach (pass in 0..2)
+    {
+        foreach (k in &order)
+        {
+            match (HashMap::get(&m, *k))
+            {
+                Some(v) : { sum = wrapping_add(sum, *v); },
+                None    : {},
+            }
+        }
+    }
+    foreach (k in &absent)
+    {
+        if (HashMap::contains(&m, *k))
+        {
+            sum = wrapping_add(sum, 1);
+        }
+    }
+    foreach (k in &order)
+    {
+        *HashMap::entry(&mut m, *k, 0) += 1;
+    }
+    foreach (i in 0..n / 2)
+    {
+        match (HashMap::swap_remove(&mut m, order[2 * i]))
+        {
+            Some(v) : { sum = wrapping_add(sum, v); },
+            None    : {},
+        }
+    }
+    foreach (k, v in &m)
+    {
+        sum = wrapping_add(sum, wrapping_add(*k, *v));
+    }
+    wrapping_add(sum, widen<u64>(HashMap::len(&m)))
+}
+
+fn words() : u64
+{
+    usize n = 200000;
+    Rng rng = Rng::new(7);
+    Vec<String> order = texts(n, 11, "key_");
+    shuffle_text(&mut order, &mut rng);
+    Vec<String> absent = texts(n, 13, "abs_");
+
+    HashMap<String, u64> m = HashMap::new();
+    u64 next = 0;
+    foreach (k in texts(n, 11, "key_"))
+    {
+        HashMap::insert(&mut m, k, next);
+        next = next + 1;
+    }
+    u64 sum = 0;
+    foreach (pass in 0..2)
+    {
+        foreach (k in &order)
+        {
+            match (HashMap::get(&m, k))
+            {
+                Some(v) : { sum = wrapping_add(sum, *v); },
+                None    : {},
+            }
+        }
+    }
+    foreach (k in &absent)
+    {
+        if (HashMap::contains(&m, k))
+        {
+            sum = wrapping_add(sum, 1);
+        }
+    }
+    wrapping_add(sum, widen<u64>(HashMap::len(&m)))
+}
+
+fn main()
+{
+    printf("%v %v\n", numbers(), words());
+}

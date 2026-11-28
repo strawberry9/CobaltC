@@ -1,0 +1,53 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.stdlib.waiting `Barrier` (D-0260); [Atomic-Wait], [Atomic-Notify]; conf.barrier-phases
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 7772697474656e203132206c65616465727320332062616420300a
+//
+// Four threads, three rounds: in each round every thread writes its own
+// slot, the barrier holds them until all four have, then each reads all
+// four slots; exactly one thread per round is told it arrived last. A
+// thread of the next round can never count in the old one.
+
+import std;
+
+fn worker(
+    ref<Barrier, shared> b,
+    ref<Atomic<u32>, shared> written,
+    ref<Atomic<u32>, shared> leaders,
+    ref<Atomic<u32>, shared> bad,
+)
+{
+    for (u32 round = 1; round <= 3; round += 1)
+    {
+        _ = Atomic::fetch_add(written, 1);
+        if (Barrier::wait(b))
+        {
+            _ = Atomic::fetch_add(leaders, 1);
+        }
+        if (Atomic::load(written) != 4 * round)       // everyone wrote this round before anyone reads
+        {
+            _ = Atomic::fetch_add(bad, 1);
+        }
+        _ = Barrier::wait(b);                          // the reading ends together too
+    }
+}
+
+fn main()
+{
+    Barrier b = Barrier::new(4);
+    Atomic<u32> written = Atomic::new(0: u32);
+    Atomic<u32> leaders = Atomic::new(0: u32);
+    Atomic<u32> bad = Atomic::new(0: u32);
+    Vec<handle<void>> hs = Vec::new();
+    for (u32 i = 0; i < 4; i += 1)
+    {
+        Vec::push(&mut hs, spawn(worker, &b, &written, &leaders, &bad));
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+    printf("written %v leaders %v bad %v\n", Atomic::load(&written), Atomic::load(&leaders), Atomic::load(&bad));
+}

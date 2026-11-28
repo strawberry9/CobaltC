@@ -1,0 +1,59 @@
+// Deadlock found
+//
+// Shows: two threads that lock two mutexes in opposite orders. In most
+// languages that hangs, sometimes, forever. Here the thread whose wait
+// would close the cycle faults with `diag.deadlock` at once, contained
+// to that thread; the other then finds the mutex the failed thread held
+// poisoned (`diag.mutex-poisoned`), since that thread may have left its
+// interior half-changed. Neither outcome depends on timing, and the
+// program goes on to report both. The fix is the usual one: take locks
+// in one order everywhere.
+
+import std;
+
+fn transfer(
+    ref<mutex<i64>, shared> from,
+    ref<mutex<i64>, shared> to,
+    i64 amount,
+    ref<Channel<u8>, shared> mine,
+    ref<Channel<u8>, shared> theirs,
+) : i64
+{
+    auto a = lock(from);
+    _ = Channel::send(mine, 1);                 // I hold my first lock...
+    _ = Channel::recv(theirs);                  // ...and so do you
+    auto b = lock(to);
+    *a -= amount;
+    *b += amount;
+    *a
+}
+
+// What became of a transfer: its result, or the name of the fault that
+// ended it (a `ThreadFailure` owns the runtime's record of it, so it is
+// taken here and dropped).
+fn outcome(Result<i64, ThreadFailure> r) : String
+{
+    match (r)
+    {
+        Ok(v)  : sprintf("finished with %v", v),
+        Err(f) : ThreadFailure::diagnostic(&f),
+    }
+}
+
+fn main()
+{
+    auto alice = Mutex::new(100: i64);
+    auto bob = Mutex::new(100: i64);
+    Channel<u8> c1 = Channel::new(1);
+    Channel<u8> c2 = Channel::new(1);
+    auto t1 = spawn(transfer, &alice, &bob, 10, &c1, &c2);
+    auto t2 = spawn(transfer, &bob, &alice, 20, &c2, &c1);
+    Vec<String> seen = Vec::new();
+    Vec::push(&mut seen, outcome(try_join(t1)));
+    Vec::push(&mut seen, outcome(try_join(t2)));
+    Vec::sort(&mut seen);
+    foreach (s in &seen)
+    {
+        printf("a transfer: %s\n", s);
+    }
+}

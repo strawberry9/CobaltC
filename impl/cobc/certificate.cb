@@ -1,0 +1,542 @@
+// cobc's certificate (D-0299).
+//
+// `--certificate FILE`: what the static pass decided before the run, body
+// by body. The type checker appends a raw record for each body it checks
+// (`typecheck.cb`'s `tier_flush`, when `Items.certificate` names the file);
+// `cert_finish` rewrites the file in its final form once the program's
+// verdict is known: a header, the verdict, and the bodies sorted by name
+// with their lines mapped to the files they came from.
+
+import std;
+import loader;
+import diags;
+
+// The file the type checker appends its raw records to (`Items.certificate`),
+// one for each cobc run: cobc's own, in the temporary directory. The
+// certificate's own file is opened once, at the end (`cert_finish`): a pipe
+// or a FIFO read the raw records, and the end of the first write closed it
+// for its reader, so the second open waited for a reader forever.
+export fn cert_raw() : String
+{
+    path_join(&temp_dir(), &sprintf("cobc-cert-%v.raw", process_id()))
+}
+
+// `certificate` as the type checker is given it: the raw records' file.
+export fn cert_raw_of(ref<Option<String>, shared> certificate) : Option<String>
+{
+    match (certificate)
+    {
+        Some(_) : Some(cert_raw()),
+        None    : None,
+    }
+}
+
+// Checks, before anything is checked or compiled, that a certificate may be
+// written at `path` (report 139): nothing is written or emptied there now.
+// A name ending in `.cb` is refused (`--certificate` takes FILE: a forgotten
+// FILE names the program); so is a directory, and a file that is there and is
+// not empty and not a certificate (the program's source, a module, its C, any
+// other data: as `--keep-c` refuses a file cobc did not write). A pipe, a FIFO
+// or a device is left alone until `cert_finish` writes it once. `Err` holds
+// the message after "cobc: ".
+export fn cert_begin(StringView path) : Result<void, String>
+{
+    if (StringView::ends_with(path, ".cb"))
+    {
+        return Err(sprintf("--certificate %v: FILE names a CobaltC source; write `--certificate FILE` with FILE a new name (it comes right after --certificate)", path));
+    }
+    match (path_kind(path))
+    {
+        Ok(Other) : Ok(()),
+        Ok(Dir)   : Err(sprintf("cannot write %v: that is a directory", path)),
+        Ok(_)     :
+        {
+            if (!is_certificate(path))
+            {
+                return Err(sprintf("cannot write %v: a file is there that is not a certificate cobc wrote; move it, or choose another FILE for --certificate", path));
+            }
+            // Opened for writing at its end, so nothing in it is lost now.
+            match (File::append(path))
+            {
+                Ok(f)  :
+                {
+                    _ = File::close(f);
+                    Ok(())
+                },
+                Err(e) : Err(sprintf("cannot write %v: %s", path, FileError::text(&e))),
+            }
+        },
+        Err(_)    :
+        {
+            // Nothing is there: a file made and removed again tells whether
+            // one can be (a missing directory, a read-only one).
+            match (File::create_new(path))
+            {
+                Ok(Some(f)) :
+                {
+                    _ = File::close(f);
+                    _ = remove_file(path);
+                    Ok(())
+                },
+                Ok(None)    : Ok(()),
+                Err(e)      : Err(sprintf("cannot write %v: %s", path, FileError::text(&e))),
+            }
+        },
+    }
+}
+
+// Whether the file at `path` is empty or a certificate (its first line).
+fn is_certificate(StringView path) : bool
+{
+    Vec<u8> head = Vec::new();
+    match (File::open(path))
+    {
+        Ok(f)  :
+        {
+            File g = f;
+            match (File::read(&mut g, &mut head, 32))
+            {
+                Ok(_)  : {},
+                Err(_) : return false,
+            }
+        },
+        Err(_) : return false,
+    }
+    if (Vec::len(&head) == 0)
+    {
+        return true;
+    }
+    match (StringView::from_utf8(&head[0..Vec::len(&head)]))
+    {
+        Ok(t)  : StringView::starts_with(t, "CobaltC certificate "),
+        Err(_) : false,
+    }
+}
+
+// The raw records start empty, in a file made new: called once the command
+// line is known to be good, just before the program is checked, so a usage
+// error leaves no raw file behind.
+export fn cert_raw_start() : Result<void, String>
+{
+    String raw = cert_raw();
+    // A file left by an earlier process of the same number is not this one's.
+    _ = remove_file(&raw);
+    match (File::create_new(&raw))
+    {
+        Ok(Some(f)) :
+        {
+            _ = File::close(f);
+            Ok(())
+        },
+        Ok(None)    : Err(sprintf("cannot write %v: it is there already", &raw)),
+        Err(e)      : Err(sprintf("cannot write %v: %s", &raw, FileError::text(&e))),
+    }
+}
+
+// Writes `text` at `path` whole: through a file beside it renamed over it, so
+// an existing certificate is replaced only once the new one is written. A
+// pipe, a FIFO or a device is written directly.
+fn cert_write(StringView path, StringView text) : Result<void, FileError>
+{
+    match (path_kind(path))
+    {
+        Ok(Other) : return write_file(path, text),
+        _         : {},
+    }
+    String tmp = sprintf("%v.cobc-%v.tmp", path, process_id());
+    match (write_file(&tmp, text))
+    {
+        Ok(_)  : {},
+        Err(e) :
+        {
+            _ = remove_file(&tmp);
+            return Err(e);
+        },
+    }
+    match (rename(&tmp, path))
+    {
+        Ok(_)  : Ok(()),
+        Err(e) :
+        {
+            _ = remove_file(&tmp);
+            Err(e)
+        },
+    }
+}
+
+struct CertBody
+{
+    String key;
+    Vec<String> lefts;
+    Vec<String> events;
+    Option<String> error;
+}
+
+fn empty_body() : CertBody
+{
+    CertBody { .key = String::new(), .lefts = Vec::new(), .events = Vec::new(), .error = None }
+}
+
+// Byte order on text, as Rust's `str` ordering.
+fn text_less(StringView a, StringView b) : bool
+{
+    usize la = StringView::len(a);
+    usize lb = StringView::len(b);
+    usize n = if (la < lb) { la } else { lb };
+    for (usize i = 0; i < n; i += 1)
+    {
+        u8 x = StringView::as_bytes(a)[i];
+        u8 y = StringView::as_bytes(b)[i];
+        if (x != y)
+        {
+            return x < y;
+        }
+    }
+    la < lb
+}
+
+// The program's own bodies first, then `std`'s, each group by name; `main`
+// ahead of the rest.
+fn body_rank(ref<CertBody, shared> b) : u8
+{
+    u8 r = 0;
+    if (StringView::starts_with(&b.key, "std::"))
+    {
+        r += 2;
+    }
+    if (b.key != "main")
+    {
+        r += 1;
+    }
+    r
+}
+
+fn body_less(ref<CertBody, shared> a, ref<CertBody, shared> b) : bool
+{
+    u8 ra = body_rank(a);
+    u8 rb = body_rank(b);
+    ra < rb || (ra == rb && text_less(&a.key, &b.key))
+}
+
+// A line of the combined text as `FILE:LINE`, or `line N` when it maps to no file.
+fn locate_text(StringView l, ref<Expansion, shared> ex) : String
+{
+    match (StringView::parse<usize>(l))
+    {
+        Ok(n) : match (locate_any(n, ex))
+        {
+            Some(p) : sprintf("%s:%v", &p.file, p.line),
+            None    : sprintf("line %v", l),
+        },
+        Err(_) : sprintf("line %v", l),
+    }
+}
+
+// `line N: WHY` as the static pass writes a reason.
+fn reason(StringView why, ref<Expansion, shared> ex) : String
+{
+    match (StringView::strip_prefix(why, "line "))
+    {
+        Some(r) : match (StringView::find(r, ": "))
+        {
+            Some(k) : sprintf(
+                "%s: %v",
+                &locate_text(&r[0..k], ex),
+                &r[k + 2..$],
+            ),
+            None : String::copy(why),
+        },
+        None : String::copy(why),
+    }
+}
+
+fn field(ref<Vec<StringView>, shared> f, usize i) : StringView
+{
+    if (i < Vec::len(f)) { f[i] } else { StringView::of("") }
+}
+
+fn rest_from(ref<Vec<StringView>, shared> f, usize from) : String
+{
+    String out = String::new();
+    for (usize i = from; i < Vec::len(f); i += 1)
+    {
+        if (i > from)
+        {
+            String::append(&mut out, " ");
+        }
+        String::append(&mut out, f[i]);
+    }
+    out
+}
+
+fn ascii_lower(StringView v) : String
+{
+    String out = String::new();
+    for (usize i = 0; i < StringView::len(v); i += 1)
+    {
+        u8 b = StringView::as_bytes(v)[i];
+        String::push_ascii(&mut out, if (b >= b'A' && b <= b'Z') { b + 32 } else { b });
+    }
+    out
+}
+
+// One raw event as the certificate shows it.
+fn event_text(StringView e, ref<Expansion, shared> ex) : String
+{
+    Vec<StringView> f = StringView::split(e, "\t");
+    String at = if (Vec::len(&f) > 1) { locate_text(f[1], ex) } else { String::new() };
+    StringView kind = field(&f, 0);
+    if (kind == "U")
+    {
+        if (Vec::len(&f) >= 5)
+        {
+            if (f[3] == "move")
+            {
+                return sprintf("dynamic %s: a move of `%v`, which `%v` may reach on some paths", &at, f[2], f[4]);
+            }
+            return sprintf(
+                "dynamic %s: an access to `%v` (%s), which `%v` may reach on some paths",
+                &at,
+                f[2],
+                &ascii_lower(f[3]),
+                f[4],
+            );
+        }
+        return sprintf("dynamic %s: %s", &at, &rest_from(&f, 2));
+    }
+    if (kind == "P")
+    {
+        return sprintf("point %s: %s", &at, &rest_from(&f, 2));
+    }
+    if (kind == "D")
+    {
+        return sprintf(
+            "tier-d %s: `%v` (%v, from %v) keeps references in data",
+            &at,
+            field(&f, 2),
+            field(&f, 3),
+            field(&f, 4),
+        );
+    }
+    if (kind == "O")
+    {
+        return sprintf(
+            "origin %s: what `%v` (%v, from %v) borrows is not known before the run",
+            &at,
+            field(&f, 2),
+            field(&f, 3),
+            field(&f, 4),
+        );
+    }
+    if (kind == "S")
+    {
+        return sprintf(
+            "static-data %s: `%v` (%v, from %v) holds static data",
+            &at,
+            field(&f, 2),
+            field(&f, 3),
+            field(&f, 4),
+        );
+    }
+    sprintf("note %s", &StringView::replace(&String::copy(e), "\t", " "))
+}
+
+// The diagnostic's id, which a raw error begins with.
+fn diag_id(StringView e) : String
+{
+    usize n = 0;
+    while (n < StringView::len(e))
+    {
+        u8 b = StringView::as_bytes(e)[n];
+        bool ok = (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || (b >= b'0' && b <= b'9') || b == b'.' || b == b'-';
+        if (!ok)
+        {
+            break;
+        }
+        n += 1;
+    }
+    if (n == 0) { String::copy(e) } else { String::copy(&e[0..n]) }
+}
+
+// Rewrites `path` from the raw records the type checker appended: the
+// header, the verdict, and the bodies, each line mapped through `ex`. A body
+// checked more than once (the pass over a program rewritten for D-0162) is
+// written once, its last record counting. `verdict` is the compiler's;
+// `None` (a static-only run, `--check`) writes how many bodies the pass
+// decided and how many left a conflict to the run.
+export fn cert_finish(
+    StringView path,
+    ref<Expansion, shared> ex,
+    str tool,
+    StringView program,
+    Option<String> verdict,
+) : Result<void, FileError>
+{
+    String raw_path = cert_raw();
+    String raw = read_file(&raw_path)?;
+    _ = remove_file(&raw_path);
+    Vec<CertBody> bodies = Vec::new();
+    CertBody cur = empty_body();
+    bool open = false;
+    Vec<StringView> lines = StringView::lines(&raw);
+    foreach (line in &lines)
+    {
+        StringView l = *line;
+        StringView kind = l;
+        StringView rest = "";
+        match (StringView::find(l, "\t"))
+        {
+            Some(k) :
+            {
+                kind = &l[0..k];
+                rest = &l[k + 1..$];
+            },
+            None    : {},
+        }
+        if (kind == "fn")
+        {
+            cur = CertBody { .key = String::copy(rest), .lefts = Vec::new(), .events = Vec::new(), .error = None };
+            open = true;
+        }
+        else if (kind == "left")
+        {
+            if (open)
+            {
+                Vec::push(&mut cur.lefts, String::copy(rest));
+            }
+        }
+        else if (kind == "ev")
+        {
+            if (open)
+            {
+                Vec::push(&mut cur.events, String::copy(rest));
+            }
+        }
+        else if (kind == "error")
+        {
+            if (open)
+            {
+                cur.error = Some(String::copy(rest));
+            }
+        }
+        else if (kind == "end")
+        {
+            if (open)
+            {
+                CertBody b = replace(&mut cur, empty_body());
+                usize i = 0;
+                while (i < Vec::len(&bodies))
+                {
+                    if (bodies[i].key == b.key)
+                    {
+                        _ = Vec::remove(&mut bodies, i);
+                    }
+                    else
+                    {
+                        i += 1;
+                    }
+                }
+                Vec::push(&mut bodies, b);
+                open = false;
+            }
+        }
+    }
+    Vec::sort_by(&mut bodies, body_less);
+    String out = String::new();
+    String::append(
+        &mut out,
+        "# What the static pass decided before the run (D-0299). A body marked `decided` left no conflict\n",
+    );
+    String::append(
+        &mut out,
+        "# of its frame-held references to the run (`rule.control.frame-references`, spec/14 §6): a conforming\n",
+    );
+    String::append(
+        &mut out,
+        "# compiler keeps no record of them (D-0284, D-0292). A body marked `left` names every conflict the run\n",
+    );
+    String::append(
+        &mut out,
+        "# checks. `cobmodel certify CERT FILE` checks a fragment program's certificate against every interleaving.\n",
+    );
+    usize decided = 0;
+    usize left = 0;
+    foreach (b in &bodies)
+    {
+        String::append(&mut out, "\n");
+        if (Vec::len(&b.lefts) == 0 && Option::is_none(&b.error))
+        {
+            decided += 1;
+            String::appendf(&mut out, "fn %s: decided\n", &b.key);
+        }
+        else if (Option::is_some(&b.error))
+        {
+            String::appendf(&mut out, "fn %s: rejected\n", &b.key);
+        }
+        else
+        {
+            left += 1;
+            String::appendf(&mut out, "fn %s: left\n", &b.key);
+        }
+        foreach (why in &b.lefts)
+        {
+            String::appendf(&mut out, "  left %s\n", &reason(why, ex));
+        }
+        foreach (e in &b.events)
+        {
+            String::appendf(&mut out, "  %s\n", &event_text(e, ex));
+        }
+        match (&b.error)
+        {
+            Some(e) : String::appendf(&mut out, "  error %s\n", &diag_id(e)),
+            None    : {},
+        }
+    }
+    String v = match (verdict)
+    {
+        Some(t) : t,
+        None    :
+        {
+            if (left == 0)
+            {
+                sprintf("static pass: every body decided (%v); the compiler's verdict needs a build", decided)
+            }
+            else
+            {
+                sprintf("static pass: %v of %v bodies left a conflict to the run", left, decided + left)
+            }
+        },
+    };
+    String head = sprintf("CobaltC certificate 1\ntool: %v\nprogram: %v\nverdict: %s\n", tool, program, &v);
+    String::append(&mut head, &out);
+    cert_write(path, &head)
+}
+
+// `cert_finish` for a program the static pass rejected: the verdict names
+// the diagnostic; a lexical or grammatical error is `diag.syntax-error`.
+export fn cert_finish_rejected(
+    StringView path,
+    ref<Expansion, shared> ex,
+    str tool,
+    StringView program,
+    StringView raw,
+) : Result<void, FileError>
+{
+    String id = if (StringView::starts_with(raw, "parse error at ") || StringView::starts_with(raw, "lex error at "))
+    {
+        if (StringView::contains(raw, ": this integer literal does not fit"))
+        {
+            "diag.literal-out-of-range"
+        }
+        else
+        {
+            "diag.syntax-error"
+        }
+    }
+    else
+    {
+        Resolved { id, .. } = resolve_user_location_col(raw, ex);
+        id
+    };
+    cert_finish(path, ex, tool, program, Some(sprintf("rejected: %s", &id)))
+}

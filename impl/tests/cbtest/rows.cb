@@ -1,0 +1,678 @@
+// The rows of spec/conformance.md as runnable programs (`overrides`,
+// `split_items`, `assemble`, `example_code`, `expected`, `agrees`, `rows`),
+// and their run under `cobc`: each
+// row compiled and run under each C compiler, checked against its stated
+// outcome and phase and, for the rows that agree, against the reference's
+// output.
+//
+// A row's fragment column is assembled into a program with the document's
+// own conventions: items at the top level, statements inside `fn main()`
+// with `bool c = true;` in scope (from an enclosing block), and a trailing
+// value expression bound to a local. Rows that refer to an earlier row's
+// context or to an `ex.*` program are completed from the override table;
+// `ex.e2e-*` rows run the example verbatim; a fragment that is a path to a
+// `.cb` file is that whole program (spec/conformance.md §14).
+
+import std;
+import host;
+import cases;
+import store;
+import suite;
+
+struct Override
+{
+    str id;
+    str frag;
+}
+
+fn overrides() : Vec<Override>
+{
+    Vec<Override> v = Vec::new();
+    Vec::push(&mut v, Override { .id = "conf.i32-div-min-neg-one", .frag = "`fn d(i32 a, i32 b) : i32 { a / b }` `d(-2147483647 - 1, -1)`" });
+    Vec::push(&mut v, Override { .id = "conf.cmp-le-ge-ne", .frag = "`bool a = 1: i32 <= 1: i32; bool b = 2: i32 >= 1: i32; bool c2 = 1: i32 != 2: i32;`" });
+    Vec::push(&mut v, Override { .id = "conf.disjoint-field-borrows-ok", .frag = "`struct P { i32 a; i32 b; } auto p = P { .a = 1, .b = 2 }; auto r1 = &mut p.a; auto r2 = &mut p.b; *r1 + *r2`" });
+    Vec::push(&mut v, Override { .id = "conf.exclusive-from-shared-rejected", .frag = "`struct P { i32 a; } fn g(ref<P, shared> p) { auto w = &mut p.a; }`" });
+    Vec::push(&mut v, Override { .id = "conf.elision-conflict-rejected", .frag = "`struct Pair { i32 a; i32 b; } fn first(ref<Pair, shared> p) : ref<i32, shared> { &p.a }` `auto pr = Pair { .a = 1, .b = 2 }; auto y = first(&pr); pr.a = 3; *y`" });
+    Vec::push(&mut v, Override { .id = "conf.index-out-of-bounds-static", .frag = "`array<i32, 3> a = [10, 20, 30]; a[3]`" });
+    Vec::push(&mut v, Override { .id = "conf.composite-destroy-recurses", .frag = "`struct P { Vec<i32> a; } { auto p = P { .a = Vec::new() }; }`" });
+    Vec::push(&mut v, Override { .id = "conf.match-non-exhaustive-rejected", .frag = "`enum Sign { Pos, Neg, Zero } fn d(Sign s) : i32 { match (s) { Pos : 1, Neg : -1 } }` `d(Neg)`" });
+    Vec::push(&mut v, Override { .id = "conf.match-wildcard-ok", .frag = "`enum Sign { Pos, Neg, Zero } fn d(Sign s) : i32 { match (s) { Pos : 1, _ : 0 } }` `d(Neg)`" });
+    Vec::push(&mut v, Override { .id = "conf.match-through-ref-rejected", .frag = "`enum E { Has(Vec<i32>), Empty } fn f(ref<E, shared> e) : usize { match (*e) { Has(x) : Vec::len(&x), Empty : 0 } }`" });
+    Vec::push(&mut v, Override { .id = "conf.generic-call-inferred", .frag = "`fn id<T>(T x) : T { x }` `id(5)`" });
+    Vec::push(&mut v, Override { .id = "conf.vec-index-shared-ok", .frag = "`Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); *Vec::index_shared(&v, 0)`" });
+    Vec::push(&mut v, Override { .id = "conf.vec-index-out-of-bounds", .frag = "`Vec<i32> v = Vec::new(); Vec::push(&mut v, 10); *Vec::index_shared(&v, 1)`" });
+    Vec::push(&mut v, Override { .id = "conf.string-from-utf8-err", .frag = "`Vec<u8> b = Vec::new(); Vec::push(&mut b, 255); match (String::from_utf8(b)) { Ok(s) : StringView::len(&s), Err(_) : 99 }`" });
+    Vec::push(&mut v, Override { .id = "conf.string-into-bytes-roundtrip", .frag = "`Vec<u8> b = Vec::new(); Vec::push(&mut b, 104); Vec::push(&mut b, 105); auto s = match (String::from_utf8(b)) { Ok(v) : v, Err(_) : String::copy(\"\") }; usize n1 = StringView::len(&s); auto bytes = String::into_bytes(s); usize n2 = Vec::len(&bytes);`" });
+    Vec::push(&mut v, Override { .id = "conf.rc-last-drop-frees", .frag = "`auto a = Rc::new(1); auto b = Rc::clone(&a); drop(a); drop(b);`" });
+    Vec::push(&mut v, Override { .id = "conf.unjoined-handle-waits", .frag = "`fn work(i32 n) : i32 { n * 2 }` `{ auto h = spawn(work, 1); }`" });
+    Vec::push(&mut v, Override { .id = "conf.literal-default-i32", .frag = "`auto x = 5;`" });
+    Vec::push(&mut v, Override { .id = "conf.literal-context-u8", .frag = "`u8 x = 200;`" });
+    Vec::push(&mut v, Override { .id = "conf.let-synthesis", .frag = "`auto x = 3: i64 + 4: i64;`" });
+    Vec::push(&mut v, Override { .id = "conf.rc-clone-shares-allocation", .frag = "`auto a = Rc::new(1); auto b = Rc::clone(&a);`" });
+    v
+}
+
+fn override_of(ref<Vec<Override>, shared> ov, StringView id) : Option<String>
+{
+    foreach (o in ov)
+    {
+        if (o.id == id)
+        {
+            return Some(String::copy(o.frag));
+        }
+    }
+    None
+}
+
+fn is_ws(u8 c) : bool
+{
+    c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 11 || c == 12
+}
+
+fn starts_item(StringView s) : bool
+{
+    StringView::starts_with(s, "fn ") || StringView::starts_with(s, "struct ") || StringView::starts_with(s, "enum ")
+        || StringView::starts_with(s, "bitstruct ") || StringView::starts_with(s, "extern ")
+        || StringView::starts_with(s, "unsafe extern ") || StringView::starts_with(s, "resource ")
+        || StringView::starts_with(s, "export ") || StringView::starts_with(s, "module ")
+        || StringView::starts_with(s, "import ") || StringView::starts_with(s, "const ")
+}
+
+// Splits `text` into top-level items and the remaining statement text.
+struct Split
+{
+    Vec<String> items;
+    String stmts;
+}
+
+fn split_items(StringView text) : Split
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    usize n = StringView::len(text);
+    Vec<String> items = Vec::new();
+    Vec<String> stmts = Vec::new();
+    usize i = 0;
+    while (i < n)
+    {
+        while (i < n && is_ws(b[i]))
+        {
+            i += 1;
+        }
+        if (i >= n)
+        {
+            break;
+        }
+        StringView at = &text[i..$];
+        if (starts_item(at))
+        {
+            if (StringView::starts_with(at, "extern ") || StringView::starts_with(at, "unsafe extern ") || StringView::starts_with(at, "import "))
+            {
+                usize j = match (StringView::find(at, ";"))
+                {
+                    Some(k) : i + k + 1,
+                    None    : n,
+                };
+                Vec::push(&mut items, String::copy(&text[i..j]));
+                i = j;
+                continue;
+            }
+            // `const τ N = e;` ends at its `;`, outside any braces `e` has.
+            if (StringView::starts_with(at, "const ") || StringView::starts_with(at, "export const "))
+            {
+                i64 depth = 0;
+                usize j = i;
+                while (j < n)
+                {
+                    if (b[j] == b'{')
+                    {
+                        depth += 1;
+                    }
+                    else if (b[j] == b'}')
+                    {
+                        depth -= 1;
+                    }
+                    else if (b[j] == b';' && depth == 0)
+                    {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                Vec::push(&mut items, String::copy(&text[i..j]));
+                i = j;
+                continue;
+            }
+            i64 depth = 0;
+            bool started = false;
+            usize j = i;
+            while (j < n)
+            {
+                if (b[j] == b'{')
+                {
+                    depth += 1;
+                    started = true;
+                }
+                else if (b[j] == b'}')
+                {
+                    depth -= 1;
+                    if (started && depth == 0)
+                    {
+                        j += 1;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            Vec::push(&mut items, String::copy(&text[i..j]));
+            i = j;
+        }
+        else
+        {
+            i64 depth = 0;
+            usize j = i;
+            while (j < n)
+            {
+                if (b[j] == b'{')
+                {
+                    depth += 1;
+                }
+                else if (b[j] == b'}')
+                {
+                    depth -= 1;
+                }
+                if (depth == 0 && j > i && is_ws(b[j - 1]) && starts_item(&text[j..$]))
+                {
+                    break;
+                }
+                j += 1;
+            }
+            Vec::push(&mut stmts, String::copy(StringView::trim(&text[i..j])));
+            i = j;
+        }
+    }
+    Split { .items = items, .stmts = String::join(&stmts, " ") }
+}
+
+export fn assemble(StringView frag0, bool value_row) : String
+{
+    String frag = StringView::replace(frag0, "\\|", "|");
+    Vec<StringView> pieces = StringView::split(&frag, "`");
+    Vec<StringView> parts = Vec::new();
+    for (usize i = 1; i < Vec::len(&pieces); i += 2)
+    {
+        Vec::push(&mut parts, pieces[i]);
+    }
+    String text = if (Vec::len(&parts) == 0) { String::clone(&frag) } else { StringView::join(&parts, " ") };
+    Split sp = split_items(&text);
+    String stmts = String::copy(StringView::trim(&sp.stmts));
+    bool needs_wrap = StringView::len(&stmts) > 0
+        && (!(StringView::ends_with(&stmts, ";") || StringView::ends_with(&stmts, "}")) || (value_row && StringView::ends_with(&stmts, "}")));
+    if (needs_wrap)
+    {
+        // Bind only the trailing expression (after the last top-level `;`,
+        // or the last top-level `}` that is not the final one).
+        slice<u8, shared> b = StringView::as_bytes(&stmts);
+        usize n = StringView::len(&stmts);
+        i64 depth = 0;
+        usize cut = 0;
+        for (usize k = 0; k < n; k += 1)
+        {
+            if (b[k] == b'{')
+            {
+                depth += 1;
+            }
+            else if (b[k] == b'}')
+            {
+                depth -= 1;
+                // Not before `else`: `if (…) { … } else { … }` is one value.
+                if (depth == 0 && (!value_row || k + 1 < n) && !StringView::starts_with(StringView::trim_start(&stmts[k + 1..$]), "else"))
+                {
+                    cut = k + 1;
+                }
+            }
+            else if (b[k] == b';' && depth == 0)
+            {
+                cut = k + 1;
+            }
+        }
+        String wrapped = sprintf("%s auto __v = %s;", &stmts[0..cut], StringView::trim(&stmts[cut..$]));
+        stmts = wrapped;
+    }
+    // CHG-0033: a fragment is assembled into a program whose root begins
+    // with `import std;` (`spec/conformance.md` §0).
+    foreach (it in &sp.items)
+    {
+        if (StringView::starts_with(StringView::trim(it), "fn main"))
+        {
+            return sprintf("import std;\n%s", &String::join(&sp.items, "\n"));
+        }
+    }
+    // `c` belongs to an enclosing block, so a fragment may declare its own
+    // `c` (D-0131: only a nested block may reuse a name).
+    sprintf("import std;\n%s\nfn main()\n{\n    bool c = true;\n    {\n    %s\n    }\n}\n", &String::join(&sp.items, "\n"), &stmts)
+}
+
+// The code of the example `id` in spec/examples.md, its annotation
+// comments taken out.
+export fn example_code(StringView examples, StringView id) : Option<String>
+{
+    String head = sprintf("### `%s`", id);
+    Vec<StringView> lines = StringView::lines(examples);
+    usize i = 0;
+    while (i < Vec::len(&lines) && !StringView::starts_with(lines[i], &head))
+    {
+        i += 1;
+    }
+    if (i == Vec::len(&lines))
+    {
+        return None;
+    }
+    i += 1;
+    Vec<StringView> code = Vec::new();
+    while (i < Vec::len(&lines))
+    {
+        StringView l = lines[i];
+        match (StringView::strip_prefix(l, "    "))
+        {
+            Some(rest) :
+            {
+                StringView c = match (StringView::find(rest, "//"))
+                {
+                    Some(k) : &rest[0..k],
+                    None    : rest,
+                };
+                Vec::push(&mut code, c);
+            },
+            None       :
+            {
+                if (StringView::starts_with(l, "**") || StringView::starts_with(l, "\u{2192}") || StringView::starts_with(l, "## ")
+                    || StringView::starts_with(l, "### "))
+                {
+                    break;
+                }
+            },
+        }
+        i += 1;
+    }
+    Some(StringView::join(&code, "\n"))
+}
+
+// A row's expectation: ok with an exit status, or a diagnostic and, when
+// the row says, its phase (`static`, `dynamic`; empty: either).
+export struct Exp
+{
+    export bool ok;
+    export u8 status;
+    export String diag;
+    export String phase;
+}
+
+export fn expected(StringView out) : Exp
+{
+    match (StringView::find(out, "`diag."))
+    {
+        Some(k) :
+        {
+            StringView rest = &out[k + 1..$];
+            usize end = Option::unwrap_or(StringView::find(rest, "`"), StringView::len(rest));
+            String phase = if (StringView::contains(out, "(static)"))
+            {
+                "static"
+            }
+            else if (StringView::contains(out, "(dynamic)") || StringView::contains(out, "terminates"))
+            {
+                "dynamic"
+            }
+            else
+            {
+                ""
+            };
+            return Exp { .ok = false, .status = 0, .diag = String::copy(&rest[0..end]), .phase = phase };
+        },
+        None    : {},
+    }
+    match (StringView::find(out, "exit status "))
+    {
+        Some(k) :
+        {
+            StringView after = &out[k + 12..$];
+            slice<u8, shared> b = StringView::as_bytes(after);
+            usize e = 0;
+            while (e < slice_len(b) && b[e] >= b'0' && b[e] <= b'9')
+            {
+                e += 1;
+            }
+            Exp { .ok = true, .status = Result::unwrap_or(StringView::parse<u8>(&after[0..e]), 0), .diag = "", .phase = "" }
+        },
+        None    : Exp { .ok = true, .status = 0, .diag = "", .phase = "" },
+    }
+}
+
+fn exp_text(ref<Exp, shared> e) : String
+{
+    if (e.ok)
+    {
+        sprintf("ok, exit status %v", e.status)
+    }
+    else if (StringView::len(&e.phase) > 0)
+    {
+        sprintf("%s (%s)", &e.diag, &e.phase)
+    }
+    else
+    {
+        String::clone(&e.diag)
+    }
+}
+
+// One row: its id, its program (the text, or the path of a whole file,
+// relative to the repository's root), its expectation.
+export struct Row
+{
+    export String id;
+    export bool is_file;
+    export String program;
+    export Exp exp;
+}
+
+// Every row that can be run, in table order.
+export fn rows(StringView spec, StringView examples) : Vec<Row>
+{
+    Vec<Override> ov = overrides();
+    Vec<Row> out = Vec::new();
+    Vec<StringView> lines = StringView::lines(spec);
+    foreach (line in &lines)
+    {
+        StringView rest = match (StringView::strip_prefix(*line, "| `conf."))
+        {
+            Some(r) : r,
+            None    : continue,
+        };
+        Vec<StringView> cols = StringView::split(*line, " | ");
+        if (Vec::len(&cols) < 3)
+        {
+            continue;
+        }
+        usize tick = Option::unwrap_or(StringView::find(rest, "`"), StringView::len(rest));
+        String id = sprintf("conf.%s", &rest[0..tick]);
+        String frag = match (override_of(&ov, &id))
+        {
+            Some(o) : o,
+            None    : String::copy(cols[1]),
+        };
+        StringView outcome = cols[2];
+        bool value_row = StringView::starts_with(StringView::trim(outcome), "`\u{2192}");
+        Exp exp = expected(outcome);
+        // The first backticked part of the fragment.
+        Option<String> first = match (StringView::strip_prefix(&frag, "`"))
+        {
+            Some(f) :
+            {
+                StringView inner = match (StringView::find(f, "`"))
+                {
+                    Some(k) : &f[0..k],
+                    None    : f,
+                };
+                Some(String::copy(inner))
+            },
+            None    : None,
+        };
+        match (&first)
+        {
+            Some(f) :
+            {
+                if (StringView::ends_with(f, ".cb"))
+                {
+                    Vec::push(&mut out, Row { .id = id, .is_file = true, .program = String::clone(f), .exp = exp });
+                    continue;
+                }
+                if (StringView::starts_with(f, "ex."))
+                {
+                    String code = match (example_code(examples, f))
+                    {
+                        Some(c) : c,
+                        None    : continue,
+                    };
+                    // Other examples mix deliberately invalid lines.
+                    if (!(StringView::starts_with(f, "ex.e2e") || *f == "ex.extern-write"))
+                    {
+                        continue;
+                    }
+                    String prog = if (StringView::contains(&code, "fn main")) { code } else { assemble(&sprintf("`%s`", &code), value_row) };
+                    Vec::push(&mut out, Row { .id = id, .is_file = false, .program = prog, .exp = exp });
+                    continue;
+                }
+            },
+            None    : {},
+        }
+        String prog = assemble(&frag, value_row);
+        Vec::push(&mut out, Row { .id = id, .is_file = false, .program = prog, .exp = exp });
+    }
+    out
+}
+
+// Whether an observed outcome (`diag` empty for ok with exit status
+// `status`) satisfies the row's expectation.
+fn agrees(ref<Exp, shared> e, StringView diag, StringView phase, u8 status) : bool
+{
+    if (e.ok)
+    {
+        return StringView::len(diag) == 0 && e.status == status;
+    }
+    if (StringView::len(diag) == 0)
+    {
+        return false;
+    }
+    if (StringView::len(&e.phase) > 0)
+    {
+        return e.diag == diag && e.phase == phase;
+    }
+    e.diag == diag
+}
+
+fn safe_name(StringView id) : String
+{
+    String s = String::new();
+    slice<u8, shared> b = StringView::as_bytes(id);
+    for (usize i = 0; i < slice_len(b); i += 1)
+    {
+        u8 c = b[i];
+        bool keep = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9');
+        String::push_ascii(&mut s, if (keep) { c } else { b'_' });
+    }
+    s
+}
+
+// One compiler's run of every row of the table: the passed count and the
+// skipped and failed rows.
+export fn spec_rows(ref<Ctx, shared> c, StringView repo, StringView cc) : Tally
+{
+    Tally t = Tally { .passed = 0, .skipped = Vec::new(), .failed = Vec::new() };
+    String spec = Result::unwrap_or(read_file(&path_join(repo, &path_join("spec", "conformance.md"))), "");
+    String examples = Result::unwrap_or(read_file(&path_join(repo, &path_join("spec", "examples.md"))), "");
+    // With the gate's store the scratch directory is the same in every run,
+    // since a diagnostic prints the path: an inline row's kept run is then
+    // the same run (D-0307).
+    String tag = if (Store::enabled(&c.st)) { sprintf("store-%vof%v", c.shard_i, c.shard_n) } else { sprintf("%v", process_id()) };
+    String scratch = path_join(&c.tmp_base, &sprintf("cbtest-rows-%s-%s", &tag, &safe_name(cc)));
+    _ = make_dir_all(&scratch);
+    Vec<Row> all = rows(&spec, &examples);
+    for (usize index = 0; index < Vec::len(&all); index += 1)
+    {
+        if (index % c.shard_n != c.shard_i - 1)
+        {
+            continue;
+        }
+        ref<Row, shared> row = &all[index];
+        String path = if (row.is_file)
+        {
+            String p = path_join(repo, &row.program);
+            Result::unwrap_or(path_canonical(&p), p)
+        }
+        else
+        {
+            String p = path_join(&scratch, &sprintf("%s.cb", &safe_name(&row.id)));
+            _ = write_file(&p, &row.program);
+            p
+        };
+        String src = Result::unwrap_or(read_file(&path), "");
+        if (platform_skipped(&src, c.on_windows))
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: its `platform:` header names another platform", &row.id));
+            continue;
+        }
+        if (!c.slow)
+        {
+            match (slow_reason(&src))
+            {
+                Some(why) :
+                {
+                    Vec::push(&mut t.skipped, sprintf("%s: slow (%s); --slow runs it", &row.id, &why));
+                    continue;
+                },
+                None      : {},
+            }
+        }
+        Option<Vec<u8>> input = stdin(&src);
+        if (Option::is_none(&input) && is_cobc_only(&src))
+        {
+            input = Some(Vec::new());
+        }
+        Kept got = cobc_run(c, cc, &path, &src, &input, index);
+        // The outcome, read from the status and the first line of stderr.
+        String first = first_line_of(&got.err);
+        if (got.status == 0 || Vec::len(&got.err) == 0)
+        {
+            u8 st = narrow_wrapping<u8>(got.status);
+            if (!agrees(&row.exp, "", "", st))
+            {
+                Vec::push(&mut t.failed, sprintf("%s: expected %s, observed ok, exit status %v", &row.id, &exp_text(&row.exp), st));
+                continue;
+            }
+        }
+        else if (got.status == 3 && !StringView::contains(&first, "internal error in cobc"))
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: %s", &row.id, Option::unwrap_or(StringView::strip_prefix(&first, "unsupported: "), &first)));
+            continue;
+        }
+        else if ((got.status == 3) || (got.status == 2 && !StringView::contains(&first, "diag.")))
+        {
+            Vec::push(&mut t.failed, sprintf("%s: cobc failed: %s", &row.id, &first));
+            continue;
+        }
+        else
+        {
+            String o = diag_of(&first);
+            Vec<StringView> dp = StringView::split(&o, " (");
+            StringView d = dp[0];
+            StringView ph = if (Vec::len(&dp) > 1) { Option::unwrap_or(StringView::strip_suffix(dp[1], ")"), dp[1]) } else { "" };
+            if (!agrees(&row.exp, d, ph, 0))
+            {
+                Vec::push(&mut t.failed, sprintf("%s: expected %s, observed %s", &row.id, &exp_text(&row.exp), &o));
+                continue;
+            }
+        }
+        // An inline row's recorded run is impl/tests/rows/ID.expect (D-0326,
+        // phase E), not beside its scratch file.
+        Ctx rc = clone(c);
+        if (!row.is_file)
+        {
+            rc.expect_dir = path_join(repo, &path_join("impl", &path_join("tests", "rows")));
+        }
+        match (check_output(&rc, &path, &src, &got, index))
+        {
+            Some(d) : Vec::push(&mut t.failed, sprintf("%s: %s", &row.id, &d)),
+            None    :
+            {
+                t.passed += 1;
+                keep_cobc_run(c, cc, &path, &src, &input, &got);
+            },
+        }
+    }
+    _ = remove_dir_all(&scratch);
+    t
+}
+
+// D-0326, phase E: each inline row's run recorded as OUT/ID.expect (a row
+// that is a file is a conformance case, recorded with the suite): run by
+// the reference and by `cobc` under each C compiler; written when every
+// outcome agrees with the row and every output is the same.
+export fn record_rows(ref<Ctx, shared> c, StringView repo, StringView out) : Tally
+{
+    Tally t = Tally { .passed = 0, .skipped = Vec::new(), .failed = Vec::new() };
+    String spec = Result::unwrap_or(read_file(&path_join(repo, &path_join("spec", "conformance.md"))), "");
+    String examples = Result::unwrap_or(read_file(&path_join(repo, &path_join("spec", "examples.md"))), "");
+    String scratch = path_join(&c.tmp_base, &sprintf("cbtest-rows-record-%v", process_id()));
+    _ = make_dir_all(&scratch);
+    _ = make_dir_all(out);
+    Vec<Row> all = rows(&spec, &examples);
+    for (usize index = 0; index < Vec::len(&all); index += 1)
+    {
+        if (index % c.shard_n != c.shard_i - 1)
+        {
+            continue;
+        }
+        ref<Row, shared> row = &all[index];
+        if (row.is_file)
+        {
+            continue;
+        }
+        String name = sprintf("%s.cb", &safe_name(&row.id));
+        String path = path_join(&scratch, &name);
+        _ = write_file(&path, &row.program);
+        String src = String::clone(&row.program);
+        if (!c.slow && Option::is_some(&slow_reason(&src)))
+        {
+            Vec::push(&mut t.skipped, sprintf("%s: slow", &row.id));
+            continue;
+        }
+        Option<Vec<u8>> input = stdin(&src);
+        Vec<Kept> runs = Vec::new();
+        // A row is recorded from the C compilers agreeing (D-0326).
+        bool bad = false;
+        foreach (cc in &c.ccs)
+        {
+            Kept k = cobc_run(c, cc, &path, &src, &input, index);
+            Outcome o = classify(k.status, &k.err);
+            bool ok = if (o.skipped)
+            {
+                false
+            }
+            else if (o.text == "ok" || StringView::starts_with(&o.text, "exit "))
+            {
+                row.exp.ok && narrow_wrapping<u8>(k.status) == row.exp.status
+            }
+            else
+            {
+                Vec<StringView> dp = StringView::split(&o.text, " (");
+                StringView ph = if (Vec::len(&dp) > 1) { Option::unwrap_or(StringView::strip_suffix(dp[1], ")"), dp[1]) } else { "" };
+                agrees(&row.exp, dp[0], ph, 0)
+            };
+            if (!ok)
+            {
+                Vec::push(&mut t.failed, sprintf("%s: [%s] expected %s, observed %s", &row.id, cc, &exp_text(&row.exp), &o.text));
+                bad = true;
+            }
+            Vec::push(&mut runs, k);
+        }
+        for (usize k = 1; !bad && k < Vec::len(&runs); k += 1)
+        {
+            if (!same_bytes(&runs[k].out, &runs[0].out) || !same_err(&runs[k].err, &runs[0].err))
+            {
+                Vec::push(&mut t.failed, sprintf("%s: the runs' outputs differ", &row.id));
+                bad = true;
+            }
+        }
+        if (bad)
+        {
+            continue;
+        }
+        String target = path_join(out, &sprintf("%s.expect", &safe_name(&row.id)));
+        match (write_file(&target, &expect_text(&runs[Vec::len(&runs) - 1])))
+        {
+            Ok(_)  : t.passed += 1,
+            Err(_) : Vec::push(&mut t.failed, sprintf("%s: cannot write %s", &row.id, &target)),
+        }
+    }
+    _ = remove_dir_all(&scratch);
+    t
+}

@@ -1,0 +1,180 @@
+# Update 209's runtime items. Report 065: the checked faults of `-a`, of a
+# division and of a shift name their values, as `+ - *` do. Report 148: a
+# `fn` value reached through a shared reference is looked at for an
+# exclusive capture only when it is a closure that captures something, and
+# `--report-tracking` lists the lines that still look. Report 337: an `Rc`
+# chain of a million links is destroyed without exhausting the stack, in
+# the order nested destruction gives. Report 315: a guard moved to another
+# thread and ended there releases the mutex, which the first thread then
+# locks again; a thread that fails holding a lock poisons it.
+file neg.cb
+import std;
+
+fn main()
+{
+    i32 a = Result::unwrap(StringView::parse<i32>("-2147483648"));
+    printf("%v\n", -a);
+}
+end
+run $COBC --run neg.cb
+status 1
+stderr-starts fault[diag.arith-overflow]: -(-2147483648) is outside `i32` (-2147483648 to 2147483647)
+file div.cb
+import std;
+
+fn main()
+{
+    i64 a = Result::unwrap(StringView::parse<i64>(&Result::unwrap(arg(0))));
+    i64 b = Result::unwrap(StringView::parse<i64>(&Result::unwrap(arg(1))));
+    printf("%v\n", a / b);
+}
+end
+run $COBC --run div.cb 7 0
+status 1
+stderr-starts fault[diag.div-by-zero]: 7 / 0: the divisor is zero
+run $COBC --run div.cb -9223372036854775808 -1
+status 1
+stderr-starts fault[diag.div-overflow]: -9223372036854775808 / -1 is outside `i64` (-9223372036854775808 to 9223372036854775807)
+file rem.cb
+import std;
+
+fn main()
+{
+    u8 a = 200;
+    u8 b = Result::unwrap(StringView::parse<u8>(&Result::unwrap(arg(0))));
+    printf("%v\n", a % b);
+}
+end
+run $COBC --run rem.cb 0
+status 1
+stderr-starts fault[diag.div-by-zero]: 200 % 0: the divisor is zero
+file shift.cb
+import std;
+
+fn main()
+{
+    i32 one = 1;
+    u32 n = Result::unwrap(StringView::parse<u32>(&Result::unwrap(arg(0))));
+    printf("%v\n", one << n);
+}
+end
+run $COBC --run shift.cb 40
+status 1
+stderr-starts fault[diag.shift-amount-out-of-range]: 1 << 40: the shift amount 40 is not below 32, the width of `i32`
+file fnref.cb
+import std;
+
+struct Filter
+{
+    fn(i64) : bool keep;
+}
+
+fn run(ref<Filter, shared> f, i64 n) : i64
+{
+    i64 c = 0;
+    for (i64 i = 0; i < n; i += 1)
+    {
+        if (f.keep(i))
+        {
+            c += 1;
+        }
+    }
+    c
+}
+
+fn main()
+{
+    Filter f = Filter { .keep = [](i64 x) : bool { (x & 3) == 0 } };
+    printf("%v\n", run(&f, 100));
+}
+end
+run $COBC --run fnref.cb
+status 0
+stdout-is 25\n
+run $COBC --report-tracking fnref.cb
+status 0
+stdout-starts no run-time tracking: every conflict is decided
+stdout-has Checks left where a `fn` value is called or read through a shared reference
+stdout-has fnref.cb:13
+file rcchain.cb
+import std;
+
+struct Node
+{
+    i64 v;
+    Option<Rc<Node>> next;
+}
+
+resource struct Tag
+{
+    i64 v;
+}
+
+fn Tag::drop(ref<Tag, exclusive> self)
+{
+    printf("tag %v\n", self.v);
+}
+
+struct Pair
+{
+    Option<Rc<Pair>> next;
+    Tag t;
+}
+
+fn main()
+{
+    Option<Rc<Pair>> p = None;
+    foreach (i in 0..3: i64)
+    {
+        p = Some(Rc::new(Pair { .next = p, .t = Tag { .v = i } }));
+    }
+    drop(p);
+    Option<Rc<Node>> head = None;
+    foreach (i in 0..1000000: i64)
+    {
+        head = Some(Rc::new(Node { .v = i, .next = head }));
+    }
+    drop(head);
+    printf("dropped\n");
+}
+end
+run $COBC --run rcchain.cb
+status 0
+stdout-is tag 2\ntag 1\ntag 0\ndropped\n
+file moved.cb
+import std;
+
+fn take(guard<i64> g)
+{
+    drop(g);
+}
+
+fn bad(ref<mutex<i64>, shared> m)
+{
+    auto g = lock(m);
+    *g += 1;
+    Vec<i64> v = Vec::new();
+    printf("%v\n", v[Vec::len(&v) + 1]);
+}
+
+fn main()
+{
+    mutex<i64> m = Mutex::new(0: i64);
+    foreach (i in 0..3: i64)
+    {
+        guard<i64> g = lock(&m);
+        *g += 1;
+        handle<void> h = spawn(take, g);
+        join(h);
+    }
+    printf("%v\n", *lock(&m));
+    handle<void> h = spawn(bad, &m);
+    _ = try_join(h);
+    printf("after\n");
+    *lock(&m) += 1;
+}
+end
+# D-0340 §8: a guard passed to `spawn` is refused at the check now.
+run $COBC --check moved.cb
+status 1
+stderr-has diag.thread-affine-moved

@@ -1,0 +1,139 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Url-Parse] [Form] [Http-Send] [Http-Redirect] (D-0173, D-0181); conf.http-client-hostile-input
+// kind: positive
+// expect: ok
+//
+// What the client will not send and how it follows redirects. `Url::parse`
+// refuses an empty host before a port, a signed port, a space or a control
+// byte anywhere and a host outside `reg-name`; a header with CR LF in its
+// value and a method that is not a token are `BadMessage` before anything
+// is sent (the port named is closed); `form_decode` splits at `&` only. On
+// loopback: `Location` values resolved as RFC 3986 §5 resolves a reference
+// (a `://` in the query, `..`, a query alone, a network path), and a
+// server sending interim responses without end is `BadMessage` after 16.
+
+import std;
+
+fn parsed(str text)
+{
+    match (Url::parse(StringView::of(text)))
+    {
+        Ok(u)  : printf("%-34s ok %s\n", text, &Url::text(&u)),
+        Err(e) : printf("%-34s refused: %s\n", text, HttpError::text(&e)),
+    }
+}
+
+// Redirects: each request target is logged; /r1 to /r4 answer 302.
+fn redirects(HttpServer s) : String
+{
+    String log = String::new();
+    String back = sprintf("//127.0.0.1:%u/landed", HttpServer::local_addr(&s).port);
+    for (usize k = 0; k < 8; k += 1)
+    {
+        HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+        Request r = match (HttpConnection::request(&mut c))
+        {
+            Ok(Some(r)) : r,
+            _           : continue,
+        };
+        String::append(&mut log, &sprintf("  %s %s\n", &r.method, &r.url));
+        Vec<Header> h = Vec::new();
+        StringView to = if (r.url == "/r1") { "/login?next=http://example.com/" }
+        else if (r.url == "/dir/r2") { "../up?x=1" }
+        else if (r.url == "/r3?a=1") { "?page=2" }
+        else if (r.url == "/r4") { &back }
+        else { "" };
+        if (StringView::len(to) > 0)
+        {
+            Vec::push(&mut h, Header::new("Location", to));
+            _ = HttpConnection::respond(&mut c, 302, &h, StringView::as_bytes(""));
+        }
+        else
+        {
+            _ = HttpConnection::respond(&mut c, 200, &h, StringView::as_bytes(&r.url));
+        }
+        HttpConnection::close(&mut c);
+    }
+    log
+}
+
+// Interim responses: 3, then 20, each followed by a 200.
+fn interim(TcpListener l)
+{
+    foreach (n in [3: usize, 20: usize])
+    {
+        TcpStream c = Result::unwrap(TcpListener::accept(&mut l));
+        Vec<u8> head = Vec::new();
+        _ = TcpStream::read(&mut c, &mut head, 4096);
+        Vec<u8> out = Vec::new();
+        for (usize i = 0; i < n; i += 1)
+        {
+            Vec::extend_from(&mut out, StringView::as_bytes("HTTP/1.1 102 Processing\r\n\r\n"));
+        }
+        Vec::extend_from(&mut out, StringView::as_bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"));
+        _ = TcpStream::write(&mut c, &out);
+        _ = TcpStream::shutdown_write(&mut c);
+        // Wait for the client to finish with the connection.
+        Vec<u8> rest = Vec::new();
+        _ = TcpStream::read(&mut c, &mut rest, 4096);
+    }
+}
+
+fn show(Result<Response, HttpError> r)
+{
+    match (r)
+    {
+        Ok(resp) : printf("  %u [%s]\n", resp.status, &Result::unwrap_or(Response::text(&resp), "?")),
+        Err(e)   : printf("  error: %s\n", HttpError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    parsed("http://:8080/x");
+    parsed("http://host:+80/");
+    parsed("http://host:080/");
+    parsed("http://example.com/a b");
+    parsed("http://example.com/x\u{7f}y");
+    parsed("http://example.com/x\u{1}y");
+    parsed("http://exa mple.com/");
+    parsed("http://exa<mple.com/");
+    parsed("http://[::1/");
+    parsed("http://127.0.0.1:65535/a%20b");
+    Vec<Param> ps = form_decode("utm=x;role=admin&b=2");
+    foreach (p in &ps)
+    {
+        printf("param %s = %s\n", &p.name, &p.value);
+    }
+    // Nothing is sent: port 1 on loopback has no server, and the refusals
+    // come before connecting.
+    HttpClient hc = HttpClient::new();
+    Request bad_header = Request::new("GET", "http://127.0.0.1:1/");
+    Vec::push(&mut bad_header.headers, Header::new("User-Agent", "tool/1.0\r\nX-Injected: yes"));
+    printf("a header with CR LF:");
+    show(HttpClient::send(&mut hc, &bad_header));
+    Request bad_method = Request::new("GET /x HTTP/1.1\r\nX:", "http://127.0.0.1:1/");
+    printf("a method that is not a token:");
+    show(HttpClient::send(&mut hc, &bad_method));
+    // Redirects.
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String base = sprintf("http://127.0.0.1:%u", HttpServer::local_addr(&s).port);
+    auto h = spawn(redirects, s);
+    foreach (path in ["/r1", "/dir/r2", "/r3?a=1", "/r4"])
+    {
+        printf("GET %s:", path);
+        show(http_get(&sprintf("%s%s", &base, path)));
+    }
+    printf("the server saw:\n%s", &join(h));
+    // Interim responses.
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String url = sprintf("http://127.0.0.1:%u/", TcpListener::local_addr(&l).port);
+    auto ih = spawn(interim, l);
+    printf("three 102s:");
+    show(http_get(&url));
+    printf("twenty 102s:");
+    show(http_get(&url));
+    join(ih);
+    0
+}

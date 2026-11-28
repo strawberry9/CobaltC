@@ -1,0 +1,99 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.stats [Stats-Median] [Stats-Percentile], [Hex], [From-Iso], [Pg-Query] [Pg-Cell], [Toml-Error], [Json-Set] (reports 240, 285, 286, 287, 301, 303, 304, 328); conf.stats-nan-passed-over, conf.string-truncate-beyond-length, conf.hex-empty-round-trip, conf.iso-offsets, conf.pg-float-whole, conf.toml-describe-error, conf.json-push-member
+// kind: positive
+// expect: ok
+//
+// Small holes in `std`: `median` and `percentile` pass a NaN over as
+// `minimum` and `maximum` do; `String::truncate` past the end changes
+// nothing, as `Vec::truncate`; no bytes round-trip through hex; ISO 8601
+// with an offset, a space for the `T` and no zone reads (what
+// `to_iso_local` writes, what PostgreSQL writes), and `PgRow::get_datetime`
+// reads a `timestamptz` cell; a whole `Float` is sent without a fraction;
+// a TOML key defined twice and a month 13 are named; a large JSON object
+// is built with `push_member` and read through `key_index`.
+
+import std;
+
+fn iso(str text)
+{
+    match (DateTime::from_iso(StringView::of(text)))
+    {
+        Ok(t)  : printf("%-30s %s %v\n", text, &DateTime::to_iso(&t), Result::unwrap(unix_ms_from_iso(StringView::of(text)))),
+        Err(e) : printf("%-30s %s\n", text, &ParseError::describe(&e, StringView::of(text))),
+    }
+}
+
+fn toml(str text)
+{
+    match (Toml::parse(StringView::of(text)))
+    {
+        Ok(_)  : printf("ok\n"),
+        Err(e) : printf("%s\n", &Toml::describe_error(&e, StringView::of(text))),
+    }
+}
+
+fn main()
+{
+    array<f64, 4> data = [3.0, 0.0 / 0.0, 1.0, 2.0];
+    printf(
+        "max %v p100 %v min %v p0 %v median %v\n",
+        Option::unwrap(maximum(&data)),
+        Option::unwrap(percentile(&data, 100.0)),
+        Option::unwrap(minimum(&data)),
+        Option::unwrap(percentile(&data, 0.0)),
+        Option::unwrap(median(&data)),
+    );
+    String title = "short";
+    String::truncate(&mut title, 80);
+    printf("truncated [%s]\n", &title);
+    Vec<u8> none = Vec::new();
+    printf("hex [%s] back %v\n", &to_hex(&none), Vec::len(&Result::unwrap(from_hex(&to_hex(&none)))));
+    iso("2024-03-10T03:30:00-04:00");
+    iso("2024-03-10T07:30:00+00:00");
+    iso("2023-11-15 09:13:20+11");
+    iso("2023-11-14 22:13:20.5+00");
+    iso("2023-11-14 22:13:20");
+    iso("2024-03-10T03:30:00+0530");
+    iso("2024-03-10T03:30:00+24:00");
+    iso("2024-03-10T03:30:00+4");
+    DateTime t = DateTime::from_unix(1710055800);
+    printf("round trip %v\n", DateTime::eq(&Result::unwrap(DateTime::from_iso(&DateTime::to_iso_local(&t))), &t));
+    Vec<Option<String>> cells = Vec::new();
+    Vec::push(&mut cells, Some("2023-11-15 09:13:20+11"));
+    Vec::push(&mut cells, Some("infinity"));
+    PgRow row = PgRow { .cells = cells };
+    printf(
+        "cell %s, %v\n",
+        &DateTime::to_iso(&Option::unwrap(PgRow::get_datetime(&row, 0))),
+        Option::is_some(&PgRow::get_datetime(&row, 1)),
+    );
+    Vec<PgValue> ps = Vec::new();
+    Vec::push(&mut ps, Float(2.0));
+    Vec::push(&mut ps, Float(-0.0));
+    Vec::push(&mut ps, Float(2.5));
+    Vec::push(&mut ps, Float(1e300));
+    foreach (p in &ps)
+    {
+        printf("sent %s\n", &Option::unwrap(PgValue::text(p)));
+    }
+    toml("name = \"x\"\nport = 80\nname = \"y\"\n");
+    toml("[server]\nport = 80\n\n[server]\nhost = \"h\"\n");
+    toml("server = 1\n[server]\nport = 80\n");
+    toml("day = 2026-13-01\n");
+    toml("a = \n");
+    Json o = JsonObject(Vec::new());
+    for (usize i = 0; i < 50000; i += 1)
+    {
+        Json::push_member(&mut o, &sprintf("key%v", i), JsonNumber(to_float<f64>(i)));
+    }
+    HashMap<String, usize> at = Json::key_index(&o);
+    ref<Vec<JsonMember>, shared> members = Option::unwrap(Json::as_object(&o));
+    f64 sum = 0.0;
+    for (usize i = 0; i < 50000; i += 1)
+    {
+        usize k = *Option::unwrap(HashMap::get(&at, &sprintf("key%v", i)));
+        sum += Option::unwrap(Json::as_f64(&members[k].value));
+    }
+    printf("json %v members, sum %v\n", HashMap::len(&at), sum);
+}

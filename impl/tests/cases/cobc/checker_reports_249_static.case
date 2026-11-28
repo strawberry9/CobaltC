@@ -1,0 +1,627 @@
+# The static pass and the two build forms on the reports of the push after
+# Update 207 (265, 266, 267, 268, 273, 290, 291, 292, 293, 313, 318, 320,
+# 346): correct programs the checker refused or the forms disagreed on, run
+# in the default form and with --all-checks; programs that passed the check
+# and always (or by timing) faulted, refused now.
+#
+# 265: a view, or a `Vec` of views or shared references, declared before
+# the text it refers to ends after the block's last statement, before the
+# block's exit destroys that text, in both forms.
+file views_before_text.cb
+import std;
+
+fn main()
+{
+    Vec<StringView> words = Vec::new();
+    String line = "alpha beta gamma";
+    words = StringView::split(&line, " ");
+    printf("%v words, first %s\n", Vec::len(&words), words[0]);
+    {
+        StringView best = "";
+        String a = "alpha";
+        best = &a;
+        printf("%s\n", best);
+    }
+    {
+        Vec<ref<String, shared>> names = Vec::new();
+        String b = "x";
+        Vec::push(&mut names, &b);
+        printf("%s\n", names[0]);
+    }
+}
+end
+run $COBC --run views_before_text.cb
+status 0
+stdout-is 3 words, first alpha\nalpha\nx\n
+run $COBC --all-checks --run views_before_text.cb
+status 0
+stdout-is 3 words, first alpha\nalpha\nx\n
+# 266: copies of a `move` closure that writes none of its captures share
+# its box and are called at once from two threads, its `self` shared (in
+# the closure's body, and in the runtime's light borrow of the box).
+file closure_copies.cb
+import std;
+
+fn apply_many(fn(i32) : i32 f, i32 n) : i32
+{
+    i32 t = 0;
+    foreach (i in 0..n)
+    {
+        t += f(i);
+    }
+    t
+}
+
+fn main()
+{
+    i32 k = 3;
+    fn(i32) : i32 s = move [k](i32 x) : i32 { x * k };
+    handle<i32> a = spawn(apply_many, s, 1000);
+    handle<i32> b = spawn(apply_many, s, 1000);
+    printf("%v\n", join(a) + join(b));
+}
+end
+run $COBC --run closure_copies.cb
+status 0
+stdout-is 2997000\n
+run $COBC --explore 6 closure_copies.cb
+status 0
+run $COBC --all-checks --run closure_copies.cb
+status 0
+stdout-is 2997000\n
+# 267: a view copied out of a field through an exclusive reference refers
+# to the text, not to the field, which may then be advanced from it.
+file view_field_advance.cb
+import std;
+
+struct Cursor
+{
+    StringView rest;
+    u32 n;
+}
+
+fn skip_one(ref<Cursor, exclusive> c)
+{
+    StringView r = c.rest;
+    c.rest = &r[1..$];
+}
+
+fn skip_count(ref<Cursor, exclusive> c)
+{
+    StringView r = c.rest;
+    c.n += 1;
+    c.rest = &r[1..$];
+}
+
+fn main()
+{
+    String text = "abcd";
+    Cursor c = Cursor { .rest = &text, .n = 0 };
+    skip_one(&mut c);
+    skip_count(&mut c);
+    printf("%s %v\n", c.rest, c.n);
+}
+end
+run $COBC --run view_field_advance.cb
+status 0
+stdout-is cd 1\n
+run $COBC --all-checks --run view_field_advance.cb
+status 0
+stdout-is cd 1\n
+# 268: a reference last used in an `else if` condition ends there, and at
+# the start of the branches before it that do not name it, in both forms.
+file else_if_end.cb
+import std;
+
+fn main()
+{
+    Vec<u32> w = Vec::from_slice(&[1: u32, 1]);
+    ref<u32, shared> it = &w[0];
+    if (*it == 0)
+    {
+        w[1] = 7;
+    }
+    else if (*it == 1)
+    {
+        w[0] = 9;
+    }
+    ref<u32, shared> jt = &w[1];
+    if (*jt == 5)
+    {
+        w[0] = 1;
+    }
+    else if (*jt == 6)
+    {
+        w[0] = 2;
+    }
+    else
+    {
+        w[1] = 3;
+    }
+    printf("%v %v\n", w[0], w[1]);
+}
+end
+run $COBC --run else_if_end.cb
+status 0
+stdout-is 9 3\n
+run $COBC --all-checks --run else_if_end.cb
+status 0
+stdout-is 9 3\n
+# ... and one named again in a later branch is not ended early.
+file else_if_late.cb
+import std;
+
+fn main()
+{
+    u32 x = 1;
+    ref<u32, shared> it = &x;
+    if (*it == 0)
+    {
+        x = 7;
+    }
+    else if (*it == 1)
+    {
+        x = 9;
+        printf("%v\n", *it);
+    }
+}
+end
+run $COBC --check else_if_late.cb
+status 1
+stderr-has still borrows
+# 273: a `match` on a local does not fold the local's known value into
+# its arms.
+file match_guard.cb
+import std;
+
+fn main()
+{
+    i32 total = 10;
+    i32 count = 0;
+    if (arg_count() > 5)
+    {
+        printf("ignoring arguments\n");
+    }
+    match (count)
+    {
+        0 : printf("no samples\n"),
+        _ : printf("average %v\n", total / count),
+    }
+}
+end
+run $COBC --run match_guard.cb
+status 0
+stdout-is no samples\n
+# 290: `slice_len(&v)` read in the statement that writes `v` borrows
+# nothing past the read, in both forms.
+file len_write.cb
+import std;
+
+fn main()
+{
+    Vec<u8> v = Vec::from_slice(&[1: u8, 2, 3]);
+    v[slice_len(&v) - 1] = 9;
+    Vec<u32> w = Vec::from_slice(&[4: u32, 5]);
+    w[0] = w[slice_len(&w) - 1];
+    Vec::push(&mut w, narrow<u32>(slice_len(&w)));
+    Vec::insert(&mut w, slice_len(&w), 8);
+    array<u32, 3> a = [1, 2, 3];
+    a[slice_len(&a) - 1] = 7;
+    printf("%v %v %v %v %v %v\n", v[2], w[0], w[2], w[3], a[2], slice_len(&w));
+}
+end
+run $COBC --run len_write.cb
+status 0
+stdout-is 9 5 2 8 7 4\n
+run $COBC --all-checks --run len_write.cb
+status 0
+stdout-is 9 5 2 8 7 4\n
+# 291: a function returning views of a local `String`, as a `Vec` or in
+# structs pushed to a `Vec`, is refused, as returning one view is.
+file escape_vec.cb
+import std;
+
+fn words() : Vec<StringView>
+{
+    String src = sprintf("%s %s", "hello", "world");
+    StringView::split_whitespace(&src)
+}
+
+fn main()
+{
+    Vec<StringView> w = words();
+    printf("%v\n", Vec::len(&w));
+}
+end
+run $COBC --check escape_vec.cb
+status 1
+stderr-has diag.reference-escapes-scope
+stderr-has `src`
+file escape_struct.cb
+import std;
+
+struct Tok
+{
+    StringView text;
+}
+
+fn lex() : Vec<Tok>
+{
+    String src = sprintf("%s %s", "hello", "world");
+    Vec<Tok> out = Vec::new();
+    foreach (w in StringView::split_whitespace(&src))
+    {
+        Vec::push(&mut out, Tok { .text = w });
+    }
+    out
+}
+
+fn main()
+{
+    Vec<Tok> toks = lex();
+    printf("%v\n", Vec::len(&toks));
+}
+end
+run $COBC --check escape_struct.cb
+status 1
+stderr-has diag.reference-escapes-scope
+# ... while views of a parameter's text are returned.
+file views_of_param.cb
+import std;
+
+struct Tok
+{
+    StringView text;
+}
+
+fn lex(StringView src) : Vec<Tok>
+{
+    Vec<Tok> out = Vec::new();
+    foreach (w in StringView::split_whitespace(src))
+    {
+        Vec::push(&mut out, Tok { .text = w });
+    }
+    out
+}
+
+fn words(ref<String, shared> s) : Vec<StringView>
+{
+    StringView::split_whitespace(s)
+}
+
+fn main()
+{
+    String s = "a b c";
+    printf("%v %v\n", Vec::len(&lex(&s)), Vec::len(&words(&s)));
+}
+end
+run $COBC --run views_of_param.cb
+status 0
+stdout-is 3 3\n
+# 292: a binder or reference last named in one branch of a nested `if`
+# ends there after its last mention, in both forms.
+file binder_nested.cb
+import std;
+
+enum Mode
+{
+    Normal,
+    Insert(String),
+}
+
+struct Ed
+{
+    Mode mode;
+    Vec<String> lines;
+}
+
+fn finish(ref<Ed, exclusive> e, u8 k)
+{
+    match (&e.mode)
+    {
+        Normal      : {},
+        Insert(buf) :
+        {
+            if (k == b'\n')
+            {
+                Vec::push(&mut e.lines, String::clone(buf));
+                e.mode = Normal;
+            }
+        },
+    }
+}
+
+enum T
+{
+    Num(f64),
+    End,
+}
+
+struct P
+{
+    T cur;
+    u32 n;
+}
+
+fn advance(ref<P, exclusive> p)
+{
+    p.cur = End;
+    p.n += 1;
+}
+
+fn f(ref<P, exclusive> p, bool go) : f64
+{
+    if (T::Num(x) = &p.cur)
+    {
+        if (go)
+        {
+            f64 v = *x;
+            advance(p);
+            return v;
+        }
+    }
+    0.0
+}
+
+fn g(ref<P, exclusive> p, bool go) : f64
+{
+    if (T::Num(x) = &p.cur)
+    {
+        if (go)
+        {
+            advance(p);
+        }
+        else
+        {
+            f64 v = *x;
+            advance(p);
+            return v;
+        }
+    }
+    0.0
+}
+
+fn main()
+{
+    Ed e = Ed { .mode = Insert("hello"), .lines = Vec::new() };
+    finish(&mut e, b'\n');
+    P p = P { .cur = T::Num(2.5), .n = 0 };
+    P q = P { .cur = T::Num(1.5), .n = 0 };
+    f64 a = f(&mut p, true);
+    f64 b = g(&mut q, false);
+    printf("%v %v %v %v %v\n", Vec::len(&e.lines), a, p.n, b, q.n);
+}
+end
+run $COBC --run binder_nested.cb
+status 0
+stdout-is 1 2.5 1 1.5 1\n
+run $COBC --all-checks --run binder_nested.cb
+status 0
+stdout-is 1 2.5 1 1.5 1\n
+# ... and one named after the write in the same branch is still refused.
+file binder_nested_late.cb
+import std;
+
+enum Mode
+{
+    Normal,
+    Insert(String),
+}
+
+fn finish(ref<Mode, exclusive> m, bool k) : usize
+{
+    match (&*m)
+    {
+        Normal      : 0,
+        Insert(buf) :
+        {
+            if (k)
+            {
+                *m = Normal;
+                printf("%s\n", buf);
+                return 2;
+            }
+            1
+        },
+    }
+}
+
+fn main()
+{
+    Mode m = Insert("hello");
+    printf("%v\n", finish(&mut m, true));
+}
+end
+run $COBC --check binder_nested_late.cb
+status 1
+stderr-has still borrows
+# 293: `slice_len` of a borrowed `const` array.
+file const_len.cb
+import std;
+
+const array<str, 3> NAMES = ["a", "b", "c"];
+
+fn count(slice<str, shared> s) : usize
+{
+    slice_len(s)
+}
+
+fn main()
+{
+    printf("%v %v\n", count(&NAMES), slice_len(&NAMES));
+    foreach (i in 0..slice_len(&NAMES))
+    {
+        printf("%s", NAMES[i]);
+    }
+    printf("\n");
+}
+end
+run $COBC --run const_len.cb
+status 0
+stdout-is 3 3\nabc\n
+run $COBC --all-checks --run const_len.cb
+status 0
+stdout-is 3 3\nabc\n
+# 313: the same `&mut` lent to `spawn` on each round of a loop, the
+# handles kept past the round: refused, naming the binding.
+file lend_loop.cb
+import std;
+
+fn worker(ref<u64, exclusive> c)
+{
+    *c += 1;
+}
+
+fn main()
+{
+    u64 count = 0;
+    {
+        Vec<handle<void>> hs = Vec::new();
+        foreach (i in 0..4)
+        {
+            Vec::push(&mut hs, spawn(worker, &mut count));
+        }
+    }
+    printf("count %v\n", count);
+}
+end
+run $COBC --check lend_loop.cb
+status 1
+stderr-has `count` may still be lent exclusively to a thread
+# ... while a handle that ends with its round may lend it again.
+file lend_round.cb
+import std;
+
+fn worker(ref<u64, exclusive> c)
+{
+    *c += 1;
+}
+
+fn main()
+{
+    u64 count = 0;
+    foreach (i in 0..4)
+    {
+        auto h = spawn(worker, &mut count);
+        join(h);
+    }
+    printf("count %v\n", count);
+}
+end
+run $COBC --run lend_round.cb
+status 0
+stdout-is count 4\n
+# 318: a resource moved out of a lock guard, whole or a field: refused,
+# naming the exchange.
+file guard_move.cb
+import std;
+
+fn take_batch(ref<mutex<Vec<String>>, shared> queue) : Vec<String>
+{
+    auto g = lock(queue);
+    Vec<String> batch = *g;
+    batch
+}
+
+fn main()
+{
+    mutex<Vec<String>> queue = Mutex::new(Vec::new());
+    printf("%v\n", Vec::len(&take_batch(&queue)));
+}
+end
+run $COBC --check guard_move.cb
+status 1
+stderr-has diag.move-while-aliased
+stderr-has replace(&mut *g,
+file guard_field.cb
+import std;
+
+struct Job
+{
+    String name;
+    u32 tries;
+}
+
+fn main()
+{
+    mutex<Job> m = Mutex::new(Job { .name = "a", .tries = 0 });
+    auto g = lock(&m);
+    String n = g.name;
+    printf("%s\n", &n);
+}
+end
+run $COBC --check guard_field.cb
+status 1
+stderr-has diag.move-out-of-field
+stderr-has replace(&mut g.name, v)
+# ... and the exchange works.
+file guard_replace.cb
+import std;
+
+fn take_batch(ref<mutex<Vec<String>>, shared> queue) : Vec<String>
+{
+    auto g = lock(queue);
+    replace(&mut *g, Vec::new())
+}
+
+fn main()
+{
+    mutex<Vec<String>> queue = Mutex::new(Vec::new());
+    {
+        auto g = lock(&queue);
+        Vec::push(&mut *g, "job");
+    }
+    Vec<String> b = take_batch(&queue);
+    printf("%v\n", Vec::len(&b));
+}
+end
+run $COBC --run guard_replace.cb
+status 0
+stdout-is 1\n
+# 320: a closure that captures nothing may be spawned without `move`.
+file spawn_nocapture.cb
+import std;
+
+fn main()
+{
+    AtomicBool flag = AtomicBool::new(false);
+    {
+        auto h = spawn([](ref<AtomicBool, shared> f) { AtomicBool::store(f, true); }, &flag);
+    }
+    printf("%v\n", AtomicBool::load(&flag));
+}
+end
+run $COBC --run spawn_nocapture.cb
+status 0
+stdout-is true\n
+run $COBC --all-checks --run spawn_nocapture.cb
+status 0
+stdout-is true\n
+# 346: `==` of two references to a `T: eq` is identity, warned of.
+file ref_identity.cb
+import std;
+
+fn contains<T: eq>(slice<T, shared> xs, ref<T, shared> v) : bool
+{
+    foreach (x in xs)
+    {
+        if (x == v)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn main()
+{
+    Vec<String> w = Vec::new();
+    Vec::push(&mut w, "b");
+    String s = "b";
+    printf("%v\n", contains(&w, &s));
+}
+end
+run $COBC --check ref_identity.cb
+status 0
+stderr-has warning[diag.reference-identity]
+stderr-has `*x == *v`

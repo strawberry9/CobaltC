@@ -1,0 +1,92 @@
+// CONFORMANCE-CASE
+// spec: 08-alias-validity
+// facility: conf.shared-reaches-exclusive-reads; spec/08 [Read-Ref-Through-Shared], [Read-Fn-Through-Shared] (D-0218, CHG-0257)
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 3133330a3133370a320a370a360a330a33300a
+//
+// Through a shared reference to a struct holding exclusive references, the
+// program reads: `*s.inner`, a copy `auto r = s.inner` (a shared
+// reference), `s.inner` and `s.part` passed where shared ones are expected,
+// and a shared reference returned. Through an exclusive reference it
+// writes. A struct the program owns is copied with its exclusive reference.
+// A `mutex` gives an exclusive lock path through a shared reference. A
+// closure that only reads its captures, or owns them (`move`), may be
+// called through a shared reference.
+
+import std;
+
+struct S
+{
+    ref<i32, exclusive> inner;
+    slice<i32, exclusive> part;
+    i32 n;
+}
+
+struct H
+{
+    fn(i32) : i32 f;
+}
+
+fn peek(ref<i32, shared> r) : i32
+{
+    *r
+}
+
+fn first(slice<i32, shared> s) : i32
+{
+    s[0]
+}
+
+fn look(ref<S, shared> s) : i32
+{
+    auto r = s.inner;
+    auto p = s.part;
+    *s.inner + *r + peek(s.inner) + first(s.part) + p[1] + s.n
+}
+
+fn give(ref<S, shared> s) : ref<i32, shared>
+{
+    s.inner
+}
+
+fn bump(ref<S, exclusive> s)
+{
+    *s.inner = *s.inner + 1;
+    s.part[0] = s.part[0] + 1;
+}
+
+fn call(ref<H, shared> h) : i32
+{
+    auto g = h.f;
+    g(1) + (h.f)(2)
+}
+
+fn main()
+{
+    i32 x = 1;
+    array<i32, 2> a = [10, 20];
+    S s = S { .inner = &mut x, .part = &mut a[0..2], .n = 100 };
+    printf("%v\n", look(&s));
+    bump(&mut s);
+    printf("%v\n", look(&s));
+    printf("%v\n", *give(&s));
+    S t = s;
+    *t.inner = 7;
+    printf("%v\n", *t.inner);
+    i32 y = 5;
+    mutex<S> m = Mutex::new(S { .inner = &mut y, .part = &mut a[0..1], .n = 0 });
+    {
+        auto g = lock(&m);
+        *g.inner = 6;
+    }
+    printf("%v\n", *lock(&m).inner);
+    i32 z = 0;
+    {
+        H h = H { .f = [z](i32 v) : i32 { v + z } };
+        printf("%v\n", call(&h));
+    }
+    i32 k = 10;
+    H p = H { .f = move [k](i32 v) : i32 { v * k } };
+    printf("%v\n", call(&p));
+}

@@ -1,0 +1,2398 @@
+// The typer (`typer.cb`): calls and closures.
+//
+// Each function mirrors the typing half of the lowering function named in
+// its comment: what decides the type of the value the lowering returns, and
+// the expected type it hands each operand. Nothing here emits, names a
+// temporary, requests a function or asks for a type descriptor.
+//
+// Closures. The lowering records a closure it lowers in `Gen::closures`
+// under an id of its name counter; the typer records each closure literal it
+// types in `Gen::tclosures` under an id of its own (`TYPER_CLOSURE` set, a
+// bit no id of the lowering has), with the same `ClosureInfo` (no C name).
+// `state::closure_info` reads a record of either kind, and through it
+// `closure_as_fn`, `closure_fn_ty`, `closure_fields` (the type predicates)
+// and the call of a closure value serve both.
+//
+// `type_return` (`lower_return`) is here too: `type_closure_result` reads
+// the type of the first value a `return` in a closure's body gives.
+
+import std;
+import ast;
+import items;
+import each;
+import state;
+import cnames;
+import typeops;
+import layout;
+import uses;
+import bodies;
+import gen;
+import typer;
+import typer_place;
+import typer_flow;
+import reach;
+
+// The bit of a closure id the typer gives (`closure_id` uses the low 56).
+const u64 TYPER_CLOSURE = 9223372036854775808;
+
+// A sub-lowering whose type decides nothing: asked, as the lowering lowers
+// it, and its answer (or its gap) left aside.
+fn visit(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> a, Option<ref<Type, shared>> expected)
+{
+    _ = type_of(g, x, a, expected);
+}
+
+// Whether the last query's `None` stands for a probe of the lowering that
+// fails (`Fx::probe_failed`), not for a construct the typer does not type.
+fn probe_failed(ref<Gen, shared> g) : bool
+{
+    StringView::starts_with(&g.typer_why, "error:")
+}
+
+// `*a` as the lowering builds it (`renumbered`, `synth`): a copy of `a`
+// under a dereference, its nodes numbered by the typer's own ids.
+fn private_deref(ref<Gen, exclusive> g, ref<Expr, shared> a) : Expr
+{
+    Expr d = Expr { .kind = ExprKind::EDeref(Box::new(clone(a))), .line = a.line, .col = a.col, .id = 0, .lit = false };
+    number_expr(&mut d, &mut g.typer_synth);
+    d
+}
+
+// `segs(args...)` as the lowering builds it, numbered by the typer's ids.
+fn private_call(ref<Gen, exclusive> g, Vec<String> segs, Vec<Expr> cargs, usize line, usize col) : Expr
+{
+    Expr callee = Expr { .kind = ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), .line = line, .col = col, .id = 0, .lit = false };
+    Expr call = Expr { .kind = ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = cargs })), .line = line, .col = col, .id = 0, .lit = false };
+    number_expr(&mut call, &mut g.typer_synth);
+    call
+}
+
+fn rawptr_of_ty(Type t) : Type
+{
+    Type::TRawptr(Box::new(t))
+}
+
+fn option_of(Type t) : Type
+{
+    Vec<Type> a = Vec::new();
+    Vec::push(&mut a, t);
+    named("std::Option", a)
+}
+
+// `lower_expr_inner`'s `ECall` arm and `lower_call_expr`.
+export fn type_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<CallExpr, shared> c = match (&e.kind)
+    {
+        ExprKind::ECall(cb) : Box::get(cb),
+        _                   : return typer_gap(g, "error:not-a-call"),
+    };
+    // D-0309: a self tail call is lowered as a jump in a body that records
+    // nothing (`Fx::self_tail_now`).
+    bool tail = !x.tracked && Vec::len(&x.tail_targets) > 0 && HashSet::contains(&g.prog.facts.self_tails, e.id);
+    match (&c.callee.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            // `reclaim<T>(p)` is a place, read.
+            if (Vec::len(&Box::get(p).segs) == 1 && Box::get(p).segs[0] == "reclaim")
+            {
+                return type_place(g, x, e);
+            }
+        },
+        _                  : {},
+    }
+    type_call_of(g, x, &c.callee, &c.args, expected, e.line, tail)
+}
+
+// `lower_call`: what the callee is.
+fn type_call_of(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> callee,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    usize line,
+    bool tail,
+) : Option<Type>
+{
+    ref<PathExpr, shared> path = match (&callee.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return type_call_value(g, x, callee, args),
+    };
+    if (Vec::len(&path.segs) == 1 && is_bound(x, &path.segs[0]))
+    {
+        // The place's type, not the binding's.
+        Type pt = type_place(g, x, callee)?;
+        return type_callable(g, x, &pt, args);
+    }
+    String name = String::join(&path.segs, "::");
+    match (variant_of(g, &path.segs))
+    {
+        Some(vr) :
+        {
+            if (!HashMap::contains(&g.prog.table.fns, &name) && Vec::len(args) == 1)
+            {
+                return type_variant(g, x, &vr.ename, vr.vi, &path.targs, Some(&args[0]), expected);
+            }
+        },
+        None     : {},
+    }
+    match (get_fn(g, &name))
+    {
+        Some(f) :
+        {
+            // The walk (`reach.cb`): the call's site, for its point checks
+            // (`lower_call` sets `Fx::pc_site`).
+            if (g.reach_on)
+            {
+                note_site(g, callee.line, callee.col);
+            }
+            Option<Type> t = type_user_call(g, x, &name, &f, &path.targs, args, expected, tail);
+            give_fn(g, &name, f);
+            return t;
+        },
+        None    : {},
+    }
+    if (HashMap::contains(&g.prog.table.externs, &name))
+    {
+        return type_std_extern(g, x, &name, args);
+    }
+    type_intrinsic(g, x, &name, &path.targs, args, expected, line, tail)
+}
+
+// A call of a value of type `t`: a `fn` value (`call_fn_value`) or a
+// closure (`call_closure_place`).
+fn type_callable(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Type, shared> t,
+    ref<Vec<Expr>, shared> args,
+) : Option<Type>
+{
+    match (t)
+    {
+        Type::TFn(ft)      : type_fn_call(g, x, Box::get(ft), args),
+        Type::TClosure(id) : type_closure_call(g, x, *id, args),
+        _                  : typer_gap(g, "error:call-of-a-non-callable"),
+    }
+}
+
+// `lower_call_value`: a callee that is not a path.
+fn type_call_value(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> callee,
+    ref<Vec<Expr>, shared> args,
+) : Option<Type>
+{
+    ref<Expr, shared> bare = strip_parens(callee);
+    bool placeish = match (&bare.kind)
+    {
+        ExprKind::EField(_) : true,
+        ExprKind::EIndex(_) : true,
+        ExprKind::EDeref(_) : true,
+        _                   : false,
+    };
+    if (placeish)
+    {
+        // `probe_place_type`, then the place itself where it holds a `fn`
+        // value (`call_fn_place`).
+        g.typer_probing += 1;
+        Option<Type> probed = type_place(g, x, bare);
+        g.typer_probing -= 1;
+        Type pt = probed?;
+        if (is_fn_type(&pt))
+        {
+            Type p = type_place(g, x, bare)?;
+            return type_callable(g, x, &p, args);
+        }
+    }
+    Type v = type_of(g, x, callee, None)?;
+    if (is_never(&v))
+    {
+        return Some(Type::TNever);
+    }
+    type_callable(g, x, &v, args)
+}
+
+// `lower_args`: each argument at its parameter's type; whether one diverges.
+fn type_args(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Vec<Type>, shared> ptypes,
+    ref<Vec<Expr>, shared> args,
+) : Option<bool>
+{
+    for (usize i = 0; i < Vec::len(ptypes) && i < Vec::len(args); i += 1)
+    {
+        Type v = type_of(g, x, &args[i], Some(&ptypes[i]))?;
+        if (is_never(&v))
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+// `call_fn_value` (`finish_call` gives the result type as it is).
+fn type_fn_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<FnTy, shared> ft,
+    ref<Vec<Expr>, shared> args,
+) : Option<Type>
+{
+    bool diverged = type_args(g, x, &ft.params, args)?;
+    if (diverged)
+    {
+        return Some(Type::TNever);
+    }
+    Some(clone(&ft.ret))
+}
+
+// The signature of closure `id`, the lowering's or the typer's.
+fn closure_sig(ref<Gen, shared> g, u64 id) : Option<FnTy>
+{
+    match (closure_info(g, id))
+    {
+        Some(info) : Some(FnTy { .params = clone(&info.params), .ret = clone(&info.ret) }),
+        None       : None,
+    }
+}
+
+// `call_closure_place`.
+fn type_closure_call(ref<Gen, exclusive> g, ref<Fx, exclusive> x, u64 id, ref<Vec<Expr>, shared> args) : Option<Type>
+{
+    Option<FnTy> sig = closure_sig(g, id);
+    match (&sig)
+    {
+        Some(ft) : type_fn_call(g, x, ft, args),
+        None     : typer_gap(g, "error:call-of-a-closure-not-lowered"),
+    }
+}
+
+// CHG-0237 (`fresh_shared_vec_arg`): `&x` of a local (or of fields of one)
+// `Vec` of plain, non-zero-sized elements, no other argument naming `x`.
+fn fresh_shared_vec(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> a,
+    usize j,
+    ref<Vec<Expr>, shared> args,
+) : Option<bool>
+{
+    ref<BorrowExpr, shared> bb = match (&a.kind)
+    {
+        ExprKind::EBorrow(b) : Box::get(b),
+        _                    : return Some(false),
+    };
+    if (bb.mode != Mode::Shared)
+    {
+        return Some(false);
+    }
+    ref<Expr, shared> root = &bb.e;
+    while (true)
+    {
+        match (&root.kind)
+        {
+            ExprKind::EField(fe) : root = &Box::get(fe).e,
+            ExprKind::EParen(pe) : root = Box::get(pe),
+            _                    : break,
+        }
+    }
+    match (&root.kind)
+    {
+        ExprKind::EDeref(d) : root = strip_parens(Box::get(d)),
+        _                   : {},
+    }
+    ref<PathExpr, shared> pe = match (&root.kind)
+    {
+        ExprKind::EPath(pp) : Box::get(pp),
+        _                   : return Some(false),
+    };
+    if (Vec::len(&pe.segs) != 1 || Vec::len(&pe.targs) != 0 || !is_bound(x, &pe.segs[0]))
+    {
+        return Some(false);
+    }
+    for (usize k = 0; k < Vec::len(args); k += 1)
+    {
+        if (k != j && mentions(&args[k], &pe.segs[0]))
+        {
+            return Some(false);
+        }
+    }
+    Type ty = type_probe(g, x, &bb.e, None)?;
+    Some(match (&ty)
+    {
+        Type::TNamed(n) :
+        {
+            ref<NamedTy, shared> nt = Box::get(n);
+            nt.name == "std::Vec" && Vec::len(&nt.args) == 1 && plain_data(
+                g,
+                &nt.args[0],
+            ) && size_align(g, &nt.args[0]).size != 0
+        },
+        _               : false,
+    })
+}
+
+// The row of the confining table for `name` (`confining_row`), where the
+// table is built already: the typer does not build it.
+fn confining_row_built(ref<Gen, shared> g, ref<String, shared> name) : Option<Vec<bool>>
+{
+    match (&g.confining)
+    {
+        Some(t) : match (HashMap::get(t, name))
+        {
+            Some(r) : Some(clone(r)),
+            None    : Some(Vec::new()),
+        },
+        None : None,
+    }
+}
+
+// `lower_user_call_access`: a call of the function `name`, declared `f`.
+// The shortcuts (`lower_call_shortcut`, `lower_vec_index_pre`, the direct
+// arguments, `native_elem_access`) give the general path's type.
+fn type_user_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    bool tail,
+) : Option<Type>
+{
+    ref<Vec<String>, shared> tps = &f.type_params;
+    HashMap<String, Type> m = HashMap::new();
+    for (usize k = 0; k < Vec::len(tps) && k < Vec::len(targs); k += 1)
+    {
+        HashMap::insert(&mut m, String::clone(&tps[k]), apply(&targs[k], &x.subst));
+    }
+    match (expected)
+    {
+        Some(exp) : unify(&f.ret, exp, tps, &mut m),
+        None      : {},
+    }
+    // Confined vectors passed to confining parameters (`mask`), and shared
+    // borrows of a vector formed here for one (`fresh_m`).
+    Option<Vec<bool>> row = confining_row_built(g, name);
+    Vec<bool> conf = match (&row)
+    {
+        Some(r) : clone(r),
+        None    : Vec::new(),
+    };
+    u64 mask = 0;
+    u64 fresh_m = 0;
+    u64 one = 1;
+    for (usize j = 0; j < Vec::len(args) && j < 64; j += 1)
+    {
+        bool cj = j < Vec::len(&conf) && conf[j];
+        if (!cj)
+        {
+            continue;
+        }
+        if (Option::is_some(&confined_local(x, &args[j])))
+        {
+            mask = mask | (one << narrow<u32>(j));
+        }
+        else if (is_shared_ref(&f.params[j].ty))
+        {
+            bool fresh = fresh_shared_vec(g, x, &args[j], j, args)?;
+            if (fresh)
+            {
+                mask = mask | (one << narrow<u32>(j));
+                fresh_m = fresh_m | (one << narrow<u32>(j));
+            }
+        }
+    }
+    // D-0079: an unsuffixed literal whose parameter type is not yet known
+    // waits for the other arguments; so does a payload-less variant.
+    Vec<usize> deferred = Vec::new();
+    Vec<usize> order = Vec::new();
+    usize np = if (Vec::len(&f.params) < Vec::len(args)) { Vec::len(&f.params) } else { Vec::len(args) };
+    for (usize k = 0; k < np; k += 1)
+    {
+        Vec::push(&mut order, k);
+    }
+    Type us = usize_ty();
+    usize k = 0;
+    while (k < Vec::len(&order))
+    {
+        usize j = order[k];
+        k += 1;
+        ref<ParamDecl, shared> p = &f.params[j];
+        ref<Expr, shared> a = &args[j];
+        bool in_mask = j < 64 && ((mask >> narrow<u32>(j)) & 1) != 0;
+        if (!Vec::contains(&deferred, j) && is_bare_num_literal(a) && !resolved(&apply(&p.ty, &m), tps) && !in_mask)
+        {
+            Vec::push(&mut deferred, j);
+            Vec::push(&mut order, j);
+            continue;
+        }
+        if (is_bare_variant(g, x, a) && !resolved(&apply(&p.ty, &m), tps) && !in_mask && count_of(&deferred, j) < 2)
+        {
+            Vec::push(&mut deferred, j);
+            Vec::push(&mut order, j);
+            continue;
+        }
+        // A shared borrow formed here: lowered with no type expected.
+        if (j < 64 && ((fresh_m >> narrow<u32>(j)) & 1) != 0)
+        {
+            Type fv = type_of(g, x, a, None)?;
+            if (is_never(&fv))
+            {
+                return Some(Type::TNever);
+            }
+            unify(&p.ty, &fv, tps, &mut m);
+            continue;
+        }
+        // A confined vector for a reference parameter (`confined_local`):
+        // passed as its address where the parameter confines it (`mask`),
+        // and read where it is by the shortcuts that take the call
+        // otherwise. It is not lowered as a value (a confined parameter is
+        // no binding at all); its type is a reference of the parameter's
+        // mode to a `Vec` of its elements, which is its borrow's type but
+        // for the mode, and `unify` does not read a mode.
+        if (in_mask || is_ref_type(&p.ty))
+        {
+            match (confined_local(x, a))
+            {
+                Some(cv) :
+                {
+                    Mode cm = match (&p.ty)
+                    {
+                        Type::TRef(r) : Box::get(r).mode,
+                        _             : return typer_gap(g, "error:confining-parameter-not-a-reference"),
+                    };
+                    Vec<Type> ea = Vec::new();
+                    Vec::push(&mut ea, clone(&cv.elem));
+                    Type cty = ref_ty(named("std::Vec", ea), cm);
+                    unify(&p.ty, &cty, tps, &mut m);
+                    continue;
+                },
+                None     :
+                {
+                    if (in_mask)
+                    {
+                        return typer_gap(g, "error:confined-argument");
+                    }
+                },
+            }
+        }
+        Type hint = apply(&p.ty, &m);
+        // A type parameter this argument cannot fix by itself: the later
+        // arguments' types fix it first. They are probed.
+        if (!resolved(&hint, tps) && !is_bare_num_literal(a))
+        {
+            for (usize l = j + 1; l < np; l += 1)
+            {
+                if (!probe_safe(&args[l]) || (l < 64 && ((mask >> narrow<u32>(l)) & 1) != 0))
+                {
+                    continue;
+                }
+                Type lh = apply(&f.params[l].ty, &m);
+                Option<Type> probed = if (resolved(
+                    &lh,
+                    tps,
+                )) { type_probe(g, x, &args[l], Some(&lh)) } else { type_probe(g, x, &args[l], None) };
+                Type lt = match (probed)
+                {
+                    Some(t) : t,
+                    None    :
+                    {
+                        // A probe that fails is skipped (`probe_try`).
+                        if (probe_failed(g))
+                        {
+                            continue;
+                        }
+                        return None;
+                    },
+                };
+                if (is_closure(&lt) && !is_fn_type(&f.params[l].ty))
+                {
+                    continue;
+                }
+                Type lu = closure_as_fn(g, &f.params[l].ty, &lt);
+                unify(&f.params[l].ty, &lu, tps, &mut m);
+            }
+            hint = apply(&p.ty, &m);
+        }
+        bool known = resolved(&hint, tps);
+        bool is_index = j == 1 && (*name == "std::Vec::index_shared" || *name == "std::Vec::index_exclusive");
+        Option<Type> lowered = if (is_index)
+        {
+            // `lower_index_arg`.
+            type_of(g, x, a, Some(&us))
+        }
+        else if (known)
+        {
+            type_of(g, x, a, Some(&hint))
+        }
+        else if (is_ctor_expr(g, x, a))
+        {
+            // Bug 040: a generic constructor takes what the parameter's type
+            // fixes already (`Gen::hint_params`). The lowering's own value is
+            // put back: the typer leaves the lowering's state as it found it.
+            Vec<String> saved = replace(&mut g.hint_params, Vec::clone(tps));
+            Option<Type> ct = type_of(g, x, a, Some(&hint));
+            g.hint_params = saved;
+            ct
+        }
+        else
+        {
+            type_of(g, x, a, None)
+        };
+        Type v = lowered?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        // A closure fixes a `fn(...) : R` parameter's type parameters by its
+        // signature (D-0073).
+        Type p_now = apply(&p.ty, &m);
+        Type vu = closure_as_fn(g, &p_now, &v);
+        unify(&p.ty, &vu, tps, &mut m);
+    }
+    Vec<Type> inst = Vec::new();
+    foreach (tp in tps)
+    {
+        match (HashMap::get(&m, tp))
+        {
+            Some(t) : Vec::push(&mut inst, clone(t)),
+            None    : return typer_gap(g, "error:cannot-infer"),
+        }
+    }
+    // The walk (`reach.cb`): the instance `lower_user_call_access` requests.
+    if (g.reach_on)
+    {
+        note_call(g, name, &inst);
+    }
+    HashMap<String, Type> fsub = subst_of(tps, &inst);
+    // D-0309: a self tail call is a jump where the C name the call asks is
+    // one this body may jump for (`Fx::tail_targets`), no borrow was formed
+    // for it (`fresh_m`) and every parameter has its argument.
+    if (tail && fresh_m == 0 && Vec::len(args) >= Vec::len(&f.params))
+    {
+        // The name: the variant for the confined arguments; its direct twin
+        // (`direct_local_call`, `zero_token_call`: not typed, they read the
+        // arguments' C text), else the name itself where the reference
+        // arguments are vouched for (`vouched_args`), else its `__arrive`
+        // twin, which is never a target.
+        if (Option::is_none(&row))
+        {
+            return typer_gap(g, "call:self-tail-before-the-confining-table");
+        }
+        String plain = if (mask == 0)
+        {
+            fn_cname(
+                name,
+                &inst,
+            )
+        }
+        else { sprintf("%s_c%v", &fn_cname(name, &inst), mask) };
+        String direct = sprintf("%s__dir", &plain);
+        bool plain_target = false;
+        bool direct_target = false;
+        foreach (tt in &x.tail_targets)
+        {
+            plain_target = plain_target || *tt == plain;
+            direct_target = direct_target || *tt == direct;
+        }
+        bool ref_param = false;
+        foreach (pd in &f.params)
+        {
+            ref_param = ref_param || is_ref_type(&pd.ty);
+        }
+        // No direct twin is asked: `direct_dispatched` answers none, or
+        // every reference parameter's argument is a place (a name, a field,
+        // an element, a dereference), which reaches the call in a temporary
+        // (`into_temp`), not as the borrow of a local or the token-0
+        // reference the twin is asked for.
+        bool places = true;
+        for (usize j = 0; j < Vec::len(&f.params) && j < Vec::len(args); j += 1)
+        {
+            if (is_ref_type(&f.params[j].ty) && !is_place_kind(&args[j]))
+            {
+                places = false;
+            }
+        }
+        // Nor where the callee has no direct twin at all (`direct_dispatched`,
+        // the question `direct_local_call` and `zero_token_call` ask first).
+        bool twins = Option::is_some(&direct_dispatched(g, x, name, f, &inst, mask, Vec::len(args)));
+        bool no_twin = !twins || !ref_param || places;
+        bool vouched = vouched_args(g, x, f, &inst, args);
+        bool jump_plain = vouched && plain_target;
+        if (!no_twin && jump_plain != direct_target)
+        {
+            // The name depends on the arguments' C text (`zero_token_call`):
+            // in the direct twin's body with arguments not vouched for, in
+            // the checked twin's with arguments vouched for. Under
+            // `COBALTC_TYPER=check`, compared with what `lower_expr` computes,
+            // it is a gap. Where the typer answers a question of the
+            // lowering, the answer is the result type: right where the call
+            // is a call, and on the safe side where it is a jump (what takes
+            // the answer makes room for a value the lowering then never
+            // gives).
+            if (g.typer_check && g.typer_probing == 0)
+            {
+                return typer_gap(g, "call:self-tail-twin");
+            }
+            return Some(apply(&f.ret, &fsub));
+        }
+        if (jump_plain)
+        {
+            return Some(Type::TNever);
+        }
+    }
+    Some(apply(&f.ret, &fsub))
+}
+
+// A call of the `std` function `helper` an intrinsic stands for.
+fn type_helper_call(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    str helper,
+    ref<Vec<Type>, shared> targs,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    bool tail,
+) : Option<Type>
+{
+    String key = String::copy(helper);
+    match (get_fn(g, &key))
+    {
+        Some(f) :
+        {
+            Option<Type> t = type_user_call(g, x, &key, &f, targs, args, expected, tail);
+            give_fn(g, &key, f);
+            t
+        },
+        None    : typer_gap(g, "error:no-such-helper"),
+    }
+}
+
+// `extern_args`: each argument at its hint (`u` a `usize`, `6` a `u64`,
+// `i` an `i64`, `-` none); no argument's type decides anything.
+fn visit_extern_args(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared> args, str pattern)
+{
+    Vec<Option<Type>> hs = hints(pattern);
+    for (usize k = 0; k < Vec::len(args); k += 1)
+    {
+        if (k < Vec::len(&hs))
+        {
+            match (&hs[k])
+            {
+                Some(t) : visit(g, x, &args[k], Some(t)),
+                None    : visit(g, x, &args[k], None),
+            }
+        }
+        else
+        {
+            visit(g, x, &args[k], None);
+        }
+    }
+}
+
+// `lower_std_extern` and `lower_extern_call`.
+fn type_std_extern(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<Vec<Expr>, shared> args,
+) : Option<Type>
+{
+    Type isz = Type::TInt(IntTy::Isize);
+    Type i64t = Type::TInt(IntTy::I64);
+    if (*name == "std::stdout_write" || *name == "std::stderr_write")
+    {
+        visit_extern_args(g, x, args, "-u");
+        return Some(isz);
+    }
+    if (*name == "std::file_read" || *name == "std::file_write")
+    {
+        visit_extern_args(g, x, args, "-u-u");
+        return Some(isz);
+    }
+    if (*name == "std::file_op" || *name == "std::task_op")
+    {
+        visit_extern_args(g, x, args, "uu-u");
+        return Some(isz);
+    }
+    if (*name == "std::fs_op" || *name == "std::fs_query")
+    {
+        visit_extern_args(g, x, args, "u-u-u");
+        return Some(isz);
+    }
+    if (*name == "std::event_op")
+    {
+        visit_extern_args(g, x, args, "uuu");
+        return Some(usize_ty());
+    }
+    if (*name == "std::clock_read")
+    {
+        visit_extern_args(g, x, args, "u");
+        return Some(i64t);
+    }
+    if (*name == "std::thread_id")
+    {
+        return Some(Type::TInt(IntTy::U64));
+    }
+    if (*name == "std::tz_offset")
+    {
+        visit_extern_args(g, x, args, "i");
+        return Some(i64t);
+    }
+    if (*name == "std::sleep_ns")
+    {
+        visit_extern_args(g, x, args, "6");
+        return Some(i64t);
+    }
+    if (*name == "std::file_at")
+    {
+        visit_extern_args(g, x, args, "uu6");
+        return Some(i64t);
+    }
+    if (*name == "std::arg_bytes")
+    {
+        visit_extern_args(g, x, args, "u-u");
+        return Some(isz);
+    }
+    if (*name == "std::stdin_read")
+    {
+        visit_extern_args(g, x, args, "-u");
+        return Some(isz);
+    }
+    Option<ExternDecl> found = match (HashMap::get(&g.prog.table.externs, name))
+    {
+        Some(d) : Some(clone(d)),
+        None    : None,
+    };
+    ExternDecl ext = match (found)
+    {
+        Some(d) : d,
+        None    : return typer_gap(g, "error:no-such-extern"),
+    };
+    // D-0141..D-0144: the runtime's primitives private to `std`, the
+    // arguments as the declaration types them (a raw pointer's with none).
+    bool runtime = *name == "std::path_op" || *name == "std::proc_op" || *name == "std::net_op" || *name == "std::os_random"
+        || *name == "std::stdout_flush" || *name == "std::stdin_read_line";
+    if (runtime)
+    {
+        for (usize k = 0; k < Vec::len(&ext.params) && k < Vec::len(args); k += 1)
+        {
+            bool raw = match (&ext.params[k].ty)
+            {
+                Type::TRawptr(_) : true,
+                _                : false,
+            };
+            if (raw)
+            {
+                visit(g, x, &args[k], None);
+            }
+            else
+            {
+                visit(g, x, &args[k], Some(&ext.params[k].ty));
+            }
+        }
+        return Some(clone(&ext.ret));
+    }
+    // `lower_extern_call`: a declared C function.
+    for (usize k = 0; k < Vec::len(&ext.params) && k < Vec::len(args); k += 1)
+    {
+        Type v = type_of(g, x, &args[k], Some(&ext.params[k].ty))?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+    }
+    if (ext.variadic)
+    {
+        for (usize k = Vec::len(&ext.params); k < Vec::len(args); k += 1)
+        {
+            Type v = type_of(g, x, &args[k], None)?;
+            if (is_never(&v))
+            {
+                return Some(Type::TNever);
+            }
+        }
+    }
+    if (is_void(&ext.ret))
+    {
+        return Some(Type::TVoid);
+    }
+    Some(clone(&ext.ret))
+}
+
+// `lower_operands`: the type of the first operand of a two-operand
+// intrinsic (a bare literal takes the other's type, so the other goes
+// first); `never` when one diverges.
+fn type_operands(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> l,
+    ref<Expr, shared> r,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    Option<Type> exp = match (expected)
+    {
+        Some(t) :
+        {
+            match (t)
+            {
+                Type::TNamed(n) :
+                {
+                    if (Box::get(n).name == "std::Option" && Vec::len(&Box::get(n).args) == 1)
+                    {
+                        Some(clone(&Box::get(n).args[0]))
+                    }
+                    else
+                    {
+                        Some(clone(t))
+                    }
+                },
+                _               : Some(clone(t)),
+            }
+        },
+        None    : None,
+    };
+    if (is_bare_literal(l) && !is_bare_literal(r))
+    {
+        Option<Type> rv0 = match (&exp)
+        {
+            Some(t) : type_of(g, x, r, Some(t)),
+            None    : type_of(g, x, r, None),
+        };
+        Type rv = rv0?;
+        if (is_never(&rv))
+        {
+            return Some(Type::TNever);
+        }
+        return type_of(g, x, l, Some(&rv));
+    }
+    Option<Type> lv0 = match (&exp)
+    {
+        Some(t) : type_of(g, x, l, Some(t)),
+        None    : type_of(g, x, l, None),
+    };
+    Type lv = lv0?;
+    if (is_never(&lv))
+    {
+        return Some(Type::TNever);
+    }
+    Type rv = type_of(g, x, r, Some(&lv))?;
+    if (is_never(&rv))
+    {
+        return Some(Type::TNever);
+    }
+    Some(lv)
+}
+
+// `lower_fmt` (`$fmt`): the format, then each argument with no type
+// expected; a reference to a number, `bool`, `str` or `StringView` is
+// formatted as the value it refers to.
+fn type_fmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared> args) : Option<Type>
+{
+    visit(g, x, &args[0], None);
+    for (usize k = 1; k < Vec::len(args); k += 1)
+    {
+        ref<Expr, shared> a0 = &args[k];
+        // `&s` of a `String` local read where it is formatted: not lowered.
+        if (Option::is_some(&fmt_direct_string(g, x, args, a0)))
+        {
+            continue;
+        }
+        Type at = type_probe(g, x, a0, None)?;
+        bool deref = match (&at)
+        {
+            Type::TRef(rm) :
+            {
+                match (&Box::get(rm).inner)
+                {
+                    Type::TInt(_)    : true,
+                    Type::TF32       : true,
+                    Type::TF64       : true,
+                    Type::TBool      : true,
+                    Type::TStr       : true,
+                    Type::TNamed(nb) : Box::get(nb).name == "std::StringView",
+                    _                : false,
+                }
+            },
+            _              : false,
+        };
+        Type v = if (deref)
+        {
+            Expr held = private_deref(g, a0);
+            type_of(g, x, &held, None)?
+        }
+        else
+        {
+            type_of(g, x, a0, None)?
+        };
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+    }
+    Some(Type::TStr)
+}
+
+// `lower_intrinsic`, `lower_intrinsic_numeric`, `lower_intrinsic_raw` and
+// `lower_intrinsic_more`: the compiler's own functions. One not typed yet
+// is its own gap (`intrinsic:<name>`).
+fn type_intrinsic(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<Vec<Type>, shared> targs,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    usize line,
+    bool tail,
+) : Option<Type>
+{
+    Type us = usize_ty();
+    Type u8t = Type::TInt(IntTy::U8);
+    Type u32t = Type::TInt(IntTy::U32);
+    Type u64t = Type::TInt(IntTy::U64);
+    Type strt = Type::TStr;
+    if (StringView::starts_with(name, "simd_"))
+    {
+        return type_simd(g, x, name, targs, args, expected);
+    }
+    if (*name == "spawn")
+    {
+        return type_spawn(g, x, args);
+    }
+    if (*name == "atomic_op")
+    {
+        // `lower_atomic_op`.
+        Type av = type_of(g, x, &args[0], None)?;
+        if (is_never(&av))
+        {
+            return Some(Type::TNever);
+        }
+        u128 op = match (&strip_parens(&args[1]).kind)
+        {
+            ExprKind::EInt(il) : Box::get(il).v,
+            _                  : return typer_gap(g, "error:atomic-op-not-a-literal"),
+        };
+        Option<Type> cell = None;
+        match (&av)
+        {
+            Type::TRef(rm) : match (&Box::get(rm).inner)
+            {
+                Type::TNamed(n) :
+                {
+                    if (Vec::len(&Box::get(n).args) > 0)
+                    {
+                        Type ta = apply(&Box::get(n).args[0], &x.subst);
+                        if (Box::get(n).name == "std::Atomic")
+                        {
+                            match (&ta)
+                            {
+                                Type::TInt(_) : cell = Some(clone(&ta)),
+                                _             : {},
+                            }
+                        }
+                        else if (Box::get(n).name == "std::AtomicPtr" && op <= 3)
+                        {
+                            cell = Some(rawptr_of_ty(ta));
+                        }
+                    }
+                },
+                _               : {},
+            },
+            _ : {},
+        }
+        Type ty = match (cell)
+        {
+            Some(t) : t,
+            None    : return typer_gap(g, "error:atomic-op-on-a-non-atomic"),
+        };
+        Type xv = type_of(g, x, &args[2], Some(&ty))?;
+        if (is_never(&xv))
+        {
+            return Some(Type::TNever);
+        }
+        Type yv = type_of(g, x, &args[3], Some(&ty))?;
+        if (is_never(&yv))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(ty);
+    }
+    if (*name == "atomic_wait_op")
+    {
+        // `lower_atomic_wait_op`.
+        Type av = type_of(g, x, &args[0], None)?;
+        if (is_never(&av))
+        {
+            return Some(Type::TNever);
+        }
+        visit(g, x, &args[1], Some(&u8t));
+        Type seen = type_of(g, x, &args[2], Some(&u64t))?;
+        if (is_never(&seen))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(u64t);
+    }
+    if (*name == "cpu_op")
+    {
+        return Some(Type::TVoid);
+    }
+    if (*name == "join_status" || *name == "cancel")
+    {
+        Type hv = type_of(g, x, &args[0], None)?;
+        if (is_never(&hv))
+        {
+            return Some(Type::TNever);
+        }
+        if (*name == "cancel")
+        {
+            return Some(Type::TVoid);
+        }
+        visit(g, x, &args[1], Some(&u8t));
+        return Some(u64t);
+    }
+    if (*name == "join")
+    {
+        // `lower_join`: the handle's result.
+        Type hv = type_of(g, x, &args[0], None)?;
+        if (is_never(&hv))
+        {
+            return Some(Type::TNever);
+        }
+        return match (&hv)
+        {
+            Type::THandle(r) : Some(clone(Box::get(r))),
+            _                : typer_gap(g, "error:join-of-a-non-handle"),
+        };
+    }
+    if (*name == "lock")
+    {
+        // `lower_lock`: a guard of the mutex's value.
+        Type mv = type_of(g, x, &args[0], None)?;
+        if (is_never(&mv))
+        {
+            return Some(Type::TNever);
+        }
+        match (&mv)
+        {
+            Type::TRef(rm) : match (&Box::get(rm).inner)
+            {
+                Type::TMutex(i) : return Some(Type::TGuard(Box::new(clone(Box::get(i))))),
+                _               : {},
+            },
+            _ : {},
+        }
+        return typer_gap(g, "error:lock-of-a-non-mutex");
+    }
+    if (*name == "Mutex::new")
+    {
+        // `[Mutex-New]`: a mutex of the value's type.
+        Option<Type> hint = if (Vec::len(targs) > 0)
+        {
+            Some(apply(&targs[0], &x.subst))
+        }
+        else
+        {
+            match (expected)
+            {
+                Some(t) : match (t)
+                {
+                    Type::TMutex(i) : Some(clone(Box::get(i))),
+                    _               : None,
+                },
+                None : None,
+            }
+        };
+        Option<Type> v0 = match (&hint)
+        {
+            Some(h) : type_of(g, x, &args[0], Some(h)),
+            None    : type_of(g, x, &args[0], None),
+        };
+        Type v = v0?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(Type::TMutex(Box::new(v)));
+    }
+    if (*name == "std::Result::map_err")
+    {
+        // `lower_map_err`: `Result<T, E>` and a function of `E` give
+        // `Result<T, R>`, `R` the function's result.
+        Type rv = type_of(g, x, &args[0], None)?;
+        if (is_never(&rv))
+        {
+            return Some(Type::TNever);
+        }
+        Option<Type> ok_ty = match (&rv)
+        {
+            Type::TNamed(n) : if (Box::get(n).name == "std::Result" && Vec::len(&Box::get(n).args) == 2) { Some(clone(&Box::get(n).args[0])) } else { None },
+            _               : None,
+        };
+        Type t_ty = match (ok_ty)
+        {
+            Some(t) : t,
+            None    : return typer_gap(g, "error:cannot-infer"),
+        };
+        Type fv = type_of(g, x, &args[1], None)?;
+        Option<Type> e2 = match (&fv)
+        {
+            Type::TFn(ft) : Some(clone(&Box::get(ft).ret)),
+            Type::TClosure(id) : match (closure_sig(g, *id))
+            {
+                Some(sig) : Some(clone(&sig.ret)),
+                None      : None,
+            },
+            _             : None,
+        };
+        Vec<Type> oargs = Vec::new();
+        Vec::push(&mut oargs, t_ty);
+        match (e2)
+        {
+            Some(t) : Vec::push(&mut oargs, t),
+            None    : return typer_gap(g, "error:map-err-function"),
+        }
+        return Some(named("std::Result", oargs));
+    }
+    if (*name == "text_write")
+    {
+        // `lower_text_write`.
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        visit(g, x, &args[1], None);
+        return Some(us);
+    }
+    if (*name == "unwrap_failed_with")
+    {
+        // `lower_unwrap_failed_with`: a fault, whatever the message is: the
+        // head and what `%v` prints of the error (through `$fmt`), or the
+        // head alone as a `str`.
+        match (type_probe(g, x, &args[0], None))
+        {
+            Some(at0) :
+            {
+                Type at = apply(&at0, &x.subst);
+                Type et = deref_ty(at);
+                bool view = is_named(&et, "std::StringView");
+                bool printed = view || is_named(&et, "std::String") || is_enum_ty(g, &et) || match (&et)
+                {
+                    Type::TInt(_) : true,
+                    Type::TF32    : true,
+                    Type::TF64    : true,
+                    Type::TBool   : true,
+                    Type::TStr    : true,
+                    _             : false,
+                };
+                if (printed)
+                {
+                    visit(g, x, &args[1], None);
+                    if (view)
+                    {
+                        Expr held = private_deref(g, &args[0]);
+                        visit(g, x, &held, None);
+                    }
+                    else
+                    {
+                        visit(g, x, &args[0], None);
+                    }
+                }
+                else
+                {
+                    visit(g, x, &args[1], Some(&strt));
+                }
+            },
+            None      : {},
+        }
+        return Some(Type::TNever);
+    }
+    if (*name == "parse_check" || *name == "parse_value")
+    {
+        // `lower_parse`.
+        if (Vec::len(targs) == 0)
+        {
+            return typer_gap(g, "error:parse-of-no-type");
+        }
+        Type t = apply(&targs[0], &x.subst);
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], Some(&us));
+        bool parsed = match (&t)
+        {
+            Type::TInt(_) : true,
+            Type::TF64    : true,
+            Type::TF32    : true,
+            Type::TBool   : true,
+            _             : false,
+        };
+        if (!parsed)
+        {
+            return typer_gap(g, "error:parse-of-a-non-numeric-type");
+        }
+        if (*name == "parse_check")
+        {
+            return Some(Type::TInt(IntTy::Isize));
+        }
+        return Some(t);
+    }
+    if (*name == "slice_len")
+    {
+        // Report 290: `slice_len(&v)` of a `Vec` or an array reads the
+        // length through the place `v` and forms no slice (a named array's
+        // is its type's, with nothing lowered); any other operand is a
+        // slice's place. A `usize` either way.
+        Option<ref<Expr, shared>> whole = match (&strip_parens(&args[0]).kind)
+        {
+            ExprKind::EBorrow(bb)  : if (Box::get(bb).mode == Mode::Shared) { Some(&Box::get(bb).e) } else { None },
+            ExprKind::ESliceOf(sb) :
+            {
+                ref<SliceExpr, shared> sl = Box::get(sb);
+                bool from0 = match (&sl.lo.kind)
+                {
+                    ExprKind::EInt(ib) : Box::get(ib).v == 0,
+                    _                  : false,
+                };
+                bool to_end = match (&sl.hi.kind)
+                {
+                    ExprKind::EDollar : true,
+                    _                 : false,
+                };
+                if (sl.mode == Mode::Shared && from0 && to_end) { Some(&sl.base) } else { None }
+            },
+            _                      : None,
+        };
+        match (whole)
+        {
+            Some(we) :
+            {
+                Type pt = match (type_probe(g, x, we, None))
+                {
+                    Some(t) : t,
+                    None    : return Some(us),
+                };
+                bool is_array = match (&pt)
+                {
+                    Type::TArray(_) : true,
+                    _               : false,
+                };
+                bool named_whole = match (&strip_parens(we).kind)
+                {
+                    ExprKind::EPath(_) : true,
+                    ExprKind::ECall(cb) : Vec::len(&Box::get(cb).args) == 0 && match (&Box::get(cb).callee.kind)
+                    {
+                        ExprKind::EPath(cp) : match (HashMap::get(
+                            &g.prog.table.fns,
+                            &String::join(&Box::get(cp).segs, "::"),
+                        ))
+                        {
+                            Some(fd) : fd.is_const,
+                            None     : false,
+                        },
+                        _ : false,
+                    },
+                    _                  : false,
+                };
+                if (is_array && named_whole)
+                {
+                    return Some(us);
+                }
+                bool fits = is_place_kind(we) && !HashSet::contains(
+                    &g.prog.facts.temp_borrows,
+                    strip_parens(&args[0]).id,
+                ) && (is_array
+                    || is_named(&pt, "std::Vec"));
+                if (fits)
+                {
+                    _ = type_place(g, x, we);
+                    return Some(us);
+                }
+            },
+            None     : {},
+        }
+        _ = type_place(g, x, &args[0]);
+        return Some(us);
+    }
+    if (*name == "str_len")
+    {
+        visit(g, x, &args[0], None);
+        return Some(us);
+    }
+    if (*name == "str_byte")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], Some(&us));
+        return Some(u8t);
+    }
+    if (*name == "str_ptr")
+    {
+        visit(g, x, &args[0], None);
+        return Some(rawptr_of_ty(u8t));
+    }
+    if (*name == "$fmt")
+    {
+        return type_fmt(g, x, args);
+    }
+    if (*name == "$require_fail")
+    {
+        if (Vec::len(args) > 1)
+        {
+            visit(g, x, &args[1], Some(&strt));
+        }
+        return Some(Type::TNever);
+    }
+    if (*name == "$assert_fail")
+    {
+        if (Vec::len(args) > 0)
+        {
+            visit(g, x, &args[0], Some(&strt));
+        }
+        return Some(Type::TNever);
+    }
+    if (*name == "std::print")
+    {
+        // `str` and `ref<String, shared>` go to `std`'s two helpers; numbers
+        // and `bool` to the runtime.
+        Type t = type_probe(g, x, &args[0], None)?;
+        bool to_string = match (&t)
+        {
+            Type::TRef(rm) : is_named(&Box::get(rm).inner, "std::String"),
+            _              : false,
+        };
+        if (is_str(&t))
+        {
+            return type_helper_call(g, x, "std::print_str", &Vec::new(), args, None, tail);
+        }
+        if (to_string)
+        {
+            return type_helper_call(g, x, "std::print_string", &Vec::new(), args, None, tail);
+        }
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(Type::TVoid);
+    }
+    if (*name == "append_native")
+    {
+        // `str`, `ref<String, shared>` and `StringView` go to `std`'s
+        // helpers, numbers and `bool` to `append_text` at their type.
+        Type t = type_probe(g, x, &args[1], None)?;
+        str h = match (&t)
+        {
+            Type::TStr      : "std::String::append_str",
+            Type::TRef(rm) : if (is_named(
+                &Box::get(rm).inner,
+                "std::String",
+            )) { "std::String::append_string" } else { "std::String::append_text" },
+            Type::TNamed(n) : if (Box::get(n).name == "std::StringView") { "std::String::append_view" } else { "std::String::append_text" },
+            _               : "std::String::append_text",
+        };
+        Vec<Type> ta = Vec::new();
+        if (h == "std::String::append_text")
+        {
+            Vec::push(&mut ta, clone(&t));
+        }
+        return type_helper_call(g, x, h, &ta, args, None, tail);
+    }
+    // ---- `lower_intrinsic_numeric` ----
+    if (*name == "sizeof" || *name == "alignof")
+    {
+        return Some(us);
+    }
+    if (*name == "static_assert")
+    {
+        return Some(Type::TVoid);
+    }
+    if (*name == "min_value" || *name == "max_value")
+    {
+        if (Vec::len(targs) == 0)
+        {
+            return typer_gap(g, "error:limit-of-no-type");
+        }
+        Type t = targ0(x, targs);
+        bool limited = match (&t)
+        {
+            Type::TF32    : true,
+            Type::TF64    : true,
+            Type::TInt(_) : true,
+            _             : false,
+        };
+        if (!limited)
+        {
+            return typer_gap(g, "error:limit-of-a-non-number");
+        }
+        return Some(t);
+    }
+    if (StringView::starts_with(name, "std::") && is_math1(name))
+    {
+        // D-0091: the argument's type.
+        Type v = type_of(g, x, &args[0], None)?;
+        return Some(v);
+    }
+    if (*name == "std::atan2" || *name == "std::powf")
+    {
+        Type a = type_of(g, x, &args[0], None)?;
+        Type b = type_of(g, x, &args[1], None)?;
+        if (is_never(&a) || is_never(&b))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(a);
+    }
+    if (*name == "widen" || *name == "narrow" || *name == "narrow_wrapping" || *name == "reinterpret" || *name == "to_float"
+        || *name == "to_int" || *name == "checked_narrow")
+    {
+        if (Vec::len(targs) == 0)
+        {
+            return typer_gap(g, "error:conversion-to-no-type");
+        }
+        Type dst = targ0(x, targs);
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        // D-0122: `checked_narrow` answers an `Option`.
+        if (*name == "checked_narrow")
+        {
+            return Some(option_of(dst));
+        }
+        return Some(dst);
+    }
+    if (*name == "count_ones" || *name == "leading_zeros" || *name == "trailing_zeros")
+    {
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(u32t);
+    }
+    if (*name == "rotate_left" || *name == "rotate_right")
+    {
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        visit(g, x, &args[1], Some(&u32t));
+        return match (&v)
+        {
+            Type::TInt(i) : Some(Type::TInt(*i)),
+            _             : Some(Type::TInt(IntTy::I32)),
+        };
+    }
+    if (*name == "read_volatile" || *name == "write_volatile")
+    {
+        Type p = type_of(g, x, &args[0], None)?;
+        if (is_never(&p))
+        {
+            return Some(Type::TNever);
+        }
+        Type pointee = match (&p)
+        {
+            Type::TRawptr(i) : clone(Box::get(i)),
+            _                : return typer_gap(g, "error:volatile-through-a-non-pointer"),
+        };
+        if (*name == "read_volatile")
+        {
+            return Some(pointee);
+        }
+        Type v = type_of(g, x, &args[1], Some(&pointee))?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(Type::TVoid);
+    }
+    if (is_int_op(name))
+    {
+        // `wrapping_*` and `saturating_*` give the operands' type (a `simd`
+        // type as it is), `checked_*` an `Option` of it.
+        Type a = type_operands(g, x, &args[0], &args[1], expected)?;
+        return match (&a)
+        {
+            Type::TNever   : Some(Type::TNever),
+            Type::TSimd(_) : Some(clone(&a)),
+            Type::TInt(i) : if (StringView::starts_with(
+                name,
+                "checked_",
+            )) { Some(option_of(Type::TInt(*i))) } else { Some(Type::TInt(*i)) },
+            _              : typer_gap(g, "error:integer-intrinsic-on-a-non-integer"),
+        };
+    }
+    // ---- `lower_intrinsic_raw` ----
+    if (*name == "str_slice")
+    {
+        visit(g, x, &args[0], None);
+        return Some(Type::TSlice(Box::new(ModedTy { .inner = u8t, .mode = Mode::Shared })));
+    }
+    if (*name == "rawptr_of")
+    {
+        // `[Rawptr-Of]`: the address of a borrowed place, or a reference
+        // value's target.
+        match (&args[0].kind)
+        {
+            ExprKind::EBorrow(b) :
+            {
+                Type pt = type_place(g, x, &Box::get(b).e)?;
+                return Some(rawptr_of_ty(pt));
+            },
+            _                    : {},
+        }
+        Type v = type_of(g, x, &args[0], None)?;
+        return match (&v)
+        {
+            Type::TRef(rm) : Some(rawptr_of_ty(clone(&Box::get(rm).inner))),
+            _              : typer_gap(g, "error:rawptr-of-a-non-reference"),
+        };
+    }
+    if (*name == "allocate")
+    {
+        visit(g, x, &args[0], Some(&us));
+        visit(g, x, &args[1], Some(&us));
+        Vec<Type> ra = Vec::new();
+        Vec::push(&mut ra, rawptr_of_ty(u8t));
+        Vec::push(&mut ra, named("std::AllocError", Vec::new()));
+        return Some(named("std::Result", ra));
+    }
+    if (*name == "deallocate")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], Some(&us));
+        visit(g, x, &args[2], Some(&us));
+        return Some(Type::TVoid);
+    }
+    if (*name == "release")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], Some(&us));
+        return Some(Type::TVoid);
+    }
+    if (*name == "copy_raw")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], None);
+        visit(g, x, &args[2], Some(&us));
+        return Some(Type::TVoid);
+    }
+    if (*name == "reinterpret_ptr" || *name == "dangling" || *name == "null_rawptr" || *name == "rawptr_from_address")
+    {
+        if (Vec::len(targs) == 0)
+        {
+            return typer_gap(g, "error:pointer-to-no-type");
+        }
+        if (*name == "reinterpret_ptr")
+        {
+            visit(g, x, &args[0], None);
+        }
+        if (*name == "rawptr_from_address")
+        {
+            Type a = type_of(g, x, &args[0], Some(&us))?;
+            if (is_never(&a))
+            {
+                return Some(Type::TNever);
+            }
+        }
+        return Some(rawptr_of_ty(targ0(x, targs)));
+    }
+    if (*name == "rawptr_address")
+    {
+        Type p = type_of(g, x, &args[0], None)?;
+        if (is_never(&p))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(us);
+    }
+    if (*name == "fault")
+    {
+        if (Vec::len(args) > 1)
+        {
+            visit(g, x, &args[1], Some(&strt));
+        }
+        return Some(Type::TNever);
+    }
+    // ---- `lower_intrinsic_more` ----
+    if (is_each_name(name))
+    {
+        // `foreach` (D-0042): the expansion for the type of the hidden
+        // binding the call names first, its nodes numbered anew.
+        if (Vec::len(args) == 0)
+        {
+            return typer_gap(g, "error:foreach-of-nothing");
+        }
+        Type t0 = type_probe(g, x, &args[0], None)?;
+        Expr ex = match (each_expand(name, &t0, args, line, args[0].col))
+        {
+            Ok(ee) : ee,
+            Err(_) : return typer_gap(g, "error:foreach-over-an-unexpected-type"),
+        };
+        number_expr(&mut ex, &mut g.typer_synth);
+        return type_of(g, x, &ex, expected);
+    }
+    if (*name == "drop")
+    {
+        return type_drop(g, x, args);
+    }
+    if (*name == "std::exit")
+    {
+        visit(g, x, &args[0], Some(&u8t));
+        return Some(Type::TNever);
+    }
+    if (*name == "clone")
+    {
+        return type_clone(g, x, args, expected, line, tail);
+    }
+    if (*name == "lend_places")
+    {
+        visit(g, x, &args[0], None);
+        return Some(Type::TVoid);
+    }
+    if (*name == "swap_places")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], None);
+        return Some(Type::TVoid);
+    }
+    if (*name == "key_less_at")
+    {
+        visit(g, x, &args[0], None);
+        visit(g, x, &args[1], Some(&us));
+        visit(g, x, &args[2], Some(&us));
+        return Some(Type::TBool);
+    }
+    if (*name == "key_less" || *name == "key_eq" || *name == "probe_eq")
+    {
+        // Each form of these (a composite key's comparison function, a
+        // call of `String::same_view`, `*a == k` with `bool` expected) is a
+        // `bool`; the keys are lowered through their references.
+        foreach (a in args)
+        {
+            visit(g, x, a, None);
+        }
+        return Some(Type::TBool);
+    }
+    if (*name == "key_hash")
+    {
+        visit(g, x, &args[0], None);
+        return Some(u64t);
+    }
+    if (*name == "probe_key")
+    {
+        // D-0312: a copy of the key the probe names: the value itself, a
+        // `String::copy` of a view, a `clone` through a reference.
+        Type t = type_probe(g, x, &args[0], None)?;
+        bool view = is_named(&t, "std::StringView");
+        bool by_ref = match (&t)
+        {
+            Type::TRef(_) : true,
+            _             : false,
+        };
+        if (!view && !by_ref)
+        {
+            return type_of(g, x, &args[0], expected);
+        }
+        Vec<String> segs = Vec::new();
+        if (view)
+        {
+            Vec::push(&mut segs, "std");
+            Vec::push(&mut segs, "String");
+            Vec::push(&mut segs, "copy");
+        }
+        else
+        {
+            Vec::push(&mut segs, "clone");
+        }
+        Vec<Expr> cargs = Vec::new();
+        Vec::push(&mut cargs, clone(&args[0]));
+        Expr call = private_call(g, segs, cargs, args[0].line, args[0].col);
+        return type_of(g, x, &call, expected);
+    }
+    g.typer_why = sprintf("intrinsic:%s", name);
+    if (g.reach_on)
+    {
+        String reason = String::clone(&g.typer_why);
+        note_gap(g, &reason);
+    }
+    None
+}
+
+// `simd_pair`: both operands of a two-operand `simd` intrinsic, the second
+// at the first's type: the first's type, `never` when one diverges.
+fn type_simd_pair(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> a,
+    ref<Expr, shared> b,
+    Option<Type> first,
+) : Option<Type>
+{
+    Option<Type> av0 = match (&first)
+    {
+        Some(t) : type_of(g, x, a, Some(t)),
+        None    : type_of(g, x, a, None),
+    };
+    Type av = av0?;
+    if (is_never(&av))
+    {
+        return Some(Type::TNever);
+    }
+    Type bv = type_of(g, x, b, Some(&av))?;
+    if (is_never(&bv))
+    {
+        return Some(Type::TNever);
+    }
+    Some(av)
+}
+
+// `lower_simd_intrinsic` (D-0254).
+fn type_simd(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<Vec<Type>, shared> targs,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    StringView nm = name;
+    bool cmp = nm == "simd_eq" || nm == "simd_ne" || nm == "simd_lt" || nm == "simd_le" || nm == "simd_gt" || nm == "simd_ge";
+    bool minmax = nm == "simd_min" || nm == "simd_max";
+    if (cmp || minmax)
+    {
+        // A comparison gives the mask type of its operands.
+        Option<Type> first = if (minmax) { simd_expected(expected) } else { None };
+        Type pt = type_simd_pair(g, x, &args[0], &args[1], first)?;
+        if (is_never(&pt) || minmax)
+        {
+            return Some(pt);
+        }
+        return Some(simd_mask(&pt));
+    }
+    if (nm == "simd_select")
+    {
+        Type m0 = type_of(g, x, &args[0], None)?;
+        if (is_never(&m0))
+        {
+            return Some(Type::TNever);
+        }
+        return type_simd_pair(g, x, &args[1], &args[2], simd_expected(expected));
+    }
+    if (nm == "simd_any" || nm == "simd_all")
+    {
+        Type m0 = type_of(g, x, &args[0], None)?;
+        if (is_never(&m0))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(Type::TBool);
+    }
+    if (nm == "simd_sum" || nm == "simd_reduce_min" || nm == "simd_reduce_max")
+    {
+        Type v0 = type_of(g, x, &args[0], None)?;
+        if (is_never(&v0))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(simd_lane(&v0));
+    }
+    if (nm == "simd_load" || nm == "simd_store")
+    {
+        // A slice named by a place is reached in place; any other is a
+        // temporary.
+        bool is_place = match (&strip_parens(&args[0]).kind)
+        {
+            ExprKind::EPath(_)  : true,
+            ExprKind::EField(_) : true,
+            ExprKind::EDeref(_) : true,
+            _                   : false,
+        };
+        Type sty = Type::TVoid;
+        if (is_place)
+        {
+            sty = type_place(g, x, &args[0])?;
+        }
+        else
+        {
+            sty = type_of(g, x, &args[0], None)?;
+            if (is_never(&sty))
+            {
+                return Some(Type::TNever);
+            }
+        }
+        Type elem = match (&sty)
+        {
+            Type::TSlice(sm) : clone(&Box::get(sm).inner),
+            _                : return typer_gap(g, "error:simd-load-from-a-non-slice"),
+        };
+        Type us = usize_ty();
+        Type i0 = type_of(g, x, &args[1], Some(&us))?;
+        if (is_never(&i0))
+        {
+            return Some(Type::TNever);
+        }
+        if (nm == "simd_store")
+        {
+            Option<Type> lit = match (&strip_parens(&args[2]).kind)
+            {
+                ExprKind::EArrayLit(items) : Some(Type::TSimd(Box::new(SizedTy { .inner = clone(&elem), .n = widen<u128>(Vec::len(items)) }))),
+                ExprKind::EArrayRepeat(r)  : Some(Type::TSimd(Box::new(SizedTy { .inner = clone(&elem), .n = Box::get(r).n }))),
+                _                          : None,
+            };
+            Option<Type> v0 = match (&lit)
+            {
+                Some(t) : type_of(g, x, &args[2], Some(t)),
+                None    : type_of(g, x, &args[2], None),
+            };
+            Type v = v0?;
+            if (is_never(&v))
+            {
+                return Some(Type::TNever);
+            }
+            return Some(Type::TVoid);
+        }
+        return Some(if (Vec::len(targs) > 0) { apply(&targs[0], &x.subst) } else { Type::TVoid });
+    }
+    g.typer_why = sprintf("intrinsic:%s", name);
+    if (g.reach_on)
+    {
+        String reason = String::clone(&g.typer_why);
+        note_gap(g, &reason);
+    }
+    None
+}
+
+// `lower_spawn`: the callee as a `fn` value (a generic function named
+// alone is instantiated from the arguments, probed), the arguments at its
+// parameter types; a handle of its result.
+fn type_spawn(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared> args) : Option<Type>
+{
+    Option<Type> callee_expected = None;
+    match (&args[0].kind)
+    {
+        ExprKind::EPath(pp) :
+        {
+            ref<PathExpr, shared> path = Box::get(pp);
+            bool local = Vec::len(&path.segs) == 1 && is_bound(x, &path.segs[0]);
+            String key = join_segs(&path.segs);
+            match (get_fn(g, &key))
+            {
+                Some(f) :
+                {
+                    Option<Option<Type>> made = if (!local && Vec::len(&path.targs) == 0 && Vec::len(&f.type_params) > 0)
+                    {
+                        spawn_callee_type(g, x, &f, args)
+                    }
+                    else
+                    {
+                        Some(None)
+                    };
+                    give_fn(g, &key, f);
+                    callee_expected = made?;
+                },
+                None    : {},
+            }
+        },
+        _                   : {},
+    }
+    Option<Type> fv0 = match (&callee_expected)
+    {
+        Some(t) : type_of(g, x, &args[0], Some(t)),
+        None    : type_of(g, x, &args[0], None),
+    };
+    Type fv = fv0?;
+    if (is_never(&fv))
+    {
+        return Some(Type::TNever);
+    }
+    Option<FnTy> sig = match (&fv)
+    {
+        Type::TFn(ft)      : Some(clone(Box::get(ft))),
+        Type::TClosure(id) : closure_sig(g, *id),
+        _                  : None,
+    };
+    FnTy ft = match (sig)
+    {
+        Some(t) : t,
+        None    : return typer_gap(g, "error:spawn-of-a-non-callable"),
+    };
+    for (usize i = 0; i < Vec::len(&ft.params) && i + 1 < Vec::len(args); i += 1)
+    {
+        Type v = type_of(g, x, &args[i + 1], Some(&ft.params[i]))?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+    }
+    Some(Type::THandle(Box::new(clone(&ft.ret))))
+}
+
+// The `fn` type `lower_spawn` expects of a generic callee `f` named alone:
+// its type parameters from the arguments it may probe; `Some(None)` where
+// they do not fix every one.
+fn spawn_callee_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<FnDecl, shared> f,
+    ref<Vec<Expr>, shared> args,
+) : Option<Option<Type>>
+{
+    HashMap<String, Type> m = HashMap::new();
+    for (usize i = 0; i < Vec::len(&f.params) && i + 1 < Vec::len(args); i += 1)
+    {
+        ref<Expr, shared> a = &args[i + 1];
+        if (!spawn_probe_safe(g, a))
+        {
+            continue;
+        }
+        Type hint = apply(&f.params[i].ty, &m);
+        Option<Type> probed = if (resolved(
+            &hint,
+            &f.type_params,
+        )) { type_probe(g, x, a, Some(&hint)) } else { type_probe(g, x, a, None) };
+        Type t0 = match (probed)
+        {
+            Some(t) : t,
+            None    :
+            {
+                if (probe_failed(g))
+                {
+                    continue;
+                }
+                return None;
+            },
+        };
+        Type t = closure_as_fn(g, &f.params[i].ty, &t0);
+        unify(&f.params[i].ty, &t, &f.type_params, &mut m);
+    }
+    foreach (tp in &f.type_params)
+    {
+        if (!HashMap::contains(&m, tp))
+        {
+            return Some(None);
+        }
+    }
+    Vec<Type> ps = Vec::new();
+    foreach (pd in &f.params)
+    {
+        Vec::push(&mut ps, apply(&pd.ty, &m));
+    }
+    Some(Some(Type::TFn(Box::new(FnTy { .params = ps, .ret = apply(&f.ret, &m) }))))
+}
+
+fn is_str(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TStr : true,
+        _          : false,
+    }
+}
+
+// `drop(e)` (`lower_intrinsic_more`): unit, but where the operand diverges.
+// A place that is not a local named alone (a field, an element, a
+// dereference, a capture) is not typed yet: `[Destroy-Projection]` makes
+// the drop of a projection a fault, which is `never`.
+fn type_drop(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Vec<Expr>, shared> args) : Option<Type>
+{
+    // `drop(reclaim<T>(p))`: the place `[Reclaim]` makes is ended.
+    match (&args[0].kind)
+    {
+        ExprKind::ECall(ce) :
+        {
+            match (&Box::get(ce).callee.kind)
+            {
+                ExprKind::EPath(cp) :
+                {
+                    ref<PathExpr, shared> pe = Box::get(cp);
+                    if (Vec::len(&pe.segs) == 1 && pe.segs[0] == "reclaim" && !is_bound(
+                        x,
+                        "reclaim",
+                    ) && Vec::len(&pe.targs) == 1)
+                    {
+                        Type et = apply(&pe.targs[0], &x.subst);
+                        if (is_resource(g, &et) || holds_fn(g, &et))
+                        {
+                            _ = type_place(g, x, &args[0]);
+                            return Some(Type::TVoid);
+                        }
+                    }
+                },
+                _                   : {},
+            }
+        },
+        _                   : {},
+    }
+    // `drop(e)` of a temporary: the value is destroyed at once.
+    if (!is_place_kind(&args[0]) && !is_paren(&args[0]))
+    {
+        Type v = type_of(g, x, &args[0], None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(Type::TVoid);
+    }
+    bool local = match (&strip_parens(&args[0]).kind)
+    {
+        ExprKind::EPath(pp) : Vec::len(&Box::get(pp).segs) == 1 && Vec::len(&Box::get(pp).targs) == 0 && match (lookup_ref(
+            x,
+            &Box::get(pp).segs[0],
+        ))
+        {
+            Some(b) : match (&b.kind)
+            {
+                BindKind::Local : true,
+                _               : false,
+            },
+            None : false,
+        },
+        _ : false,
+    };
+    if (local)
+    {
+        _ = type_place(g, x, &args[0]);
+        return Some(Type::TVoid);
+    }
+    // `drop(*p)`: raw storage's value moves out and is destroyed; a
+    // reference's referent is destroyed through it.
+    match (&args[0].kind)
+    {
+        ExprKind::EDeref(inner) :
+        {
+            Type pt = type_probe(g, x, Box::get(inner), None)?;
+            bool through = match (&pt)
+            {
+                Type::TRawptr(_) : true,
+                Type::TRef(_)    : true,
+                _                : false,
+            };
+            if (through)
+            {
+                _ = type_place(g, x, &args[0]);
+                return Some(Type::TVoid);
+            }
+        },
+        _                       : {},
+    }
+    typer_gap(g, "intrinsic:drop-of-a-projection")
+}
+
+// D-0116 `clone(&x)` (`lower_intrinsic_more`): a plain `T` is `*r` (`x`
+// itself for `&x`); a resource `T` is a call of its `T::clone` at `T`'s
+// arguments.
+fn type_clone(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Vec<Expr>, shared> args,
+    Option<ref<Type, shared>> expected,
+    usize line,
+    bool tail,
+) : Option<Type>
+{
+    Option<ref<Expr, shared>> borrowed = match (&args[0].kind)
+    {
+        ExprKind::EBorrow(b) : if (Box::get(b).mode == Mode::Shared) { Some(&Box::get(b).e) } else { None },
+        _                    : None,
+    };
+    Type ty = match (borrowed)
+    {
+        Some(inner) : type_probe(g, x, inner, None)?,
+        None        : deref_ty(type_probe(g, x, &args[0], None)?),
+    };
+    if (!is_resource(g, &ty))
+    {
+        match (borrowed)
+        {
+            Some(inner) : return type_of(g, x, inner, expected),
+            None        : {},
+        }
+        Expr d = private_deref(g, &args[0]);
+        return type_of(g, x, &d, expected);
+    }
+    ref<NamedTy, shared> nt = match (&ty)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return typer_gap(g, "error:clone-of-a-resource-not-named"),
+    };
+    String key = sprintf("%s::clone", &nt.name);
+    match (get_fn(g, &key))
+    {
+        Some(f) :
+        {
+            Option<Type> t = type_user_call(g, x, &key, &f, &nt.args, args, expected, tail);
+            give_fn(g, &key, f);
+            t
+        },
+        None    : typer_gap(g, "error:clone-of-a-type-with-no-clone"),
+    }
+}
+
+// `lower_closure` and `lower_closure_body`: the capture struct's fields,
+// the parameter types, and the result type: the written one, else the one
+// the checker gave a result that holds a `fn` value (`fn_result_of`), else
+// the body's (`type_closure_result`, D-0081).
+export fn type_closure(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<ClosureExpr, shared> c = match (&e.kind)
+    {
+        ExprKind::EClosure(cl) : Box::get(cl),
+        _                      : return typer_gap(g, "error:not-a-closure"),
+    };
+    Option<Type> declared = match (&c.ret)
+    {
+        Some(rt) : Some(clone(rt)),
+        None     : fn_result_of(g, x, e.id, expected),
+    };
+    Vec<CapField> fields = Vec::new();
+    bool writes_self = false;
+    foreach (cn in &c.captures)
+    {
+        Binding b = match (lookup(x, cn))
+        {
+            Some(b) : b,
+            None    : return typer_gap(g, "error:unbound-capture"),
+        };
+        Type vty = binding_place_ty(&b);
+        bool written = body_writes(&c.body, cn);
+        if (c.is_move)
+        {
+            writes_self = writes_self || written;
+            Vec::push(&mut fields, CapField { .name = String::clone(cn), .ty = vty });
+        }
+        else
+        {
+            Mode mode = if (written) { Mode::Exclusive } else { Mode::Shared };
+            Vec::push(&mut fields, CapField { .name = String::clone(cn), .ty = ref_ty(vty, mode) });
+        }
+    }
+    Vec<Type> ptypes = Vec::new();
+    foreach (pd in &c.params)
+    {
+        Vec::push(&mut ptypes, apply(&pd.ty, &x.subst));
+    }
+    Type ret = match (&declared)
+    {
+        Some(t) : apply(t, &x.subst),
+        None    :
+        {
+            // The body's result (D-0081, `type_closure_result`). Kept by the
+            // literal's id (beside the memo, under a key no query has): a
+            // second query of the literal finds the body's `return`s in the
+            // memo, where they keep nothing.
+            String key = sprintf("%v closure-result", e.id);
+            Option<Type> kept = match (HashMap::get(&x.tmemo, &key))
+            {
+                Some(t) : Some(clone(t)),
+                None    : None,
+            };
+            match (kept)
+            {
+                Some(t) : t,
+                None    :
+                {
+                    Type learnt = type_closure_result(g, x, &c.params, c.is_move, &c.body, &fields, &ptypes)?;
+                    if (e.id != 0)
+                    {
+                        HashMap::insert(&mut x.tmemo, key, clone(&learnt));
+                    }
+                    learnt
+                },
+            }
+        },
+    };
+    // The second pass, the body lowered for real at the result type: its
+    // type decides nothing.
+    Option<Type> unused = None;
+    _ = type_closure_body(g, x, &c.params, c.is_move, &c.body, &fields, &ptypes, &ret, Some(&ret), &mut unused);
+    // The walk (`reach.cb`) keeps one record per literal, instance and result
+    // type: a later query of the literal gives the record made first.
+    String rkey = sprintf("%v closure-record %s", e.id, &type_code(&ret));
+    if (g.reach_on && e.id != 0)
+    {
+        match (HashMap::get(&x.tmemo, &rkey))
+        {
+            Some(t) : return Some(clone(t)),
+            None    : {},
+        }
+    }
+    g.tclosure_n += 1;
+    u64 id = TYPER_CLOSURE | g.tclosure_n;
+    HashMap::insert(
+        &mut g.tclosures,
+        id,
+        ClosureInfo { .fields = fields, .is_move = c.is_move, .params = ptypes, .ret = ret, .cname = String::new(), .writes_self = writes_self },
+    );
+    if (g.reach_on && e.id != 0)
+    {
+        HashMap::insert(&mut x.tmemo, rkey, Type::TClosure(id));
+    }
+    Some(Type::TClosure(id))
+}
+
+// The result type of a closure with none written (D-0081), the question
+// `lower_closure_body` asks: the body with no type expected, in a body whose
+// result type is unit; where it ends in a `return`, the type of the first
+// value a `return` in it gives, unit with none.
+export fn type_closure_result(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Vec<ParamDecl>, shared> params,
+    bool is_move,
+    ref<Block, shared> body,
+    ref<Vec<CapField>, shared> fields,
+    ref<Vec<Type>, shared> ptypes,
+) : Option<Type>
+{
+    Type unit_ty = Type::TVoid;
+    Option<Type> returned = None;
+    g.typer_probing += 1;
+    Option<Type> bt = type_closure_body(g, x, params, is_move, body, fields, ptypes, &unit_ty, None, &mut returned);
+    g.typer_probing -= 1;
+    Type body_ty = bt?;
+    if (!is_never(&body_ty))
+    {
+        return Some(body_ty);
+    }
+    match (returned)
+    {
+        Some(t) : Some(t),
+        None    : Some(Type::TVoid),
+    }
+}
+
+// Whether `t` names a closure the typer recorded (`TYPER_CLOSURE`), one the
+// lowering has not lowered.
+export fn names_typer_closure(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TClosure(id) : (*id & TYPER_CLOSURE) != 0,
+        Type::TRef(m)      : names_typer_closure(&Box::get(m).inner),
+        Type::TSlice(m)    : names_typer_closure(&Box::get(m).inner),
+        Type::TRawptr(i)   : names_typer_closure(Box::get(i)),
+        Type::TArray(a)    : names_typer_closure(&Box::get(a).inner),
+        Type::TSimd(a)     : names_typer_closure(&Box::get(a).inner),
+        Type::THandle(i)   : names_typer_closure(Box::get(i)),
+        Type::TMutex(i)    : names_typer_closure(Box::get(i)),
+        Type::TGuard(i)    : names_typer_closure(Box::get(i)),
+        Type::TFn(f)       :
+        {
+            foreach (p in &Box::get(f).params)
+            {
+                if (names_typer_closure(p))
+                {
+                    return true;
+                }
+            }
+            names_typer_closure(&Box::get(f).ret)
+        },
+        Type::TNamed(n)    :
+        {
+            foreach (a in &Box::get(n).args)
+            {
+                if (names_typer_closure(a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                  : false,
+    }
+}
+
+// The type of a closure's body (its parameters `params`, `is_move`, `body`)
+// under its own bindings (its parameters, then its captures, as
+// `lower_closure_body` binds them), in a body whose result type is `ret`;
+// `returned` is given the type of the first value a `return` in it gave in
+// a probe-mirroring query.
+//
+// The body is lowered by `lower_block_body`, not `lower_block`
+// (`typer_flow::walk_block`): a closure value with no type expected stays
+// the closure.
+fn type_closure_body(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Vec<ParamDecl>, shared> params,
+    bool is_move,
+    ref<Block, shared> body,
+    ref<Vec<CapField>, shared> fields,
+    ref<Vec<Type>, shared> ptypes,
+    ref<Type, shared> ret,
+    Option<ref<Type, shared>> expected,
+    ref<Option<Type>, exclusive> returned,
+) : Option<Type>
+{
+    Vec::push(&mut x.scopes, HashMap::new());
+    Type saved_ret = replace(&mut x.ret, clone(ret));
+    for (usize i = 0; i < Vec::len(params); i += 1)
+    {
+        bind_in_scope(
+            x,
+            &params[i].name,
+            Binding { .c = String::new(), .ty = clone(&ptypes[i]), .root = String::new(), .kind = BindKind::Local },
+        );
+    }
+    for (usize i = 0; i < Vec::len(fields); i += 1)
+    {
+        BindKind kind = if (is_move) { BindKind::CaptureVal(i) } else { BindKind::CaptureRef(i) };
+        bind_in_scope(
+            x,
+            &fields[i].name,
+            Binding { .c = String::new(), .ty = clone(&fields[i].ty), .root = String::new(), .kind = kind },
+        );
+    }
+    // The first value a `return` of this body gives; an enclosing closure's
+    // own is kept aside.
+    Option<Type> outer_returns = replace(&mut g.typer_returns, None);
+    Option<Type> t = walk_block(g, x, body, expected);
+    *returned = replace(&mut g.typer_returns, outer_returns);
+    x.ret = saved_ret;
+    _ = Vec::pop(&mut x.scopes);
+    t
+}
+
+// `lower_return`: the operand at the body's result type; `never`. In a
+// query that mirrors a probe, the type of the first value a `return` gives
+// is kept (`Gen::typer_returns`): `type_closure_result` reads it.
+export fn type_return(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Option<Box<Expr>>, shared> r) : Option<Type>
+{
+    match (r)
+    {
+        Some(e) :
+        {
+            Type ret = clone(&x.ret);
+            Type rv = type_of(g, x, Box::get(e), Some(&ret))?;
+            if (g.typer_probing > 0 && Option::is_none(&g.typer_returns) && !is_never(&rv))
+            {
+                g.typer_returns = Some(rv);
+            }
+        },
+        None    : {},
+    }
+    Some(Type::TNever)
+}

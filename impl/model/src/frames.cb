@@ -1,0 +1,1138 @@
+// The whole-program and lexical parts of `rule.control.frame-references`
+// (`spec/14` §6, D-0282), written from the specification:
+//
+// - the access summaries `reads(F, p)` and `writes(F, p)` of every
+//   function's reference parameters, computed over the program to a fixed
+//   point;
+// - each body's source positions: where every expression ends in source
+//   (evaluation) order, which binding each mention names, and the loops,
+//   for the rule's lexical liveness;
+// - the call-site rule's "certainly overlap" on keys.
+//
+// The state-dependent half (inherited facts, the call-site rule, element
+// accesses, evaluation order, moving out through a reference) runs in
+// `statics.cb` beside `rule.control.flow-analysis`, over the same state.
+//
+// A step of a flow-analysis place (`StepK`) is declared here, so that
+// `statics` imports `frames` and not the reverse.
+// A list of steps is kept encoded as a `String` (`steps_enc`) whose order
+// as text is the order of the list, so that a place is a key type.
+
+import std;
+import ast;
+import maps;
+
+export enum StepK
+{
+    Field,
+    // A literal index place: only an array has them (D-0221: a `Vec`'s
+    // elements are not places).
+    Idx(i64),
+    // A slice's step, its range [lo, hi) of literal bounds (D-0070).
+    Range { i64 lo; i64 hi; },
+}
+
+fn push_hex(ref<String, exclusive> s, i64 k)
+{
+    u64 u = reinterpret<u64>(k) ^ 0x8000000000000000;
+    String::appendf(s, "%016x", u);
+}
+
+fn hex_at(slice<u8, shared> b, usize at) : i64
+{
+    u64 u = 0;
+    for (usize i = 0; i < 16; i += 1)
+    {
+        u8 c = b[at + i];
+        u64 d = 0;
+        if (c >= b'a')
+        {
+            d = widen<u64>(c - b'a') + 10;
+        }
+        else
+        {
+            d = widen<u64>(c - b'0');
+        }
+        u = (u << 4) | d;
+    }
+    reinterpret<i64>(u ^ 0x8000000000000000)
+}
+
+// One step, encoded: `f`, `i` and the index, `r` and the bounds, each
+// number sixteen hexadecimal digits of its value offset by 2^63.
+export fn step_enc(ref<String, exclusive> s, ref<StepK, shared> st)
+{
+    match (st)
+    {
+        StepK::Field            : String::push_ascii(s, b'f'),
+        StepK::Idx(k)           :
+        {
+            String::push_ascii(s, b'i');
+            push_hex(s, *k);
+        },
+        StepK::Range { lo, hi } :
+        {
+            String::push_ascii(s, b'r');
+            push_hex(s, *lo);
+            push_hex(s, *hi);
+        },
+    }
+}
+
+export fn steps_enc(ref<Vec<StepK>, shared> v) : String
+{
+    String s = String::new();
+    foreach (st in v)
+    {
+        step_enc(&mut s, st);
+    }
+    s
+}
+
+export fn steps_dec(StringView e) : Vec<StepK>
+{
+    slice<u8, shared> b = StringView::as_bytes(e);
+    Vec<StepK> out = Vec::new();
+    usize i = 0;
+    while (i < slice_len(b))
+    {
+        if (b[i] == b'f')
+        {
+            Vec::push(&mut out, StepK::Field);
+            i += 1;
+        }
+        else if (b[i] == b'i')
+        {
+            Vec::push(&mut out, StepK::Idx(hex_at(b, i + 1)));
+            i += 17;
+        }
+        else
+        {
+            Vec::push(&mut out, StepK::Range { .lo = hex_at(b, i + 1), .hi = hex_at(b, i + 17) });
+            i += 33;
+        }
+    }
+    out
+}
+
+export fn field_step() : String
+{
+    "f"
+}
+
+export fn idx_step(i64 k) : String
+{
+    String s = String::new();
+    step_enc(&mut s, &StepK::Idx(k));
+    s
+}
+
+export fn range_step(i64 lo, i64 hi) : String
+{
+    String s = String::new();
+    step_enc(&mut s, &StepK::Range { .lo = lo, .hi = hi });
+    s
+}
+
+// Whether the encoded steps hold a step other than a field.
+export fn steps_all_fields(StringView e) : bool
+{
+    foreach (c in StringView::as_bytes(e))
+    {
+        if (*c != b'f')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// A projection: a field path from a parameter's referent, cut at the first
+// index or range (the empty path is the whole referent), encoded.
+export struct Summary
+{
+    export SSet<String> reads;
+    export SSet<String> writes;
+}
+
+export fn Summary::new() : Summary
+{
+    Summary { .reads = SSet::new(), .writes = SSet::new() }
+}
+
+fn summary_eq(ref<Summary, shared> a, ref<Summary, shared> b) : bool
+{
+    SSet::eq(&a.reads, &b.reads) && SSet::eq(&a.writes, &b.writes)
+}
+
+// Per function with a body, per parameter: its summary when it is a
+// reference parameter (a reference or a slice), else None.
+export struct FnSums
+{
+    export String name;
+    export Vec<Option<Summary>> params;
+}
+
+export struct Summaries
+{
+    export Vec<FnSums> fns;
+}
+
+// The summary of parameter `i` of `f`, if it has one.
+export fn Summaries::get(ref<Summaries, shared> s, StringView f, usize i) : Option<Summary>
+{
+    foreach (x in &s.fns)
+    {
+        if (x.name == f)
+        {
+            if (i < Vec::len(&x.params))
+            {
+                return clone(&x.params[i]);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn sums_eq(ref<Summaries, shared> a, ref<Summaries, shared> b) : bool
+{
+    if (Vec::len(&a.fns) != Vec::len(&b.fns))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(&a.fns); i += 1)
+    {
+        ref<FnSums, shared> x = &a.fns[i];
+        ref<FnSums, shared> y = &b.fns[i];
+        if (x.name != y.name || Vec::len(&x.params) != Vec::len(&y.params))
+        {
+            return false;
+        }
+        for (usize k = 0; k < Vec::len(&x.params); k += 1)
+        {
+            bool same = match (&x.params[k])
+            {
+                Some(p) : match (&y.params[k])
+                {
+                    Some(q) : summary_eq(p, q),
+                    None    : false,
+                },
+                None : match (&y.params[k])
+                {
+                    Some(_) : false,
+                    None    : true,
+                },
+            };
+            if (!same)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// How a callee's parameter takes its argument, for the rule: as a reference
+// or slice in a mode, as a type parameter's type (instantiated in the
+// fragment at a reference only by `Vec<ref<…>>` and `Channel<ref<…>>`), as a
+// value that holds a reference, or as a value that holds none.
+export enum PK
+{
+    Ref(Mode),
+    TyParam,
+    Holds,
+    Plain,
+}
+
+export fn pk_is_ref(ref<PK, shared> k) : bool
+{
+    match (k)
+    {
+        PK::Ref(_) : true,
+        _          : false,
+    }
+}
+
+export fn ty_pk(ref<Ty, shared> t) : PK
+{
+    match (t)
+    {
+        Ty::Ref { t: _, m } : PK::Ref(*m),
+        Ty::Slice(m)        : PK::Ref(*m),
+        // A closure or `fn` value is a frame-held reference (D-0281: a
+        // closure passed and called is tier S): it holds its captures' borrows.
+        Ty::Fn(_)           : PK::Holds,
+        _                   :
+        {
+            if (Ty::holds_ref(t) || ty_eq(t, &Ty::VecR))
+            {
+                return PK::Holds;
+            }
+            PK::Plain
+        },
+    }
+}
+
+fn pks(Vec<PK> v) : Option<Vec<PK>>
+{
+    Some(v)
+}
+
+// The parameters of the `std` functions the fragment calls, as the rule
+// sees them; None for a name that is not one.
+export fn std_params(StringView f) : Option<Vec<PK>>
+{
+    Vec<PK> v = Vec::new();
+    if (f == "Mutex::new" || f == "Atomic::new" || f == "Channel::new")
+    {
+        Vec::push(&mut v, PK::Plain);
+    }
+    else if (f == "Vec::new")
+    {
+    }
+    else if (f == "lock" || f == "Atomic::load" || f == "Atomic::notify_all" || f == "Channel::recv" || f == "Channel::close")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Shared));
+    }
+    else if (f == "Atomic::store" || f == "Atomic::fetch_add" || f == "Atomic::wait")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Shared));
+        Vec::push(&mut v, PK::Plain);
+    }
+    else if (f == "Vec::push")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+        Vec::push(&mut v, PK::TyParam);
+    }
+    else if (f == "Vec::pop")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+    }
+    else if (f == "Vec::index_exclusive")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+        Vec::push(&mut v, PK::Plain);
+    }
+    else if (f == "swap")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+    }
+    else if (f == "replace")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Excl));
+        Vec::push(&mut v, PK::Plain);
+    }
+    else if (f == "Channel::send")
+    {
+        Vec::push(&mut v, PK::Ref(Mode::Shared));
+        Vec::push(&mut v, PK::TyParam);
+    }
+    else
+    {
+        return None;
+    }
+    pks(v)
+}
+
+// Whether a call's result is a reference (a reference or a slice) itself.
+fn returns_ref(ref<Program, shared> prog, StringView f) : bool
+{
+    match (Program::func(prog, f))
+    {
+        Some(func) : is_ref_ty(&func.ret) || is_slice_ty(&func.ret),
+        None       : f == "Vec::index_exclusive",
+    }
+}
+
+export fn param_pks(ref<Program, shared> prog, StringView f) : Vec<PK>
+{
+    match (Program::func(prog, f))
+    {
+        Some(func) :
+        {
+            Vec<PK> v = Vec::new();
+            foreach (p in &func.params)
+            {
+                Vec::push(&mut v, ty_pk(&p.ty));
+            }
+            v
+        },
+        None : match (std_params(f))
+        {
+            Some(v) : v,
+            None    : Vec::new(),
+        },
+    }
+}
+
+fn pk_at(ref<Vec<PK>, shared> v, usize i) : Option<PK>
+{
+    if (i < Vec::len(v))
+    {
+        return Some(v[i]);
+    }
+    None
+}
+
+enum U
+{
+    Read,
+    Write,
+    Borrow(Mode),
+}
+
+// A root of a reference value: (parameter, path).
+export struct PRoot
+{
+    export usize param;
+    export String path;
+}
+
+// One function body's summary pass: which (parameter, path) each local
+// reference is rooted at, and the reads and writes found.
+struct SumCx
+{
+    Program prog;
+    Summaries sums;
+    // The reference parameters by name: their index.
+    HashMap<String, usize> params;
+    // Those of them that are shared.
+    SSet<String> shared;
+    // "a local reference bound from a p-rooted borrow, or from a call on one
+    // that returns a reference, is rooted where that is" (flow-insensitive:
+    // every binding of the local counts).
+    HashMap<String, SSet<PRoot>> alias;
+    Vec<Summary> out;
+}
+
+// Where a reference value is rooted, as (parameter, path).
+fn SumCx::ref_root(ref<SumCx, shared> cx, ref<Expr, shared> e) : SSet<PRoot>
+{
+    match (&e.k)
+    {
+        ExprK::Var(n)                 : SumCx::var_roots(cx, n),
+        ExprK::Borrow { m, e: p }     : SumCx::place_root(cx, Box::get(p)),
+        ExprK::Slice { m, v, lo, hi } : SumCx::var_roots(cx, v),
+        ExprK::Call { f, xs }         :
+        {
+            if (!returns_ref(&cx.prog, f))
+            {
+                return SSet::new();
+            }
+            Vec<PK> pk = param_pks(&cx.prog, f);
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                if (i < Vec::len(&pk) && pk_is_ref(&pk[i]))
+                {
+                    return SumCx::ref_root(cx, &xs[i]);
+                }
+            }
+            SSet::new()
+        },
+        _                             : SSet::new(),
+    }
+}
+
+fn SumCx::var_roots(ref<SumCx, shared> cx, StringView n) : SSet<PRoot>
+{
+    SSet<PRoot> s = match (HashMap::get(&cx.alias, n))
+    {
+        Some(a) : clone(a),
+        None    : SSet::new(),
+    };
+    match (HashMap::get(&cx.params, n))
+    {
+        Some(i) : { _ = SSet::insert(&mut s, PRoot { .param = *i, .path = "" }); },
+        None    : {},
+    }
+    s
+}
+
+// Where a place lies in a parameter's referent, if it does.
+fn SumCx::place_root(ref<SumCx, shared> cx, ref<Expr, shared> e) : SSet<PRoot>
+{
+    match (&e.k)
+    {
+        ExprK::Deref(a)       : SumCx::ref_root(cx, Box::get(a)),
+        // `p.r`, `(*p).r` of a reference to a Hold (auto-deref).
+        ExprK::Field(a)       :
+        {
+            SSet<PRoot> base = match (&Box::get(a).k)
+            {
+                ExprK::Deref(b) : SumCx::ref_root(cx, Box::get(b)),
+                ExprK::Var(n)   : SumCx::var_roots(cx, n),
+                _               : SumCx::place_root(cx, Box::get(a)),
+            };
+            SSet<PRoot> out = SSet::new();
+            foreach (r in &base.keys)
+            {
+                String p = clone(&r.path);
+                if (steps_all_fields(&p))
+                {
+                    String::append(&mut p, &field_step());
+                }
+                _ = SSet::insert(&mut out, PRoot { .param = r.param, .path = p });
+            }
+            out
+        },
+        // `s[k]` of a slice parameter: cut at the index.
+        ExprK::Index { v, k } : SumCx::var_roots(cx, v),
+        _                     : SSet::new(),
+    }
+}
+
+fn SumCx::record(ref<SumCx, exclusive> cx, ref<SSet<PRoot>, shared> roots, U u)
+{
+    foreach (r in &roots.keys)
+    {
+        match (u)
+        {
+            U::Read                 : { _ = SSet::insert(&mut cx.out[r.param].reads, clone(&r.path)); },
+            U::Borrow(Mode::Shared) : { _ = SSet::insert(&mut cx.out[r.param].reads, clone(&r.path)); },
+            U::Write                : { _ = SSet::insert(&mut cx.out[r.param].writes, clone(&r.path)); },
+            U::Borrow(Mode::Excl)   : { _ = SSet::insert(&mut cx.out[r.param].writes, clone(&r.path)); },
+        }
+    }
+}
+
+fn SumCx::visit_call(ref<SumCx, exclusive> cx, StringView f, ref<Vec<Expr>, shared> args)
+{
+    Vec<PK> pk = param_pks(&cx.prog, f);
+    for (usize i = 0; i < Vec::len(args); i += 1)
+    {
+        ref<Expr, shared> a = &args[i];
+        SumCx::visit(cx, a, U::Read);
+        SSet<PRoot> roots = SumCx::ref_root(cx, a);
+        if (SSet::len(&roots) == 0)
+        {
+            continue;
+        }
+        Option<Summary> callee = Summaries::get(&cx.sums, f, i);
+        Option<PK> k = pk_at(&pk, i);
+        bool has_body = Program::has_func(&cx.prog, f);
+        match (k)
+        {
+            Some(PK::Ref(m))  :
+            {
+                match (&callee)
+                {
+                    // "passing a p-rooted reference at π to G's reference
+                    // parameter q puts π·ρ in reads for each ρ in reads(G,
+                    // q), and likewise for writes"
+                    Some(g) :
+                    {
+                        if (has_body)
+                        {
+                            foreach (r in &roots.keys)
+                            {
+                                foreach (rho in &g.reads.keys)
+                                {
+                                    _ = SSet::insert(&mut cx.out[r.param].reads, sprintf("%s%s", &r.path, rho));
+                                }
+                                foreach (rho in &g.writes.keys)
+                                {
+                                    _ = SSet::insert(&mut cx.out[r.param].writes, sprintf("%s%s", &r.path, rho));
+                                }
+                            }
+                            continue;
+                        }
+                    },
+                    None    : {},
+                }
+                // "to a function with no body, π in reads, and in
+                // writes when the parameter is exclusive"; a function
+                // of `std` has the same summary.
+                SumCx::record(cx, &roots, U::Read);
+                if (m == Mode::Excl)
+                {
+                    SumCx::record(cx, &roots, U::Write);
+                }
+            },
+            // "to a parameter of a type parameter's type … π in
+            // reads, and in writes unless the argument is a shared
+            // borrow or a shared binding"
+            Some(PK::TyParam) :
+            {
+                bool shared = match (&a.k)
+                {
+                    ExprK::Borrow { m, e } : *m == Mode::Shared,
+                    ExprK::Var(n)          : sset_has(&cx.shared, n),
+                    _                      : false,
+                };
+                SumCx::record(cx, &roots, U::Read);
+                if (!shared)
+                {
+                    SumCx::record(cx, &roots, U::Write);
+                }
+            },
+            _                 : {},
+        }
+    }
+}
+
+fn SumCx::visit(ref<SumCx, exclusive> cx, ref<Expr, shared> e, U u)
+{
+    match (&e.k)
+    {
+        ExprK::Int(_)                 : {},
+        ExprK::Var(_)                 : {},
+        ExprK::Join(_)                : {},
+        ExprK::Deref(a)               :
+        {
+            SSet<PRoot> r = SumCx::place_root(cx, e);
+            SumCx::record(cx, &r, u);
+            SumCx::visit(cx, Box::get(a), U::Read);
+        },
+        ExprK::Field(a)               :
+        {
+            SSet<PRoot> r = SumCx::place_root(cx, e);
+            SumCx::record(cx, &r, u);
+            match (&Box::get(a).k)
+            {
+                ExprK::Deref(b) : SumCx::visit(cx, Box::get(b), U::Read),
+                _               : SumCx::visit(cx, Box::get(a), U::Read),
+            }
+        },
+        ExprK::Index { v, k }         :
+        {
+            SSet<PRoot> r = SumCx::place_root(cx, e);
+            SumCx::record(cx, &r, u);
+        },
+        ExprK::Borrow { m, e: a }     : SumCx::visit(cx, Box::get(a), U::Borrow(*m)),
+        ExprK::Slice { m, v, lo, hi } :
+        {
+            SSet<PRoot> r = SumCx::var_roots(cx, v);
+            SumCx::record(cx, &r, U::Borrow(*m));
+        },
+        ExprK::Add { a, b }           :
+        {
+            SumCx::visit(cx, Box::get(a), U::Read);
+            SumCx::visit(cx, Box::get(b), U::Read);
+        },
+        ExprK::Gt { a, b }            :
+        {
+            SumCx::visit(cx, Box::get(a), U::Read);
+            SumCx::visit(cx, Box::get(b), U::Read);
+        },
+        ExprK::Call { f, xs }         : SumCx::visit_call(cx, f, xs),
+        ExprK::Spawn { f, xs }        : SumCx::visit_call(cx, f, xs),
+        ExprK::HoldLit(a)             : SumCx::visit(cx, Box::get(a), U::Read),
+        ExprK::JobLit(a)              : SumCx::visit(cx, Box::get(a), U::Read),
+        ExprK::CallVal(a)             : SumCx::visit(cx, Box::get(a), U::Read),
+        ExprK::SpawnClo(a)            : SumCx::visit(cx, Box::get(a), U::Read),
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (x in xs)
+            {
+                SumCx::visit(cx, x, U::Read);
+            }
+        },
+        // "a closure that captures a p-rooted reference puts π in both"
+        ExprK::Closure(c)             :
+        {
+            foreach (x in &Box::get(c).caps)
+            {
+                SSet<PRoot> r = SumCx::var_roots(cx, x);
+                SumCx::record(cx, &r, U::Read);
+                SumCx::record(cx, &r, U::Write);
+            }
+        },
+    }
+}
+
+fn SumCx::bind(ref<SumCx, exclusive> cx, StringView name, ref<Expr, shared> init)
+{
+    SSet<PRoot> r = SumCx::ref_root(cx, init);
+    if (SSet::len(&r) == 0)
+    {
+        return;
+    }
+    ref<SSet<PRoot>, exclusive> a = HashMap::entry(&mut cx.alias, name, SSet::new());
+    foreach (x in &r.keys)
+    {
+        _ = SSet::insert(a, clone(x));
+    }
+}
+
+fn SumCx::block(ref<SumCx, exclusive> cx, ref<Block, shared> b)
+{
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init }              :
+            {
+                SumCx::visit(cx, init, U::Read);
+                SumCx::bind(cx, name, init);
+            },
+            StmtK::Assign { place, value }             :
+            {
+                match (&place.k)
+                {
+                    // A whole local written: not a place of a referent.
+                    ExprK::Var(n) : SumCx::bind(cx, n, value),
+                    _             : SumCx::visit(cx, place, U::Write),
+                }
+                SumCx::visit(cx, value, U::Read);
+            },
+            StmtK::Expr(e)                             : SumCx::visit(cx, e, U::Read),
+            StmtK::Print(e)                            : SumCx::visit(cx, e, U::Read),
+            StmtK::Discard(e)                          : SumCx::visit(cx, e, U::Read),
+            StmtK::Block(x)                            : SumCx::block(cx, x),
+            StmtK::If { cond, thn, els }               :
+            {
+                SumCx::visit(cx, cond, U::Read);
+                SumCx::block(cx, thn);
+                match (els)
+                {
+                    Some(e) : SumCx::block(cx, e),
+                    None    : {},
+                }
+            },
+            StmtK::While { cond, body }                :
+            {
+                SumCx::visit(cx, cond, U::Read);
+                SumCx::block(cx, body);
+            },
+            StmtK::Match { scrut, binder, some, none } :
+            {
+                SumCx::visit(cx, scrut, U::Read);
+                SumCx::bind(cx, binder, scrut);
+                SumCx::block(cx, some);
+                SumCx::block(cx, none);
+            },
+            StmtK::Break                               : {},
+            StmtK::Continue                            : {},
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : SumCx::visit(cx, t, U::Read),
+        None    : {},
+    }
+}
+
+fn fresh_out(usize n) : Vec<Summary>
+{
+    Vec<Summary> v = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut v, Summary::new());
+    }
+    v
+}
+
+// "The summaries are computed over the whole program to a fixed point."
+// The fragment has no `unsafe`; the `std` functions are not in `prog.funcs`
+// (their summaries are the fixed {ε} the rule gives them, in `std_params`).
+export fn summaries(ref<Program, shared> prog) : Summaries
+{
+    Summaries sums = Summaries { .fns = Vec::new() };
+    foreach (f in &prog.funcs)
+    {
+        Vec<Option<Summary>> ps = Vec::new();
+        foreach (p in &f.params)
+        {
+            if (pk_is_ref(&ty_pk(&p.ty)))
+            {
+                Vec::push(&mut ps, Some(Summary::new()));
+            }
+            else
+            {
+                Vec::push(&mut ps, None);
+            }
+        }
+        Vec::push(&mut sums.fns, FnSums { .name = clone(&f.name), .params = ps });
+    }
+    for (usize round = 0; round < 64; round += 1)
+    {
+        Summaries next = clone(&sums);
+        for (usize fi = 0; fi < Vec::len(&prog.funcs); fi += 1)
+        {
+            ref<Func, shared> f = &prog.funcs[fi];
+            HashMap<String, usize> params = HashMap::new();
+            SSet<String> shared = SSet::new();
+            for (usize i = 0; i < Vec::len(&f.params); i += 1)
+            {
+                PK k = ty_pk(&f.params[i].ty);
+                if (pk_is_ref(&k))
+                {
+                    _ = HashMap::insert(&mut params, clone(&f.params[i].name), i);
+                }
+                if (k == PK::Ref(Mode::Shared))
+                {
+                    _ = SSet::insert(&mut shared, clone(&f.params[i].name));
+                }
+            }
+            SumCx cx = SumCx { .prog = clone(prog), .sums = clone(&sums), .params = params, .shared = shared, .alias = HashMap::new(), .out = fresh_out(Vec::len(&f.params)) };
+            // The aliases of a body are found before its accesses are read
+            // through them: two passes.
+            SumCx::block(&mut cx, &f.body);
+            cx.out = fresh_out(Vec::len(&f.params));
+            SumCx::block(&mut cx, &f.body);
+            for (usize i = 0; i < Vec::len(&cx.out); i += 1)
+            {
+                match (&mut next.fns[fi].params[i])
+                {
+                    Some(cur) :
+                    {
+                        foreach (r in &cx.out[i].reads.keys)
+                        {
+                            _ = SSet::insert(&mut cur.reads, clone(r));
+                        }
+                        foreach (w in &cx.out[i].writes.keys)
+                        {
+                            _ = SSet::insert(&mut cur.writes, clone(w));
+                        }
+                    },
+                    None      : {},
+                }
+            }
+        }
+        if (sums_eq(&next, &sums))
+        {
+            break;
+        }
+        sums = next;
+    }
+    sums
+}
+
+export const usize NONE = ~0;
+
+// A body's source positions (the rule's lexical liveness): every
+// expression's position at its end in evaluation order, which is source
+// order in the fragment; each binding's declaration and mentions; the
+// loops. Indexed by the numbers `number_program` gave; `NONE` where the
+// body has no such node.
+export struct Loop
+{
+    export usize start;
+    export usize end;
+}
+
+export struct Positions
+{
+    export Vec<usize> at;
+    export Vec<usize> stmt_end;
+    // A `let` or `match` statement -> the binding it declares.
+    export Vec<usize> decl;
+    export Vec<usize> decl_seq;
+    export Vec<Vec<usize>> mentions;
+    export Vec<Loop> loops;
+    usize next;
+    Vec<HashMap<String, usize>> scopes;
+}
+
+fn filled(usize n) : Vec<usize>
+{
+    Vec::filled(n, NONE)
+}
+
+// `params` are bound at the entry (a closure body's captures too), as
+// bindings 0, 1, ….
+export fn Positions::of(ref<Program, shared> prog, ref<Vec<String>, shared> params, ref<Block, shared> body) : Positions
+{
+    Positions p = Positions
+    {
+        .at = filled(prog.nexprs),
+        .stmt_end = filled(prog.nstmts),
+        .decl = filled(prog.nstmts),
+        .decl_seq = Vec::new(),
+        .mentions = Vec::new(),
+        .loops = Vec::new(),
+        .next = 0,
+        .scopes = Vec::new(),
+    };
+    Vec::push(&mut p.scopes, HashMap::new());
+    foreach (n in params)
+    {
+        _ = Positions::declare(&mut p, n);
+    }
+    Positions::block(&mut p, body);
+    p
+}
+
+fn Positions::declare(ref<Positions, exclusive> p, StringView n) : usize
+{
+    usize id = Vec::len(&p.decl_seq);
+    Vec::push(&mut p.decl_seq, p.next);
+    Vec::push(&mut p.mentions, Vec::new());
+    usize top = Vec::len(&p.scopes) - 1;
+    _ = HashMap::insert(&mut p.scopes[top], String::copy(n), id);
+    id
+}
+
+// "A mention resolves to the binding in scope where it is written."
+fn Positions::mention(ref<Positions, exclusive> p, StringView n)
+{
+    usize at = p.next;
+    usize k = Vec::len(&p.scopes);
+    while (k > 0)
+    {
+        k -= 1;
+        Option<usize> found = match (HashMap::get(&p.scopes[k], n))
+        {
+            Some(id) : Some(*id),
+            None     : None,
+        };
+        match (found)
+        {
+            Some(id) :
+            {
+                Vec::push(&mut p.mentions[id], at);
+                return;
+            },
+            None     : {},
+        }
+    }
+}
+
+fn Positions::expr(ref<Positions, exclusive> p, ref<Expr, shared> e)
+{
+    match (&e.k)
+    {
+        ExprK::Int(_)                 : {},
+        ExprK::Var(n)                 : Positions::mention(p, n),
+        ExprK::Index { v, k }         : Positions::mention(p, v),
+        ExprK::Join(n)                : Positions::mention(p, n),
+        ExprK::Slice { m, v, lo, hi } : Positions::mention(p, v),
+        ExprK::Deref(a)               : Positions::expr(p, Box::get(a)),
+        ExprK::Field(a)               : Positions::expr(p, Box::get(a)),
+        ExprK::Borrow { m, e: a }     : Positions::expr(p, Box::get(a)),
+        ExprK::HoldLit(a)             : Positions::expr(p, Box::get(a)),
+        ExprK::JobLit(a)              : Positions::expr(p, Box::get(a)),
+        ExprK::CallVal(a)             : Positions::expr(p, Box::get(a)),
+        ExprK::SpawnClo(a)            : Positions::expr(p, Box::get(a)),
+        // A closure mentions what it captures; its body is a body of its own.
+        ExprK::Closure(c)             :
+        {
+            foreach (x in &Box::get(c).caps)
+            {
+                Positions::mention(p, x);
+            }
+        },
+        ExprK::Add { a, b }           :
+        {
+            Positions::expr(p, Box::get(a));
+            Positions::expr(p, Box::get(b));
+        },
+        ExprK::Gt { a, b }            :
+        {
+            Positions::expr(p, Box::get(a));
+            Positions::expr(p, Box::get(b));
+        },
+        ExprK::Call { f, xs }         :
+        {
+            foreach (x in xs)
+            {
+                Positions::expr(p, x);
+            }
+        },
+        ExprK::Spawn { f, xs }        :
+        {
+            foreach (x in xs)
+            {
+                Positions::expr(p, x);
+            }
+        },
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (x in xs)
+            {
+                Positions::expr(p, x);
+            }
+        },
+    }
+    p.at[e.id] = p.next;
+    p.next += 1;
+}
+
+fn Positions::block(ref<Positions, exclusive> p, ref<Block, shared> b)
+{
+    Vec::push(&mut p.scopes, HashMap::new());
+    foreach (s in &b.stmts)
+    {
+        Positions::stmt(p, s);
+    }
+    match (&b.tail)
+    {
+        Some(t) : Positions::expr(p, t),
+        None    : {},
+    }
+    _ = Vec::pop(&mut p.scopes);
+}
+
+fn Positions::stmt(ref<Positions, exclusive> p, ref<Stmt, shared> s)
+{
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              :
+        {
+            Positions::expr(p, init);
+            usize id = Positions::declare(p, name);
+            p.decl[s.id] = id;
+        },
+        StmtK::Assign { place, value }             :
+        {
+            Positions::expr(p, place);
+            Positions::expr(p, value);
+        },
+        StmtK::Expr(e)                             : Positions::expr(p, e),
+        StmtK::Print(e)                            : Positions::expr(p, e),
+        StmtK::Discard(e)                          : Positions::expr(p, e),
+        StmtK::Block(b)                            : Positions::block(p, b),
+        StmtK::If { cond, thn, els }               :
+        {
+            Positions::expr(p, cond);
+            Positions::block(p, thn);
+            match (els)
+            {
+                Some(e) : Positions::block(p, e),
+                None    : {},
+            }
+        },
+        StmtK::While { cond, body }                :
+        {
+            usize start = p.next;
+            Positions::expr(p, cond);
+            Positions::block(p, body);
+            Vec::push(&mut p.loops, Loop { .start = start, .end = p.next });
+        },
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            Positions::expr(p, scrut);
+            Vec::push(&mut p.scopes, HashMap::new());
+            usize id = Positions::declare(p, binder);
+            p.decl[s.id] = id;
+            Positions::block(p, some);
+            _ = Vec::pop(&mut p.scopes);
+            Positions::block(p, none);
+        },
+        StmtK::Break                               : {},
+        StmtK::Continue                            : {},
+    }
+    p.stmt_end[s.id] = p.next;
+    p.next += 1;
+}
+
+// "A frame-held reference h is live at a point P when the binding of that
+// name in scope at P is mentioned after P in the source, or anywhere in a
+// loop that encloses P and that its declaration precedes."
+export fn Positions::live_after(ref<Positions, shared> p, usize id, usize at) : bool
+{
+    if (id >= Vec::len(&p.mentions))
+    {
+        return false;
+    }
+    ref<Vec<usize>, shared> ms = &p.mentions[id];
+    foreach (s in ms)
+    {
+        if (*s > at)
+        {
+            return true;
+        }
+    }
+    foreach (l in &p.loops)
+    {
+        if (l.start <= at && at < l.end && p.decl_seq[id] < l.start)
+        {
+            foreach (s in ms)
+            {
+                if (l.start <= *s && *s < l.end)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn i64_max(i64 a, i64 b) : i64
+{
+    if (a > b)
+    {
+        return a;
+    }
+    b
+}
+
+fn i64_min(i64 a, i64 b) : i64
+{
+    if (a < b)
+    {
+        return a;
+    }
+    b
+}
+
+// Whether two steps meet: equal fields, equal indices, an index inside a
+// range, two intersecting ranges.
+export fn step_meet(ref<StepK, shared> x, ref<StepK, shared> y) : bool
+{
+    match (x)
+    {
+        StepK::Field : match (y)
+        {
+            StepK::Field : true,
+            _            : false,
+        },
+        StepK::Idx(i) : match (y)
+        {
+            StepK::Idx(j)           : *i == *j,
+            StepK::Range { lo, hi } : *lo <= *i && *i < *hi,
+            _                       : false,
+        },
+        StepK::Range { lo, hi } : match (y)
+        {
+            StepK::Idx(k)                     : *lo <= *k && *k < *hi,
+            StepK::Range { lo: lo2, hi: hi2 } : i64_max(*lo, *lo2) < i64_min(*hi, *hi2),
+            _                                 : false,
+        },
+    }
+}
+
+// Two keys "certainly overlap" when their roots are equal (the caller
+// compares them), their paths agree step by step, and the longer path's
+// remainder holds no range that may be empty. Every index and bound of the
+// fragment is a literal, so "may overlap" never arises here.
+export fn certain(StringView ae, StringView be) : bool
+{
+    Vec<StepK> a = steps_dec(ae);
+    Vec<StepK> b = steps_dec(be);
+    usize n = Vec::len(&a);
+    if (Vec::len(&b) < n)
+    {
+        n = Vec::len(&b);
+    }
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (!step_meet(&a[i], &b[i]))
+        {
+            return false;
+        }
+    }
+    ref<Vec<StepK>, shared> rest = &b;
+    if (Vec::len(&a) > n)
+    {
+        rest = &a;
+    }
+    for (usize i = n; i < Vec::len(rest); i += 1)
+    {
+        match (&rest[i])
+        {
+            StepK::Range { lo, hi } :
+            {
+                if (*lo >= *hi)
+                {
+                    return false;
+                }
+            },
+            _                       : {},
+        }
+    }
+    true
+}

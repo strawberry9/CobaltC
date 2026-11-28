@@ -1,0 +1,1447 @@
+// `std::http` (spec/21 §2p, D-0173, D-0174): HTTP/1.1 (RFC 9110, RFC 9112)
+// over `std::net` and `std::tls`. A client that fetches a URL or posts to
+// one, following redirects and decoding chunked bodies, with limits on
+// what it will read; and a server that accepts connections, parses their
+// requests and writes responses, keeping a connection open for the next
+// request when the client asks. Written in CobaltC. HTTP/1.1 only: no
+// HTTP/2, no compression, no cookies, no proxies. The client and the
+// server are the submodules `client` and `server` (D-0187), re-exported
+// here; what both use -- errors, URLs, forms, headers, messages and the
+// buffered reader -- is declared here.
+
+// Why a request or a connection failed.
+/// Why an HTTP request or connection failed.
+///
+/// - `HttpNetFailure(e)`: the network failed, as `e` says.
+/// - `HttpTlsFailure(e)`: the TLS connection failed, as `e` says.
+/// - `BadUrl`: the URL is malformed (`Url::parse`).
+/// - `UnsupportedScheme`: the URL's scheme is neither `http` nor `https`.
+/// - `NoRoots`: an https request needed the system's trusted roots and `TrustStore::system` failed.
+/// - `BadMessage`: an HTTP message received is malformed; or one to be sent would be: a header whose name
+///   is not a token or whose value holds a control byte other than the tab (a CR or LF would start a
+///   header or a body of its own), a method that is not a token, or a status outside 100 to 599; or a
+///   server's response with no request waiting for one (`HttpConnection::respond` called twice).
+/// - `TooLarge`: a message's head is over 65536 bytes, or its body over the limit.
+/// - `TooManyRedirects`: a response asked for one redirect more than the client's `max_redirects`.
+/// - `ConnectionClosed`: the connection ended inside a message.
+export enum HttpError
+{
+    HttpNetFailure(NetError),
+    HttpTlsFailure(TlsError),
+    BadUrl,
+    UnsupportedScheme,
+    NoRoots,
+    BadMessage,
+    TooLarge,
+    TooManyRedirects,
+    ConnectionClosed,
+}
+
+/// A one-line description of the error, for messages.
+export fn HttpError::text(ref<HttpError, shared> e) : str
+{
+    match (e)
+    {
+        HttpNetFailure(n) : NetError::text(n),
+        HttpTlsFailure(t) : TlsError::text(t),
+        BadUrl            : "the URL is malformed",
+        UnsupportedScheme : "the URL's scheme is neither http nor https",
+        NoRoots           : "no trusted roots for https (TrustStore::system failed)",
+        BadMessage        : "the HTTP message is malformed",
+        TooLarge          : "the HTTP message is larger than the limit",
+        TooManyRedirects  : "too many redirects",
+        ConnectionClosed  : "the connection was closed",
+    }
+}
+
+// ---- URLs ----
+
+// A parsed `scheme://host[:port]/path?query`; the fragment, which never
+// reaches a server, is dropped. `port` is the scheme's default when the
+// text names none; `path` is "/" when it names none.
+/// A parsed absolute URL, `scheme://host[:port]/path?query`.
+///
+/// - `scheme`: lower-cased.
+/// - `host`: lower-cased; an IPv6 host keeps its brackets (`[::1]`).
+/// - `port`: the number after the host's `:`, or the scheme's default: 443 for `https`, 80 otherwise.
+/// - `path`: "/" when the text has none.
+/// - `query`: the text after `?`, without it; empty when there is none.
+///
+/// The fragment (`#…`), which never reaches a server, is dropped.
+export struct Url
+{
+    export String scheme;
+    export String host;
+    export u16 port;
+    export String path;
+    export String query;
+}
+
+fn default_port(StringView scheme) : u16
+{
+    if (scheme == "https") { 443 } else { 80 }
+}
+
+// A port: 1 to 5 decimal digits, at most 65535 (RFC 3986 §3.2.3 has no
+// sign).
+fn port_digits(StringView t) : Option<u16>
+{
+    slice<u8, shared> b = StringView::as_bytes(t);
+    if (slice_len(b) == 0 || slice_len(b) > 5)
+    {
+        return None;
+    }
+    u32 v = 0;
+    foreach (c in b)
+    {
+        if (*c < b'0' || *c > b'9')
+        {
+            return None;
+        }
+        v = v * 10 + widen<u32>(*c - b'0');
+    }
+    if (v > 65535)
+    {
+        return None;
+    }
+    Some(narrow<u16>(v))
+}
+
+// A URL's or a `Host` header's host (RFC 3986 §3.2.2): a bracketed IPv6
+// address (hex digits, `:` and `.` inside the brackets), or a non-empty
+// `reg-name` -- unreserved bytes, sub-delims and `%` -- which an IPv4
+// address is too.
+fn host_ok(StringView h) : bool
+{
+    slice<u8, shared> b = StringView::as_bytes(h);
+    usize n = slice_len(b);
+    if (n == 0)
+    {
+        return false;
+    }
+    if (b[0] == b'[')
+    {
+        if (n < 3 || b[n - 1] != b']')
+        {
+            return false;
+        }
+        for (usize i = 1; i + 1 < n; i += 1)
+        {
+            u8 c = b[i];
+            if (!(Option::is_some(&hex_digit(c)) || c == b':' || c == b'.'))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    foreach (p in b)
+    {
+        u8 c = *p;
+        bool sub_delim = false;
+        foreach (m in StringView::as_bytes("!$&'()*+,;=%"))
+        {
+            if (*m == c)
+            {
+                sub_delim = true;
+            }
+        }
+        if (!is_unreserved(c) && !sub_delim)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// A `Host` field's value (RFC 9112 §3.2, RFC 9110 §7.2): empty, or
+// `uri-host [":" port]` with the port's digits (possibly none).
+fn host_field_ok(StringView v) : bool
+{
+    StringView t = StringView::trim(v);
+    slice<u8, shared> b = StringView::as_bytes(t);
+    usize n = slice_len(b);
+    if (n == 0)
+    {
+        return true;
+    }
+    usize host_end = n;
+    if (b[0] == b'[')
+    {
+        host_end = match (StringView::find(t, "]"))
+        {
+            Some(i) : i + 1,
+            None    : return false,
+        };
+    }
+    else
+    {
+        host_end = 0;
+        while (host_end < n && b[host_end] != b':')
+        {
+            host_end += 1;
+        }
+    }
+    if (!host_ok(&t[0..host_end]))
+    {
+        return false;
+    }
+    if (host_end == n)
+    {
+        return true;
+    }
+    if (b[host_end] != b':' || n - host_end - 1 > 5)
+    {
+        return false;
+    }
+    for (usize i = host_end + 1; i < n; i += 1)
+    {
+        if (b[i] < b'0' || b[i] > b'9')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A host and an optional port, or nothing; never a path, a space or user information.
+unittest "host_field_ok: what a Host field may hold"
+{
+    assert(host_field_ok("") && host_field_ok("example.com") && host_field_ok("h:8080"));
+    assert(host_field_ok("[::1]:443") && host_field_ok("127.0.0.1"));
+    assert(!host_field_ok("evil.com/x?y@z w") && !host_field_ok("a@b") && !host_field_ok("h:80:80"));
+    assert(!host_field_ok("[::1") && !host_field_ok("h:8x"));
+}
+
+// `Err(BadUrl)` for text without `://`, with no host, with user
+// information (`user@`), with a port that is not digits, or with a
+// space, a control byte or DEL anywhere (which, written into a request
+// line or a `Host` header, would inject text into the request).
+/// Parses an absolute URL.
+///
+/// `Err(BadUrl)` for text without `://`; with an empty host, whether or not a port follows; with a host
+/// that is neither a name of RFC 3986's `reg-name` characters (letters, digits, `-._~!$&'()*+,;=` and
+/// `%`) nor a bracketed IPv6 address; with user information (`user@`); with a port that is not 1 to 5
+/// decimal digits up to 65535 (no sign); or with a space, a control byte or DEL anywhere in the text,
+/// which a request line or `Host` header would otherwise carry into the request (a space in a path is
+/// written `%20`). The scheme is not checked here: `HttpClient::send` gives `Err(UnsupportedScheme)` for
+/// one that is neither `http` nor `https`.
+export fn Url::parse(StringView text) : Result<Url, HttpError>
+{
+    foreach (c in StringView::as_bytes(text))
+    {
+        if (*c <= 32 || *c == 127)
+        {
+            return Err(BadUrl);
+        }
+    }
+    usize sep = match (StringView::find(text, "://"))
+    {
+        Some(i) : i,
+        None    : return Err(BadUrl),
+    };
+    String scheme = StringView::to_ascii_lower(&String::copy(&text[0..sep]));
+    StringView rest = &text[sep + 3..$];
+    usize n = StringView::len(rest);
+    slice<u8, shared> b = StringView::as_bytes(rest);
+    usize auth_end = 0;
+    while (auth_end < n && b[auth_end] != b'/' && b[auth_end] != b'?' && b[auth_end] != b'#')
+    {
+        auth_end += 1;
+    }
+    StringView authority = &rest[0..auth_end];
+    if (auth_end == 0 || Option::is_some(&StringView::find(authority, "@")))
+    {
+        return Err(BadUrl);
+    }
+    slice<u8, shared> ab = StringView::as_bytes(authority);
+    usize host_end = auth_end;
+    if (ab[0] == b'[')
+    {
+        host_end = match (StringView::find(authority, "]"))
+        {
+            Some(i) : i + 1,
+            None    : return Err(BadUrl),
+        };
+    }
+    else
+    {
+        host_end = 0;
+        while (host_end < auth_end && ab[host_end] != b':')
+        {
+            host_end += 1;
+        }
+    }
+    if (!host_ok(&authority[0..host_end]))
+    {
+        return Err(BadUrl);
+    }
+    String host = StringView::to_ascii_lower(&String::copy(&authority[0..host_end]));
+    u16 port = default_port(&scheme);
+    if (host_end < auth_end)
+    {
+        if (ab[host_end] != b':')
+        {
+            return Err(BadUrl);
+        }
+        port = match (port_digits(&authority[host_end + 1..auth_end]))
+        {
+            Some(p) : p,
+            None    : return Err(BadUrl),
+        };
+    }
+    usize path_end = auth_end;
+    while (path_end < n && b[path_end] != b'?' && b[path_end] != b'#')
+    {
+        path_end += 1;
+    }
+    String path = if (path_end == auth_end) { "/" } else
+    {
+        String::copy(&rest[auth_end..path_end])
+    };
+    String query = String::new();
+    if (path_end < n && b[path_end] == b'?')
+    {
+        usize q_end = path_end + 1;
+        while (q_end < n && b[q_end] != b'#')
+        {
+            q_end += 1;
+        }
+        String::append(&mut query, &rest[path_end + 1..q_end]);
+    }
+    Ok(Url { .scheme = scheme, .host = host, .port = port, .path = path, .query = query })
+}
+
+/// Scheme and host are lower-cased, the port and path take their defaults, and the fragment is dropped.
+unittest "Url::parse: defaults and normalisation"
+{
+    Url u = Result::unwrap(Url::parse("HTTPS://Example.com/a/b?x=1#top"));
+    assert(u.scheme == "https" && u.host == "example.com" && u.port == 443);
+    assert(u.path == "/a/b" && u.query == "x=1");
+    assert(Url::target(&u) == "/a/b?x=1");
+    Url v = Result::unwrap(Url::parse("http://[::1]:8080"));
+    assert(v.host == "[::1]" && v.path == "/");
+    assert(Url::text(&v) == "http://[::1]:8080/");
+    assert(Result::is_err(&Url::parse("http://user@example.com/")));
+}
+
+/// An empty host, a signed port, a space or a control byte anywhere, and a host outside `reg-name` are refused.
+unittest "Url::parse: what cannot be written into a request"
+{
+    assert(Result::is_err(&Url::parse("http://:8080/x")));
+    assert(Result::is_err(&Url::parse("http://host:+80/")));
+    assert(Result::is_err(&Url::parse("http://example.com/a b")));
+    assert(Result::is_err(&Url::parse("http://example.com/x\r\nX-Evil: 1")));
+    assert(Result::is_err(&Url::parse("http://exa mple.com/")));
+    assert(Result::is_err(&Url::parse("http://exa\"mple.com/")));
+    assert(Result::is_err(&Url::parse("http://[::1/")));
+    assert(Result::unwrap(Url::parse("http://127.0.0.1:65535/a%20b")).port == 65535);
+}
+
+// The request target: the path, and `?query` when there is one.
+/// The request target: the path, then `?` and the query when the query is not empty.
+export fn Url::target(ref<Url, shared> u) : String
+{
+    String t = String::clone(&u.path);
+    if (StringView::len(&u.query) > 0)
+    {
+        String::append(&mut t, "?");
+        String::append(&mut t, &u.query);
+    }
+    t
+}
+
+// The host as a `Host` header or a URL writes it: with the port when it
+// is not the scheme's default.
+fn host_text(ref<Url, shared> u) : String
+{
+    String h = String::clone(&u.host);
+    if (u.port != default_port(&u.scheme))
+    {
+        String::append(&mut h, ":");
+        String::append(&mut h, u.port);
+    }
+    h
+}
+
+// The URL as text again.
+/// The URL as text again, with the port only when it is not the scheme's default.
+///
+/// The fragment, dropped by `Url::parse`, does not come back.
+export fn Url::text(ref<Url, shared> u) : String
+{
+    String t = String::clone(&u.scheme);
+    String::append(&mut t, "://");
+    String::append(&mut t, &host_text(u));
+    String::append(&mut t, &Url::target(u));
+    t
+}
+
+fn is_unreserved(u8 b) : bool
+{
+    ascii_is_alnum(b) || b == b'-' || b == b'.' || b == b'_' || b == b'~'
+}
+
+// RFC 3986 percent-encoding: unreserved bytes as they are, every other
+// as `%XX` (upper-case hex).
+/// Percent-encodes `bytes` as RFC 3986 does: unreserved bytes as they are, every other as `%XX`.
+///
+/// The unreserved bytes are ASCII letters and digits, `-`, `.`, `_` and `~`; the hex digits are upper
+/// case. A space becomes `%20`; `form_encode` writes it as `+`.
+export fn percent_encode(slice<u8, shared> bytes) : String
+{
+    String out = String::new();
+    str digits = "0123456789ABCDEF";
+    foreach (c in bytes)
+    {
+        if (is_unreserved(*c))
+        {
+            String::push_ascii(&mut out, *c);
+        }
+        else
+        {
+            String::push_ascii(&mut out, b'%');
+            String::push_ascii(&mut out, str_byte(digits, widen<usize>(*c >> 4)));
+            String::push_ascii(&mut out, str_byte(digits, widen<usize>(*c & 15)));
+        }
+    }
+    out
+}
+
+fn hex_digit(u8 c) : Option<u8>
+{
+    if (c >= b'0' && c <= b'9') { Some(c - b'0') }
+    else if (c >= b'a' && c <= b'f') { Some(c - b'a' + 10) }
+    else if (c >= b'A' && c <= b'F') { Some(c - b'A' + 10) }
+    else { None }
+}
+
+// The bytes `text` percent-encodes; None for a `%` not followed by two
+// hex digits.
+/// The bytes `text` percent-encodes, each `%XX` decoded.
+///
+/// `None` for a `%` not followed by two hex digits; hex digits of either case are read. A `+` stays
+/// a `+`; `form_decode` reads it as a space.
+export fn percent_decode(StringView text) : Option<Vec<u8>>
+{
+    slice<u8, shared> b = StringView::as_bytes(text);
+    Vec<u8> out = Vec::new();
+    usize i = 0;
+    while (i < slice_len(b))
+    {
+        if (b[i] == b'%')
+        {
+            if (i + 3 > slice_len(b))
+            {
+                return None;
+            }
+            u8 hi = hex_digit(b[i + 1])?;
+            u8 lo = hex_digit(b[i + 2])?;
+            Vec::push(&mut out, hi * 16 + lo);
+            i += 3;
+        }
+        else
+        {
+            Vec::push(&mut out, b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Percent-encoding writes UTF-8 bytes as escapes, and decoding gives the bytes back.
+unittest "percent_decode: the reverse of percent_encode"
+{
+    assert(percent_encode(StringView::as_bytes("a b/ü")) == "a%20b%2F%C3%BC");
+    Vec<u8> back = Option::unwrap(percent_decode("a%20b%2f"));
+    assert(Result::unwrap(String::from_utf8(back)) == "a b/");
+    assert(Option::is_none(&percent_decode("100%")));
+}
+
+// ---- D-0181: query strings and form bodies ----
+
+// One name and value of a query string or an
+// `application/x-www-form-urlencoded` body. Names compare exactly (unlike
+// a header's).
+/// One name and value of a query string or an `application/x-www-form-urlencoded` body.
+///
+/// Names compare exactly (`find_param`), unlike a header's.
+export struct Param
+{
+    export String name;
+    export String value;
+}
+
+/// A parameter with a copy of `name` and of `value`.
+export fn Param::new(StringView name, StringView value) : Param
+{
+    Param { .name = String::copy(name), .value = String::copy(value) }
+}
+
+// The value of the first parameter named `name`, exactly.
+/// The value of the first parameter named exactly `name`, or `None` when there is none.
+///
+/// The comparison is case-sensitive, unlike `find_header`'s.
+export fn find_param(slice<Param, shared> params, StringView name) : Option<StringView> from params
+{
+    for (usize i = 0; i < slice_len(params); i += 1)
+    {
+        if (params[i].name == name)
+        {
+            return Some(&params[i].value);
+        }
+    }
+    None
+}
+
+// The parameters of `text`, a query string (without its `?`) or a form
+// body: `name=value` pairs separated by `&` alone (a `;` is part of a
+// name or value, as WHATWG's form parsing and Python since CVE-2021-23336
+// read it: splitting at `;` too lets a cache or proxy that splits at `&`
+// see other parameters than the program), each name and value
+// percent-decoded with `+` read as a space; a pair without `=` has an
+// empty value; empty pairs are skipped. A name or value that is not
+// UTF-8 after decoding, or a bad percent-escape, is kept as the text
+// given, so nothing is lost.
+/// The parameters of a query string (without its `?`) or of an `application/x-www-form-urlencoded` body.
+///
+/// The text is split into `name=value` pairs at `&` only, and empty pairs are skipped; a `;` is part of a
+/// name or value, as the WHATWG URL standard reads it (splitting at `;` too would let a cache or proxy
+/// that splits at `&` see other parameters than the program does). A pair without `=` has an empty value.
+/// Each name and value is read with `+` as a space and then percent-decoded; one that is not UTF-8 after
+/// decoding, or holds a bad escape, is kept as given, so nothing is lost.
+export fn form_decode(StringView text) : Vec<Param>
+{
+    Vec<Param> out = Vec::new();
+    foreach (p in StringView::split(text, "&"))
+    {
+        if (StringView::len(p) == 0)
+        {
+            continue;
+        }
+        StringView name = p;
+        StringView value = "";
+        if (Some(eq) = StringView::find(p, "="))
+        {
+            name = &p[0..eq];
+            value = &p[eq + 1..$];
+        }
+        Vec::push(&mut out, Param { .name = form_part(name), .value = form_part(value) });
+    }
+    out
+}
+
+/// Bare names get an empty value, empty pairs are skipped, a bad escape is kept as given, and `;` separates nothing.
+unittest "form_decode: pairs, bare names and bad escapes"
+{
+    Vec<Param> ps = form_decode("q=red+fish&flag&&n=%41&x=%zz;role=admin");
+    assert(Vec::len(&ps) == 4);
+    assert(Option::unwrap(find_param(&ps, "q")) == "red fish");
+    assert(Option::unwrap(find_param(&ps, "flag")) == "");
+    assert(Option::unwrap(find_param(&ps, "n")) == "A");
+    assert(Option::unwrap(find_param(&ps, "x")) == "%zz;role=admin");
+    assert(Option::is_none(&find_param(&ps, "role")));
+    assert(Option::is_none(&find_param(&ps, "Q")));
+}
+
+// One part of a form, decoded: `+` a space, then percent-decoding.
+fn form_part(StringView v) : String
+{
+    String plus = StringView::replace(v, "+", " ");
+    match (percent_decode(&plus))
+    {
+        Some(b) : match (String::from_utf8(b))
+        {
+            Ok(s)  : s,
+            Err(_) : plus,
+        },
+        None : plus,
+    }
+}
+
+// `params` as a query string or form body: `name=value` pairs joined by
+// `&`, each name and value percent-encoded (a space as `+`), so
+// `form_decode` reads it back. Without a leading `?`.
+/// Encodes `params` as a query string or form body that `form_decode` reads back.
+///
+/// The pairs are `name=value`, joined by `&`, each name and value percent-encoded with a space as `+`.
+/// There is no leading `?`.
+export fn form_encode(slice<Param, shared> params) : String
+{
+    String out = String::new();
+    for (usize i = 0; i < slice_len(params); i += 1)
+    {
+        if (i > 0)
+        {
+            String::push_ascii(&mut out, b'&');
+        }
+        String::append(&mut out, &form_encode_part(&params[i].name));
+        String::push_ascii(&mut out, b'=');
+        String::append(&mut out, &form_encode_part(&params[i].value));
+    }
+    out
+}
+
+/// A space becomes `+` and a reserved byte an escape, so the value comes back intact.
+unittest "form_encode: spaces and reserved bytes"
+{
+    Vec<Param> ps = Vec::new();
+    Vec::push(&mut ps, Param::new("q", "a b&c"));
+    Vec::push(&mut ps, Param::new("lang", "en"));
+    String body = form_encode(&ps);
+    assert(body == "q=a+b%26c&lang=en");
+    Vec<Param> back = form_decode(&body);
+    assert(back[0].value == "a b&c");
+}
+
+fn form_encode_part(ref<String, shared> s) : String
+{
+    String enc = percent_encode(StringView::as_bytes(s));
+    StringView::replace(&enc, "%20", "+")
+}
+
+// The parameters of the URL's query, by `form_decode`.
+/// The parameters of the URL's query, as `form_decode` reads them.
+export fn Url::query_pairs(ref<Url, shared> u) : Vec<Param>
+{
+    form_decode(&u.query)
+}
+
+// ---- headers and messages ----
+
+// One header field. Names compare without regard to case.
+/// One header field: a name and a value.
+///
+/// Names compare without regard to ASCII case (`find_header`).
+export struct Header
+{
+    export String name;
+    export String value;
+}
+
+/// A header with a copy of `name` and of `value`.
+export fn Header::new(StringView name, StringView value) : Header
+{
+    Header { .name = String::copy(name), .value = String::copy(value) }
+}
+
+fn name_eq(StringView a, str b) : bool
+{
+    ascii_ieq_str(a.bytes, b)
+}
+
+fn names_eq(StringView a, StringView b) : bool
+{
+    ascii_ieq(a.bytes, b.bytes)
+}
+
+// Whether two names are equal ignoring ASCII case, on the bytes: shared
+// slices of plain bytes, read unchecked.
+fn ascii_ieq(slice<u8, shared> a, slice<u8, shared> b) : bool
+{
+    if (slice_len(a) != slice_len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        if (ascii_to_lower(a[i]) != ascii_to_lower(b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn ascii_ieq_str(slice<u8, shared> a, str b) : bool
+{
+    if (slice_len(a) != str_len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < slice_len(a); i += 1)
+    {
+        if (ascii_to_lower(a[i]) != ascii_to_lower(str_byte(b, i)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_header(slice<Header, shared> headers, StringView name) : bool
+{
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (names_eq(&headers[i].name, name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// The value of the first header named `name`, whatever its case.
+/// The value of the first header named `name`, ignoring ASCII case, or `None` when there is none.
+export fn find_header(slice<Header, shared> headers, StringView name) : Option<StringView> from headers
+{
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (names_eq(&headers[i].name, name))
+        {
+            return Some(&headers[i].value);
+        }
+    }
+    None
+}
+
+// A request: for the client, `url` is absolute (`https://…`); for a
+// request a server received, it is the target as sent (`/path?query`).
+/// An HTTP request: the method, the URL, the headers and the body.
+///
+/// For the client, `url` is absolute (`https://…`); for a request a server received, it is the target as
+/// sent (`/path?query`). A server's request has the body decoded if it came chunked.
+export struct Request
+{
+    export String method;
+    export String url;
+    export Vec<Header> headers;
+    export Vec<u8> body;
+}
+
+/// A request with `method` and `url`, no headers and an empty body.
+export fn Request::new(StringView method, StringView url) : Request
+{
+    Request { .method = String::copy(method), .url = String::copy(url), .headers = Vec::new(), .body = Vec::new() }
+}
+
+/// The value of the request's first header named `name`, ignoring ASCII case.
+export fn Request::header(ref<Request, shared> r, StringView name) : Option<StringView> from r
+{
+    find_header(&r.headers, name)
+}
+
+/// A header is found whatever the case of its name.
+unittest "Request::header: names ignore case"
+{
+    Request r = Request::new("POST", "https://example.com/upload");
+    Vec::push(&mut r.headers, Header::new("Content-Type", "text/plain"));
+    assert(Option::unwrap(Request::header(&r, "content-type")) == "text/plain");
+    assert(Option::is_none(&Request::header(&r, "accept")));
+}
+
+// A response: the status, its reason phrase, the headers and the whole
+// body (decoded if it was chunked).
+/// An HTTP response: the status, its reason phrase, the headers and the whole body.
+///
+/// The client gives the body decoded if it came chunked, and decompressed if it came with
+/// `Content-Encoding: gzip` or `deflate` (that header and `Content-Length` are then dropped).
+export struct Response
+{
+    export u16 status;
+    export String reason;
+    export Vec<Header> headers;
+    export Vec<u8> body;
+}
+
+/// The value of the response's first header named `name`, ignoring ASCII case.
+export fn Response::header(ref<Response, shared> r, StringView name) : Option<StringView> from r
+{
+    find_header(&r.headers, name)
+}
+
+// D-0193: the body as text: a copy of its bytes, which must be UTF-8.
+/// The body as text: a copy of its bytes, which must be UTF-8.
+///
+/// `Err(e)` when they are not.
+export fn Response::text(ref<Response, shared> r) : Result<String, Utf8Error>
+{
+    String::from_utf8(Vec::clone(&r.body))
+}
+
+// The reason phrase of a status code, as RFC 9110 lists them.
+/// The reason phrase RFC 9110 gives a status code, such as "Not Found" for 404.
+///
+/// "" for a status it does not list here.
+export fn reason_phrase(u16 status) : str
+{
+    match (status)
+    {
+        100 : "Continue",
+        101 : "Switching Protocols",
+        200 : "OK",
+        201 : "Created",
+        202 : "Accepted",
+        203 : "Non-Authoritative Information",
+        204 : "No Content",
+        205 : "Reset Content",
+        206 : "Partial Content",
+        300 : "Multiple Choices",
+        301 : "Moved Permanently",
+        302 : "Found",
+        303 : "See Other",
+        304 : "Not Modified",
+        305 : "Use Proxy",
+        307 : "Temporary Redirect",
+        308 : "Permanent Redirect",
+        400 : "Bad Request",
+        401 : "Unauthorized",
+        402 : "Payment Required",
+        403 : "Forbidden",
+        404 : "Not Found",
+        405 : "Method Not Allowed",
+        406 : "Not Acceptable",
+        407 : "Proxy Authentication Required",
+        408 : "Request Timeout",
+        409 : "Conflict",
+        410 : "Gone",
+        411 : "Length Required",
+        412 : "Precondition Failed",
+        413 : "Content Too Large",
+        414 : "URI Too Long",
+        415 : "Unsupported Media Type",
+        416 : "Range Not Satisfiable",
+        417 : "Expectation Failed",
+        421 : "Misdirected Request",
+        422 : "Unprocessable Content",
+        426 : "Upgrade Required",
+        429 : "Too Many Requests",
+        500 : "Internal Server Error",
+        501 : "Not Implemented",
+        502 : "Bad Gateway",
+        503 : "Service Unavailable",
+        504 : "Gateway Timeout",
+        505 : "HTTP Version Not Supported",
+        _   : "",
+    }
+}
+
+/// A listed code has its phrase, and any other the empty string.
+unittest "reason_phrase: unlisted codes"
+{
+    assert(reason_phrase(404) == "Not Found");
+    assert(reason_phrase(422) == "Unprocessable Content");
+    assert(reason_phrase(410) == "Gone");
+    assert(reason_phrase(299) == "");
+}
+
+// The most a message's head (request or status line and headers) may
+// take, and a chunk-size line.
+const usize MAX_HEAD = 65536;
+
+// ---- a buffered reader over a plain or a TLS connection ----
+
+// `Gone`: a server connection whose TLS handshake failed (the TCP stream
+// went into `TlsStream::server` and did not come back).
+enum Conn
+{
+    Plain(TcpStream),
+    Secure(TlsStream),
+    Gone,
+}
+
+fn conn_read(ref<Conn, exclusive> c, ref<Vec<u8>, exclusive> buf, usize max) : Result<usize, HttpError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(HttpNetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::read(s, buf, max))
+        {
+            Ok(n)  : Ok(n),
+            Err(e) : Err(HttpTlsFailure(e)),
+        },
+        Gone : Err(ConnectionClosed),
+    }
+}
+
+fn conn_write(ref<Conn, exclusive> c, slice<u8, shared> data) : Result<void, HttpError>
+{
+    match (c)
+    {
+        Plain(s) : match (TcpStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(HttpNetFailure(e)),
+        },
+        Secure(s) : match (TlsStream::write(s, data))
+        {
+            Ok(_)  : Ok(()),
+            Err(e) : Err(HttpTlsFailure(e)),
+        },
+        Gone : Err(ConnectionClosed),
+    }
+}
+
+fn conn_close(ref<Conn, exclusive> c)
+{
+    match (c)
+    {
+        Plain(s)  : { _ = TcpStream::shutdown_write(s); },
+        Secure(s) : { _ = TlsStream::close(s); },
+        Gone      : {},
+    }
+}
+
+// Bytes read ahead of what the parser has consumed.
+struct Reader
+{
+    Conn conn;
+    Vec<u8> buf;
+    usize at;
+    u64 deadline_ns;   // report 432: when the reads must be done (`monotonic_ns`), or 0
+}
+
+// More bytes into the buffer; false at the end of the stream. The bytes
+// already consumed are dropped first, so the buffer holds at most the
+// unread part of one line (or one read) and the next read: a peer whose
+// writes end mid-line cannot make it grow with every byte it sends.
+fn fill_buffer(ref<Reader, exclusive> r) : Result<bool, HttpError>
+{
+    if (r.at > 0)
+    {
+        if (r.at == Vec::len(&r.buf))
+        {
+            Vec::clear(&mut r.buf);
+        }
+        else
+        {
+            Vec<u8> rest = Vec::from_slice(&r.buf[r.at..$]);
+            overwrite(&mut r.buf, rest);
+        }
+        r.at = 0;
+    }
+    if (r.deadline_ns != 0 && monotonic_ns() >= r.deadline_ns)
+    {
+        return Err(HttpNetFailure(TimedOut));
+    }
+    usize n = conn_read(&mut r.conn, &mut r.buf, 16384)?;
+    if (r.deadline_ns != 0 && n > 0 && monotonic_ns() >= r.deadline_ns)
+    {
+        return Err(HttpNetFailure(TimedOut));
+    }
+    Ok(n > 0)
+}
+
+// Report 431: up to `max` more bytes read and dropped, until the stream
+// ends, fails or times out.
+fn drain_input(ref<Reader, exclusive> r, usize max)
+{
+    r.deadline_ns = 0;
+    usize seen = 0;
+    while (seen < max)
+    {
+        Vec::clear(&mut r.buf);
+        r.at = 0;
+        match (conn_read(&mut r.conn, &mut r.buf, 65536))
+        {
+            Ok(n)  :
+            {
+                if (n == 0)
+                {
+                    break;
+                }
+                seen += n;
+            },
+            Err(_) : break,
+        }
+    }
+    Vec::clear(&mut r.buf);
+}
+
+fn available(ref<Reader, shared> r) : usize
+{
+    Vec::len(&r.buf) - r.at
+}
+
+// A line without its CRLF (a bare LF is accepted too); None at the end
+// of the stream before any byte; TooLarge past `limit` bytes.
+// The first newline in `b` from `at`, or its length: the bytes are the
+// function's only reference, read unchecked.
+fn http_newline_from(slice<u8, shared> b, usize at) : usize
+{
+    usize i = at;
+    while (i < slice_len(b) && b[i] != b'\n')
+    {
+        i += 1;
+    }
+    i
+}
+
+fn http_line(ref<Reader, exclusive> r, usize limit) : Result<Option<String>, HttpError>
+{
+    http_line_mode(r, limit, false)
+}
+
+// A line of chunked framing (RFC 9112 §7.1): it ends in CRLF, and holds
+// no other CR (a bare LF or CR is BadMessage, where a start line or a
+// header line may end in a bare LF, §2.2).
+fn http_line_crlf(ref<Reader, exclusive> r, usize limit) : Result<Option<String>, HttpError>
+{
+    http_line_mode(r, limit, true)
+}
+
+fn has_cr(slice<u8, shared> b) : bool
+{
+    foreach (c in b)
+    {
+        if (*c == b'\r')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Report 425: whether `b` is UTF-8.
+fn utf8_valid(slice<u8, shared> b) : bool
+{
+    Result::is_ok(&StringView::from_utf8(b))
+}
+
+// Report 425: ISO-8859-1 bytes as UTF-8: each byte is the character of its
+// value.
+fn latin1_to_utf8(slice<u8, shared> b) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    foreach (c in b)
+    {
+        u8 x = *c;
+        if (x < 128)
+        {
+            Vec::push(&mut out, x);
+        }
+        else
+        {
+            Vec::push(&mut out, 192 | (x >> 6));
+            Vec::push(&mut out, 128 | (x & 63));
+        }
+    }
+    out
+}
+
+fn http_line_mode(ref<Reader, exclusive> r, usize limit, bool strict) : Result<Option<String>, HttpError>
+{
+    usize scanned = 0;
+    while (true)
+    {
+        usize i = http_newline_from(&r.buf, r.at + scanned);
+        if (i < Vec::len(&r.buf))
+        {
+            usize end = if (i > r.at && r.buf[i - 1] == b'\r') { i - 1 } else { i };
+            if (strict && (end == i || has_cr(&r.buf[r.at..end])))
+            {
+                return Err(BadMessage);
+            }
+            Vec<u8> bytes = Vec::from_slice(&r.buf[r.at..end]);
+            r.at = i + 1;
+            // Report 425: a line that is not UTF-8 is read as ISO-8859-1, each
+            // byte the character of its value (RFC 9110 §5.5's obs-text: a
+            // Latin-1 file name or cookie), as browsers and curl take it.
+            Vec<u8> text = if (utf8_valid(&bytes[0..$])) { bytes } else { latin1_to_utf8(&bytes[0..$]) };
+            return match (String::from_utf8(text))
+            {
+                Ok(s)  : Ok(Some(s)),
+                Err(_) : Err(BadMessage),
+            };
+        }
+        scanned = Vec::len(&r.buf) - r.at;
+        if (scanned > limit)
+        {
+            return Err(TooLarge);
+        }
+        if (!fill_buffer(r)?)
+        {
+            return if (scanned == 0) { Ok(None) } else { Err(BadMessage) };
+        }
+    }
+}
+
+// Exactly `n` bytes appended to `out`; ConnectionClosed when the stream ends first.
+fn read_n(ref<Reader, exclusive> r, ref<Vec<u8>, exclusive> out, usize n) : Result<void, HttpError>
+{
+    usize need = n;
+    while (need > 0)
+    {
+        if (available(r) == 0)
+        {
+            if (!fill_buffer(r)?)
+            {
+                return Err(ConnectionClosed);
+            }
+        }
+        usize take = min(need, available(r));
+        Vec::extend_from(out, &r.buf[r.at..r.at + take]);
+        r.at += take;
+        need -= take;
+    }
+    Ok(())
+}
+
+// Everything to the end of the stream, at most `max` bytes.
+fn read_to_end(ref<Reader, exclusive> r, ref<Vec<u8>, exclusive> out, usize max) : Result<void, HttpError>
+{
+    while (true)
+    {
+        usize have = available(r);
+        if (have > 0)
+        {
+            if (Vec::len(out) + have > max)
+            {
+                return Err(TooLarge);
+            }
+            Vec::extend_from(out, &r.buf[r.at..$]);
+            r.at = Vec::len(&r.buf);
+        }
+        if (!fill_buffer(r)?)
+        {
+            return Ok(());
+        }
+    }
+}
+
+// Header lines up to the empty line; the head may not exceed MAX_HEAD.
+fn read_headers(ref<Reader, exclusive> r, usize used) : Result<Vec<Header>, HttpError>
+{
+    Vec<Header> headers = Vec::new();
+    usize total = used;
+    while (true)
+    {
+        String line = match (http_line(r, MAX_HEAD)?)
+        {
+            Some(l) : l,
+            None    : return Err(BadMessage),
+        };
+        total += StringView::len(&line) + 2;
+        if (total > MAX_HEAD)
+        {
+            return Err(TooLarge);
+        }
+        if (StringView::len(&line) == 0)
+        {
+            return Ok(headers);
+        }
+        StringView v = &line;
+        usize colon = match (StringView::find(v, ":"))
+        {
+            Some(i) : i,
+            None    : return Err(BadMessage),
+        };
+        StringView name = &v[0..colon];
+        if (colon == 0 || !is_token(name))
+        {
+            return Err(BadMessage);
+        }
+        // RFC 9110 §5.5: a field value holds no NUL, CR or LF (nor another
+        // control but the tab).
+        foreach (b in StringView::as_bytes(&v[colon + 1..$]))
+        {
+            if ((*b < 32 && *b != 9) || *b == 127)
+            {
+                return Err(BadMessage);
+            }
+        }
+        Vec::push(
+            &mut headers,
+            Header { .name = String::copy(name), .value = String::copy(StringView::trim(&v[colon + 1..$])) },
+        );
+    }
+}
+
+// How a message's body is delimited (RFC 9112 §6).
+enum BodyLength
+{
+    Length(usize),
+    Chunked,
+    UntilClose,
+    NoBody,
+}
+
+// RFC 9110 §5.1: a field name is a token, `1*tchar`.
+fn is_token(StringView s) : bool
+{
+    if (StringView::len(s) == 0)
+    {
+        return false;
+    }
+    foreach (b in StringView::as_bytes(s))
+    {
+        u8 c = *b;
+        bool alnum = (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z');
+        bool mark = false;
+        foreach (m in StringView::as_bytes("!#$%&'*+-.^_`|~"))
+        {
+            if (*m == c)
+            {
+                mark = true;
+            }
+        }
+        if (!alnum && !mark)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// A header to be written: the name a token, the value free of control
+// bytes but the tab, and of DEL (RFC 9110 §5.1, §5.5), so a CR LF in it
+// cannot start a header or a body of its own (response splitting,
+// request injection).
+fn field_ok(ref<Header, shared> h) : bool
+{
+    if (!is_token(&h.name))
+    {
+        return false;
+    }
+    foreach (b in StringView::as_bytes(&h.value))
+    {
+        if ((*b < 32 && *b != 9) || *b == 127)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// `name: value` CRLF appended to `head`; BadMessage for a header
+// `field_ok` refuses.
+fn write_field(ref<String, exclusive> head, ref<Header, shared> h) : Result<void, HttpError>
+{
+    if (!field_ok(h))
+    {
+        return Err(BadMessage);
+    }
+    String::append(head, &h.name);
+    String::append(head, ": ");
+    String::append(head, &h.value);
+    String::append(head, "\r\n");
+    Ok(())
+}
+
+// The options of a message's `Connection` fields (RFC 9110 §7.6.1): a
+// comma-separated list in each, its case ignored. Whether `option` is
+// among them.
+fn connection_has(slice<Header, shared> headers, str option) : bool
+{
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (names_eq(&headers[i].name, "connection"))
+        {
+            foreach (o in StringView::split(&headers[i].value, ","))
+            {
+                if (name_eq(StringView::trim(o), option))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `close` anywhere in any `Connection` field counts.
+unittest "connection_has: a list of options"
+{
+    Vec<Header> hs = Vec::new();
+    Vec::push(&mut hs, Header::new("Connection", "keep-alive, Close"));
+    assert(connection_has(&hs, "close") && connection_has(&hs, "keep-alive"));
+    assert(!connection_has(&hs, "upgrade"));
+    assert(!field_ok(&Header::new("X", "a\r\nSet-Cookie: x")));
+    assert(!field_ok(&Header::new("X Y", "a")));
+    assert(field_ok(&Header::new("X", "a\tb")));
+}
+
+// How many of `headers` are named `name`, its case ignored.
+fn count_header(slice<Header, shared> headers, StringView name) : usize
+{
+    usize n = 0;
+    for (usize i = 0; i < slice_len(headers); i += 1)
+    {
+        if (names_eq(&headers[i].name, name))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// RFC 9112 §6.3: a message's framing. `Transfer-Encoding` is one field,
+// `chunked`, and never beside `Content-Length`; `Content-Length` is digits,
+// and fields of it that disagree make the framing invalid (one field and
+// another honoured by a proxy in front is request smuggling), so every one
+// must give the same number.
+fn body_length(slice<Header, shared> headers, bool response) : Result<BodyLength, HttpError>
+{
+    Option<StringView> te = find_header(headers, "transfer-encoding");
+    Option<StringView> cl = find_header(headers, "content-length");
+    if (Some(t) = te)
+    {
+        if (Option::is_some(&cl) || count_header(headers, "transfer-encoding") != 1 || !name_eq(StringView::trim(t), "chunked"))
+        {
+            return Err(BadMessage);
+        }
+        return Ok(Chunked);
+    }
+    if (Some(c) = cl)
+    {
+        StringView first = StringView::trim(c);
+        for (usize i = 0; i < slice_len(headers); i += 1)
+        {
+            if (names_eq(&headers[i].name, "content-length") && StringView::trim(&headers[i].value) != first)
+            {
+                return Err(BadMessage);
+            }
+        }
+        foreach (b in StringView::as_bytes(first))
+        {
+            if (*b < b'0' || *b > b'9')
+            {
+                return Err(BadMessage);
+            }
+        }
+        return match (StringView::parse<usize>(first))
+        {
+            Ok(n)  : Ok(Length(n)),
+            Err(_) : Err(BadMessage),
+        };
+    }
+    Ok(if (response) { UntilClose } else { NoBody })
+}
+
+// Content-Length fields that disagree, or are not digits, make a message's framing invalid.
+unittest "body_length: Content-Length fields that disagree"
+{
+    Vec<Header> same = Vec::new();
+    Vec::push(&mut same, Header { .name = "Content-Length", .value = "3" });
+    Vec::push(&mut same, Header { .name = "content-length", .value = "3" });
+    assert(Result::is_ok(&body_length(&same, false)));
+    Vec<Header> two = Vec::new();
+    Vec::push(&mut two, Header { .name = "Content-Length", .value = "1" });
+    Vec::push(&mut two, Header { .name = "Content-Length", .value = "30" });
+    assert(Result::is_err(&body_length(&two, false)));
+    Vec<Header> sign = Vec::new();
+    Vec::push(&mut sign, Header { .name = "Content-Length", .value = "+3" });
+    assert(Result::is_err(&body_length(&sign, false)));
+    Vec<Header> te = Vec::new();
+    Vec::push(&mut te, Header { .name = "Transfer-Encoding", .value = "chunked" });
+    Vec::push(&mut te, Header { .name = "Transfer-Encoding", .value = "chunked" });
+    assert(Result::is_err(&body_length(&te, false)));
+}
+
+// A chunk-size line's size (RFC 9112 §7.1): 1 to 8 hex digits from its
+// first byte, then nothing, or optional spaces or tabs and `;` and the
+// chunk extensions, which hold no control byte but the tab and no DEL.
+// None for anything else (a leading space, a sign, a bare CR or a NUL in
+// an extension), which a front end may read otherwise.
+fn chunk_size(StringView line) : Option<usize>
+{
+    slice<u8, shared> b = StringView::as_bytes(line);
+    usize n = slice_len(b);
+    usize i = 0;
+    usize size = 0;
+    // Report 423: the digits past the eighth are counted, not added in
+    // (17 of them overflowed `usize` and faulted the server or client).
+    while (i < n && Option::is_some(&hex_digit(b[i])))
+    {
+        if (i < 8)
+        {
+            size = size * 16 + widen<usize>(hex_digit(b[i])?);
+        }
+        i += 1;
+    }
+    if (i == 0 || i > 8)
+    {
+        return None;
+    }
+    while (i < n && (b[i] == b' ' || b[i] == 9))
+    {
+        i += 1;
+    }
+    if (i < n && b[i] != b';')
+    {
+        return None;
+    }
+    while (i < n)
+    {
+        if ((b[i] < 32 && b[i] != 9) || b[i] == 127)
+        {
+            return None;
+        }
+        i += 1;
+    }
+    Some(size)
+}
+
+/// A size is hex digits from the first byte; an extension holds no control byte.
+unittest "chunk_size: what a chunk-size line may hold"
+{
+    assert(Option::unwrap(chunk_size("1f")) == 31);
+    assert(Option::unwrap(chunk_size("3 ;name=\"v\"")) == 3);
+    assert(Option::is_none(&chunk_size(" 3")));
+    assert(Option::is_none(&chunk_size("3 x")));
+    assert(Option::is_none(&chunk_size("+3")));
+    assert(Option::is_none(&chunk_size("2;a\u{1}")));
+    assert(Option::is_none(&chunk_size("")));
+    assert(Option::is_none(&chunk_size("123456789")));
+}
+
+// The body, decoded, at most `max` bytes; the chunked trailers are read
+// as header fields (the same rules and the same 64 KiB limit as the head)
+// and dropped.
+fn read_body(ref<Reader, exclusive> r, BodyLength how, usize max) : Result<Vec<u8>, HttpError>
+{
+    Vec<u8> body = Vec::new();
+    match (how)
+    {
+        NoBody     : {},
+        Length(n)  :
+        {
+            if (n > max)
+            {
+                return Err(TooLarge);
+            }
+            read_n(r, &mut body, n)?;
+        },
+        UntilClose : read_to_end(r, &mut body, max)?,
+        Chunked    :
+        {
+            while (true)
+            {
+                String line = match (http_line_crlf(r, MAX_HEAD)?)
+                {
+                    Some(l) : l,
+                    None    : return Err(ConnectionClosed),
+                };
+                usize size = Option::ok_or(chunk_size(&line), BadMessage)?;
+                if (size == 0)
+                {
+                    break;
+                }
+                if (Vec::len(&body) + size > max)
+                {
+                    return Err(TooLarge);
+                }
+                read_n(r, &mut body, size)?;
+                match (http_line_crlf(r, 2)?)
+                {
+                    Some(end) : if (StringView::len(&end) != 0) { return Err(BadMessage); },
+                    None      : return Err(ConnectionClosed),
+                }
+            }
+            // Trailers, up to the empty line: fields, within the head's
+            // limit (a stream of trailer lines is not read without end).
+            _ = read_headers(r, 0)?;
+        },
+    }
+    Ok(body)
+}
+
+export module client "http/client.cb";
+export module server "http/server.cb";
+
+export import std::http::client;
+export import std::http::server;

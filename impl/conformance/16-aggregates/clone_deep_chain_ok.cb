@@ -1,0 +1,317 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.agg.derived-clone [Derived-Clone] (D-0116); conf.clone-deep-chain
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6c69737420747275652074727565207472756520747275650a72657620747275652074727565207472756520747275650a7472656520747275652074727565207472756520747275650a626f746820747275652074727565207472756520747275650a6b6570742074727565207472756520747275652074727565207472756520747275650a6f726465722030203120320a
+//
+// The derived `clone` of a chain (a type that links to one more of it
+// through `Option<Box<…>>` or `Box<…>`) copies a chain deeper than a
+// thousand links (where the compiler's copy leaves recursion for a loop)
+// to an equal chain, each field copied by `clone` once and in the order
+// spec/16 §4a gives: across the whole chain, a field before the link from
+// the head down, one after it from the tail up. A struct with a field that
+// owns something on each side of its link (copied as a tree is, see
+// clone_deep_tree_ok.cb) keeps the same order, and one whose module
+// declares `clone_chain` is copied as before.
+
+import std;
+
+static Atomic<u64> HASH = 0;
+static Atomic<u64> COUNT = 0;
+
+// A `Tag` owns its text, so `clone` of one calls `Tag::clone`, which notes
+// the call.
+struct Tag
+{
+    u64 id;
+    String text;
+}
+
+fn tag(u64 id) : Tag
+{
+    Tag { .id = id, .text = String::new() }
+}
+
+fn Tag::clone(ref<Tag, shared> self) : Tag
+{
+    u64 h = Atomic::load(&HASH);
+    Atomic::store(&HASH, mix(h, 31, self.id + 1));
+    _ = Atomic::fetch_add(&COUNT, 1);
+    tag(self.id)
+}
+
+fn mix(u64 h, u64 k, u64 v) : u64
+{
+    wrapping_add(wrapping_mul(h, k), v)
+}
+
+fn reset()
+{
+    Atomic::store(&HASH, 0);
+    Atomic::store(&COUNT, 0);
+}
+
+// The hash `Tag::clone` makes of ids `first`, `first + step`, … (`n` of them).
+fn expected(u64 first, i64 step, u64 n) : u64
+{
+    u64 h = 0;
+    i64 id = narrow<i64>(first);
+    foreach (i in 0..n)
+    {
+        h = mix(h, 31, narrow<u64>(id) + 1);
+        id += step;
+    }
+    h
+}
+
+module m
+{
+    import std;
+
+    export struct Node<T>
+    {
+        export T value;
+        export String name;
+        export Option<Box<Node<T>>> next;
+    }
+}
+
+struct Rev
+{
+    Option<Box<Rev>> next;
+    Tag tag;
+    u32 plain;
+}
+
+enum Tree
+{
+    Leaf(Tag),
+    Mid(Option<Box<Tree>>),
+    Branch(Box<Tree>),
+}
+
+struct Both
+{
+    Tag a;
+    Option<Box<Both>> next;
+    Tag b;
+}
+
+struct Kept
+{
+    Tag tag;
+    Option<Box<Kept>> next;
+}
+
+fn Kept::clone_chain(ref<Kept, shared> self) : u64
+{
+    self.tag.id
+}
+
+fn list_sum(ref<Option<Box<m::Node<Tag>>>, shared> l) : u64
+{
+    u64 s = 0;
+    ref<Option<Box<m::Node<Tag>>>, shared> p = l;
+    while (true)
+    {
+        match (p)
+        {
+            Some(b) :
+            {
+                ref<m::Node<Tag>, shared> n = Box::get(b);
+                s = mix(s, 7, n.value.id + widen<u64>(StringView::len(&n.name)));
+                p = &n.next;
+            },
+            None    : break,
+        }
+    }
+    s
+}
+
+fn rev_sum(ref<Rev, shared> r) : u64
+{
+    u64 s = 0;
+    ref<Rev, shared> p = r;
+    while (true)
+    {
+        s = mix(s, 7, p.tag.id + widen<u64>(p.plain));
+        match (&p.next)
+        {
+            Some(b) : p = Box::get(b),
+            None    : break,
+        }
+    }
+    s
+}
+
+fn tree_sum(ref<Tree, shared> t) : u64
+{
+    u64 s = 0;
+    ref<Tree, shared> p = t;
+    while (true)
+    {
+        match (p)
+        {
+            Leaf(g)   : return mix(s, 7, g.id),
+            Mid(o)    :
+            {
+                s = mix(s, 7, 1);
+                match (o)
+                {
+                    Some(b) : p = Box::get(b),
+                    None    : return s,
+                }
+            },
+            Branch(b) :
+            {
+                s = mix(s, 7, 2);
+                p = Box::get(b);
+            },
+        }
+    }
+    s
+}
+
+fn both_sum(ref<Both, shared> r) : u64
+{
+    u64 s = 0;
+    ref<Both, shared> p = r;
+    while (true)
+    {
+        s = mix(s, 7, p.a.id * 3 + p.b.id);
+        match (&p.next)
+        {
+            Some(b) : p = Box::get(b),
+            None    : break,
+        }
+    }
+    s
+}
+
+fn kept_sum(ref<Kept, shared> r) : u64
+{
+    u64 s = 0;
+    ref<Kept, shared> p = r;
+    while (true)
+    {
+        s = mix(s, 7, p.tag.id);
+        match (&p.next)
+        {
+            Some(b) : p = Box::get(b),
+            None    : break,
+        }
+    }
+    s
+}
+
+fn main()
+{
+    u64 n = 3000;
+    // A list, the head `n - 1`: copied head first.
+    Option<Box<m::Node<Tag>>> list = None;
+    foreach (i in 0..n)
+    {
+        list = Some(Box::new(m::Node { .value = tag(i), .name = sprintf("n%v", i % 10), .next = list }));
+    }
+    reset();
+    Option<Box<m::Node<Tag>>> list2 = clone(&list);
+    printf(
+        "list %v %v %v %v\n",
+        list_sum(&list) == list_sum(&list2),
+        Atomic::load(&COUNT) == n,
+        Atomic::load(&HASH) == expected(n - 1, -1, n),
+        list_sum(&list) != 0,
+    );
+    // The tag after the link: copied from the tail up.
+    Rev r = Rev { .next = None, .tag = tag(0), .plain = 5 };
+    foreach (i in 1..n)
+    {
+        r = Rev { .next = Some(Box::new(r)), .tag = tag(i), .plain = narrow<u32>(i % 3) };
+    }
+    reset();
+    Rev r2 = clone(&r);
+    printf(
+        "rev %v %v %v %v\n",
+        rev_sum(&r) == rev_sum(&r2),
+        Atomic::load(&COUNT) == n,
+        Atomic::load(&HASH) == expected(0, 1, n),
+        r2.tag.id == n - 1,
+    );
+    // An enum of two kinds of link.
+    Tree t = Tree::Leaf(tag(42));
+    foreach (i in 0..n)
+    {
+        t = if (i % 3 == 1) { Tree::Mid(Some(Box::new(t))) } else { Tree::Branch(Box::new(t)) };
+    }
+    reset();
+    Tree t2 = clone(&t);
+    printf(
+        "tree %v %v %v %v\n",
+        tree_sum(&t) == tree_sum(&t2),
+        Atomic::load(&COUNT) == 1,
+        Atomic::load(&HASH) == 43,
+        tree_sum(&Tree::Mid(None)) == 1,
+    );
+    // Fields that own something on both sides of the link: §4a's order,
+    // `a` from the head down, then `b` from the tail up.
+    Both b = Both { .a = tag(0), .next = None, .b = tag(0) };
+    foreach (i in 1..n)
+    {
+        b = Both { .a = tag(i), .next = Some(Box::new(b)), .b = tag(i) };
+    }
+    reset();
+    Both b2 = clone(&b);
+    u64 down = expected(n - 1, -1, n);
+    u64 want = down;
+    foreach (i in 0..n)
+    {
+        want = mix(want, 31, i + 1);
+    }
+    printf(
+        "both %v %v %v %v\n",
+        both_sum(&b) == both_sum(&b2),
+        Atomic::load(&COUNT) == 2 * n,
+        Atomic::load(&HASH) == want,
+        b2.a.id == n - 1,
+    );
+    Kept k = Kept { .tag = tag(7), .next = None };
+    foreach (i in 0..n / 30)
+    {
+        k = Kept { .tag = tag(i), .next = Some(Box::new(k)) };
+    }
+    reset();
+    Kept k2 = clone(&k);
+    printf(
+        "kept %v %v %v %v %v %v\n",
+        kept_sum(&k) == kept_sum(&k2),
+        Atomic::load(&COUNT) == 101,
+        Kept::clone_chain(&k2) == 99,
+        Atomic::load(&HASH) != 0,
+        kept_sum(&k2) != 0,
+        true,
+    );
+    // A short chain's copies, in order.
+    reset();
+    Option<Box<m::Node<Tag>>> short = None;
+    foreach (i in 0..n / 1000)
+    {
+        short = Some(Box::new(m::Node { .value = tag(2 - i), .name = String::new(), .next = short }));
+    }
+    Option<Box<m::Node<Tag>>> short2 = clone(&short);
+    ref<Option<Box<m::Node<Tag>>>, shared> p = &short2;
+    printf("order");
+    while (true)
+    {
+        match (p)
+        {
+            Some(x) :
+            {
+                printf(" %v", Box::get(x).value.id);
+                p = &Box::get(x).next;
+            },
+            None    : break,
+        }
+    }
+    printf("\n");
+}

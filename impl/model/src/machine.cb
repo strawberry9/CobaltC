@@ -1,0 +1,5694 @@
+// The dynamic half of the model: an abstract machine over Σ (`spec/04`),
+// written from the rules of `spec/05`, `08`, `09`, `14`, `15`, `16`, `19`
+// and `20` §2 for the fragment's constructs.
+//
+// Each function is compiled to a list of instructions; one instruction is
+// one step of one thread (`[Thread-Step]`), at about the granularity of a
+// rule: a binding lookup, a projection, a read, a write, a borrow, a
+// statement's exit, a block's exit, a call, a spawn, a join. `Vec`'s
+// operations are one step each, with the effects their `std` bodies have on
+// Σ (`spec/21` §1: reclaim, release, the buffer's growth).
+//
+// `held-by` is not stored: it is computed from what live objects hold, as
+// `spec/04` defines it (D-0215).
+//
+// The trace of `cobmodel trace` (D-0270) is a field of the state
+// (`tracing`, `trace`), outside what the explorer compares: CobaltC has no
+// thread-local to keep it in.
+
+import std;
+import ast;
+import maps;
+import statics;
+
+export enum Val
+{
+    Unit,
+    Int(i64),
+    Bool(bool),
+    Ref(u32),
+    Hold(u32),
+    Vec { u32 buf; u32 len; u32 cap; },
+    Handle(u32),
+    Opt(Option<Box<Val>>),
+    Mutex(i64),
+    Guard(u32),
+    Chan { Vec<Val> q; bool closed; u32 cap; },
+    Res(Option<Box<Val>>), // Result<void, T>: Err(v) as Some(v)
+    // A closure (`rule.fn.closure`): its body's function, its captures
+    // (borrows, or the values moved in), whether it is a `move` closure
+    // and whether it writes itself (D-0239).
+    Clo { usize func; Vec<Val> caps; bool mv; bool ws; },
+    // A slice: its borrow, and the run's start and length in its source.
+    Slice { u32 tok; u32 start; u32 len; },
+    Job(u32),      // struct Job { handle<void> h; }
+    Arr(Vec<i64>), // array<i32, 2>
+    // An `Atomic<i32>`: its value, and its wake count (`state.sync`'s
+    // `wake-count`, D-0253).
+    Atomic { i64 v; u64 w; },
+}
+
+// A resource, or a closure that owns one (`rule.type.is-resource`: a
+// closure whose captures include a resource is one by derivation).
+export fn Val::owns_resource(ref<Val, shared> v) : bool
+{
+    match (v)
+    {
+        Val::Vec { .. }                 : true,
+        Val::Handle(_)                  : true,
+        Val::Job(_)                     : true,
+        Val::Mutex(_)                   : true,
+        Val::Guard(_)                   : true,
+        Val::Chan { .. }                : true,
+        Val::Atomic { .. }              : true,
+        Val::Clo { func, caps, mv, ws } :
+        {
+            foreach (c in caps)
+            {
+                if (Val::owns_resource(c))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                               : false,
+    }
+}
+
+fn Val::refs_into(ref<Val, shared> v, ref<Vec<u32>, exclusive> out)
+{
+    match (v)
+    {
+        Val::Ref(t)                     : Vec::push(out, *t),
+        Val::Hold(t)                    : Vec::push(out, *t),
+        Val::Guard(t)                   : Vec::push(out, *t),
+        Val::Slice { tok, start, len }  : Vec::push(out, *tok),
+        Val::Opt(o) : match (o)
+        {
+            Some(b) : Val::refs_into(Box::get(b), out),
+            None    : {},
+        },
+        Val::Res(o) : match (o)
+        {
+            Some(b) : Val::refs_into(Box::get(b), out),
+            None    : {},
+        },
+        Val::Chan { q, closed, cap }    :
+        {
+            foreach (x in q)
+            {
+                Val::refs_into(x, out);
+            }
+        },
+        Val::Clo { func, caps, mv, ws } :
+        {
+            foreach (x in caps)
+            {
+                Val::refs_into(x, out);
+            }
+        },
+        _                               : {},
+    }
+}
+
+export fn Val::refs(ref<Val, shared> v) : Vec<u32>
+{
+    Vec<u32> out = Vec::new();
+    Val::refs_into(v, &mut out);
+    out
+}
+
+// Whether `v` holds the path `a` (`refs().contains(&a)`, without the list).
+fn Val::has_ref(ref<Val, shared> v, u32 a) : bool
+{
+    match (v)
+    {
+        Val::Ref(t)                     : *t == a,
+        Val::Hold(t)                    : *t == a,
+        Val::Guard(t)                   : *t == a,
+        Val::Slice { tok, start, len }  : *tok == a,
+        Val::Opt(o) : match (o)
+        {
+            Some(b) : Val::has_ref(Box::get(b), a),
+            None    : false,
+        },
+        Val::Res(o) : match (o)
+        {
+            Some(b) : Val::has_ref(Box::get(b), a),
+            None    : false,
+        },
+        Val::Chan { q, closed, cap }    :
+        {
+            foreach (x in q)
+            {
+                if (Val::has_ref(x, a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Val::Clo { func, caps, mv, ws } :
+        {
+            foreach (x in caps)
+            {
+                if (Val::has_ref(x, a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                               : false,
+    }
+}
+
+fn Val::has_any_ref(ref<Val, shared> v) : bool
+{
+    match (v)
+    {
+        Val::Ref(_)                     : true,
+        Val::Hold(_)                    : true,
+        Val::Guard(_)                   : true,
+        Val::Slice { .. }               : true,
+        Val::Opt(o) : match (o)
+        {
+            Some(b) : Val::has_any_ref(Box::get(b)),
+            None    : false,
+        },
+        Val::Res(o) : match (o)
+        {
+            Some(b) : Val::has_any_ref(Box::get(b)),
+            None    : false,
+        },
+        Val::Chan { q, closed, cap }    :
+        {
+            foreach (x in q)
+            {
+                if (Val::has_any_ref(x))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        Val::Clo { func, caps, mv, ws } :
+        {
+            foreach (x in caps)
+            {
+                if (Val::has_any_ref(x))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                               : false,
+    }
+}
+
+// The sorted, distinct paths a value holds.
+fn ref_set(ref<Val, shared> v) : Vec<u32>
+{
+    Vec<u32> r = Val::refs(v);
+    Vec::sort(&mut r);
+    Vec::dedup(&mut r);
+    r
+}
+
+fn opt_ref_set(ref<Option<Val>, shared> v) : Vec<u32>
+{
+    match (v)
+    {
+        Some(x) : ref_set(x),
+        None    : Vec::new(),
+    }
+}
+
+fn opt_box_eq(ref<Option<Box<Val>>, shared> a, ref<Option<Box<Val>>, shared> b) : bool
+{
+    match (a)
+    {
+        Some(x) : match (b)
+        {
+            Some(y) : Val::eq(Box::get(x), Box::get(y)),
+            None    : false,
+        },
+        None : match (b)
+        {
+            Some(_) : false,
+            None    : true,
+        },
+    }
+}
+
+fn vals_eq(ref<Vec<Val>, shared> a, ref<Vec<Val>, shared> b) : bool
+{
+    if (Vec::len(a) != Vec::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(a); i += 1)
+    {
+        if (!Val::eq(&a[i], &b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// Structural equality.
+export fn Val::eq(ref<Val, shared> a, ref<Val, shared> b) : bool
+{
+    match (a)
+    {
+        Val::Unit : match (b)
+        {
+            Val::Unit : true,
+            _         : false,
+        },
+        Val::Int(x) : match (b)
+        {
+            Val::Int(y) : *x == *y,
+            _           : false,
+        },
+        Val::Bool(x) : match (b)
+        {
+            Val::Bool(y) : *x == *y,
+            _            : false,
+        },
+        Val::Ref(x) : match (b)
+        {
+            Val::Ref(y) : *x == *y,
+            _           : false,
+        },
+        Val::Hold(x) : match (b)
+        {
+            Val::Hold(y) : *x == *y,
+            _            : false,
+        },
+        Val::Vec { buf, len, cap } : match (b)
+        {
+            Val::Vec { buf: b2, len: l2, cap: c2 } : *buf == *b2 && *len == *l2 && *cap == *c2,
+            _                                      : false,
+        },
+        Val::Handle(x) : match (b)
+        {
+            Val::Handle(y) : *x == *y,
+            _              : false,
+        },
+        Val::Opt(x) : match (b)
+        {
+            Val::Opt(y) : opt_box_eq(x, y),
+            _           : false,
+        },
+        Val::Mutex(x) : match (b)
+        {
+            Val::Mutex(y) : *x == *y,
+            _             : false,
+        },
+        Val::Guard(x) : match (b)
+        {
+            Val::Guard(y) : *x == *y,
+            _             : false,
+        },
+        Val::Chan { q, closed, cap } : match (b)
+        {
+            Val::Chan { q: q2, closed: c2, cap: k2 } : *closed == *c2 && *cap == *k2 && vals_eq(q, q2),
+            _                                        : false,
+        },
+        Val::Res(x) : match (b)
+        {
+            Val::Res(y) : opt_box_eq(x, y),
+            _           : false,
+        },
+        Val::Clo { func, caps, mv, ws } : match (b)
+        {
+            Val::Clo { func: f2, caps: c2, mv: m2, ws: w2 } : *func == *f2 && *mv == *m2 && *ws == *w2 && vals_eq(caps, c2),
+            _                                               : false,
+        },
+        Val::Slice { tok, start, len } : match (b)
+        {
+            Val::Slice { tok: t2, start: s2, len: l2 } : *tok == *t2 && *start == *s2 && *len == *l2,
+            _                                          : false,
+        },
+        Val::Job(x) : match (b)
+        {
+            Val::Job(y) : *x == *y,
+            _           : false,
+        },
+        Val::Arr(x) : match (b)
+        {
+            Val::Arr(y) : Vec::eq(x, y),
+            _           : false,
+        },
+        Val::Atomic { v, w } : match (b)
+        {
+            Val::Atomic { v: v2, w: w2 } : *v == *v2 && *w == *w2,
+            _                            : false,
+        },
+    }
+}
+
+// A step of a path (`spec/04` `steps`): a field (`Hold`'s `r` is 0, a
+// mutex's interior 1, a closure's captures 0, 1, …), or a storage step
+// over a vector's elements: a slice's range, an element's index (D-0238).
+export enum PStep
+{
+    F(u8),
+    R { u32 lo; u32 hi; },
+    I(u32),
+}
+
+export struct Elem
+{
+    export u32 buf;
+    export u32 i;
+}
+
+export struct Obj
+{
+    export bool is_res;
+    export Option<Val> val;    // None: uninitialized
+    export Option<Elem> elem;  // a reclaimed element: (buffer, index)
+    export Option<u32> scope;
+    export u64 origin;
+}
+
+export enum Owner
+{
+    T(u32),
+    Transit,
+}
+
+export struct Path
+{
+    export u32 of;
+    export Vec<PStep> steps;
+    export Mode mode;
+    export Owner thread;
+    export bool valid;
+    export u32 frame;
+    export Option<u32> scope;
+    export Option<u32> base;
+    export bool pending;
+    // Formed by `[Lock]`: lock-derived (`spec/19` §2).
+    export bool lockp;
+    // A projection (`[Field-Access]`): it exists only for the one access
+    // made through it (`spec/08` §4's reading; `[Field-Access]` itself does
+    // not say when it ends — D-0219 finding).
+    export bool transient;
+}
+
+export struct Fault
+{
+    export str diag;
+    export usize line;
+    // D-0299 (`cobmodel certify`): the path the access that faulted went
+    // through, when the fault is an access's; and whether the fault is a
+    // check of a value's own state (an empty `fn` value called, a handle
+    // already joined), which a program keeping no record of references
+    // still makes.
+    export Option<u32> tok;
+    export bool value;
+}
+
+export enum Status
+{
+    Running,
+    Done(Val),
+    Failed(Fault),
+    Taken,
+}
+
+export fn Status::is_running(ref<Status, shared> s) : bool
+{
+    match (s)
+    {
+        Status::Running : true,
+        _               : false,
+    }
+}
+
+export fn Status::is_taken(ref<Status, shared> s) : bool
+{
+    match (s)
+    {
+        Status::Taken : true,
+        _             : false,
+    }
+}
+
+export enum SVal
+{
+    V(Val),
+    Place(u32),
+}
+
+export struct Act
+{
+    export usize func;
+    export usize pc;
+    export Vec<SVal> stack;
+    export SMap<String, Vec<u32>> slots; // innermost binding last
+    export Vec<u32> frames;              // this call's open block frames, innermost last
+    export u32 param_frame;
+    export Option<Vec<u32>> exiting;     // a block exit in progress (it may wait on a handle)
+}
+
+export struct ScopeAt
+{
+    export u32 sc;
+    export u32 frame;
+}
+
+export struct Thread
+{
+    export Vec<Act> acts;
+    export Vec<ScopeAt> scopes;
+    export Status status;
+    // The thread has begun a wait (a join, a lock, a handle's end) that did
+    // not close a cycle when it began (`[Deadlock]` (a)).
+    export bool waiting;
+    // Not `contained` (`spec/18`): lent an exclusive reference at its spawn,
+    // or it has locked a mutex whose interior may hold one (a channel of
+    // exclusive references): its fault ends the program.
+    export bool lent;
+    // D-0241: the root paths of the bindings `Ins::Licensed` named for the
+    // current statement.
+    export SSet<u32> licensed;
+}
+
+enum Wait
+{
+    Thread(u32),
+    Chan,
+    Atomic,
+}
+
+export enum Sync
+{
+    Unlocked,
+    LockedBy(u32),
+    Poisoned(u32),
+}
+
+export struct Moving
+{
+    export u32 o;
+    export u32 a;
+    export u32 t;
+    export Val v;
+}
+
+export struct State
+{
+    // D-0270, `cobmodel trace` only: whether the trace is kept, and its
+    // lines.
+    export bool tracing;
+    export Vec<String> trace;
+    // D-0270, trace only (empty and false otherwise): the next borrow is a
+    // pending argument's, or a lend; the next store is of what the trace
+    // already wrote; object ends are a frame's (not written one by one);
+    // an object moved whole and not yet re-bound; the handle and guard
+    // objects the fragment's `spawn` and `lock` establish.
+    export bool pend_next;
+    export bool lend_next;
+    export bool quiet_store;
+    export u32 quiet_end;
+    export bool emit_end;
+    export Option<Moving> moving;
+    export SMap<u32, u32> handle_obj;
+    export SMap<u32, u32> guard_obj;
+    export SMap<u32, Obj> objs;
+    export SMap<u32, Path> paths;
+    export SMap<u32, u32> holder;
+    export SMap<u32, Vec<Val>> bufs; // a Vec's buffer: its cells' values
+    export SMap<Elem, u32> elems;
+    export SMap<u32, Thread> threads;
+    export Vec<i64> out;
+    export u32 next;
+    export u64 clock;
+    export SMap<u32, Sync> sync;
+    // D-0258: each static's root path (a shared path to its object, which
+    // never ends), in the program's order.
+    export Vec<u32> statics;
+}
+
+export enum Ins
+{
+    StmtEnter,
+    // D-0241, `--as-licensed`: the bindings every access to which in this
+    // statement the discharge table proves clash-free.
+    Licensed(Vec<String>),
+    StmtExit(bool), // keep
+    BlockEnter,
+    BlockExit(Vec<String>), // the names the block declares
+    EndBinding(String),
+    // D-0341 `[Ref-Reassign-Releases]`: the reference binding keeps its
+    // place, and the reference it held is let go (a later whole assignment
+    // gives it another).
+    ReleaseRef(String),
+    Int(i64),
+    Var(String),
+    Read,
+    Deref,
+    Field(u8),
+    // In a closure body: a borrow capture's place, `*a_i` for the
+    // reference `a_i` the field on the stack holds, used as stored
+    // (`[Closure-Call]`, D-0239).
+    CapRef,
+    // An array from its elements on the stack.
+    MkArr(usize),
+    // A closure value from its captures on the stack.
+    MkClo { usize func; usize n; bool mv; bool ws; },
+    // `[Closure-Call]` of the closure at the place on the stack.
+    CallClo,
+    // `spawn` of the closure value on the stack.
+    SpawnClo,
+    JobLit,
+    // An argument read by value, or moved when it is a resource.
+    ArgVal,
+    // `[Slice-Form]` from the place on the stack (a `Vec`, or a slice binding).
+    SliceForm { Mode mode; u32 lo; u32 hi; bool arg; },
+    // `[Index-Vec]` (D-0238) / `[Slice-Index]`: an element place.
+    IndexVec(Mode),
+    Borrow { Mode mode; bool arg; },
+    Add,
+    Gt,
+    Let(String),
+    Assign,
+    Call { usize f; usize n; },
+    VecNew,
+    VecPush,
+    VecPop,
+    Swap,
+    Replace,
+    VecIndex(Mode),
+    Spawn { usize f; usize n; },
+    Join,
+    HoldLit,
+    MutexNew,
+    Lock,
+    // D-0249, D-0253: `Atomic::new`; an operation on the atomic a shared
+    // reference reaches (0 load, 1 store, 4 checked add), one step
+    // (`[Atomic-Op]`); `notify_all` (`[Atomic-Notify]`); `Atomic::wait` as
+    // `std` writes it: a check (read the wake count and the value, and
+    // leave for the given address when the value differs) and a sleep
+    // until the count moves (`[Atomic-Wait]`), back to the check.
+    AtomicNew,
+    // D-0258: the place of the k-th static (`[Static-Use]`), its root path.
+    Static(usize),
+    AtomicOp(u8),
+    AtomicNotify,
+    AtomicWaitCheck(usize),
+    AtomicWaitSleep(usize),
+    ChanNew,
+    ChanLend,
+    ChanSend,
+    ChanRecv,
+    ChanClose,
+    MatchSome(usize), // an Option: Some(v) leaves v, None jumps
+    Move,             // a resource place passed by value: `[Store-Binding-Place-Transfer]`
+    Print,
+    Pop,
+    JumpIfFalse(usize),
+    Jump(usize),
+    Ret,
+}
+
+fn debug_strs(ref<Vec<String>, shared> v) : String
+{
+    String o = "[";
+    for (usize i = 0; i < Vec::len(v); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut o, ", ");
+        }
+        String::append(&mut o, &debug_text(&v[i]));
+    }
+    String::push_ascii(&mut o, b']');
+    o
+}
+
+// Rust's `{:?}` of a name (quoted; the fragment's names need no escapes,
+// but a quote or a backslash gets one).
+fn debug_text(StringView s) : String
+{
+    String o = "\"";
+    foreach (c in StringView::as_bytes(s))
+    {
+        if (*c == b'"' || *c == b'\\')
+        {
+            String::push_ascii(&mut o, b'\\');
+        }
+        String::push_ascii(&mut o, *c);
+    }
+    String::push_ascii(&mut o, b'"');
+    o
+}
+
+// Rust's `{:?}` of an instruction, for `--witness`.
+export fn Ins::debug(ref<Ins, shared> i) : String
+{
+    match (i)
+    {
+        Ins::StmtEnter                       : "StmtEnter",
+        Ins::Licensed(v)                     : sprintf("Licensed(%s)", &debug_strs(v)),
+        Ins::StmtExit(k)                     : sprintf("StmtExit { keep: %s }", *k),
+        Ins::BlockEnter                      : "BlockEnter",
+        Ins::BlockExit(v)                    : sprintf("BlockExit(%s)", &debug_strs(v)),
+        Ins::EndBinding(n)                   : sprintf("EndBinding(%s)", &debug_text(n)),
+        Ins::ReleaseRef(n)                   : sprintf("ReleaseRef(%s)", &debug_text(n)),
+        Ins::Int(k)                          : sprintf("Int(%d)", *k),
+        Ins::Var(n)                          : sprintf("Var(%s)", &debug_text(n)),
+        Ins::Read                            : "Read",
+        Ins::Deref                           : "Deref",
+        Ins::Field(k)                        : sprintf("Field(%d)", *k),
+        Ins::CapRef                          : "CapRef",
+        Ins::MkArr(n)                        : sprintf("MkArr(%d)", *n),
+        Ins::MkClo { func, n, mv, ws }       : sprintf("MkClo { func: %d, n: %d, mv: %s, ws: %s }", *func, *n, *mv, *ws),
+        Ins::CallClo                         : "CallClo",
+        Ins::SpawnClo                        : "SpawnClo",
+        Ins::JobLit                          : "JobLit",
+        Ins::ArgVal                          : "ArgVal",
+        Ins::SliceForm { mode, lo, hi, arg } : sprintf("SliceForm { mode: %s, lo: %d, hi: %d, arg: %s }", Mode::debug(*mode), *lo, *hi, *arg),
+        Ins::IndexVec(m)                     : sprintf("IndexVec(%s)", Mode::debug(*m)),
+        Ins::Borrow { mode, arg }            : sprintf("Borrow { mode: %s, arg: %s }", Mode::debug(*mode), *arg),
+        Ins::Add                             : "Add",
+        Ins::Gt                              : "Gt",
+        Ins::Let(n)                          : sprintf("Let(%s)", &debug_text(n)),
+        Ins::Assign                          : "Assign",
+        Ins::Call { f, n }                   : sprintf("Call(%d, %d)", *f, *n),
+        Ins::VecNew                          : "VecNew",
+        Ins::VecPush                         : "VecPush",
+        Ins::VecPop                          : "VecPop",
+        Ins::Swap                            : "Swap",
+        Ins::Replace                         : "Replace",
+        Ins::VecIndex(m)                     : sprintf("VecIndex(%s)", Mode::debug(*m)),
+        Ins::Spawn { f, n }                  : sprintf("Spawn(%d, %d)", *f, *n),
+        Ins::Join                            : "Join",
+        Ins::HoldLit                         : "HoldLit",
+        Ins::MutexNew                        : "MutexNew",
+        Ins::Lock                            : "Lock",
+        Ins::AtomicNew                       : "AtomicNew",
+        Ins::Static(k)                       : sprintf("Static(%d)", *k),
+        Ins::AtomicOp(k)                     : sprintf("AtomicOp(%d)", *k),
+        Ins::AtomicNotify                    : "AtomicNotify",
+        Ins::AtomicWaitCheck(k)              : sprintf("AtomicWaitCheck(%d)", *k),
+        Ins::AtomicWaitSleep(k)              : sprintf("AtomicWaitSleep(%d)", *k),
+        Ins::ChanNew                         : "ChanNew",
+        Ins::ChanLend                        : "ChanLend",
+        Ins::ChanSend                        : "ChanSend",
+        Ins::ChanRecv                        : "ChanRecv",
+        Ins::ChanClose                       : "ChanClose",
+        Ins::MatchSome(k)                    : sprintf("MatchSome(%d)", *k),
+        Ins::Move                            : "Move",
+        Ins::Print                           : "Print",
+        Ins::Pop                             : "Pop",
+        Ins::JumpIfFalse(k)                  : sprintf("JumpIfFalse(%d)", *k),
+        Ins::Jump(k)                         : sprintf("Jump(%d)", *k),
+        Ins::Ret                             : "Ret",
+    }
+}
+
+export struct InsL
+{
+    export Ins ins;
+    export usize line;
+}
+
+export struct CodeFn
+{
+    export Func f;
+    export Vec<InsL> code;
+}
+
+export struct Code
+{
+    export Vec<CodeFn> funcs;
+    // D-0258: the program's statics (name, first value), in order.
+    export Vec<StaticDecl> statics;
+    // D-0299 (`cobmodel certify`): per function, whether the certificate
+    // calls its body decided -- an alias or temporal fault at one of its
+    // steps is then `model.decided-but-false`, since a compiler keeps no
+    // record of such a body's references (D-0284, D-0292). A closure's body
+    // is decided when the function it is written in is.
+    export Vec<bool> decided;
+    // The certificate's program verdict is `decided`: no record at all.
+    export bool all_decided;
+}
+
+export fn Code::index(ref<Code, shared> c, StringView name) : usize
+{
+    for (usize i = 0; i < Vec::len(&c.funcs); i += 1)
+    {
+        if (c.funcs[i].f.name == name)
+        {
+            return i;
+        }
+    }
+    Option::expect(None, "function")
+}
+
+// ---------------------------------------------------------------- compiling
+
+enum Unw
+{
+    Stmt,
+    Block(Vec<String>),
+    // A loop: its test's address and the `break` jumps to patch.
+    Loop { usize top; Vec<usize> breaks; },
+}
+
+struct Comp
+{
+    Program prog;
+    HashMap<EndKey, Vec<String>> ends;
+    // D-0241: given, each statement first names the bindings whose
+    // accesses there the discharge table proves (`Ins::Licensed`).
+    bool licensing;
+    HashMap<ProvenKey, bool> licensed;
+    String fname;
+    Vec<InsL> out;
+    usize block_no;
+    Vec<String> names; // function names, for indices
+    // In a closure body: each capture's field and whether it is a borrow.
+    HashMap<String, CapField> caps;
+    // What a `break` or `continue` leaves, innermost last (`[Break]`: every
+    // scope and frame up to and including the loop body).
+    Vec<Unw> unw;
+}
+
+struct CapField
+{
+    u8 field;
+    bool borrow;
+}
+
+// `[Break]` / `[Continue]`: exit each statement scope and block up to
+// the loop's body, then jump to the loop's exit or its test.
+fn Comp::leave_loop(ref<Comp, exclusive> c, bool brk, usize line)
+{
+    Vec<Ins> seq = Vec::new();
+    Option<usize> at = None;
+    usize k = Vec::len(&c.unw);
+    while (k > 0)
+    {
+        k -= 1;
+        bool stop = false;
+        match (&c.unw[k])
+        {
+            Unw::Stmt                 : Vec::push(&mut seq, Ins::StmtExit(false)),
+            Unw::Block(n)             : Vec::push(&mut seq, Ins::BlockExit(clone(n))),
+            Unw::Loop { top, breaks } :
+            {
+                at = Some(k);
+                stop = true;
+            },
+        }
+        if (stop)
+        {
+            break;
+        }
+    }
+    // The loop's own statement scope lies below its entry and stays:
+    // the test runs in it, and its exit follows the loop's end.
+    usize l = Option::expect(at, "break outside a loop (rejected statically)");
+    foreach (i in seq)
+    {
+        Comp::emit(c, i, line);
+    }
+    usize j = Vec::len(&c.out);
+    if (brk)
+    {
+        Comp::emit(c, Ins::Jump(0), line);
+        match (&mut c.unw[l])
+        {
+            Unw::Loop { top, breaks } : Vec::push(breaks, j),
+            _                         : {},
+        }
+    }
+    else
+    {
+        usize top = match (&c.unw[l])
+        {
+            Unw::Loop { top, breaks } : *top,
+            _                         : 0,
+        };
+        Comp::emit(c, Ins::Jump(top), line);
+    }
+}
+
+fn Comp::emit(ref<Comp, exclusive> c, Ins i, usize line)
+{
+    Vec::push(&mut c.out, InsL { .ins = i, .line = line });
+}
+
+fn Comp::fidx(ref<Comp, shared> c, StringView f) : usize
+{
+    for (usize i = 0; i < Vec::len(&c.names); i += 1)
+    {
+        if (c.names[i] == f)
+        {
+            return i;
+        }
+    }
+    Option::expect(None, "helper")
+}
+
+fn Comp::static_index(ref<Comp, shared> c, StringView n) : usize
+{
+    for (usize i = 0; i < Vec::len(&c.prog.statics); i += 1)
+    {
+        if (&c.prog.statics[i].name == n)
+        {
+            return i;
+        }
+    }
+    0
+}
+
+fn Comp::var(ref<Comp, exclusive> c, StringView n, usize line)
+{
+    Option<CapField> cap = match (HashMap::get(&c.caps, n))
+    {
+        Some(x) : Some(*x),
+        None    : None,
+    };
+    match (cap)
+    {
+        // A capture: the closure's field, reached through `self`;
+        // a borrow capture is the place its reference reaches.
+        Some(x) :
+        {
+            Comp::emit(c, Ins::Var("$self"), line);
+            Comp::emit(c, Ins::Field(x.field), line);
+            if (x.borrow)
+            {
+                Comp::emit(c, Ins::CapRef, line);
+            }
+        },
+        None    :
+        {
+            if (Program::is_static(&c.prog, n))
+            {
+                usize k = Comp::static_index(c, n);
+                Comp::emit(c, Ins::Static(k), line);
+            }
+            else
+            {
+                Comp::emit(c, Ins::Var(String::copy(n)), line);
+            }
+        },
+    }
+}
+
+fn Comp::expr(ref<Comp, exclusive> c, ref<Expr, shared> e, usize line, bool arg)
+{
+    match (&e.k)
+    {
+        ExprK::Int(k)                 : Comp::emit(c, Ins::Int(*k), line),
+        ExprK::Var(n)                 : Comp::var(c, n, line),
+        ExprK::Deref(a)               :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Deref, line);
+        },
+        ExprK::Field(a)               :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Field(0), line);
+        },
+        ExprK::Index { v, k }         :
+        {
+            // `v[k]`: the element place (`[Index-Vec]`, D-0238, or
+            // `[Slice-Index]`); the mode is fixed by the context: see
+            // `place`.
+            Comp::index(c, v, *k, Mode::Shared, line);
+        },
+        ExprK::Slice { m, v, lo, hi } :
+        {
+            Comp::var(c, v, line);
+            Comp::emit(c, Ins::SliceForm { .mode = *m, .lo = narrow_wrapping<u32>(*lo), .hi = narrow_wrapping<u32>(*hi), .arg = arg }, line);
+        },
+        ExprK::Closure(cb)            :
+        {
+            ref<Clo, shared> cl = Box::get(cb);
+            foreach (x in &cl.caps)
+            {
+                Expr xe = ex_var(x);
+                if (cl.mv)
+                {
+                    Comp::expr(c, &xe, line, false);
+                    Comp::emit(c, Ins::Read, line);
+                }
+                else
+                {
+                    Mode m = Mode::Shared;
+                    if (writes_root(&cl.body, x))
+                    {
+                        m = Mode::Excl;
+                    }
+                    Comp::place(c, &xe, m, line);
+                    Comp::emit(c, Ins::Borrow { .mode = m, .arg = false }, line);
+                }
+            }
+            bool ws = false;
+            if (cl.mv)
+            {
+                foreach (x in &cl.caps)
+                {
+                    if (writes_root(&cl.body, x))
+                    {
+                        ws = true;
+                    }
+                }
+            }
+            Comp::emit(c, Ins::MkClo { .func = Vec::len(&c.prog.funcs) + cl.id, .n = Vec::len(&cl.caps), .mv = cl.mv, .ws = ws }, line);
+        },
+        ExprK::CallVal(a)             :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::CallClo, line);
+        },
+        ExprK::SpawnClo(a)            :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::SpawnClo, line);
+        },
+        ExprK::JobLit(a)              :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::ArgVal, line);
+            Comp::emit(c, Ins::JobLit, line);
+        },
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (x in xs)
+            {
+                Comp::expr(c, x, line, false);
+                Comp::emit(c, Ins::Read, line);
+            }
+            Comp::emit(c, Ins::MkArr(Vec::len(xs)), line);
+        },
+        ExprK::Borrow { m, e: a }     :
+        {
+            Comp::place(c, Box::get(a), *m, line);
+            Comp::emit(c, Ins::Borrow { .mode = *m, .arg = arg }, line);
+        },
+        ExprK::Add { a, b }           :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::expr(c, Box::get(b), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Add, line);
+        },
+        ExprK::Gt { a, b }            :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::expr(c, Box::get(b), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Gt, line);
+        },
+        ExprK::Call { f, xs }         : Comp::call(c, f, xs, line),
+        ExprK::Spawn { f, xs }        :
+        {
+            Vec<Ty> params = Comp::params_of(c, f);
+            for (usize k = 0; k < Vec::len(xs); k += 1)
+            {
+                Comp::arg_k(c, &xs[k], &params, k, line);
+            }
+            usize i = Comp::fidx(c, f);
+            Comp::emit(c, Ins::Spawn { .f = i, .n = Vec::len(xs) }, line);
+        },
+        ExprK::Join(t)                :
+        {
+            Comp::emit(c, Ins::Var(clone(t)), line);
+            Comp::emit(c, Ins::Join, line);
+        },
+        ExprK::HoldLit(a)             :
+        {
+            Comp::expr(c, Box::get(a), line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::HoldLit, line);
+        },
+    }
+}
+
+fn Comp::params_of(ref<Comp, shared> c, StringView f) : Vec<Ty>
+{
+    Vec<Ty> params = Vec::new();
+    match (Program::func(&c.prog, f))
+    {
+        Some(x) :
+        {
+            foreach (p in &x.params)
+            {
+                Vec::push(&mut params, clone(&p.ty));
+            }
+        },
+        None    : {},
+    }
+    params
+}
+
+fn Comp::call(ref<Comp, exclusive> c, StringView f, ref<Vec<Expr>, shared> args, usize line)
+{
+    if (f == "Vec::new")
+    {
+        Comp::emit(c, Ins::VecNew, line);
+    }
+    else if (f == "Mutex::new" || f == "lock" || f == "Channel::new" || f == "Atomic::new")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        if (f == "Mutex::new")
+        {
+            Comp::emit(c, Ins::MutexNew, line);
+        }
+        else if (f == "lock")
+        {
+            Comp::emit(c, Ins::Lock, line);
+        }
+        else if (f == "Channel::new")
+        {
+            Comp::emit(c, Ins::ChanNew, line);
+        }
+        else
+        {
+            Comp::emit(c, Ins::AtomicNew, line);
+        }
+    }
+    else if (f == "Atomic::load" || f == "Atomic::notify_all")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        if (f == "Atomic::load")
+        {
+            Comp::emit(c, Ins::AtomicOp(0), line);
+        }
+        else
+        {
+            Comp::emit(c, Ins::AtomicNotify, line);
+        }
+    }
+    else if (f == "Atomic::store" || f == "Atomic::fetch_add")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        Comp::expr(c, &args[1], line, true);
+        Comp::emit(c, Ins::Read, line);
+        if (f == "Atomic::store")
+        {
+            Comp::emit(c, Ins::AtomicOp(1), line);
+        }
+        else
+        {
+            Comp::emit(c, Ins::AtomicOp(4), line);
+        }
+    }
+    else if (f == "Atomic::wait")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        Comp::expr(c, &args[1], line, true);
+        Comp::emit(c, Ins::Read, line);
+        usize check = Vec::len(&c.out);
+        Comp::emit(c, Ins::AtomicWaitCheck(0), line);
+        Comp::emit(c, Ins::AtomicWaitSleep(check), line);
+        usize end = Vec::len(&c.out);
+        c.out[check].ins = Ins::AtomicWaitCheck(end);
+    }
+    else if (f == "Channel::send")
+    {
+        // `lend_places(&mut v)` is the body's first line, before
+        // any wait.
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        Comp::expr(c, &args[1], line, true);
+        Comp::emit(c, Ins::Read, line);
+        Comp::emit(c, Ins::ChanLend, line);
+        Comp::emit(c, Ins::ChanSend, line);
+    }
+    else if (f == "Channel::recv" || f == "Channel::close")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::Read, line);
+        if (f == "Channel::recv")
+        {
+            Comp::emit(c, Ins::ChanRecv, line);
+        }
+        else
+        {
+            Comp::emit(c, Ins::ChanClose, line);
+        }
+    }
+    else if (f == "Vec::push")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::expr(c, &args[1], line, true);
+        Comp::emit(c, Ins::ArgVal, line);
+        Comp::emit(c, Ins::VecPush, line);
+    }
+    else if (f == "Vec::pop")
+    {
+        Comp::expr(c, &args[0], line, true);
+        Comp::emit(c, Ins::VecPop, line);
+    }
+    else if (f == "swap" || f == "replace")
+    {
+        // `swap(a, b)`, `replace(r, v)` (`spec/21` §3b): the
+        // references passed on, `[Swap-Places]` one step (D-0235).
+        Vec<Ty> none = Vec::new();
+        Comp::arg_k(c, &args[0], &none, 0, line);
+        Comp::arg_k(c, &args[1], &none, 1, line);
+        if (f == "swap")
+        {
+            Comp::emit(c, Ins::Swap, line);
+        }
+        else
+        {
+            Comp::emit(c, Ins::Replace, line);
+        }
+    }
+    else if (f == "Vec::index_exclusive")
+    {
+        // `Vec::index_exclusive(v, k)` called as written: the
+        // reference passed on whole (D-0222's case).
+        Vec<Ty> none = Vec::new();
+        Comp::arg_k(c, &args[0], &none, 0, line);
+        Comp::arg_k(c, &args[1], &none, 1, line);
+        Comp::emit(c, Ins::VecIndex(Mode::Excl), line);
+    }
+    else
+    {
+        Vec<Ty> params = Comp::params_of(c, f);
+        for (usize k = 0; k < Vec::len(args); k += 1)
+        {
+            Comp::arg_k(c, &args[k], &params, k, line);
+        }
+        usize i = Comp::fidx(c, f);
+        Comp::emit(c, Ins::Call { .f = i, .n = Vec::len(args) }, line);
+    }
+}
+
+// An argument: a resource is moved from its place, anything else read.
+fn Comp::arg_k(ref<Comp, exclusive> c, ref<Expr, shared> a, ref<Vec<Ty>, shared> params, usize k, usize line)
+{
+    bool res = k < Vec::len(params) && Ty::is_resource(&params[k]);
+    bool var = match (&a.k)
+    {
+        ExprK::Var(_) : true,
+        _             : false,
+    };
+    if (res && var)
+    {
+        Comp::expr(c, a, line, false);
+        Comp::emit(c, Ins::Move, line);
+    }
+    else
+    {
+        Comp::expr(c, a, line, true);
+        Comp::emit(c, Ins::Read, line);
+    }
+}
+
+fn Comp::index(ref<Comp, exclusive> c, StringView v, i64 k, Mode m, usize line)
+{
+    Comp::var(c, v, line);
+    Comp::emit(c, Ins::Int(k), line);
+    Comp::emit(c, Ins::IndexVec(m), line);
+}
+
+// A place expression evaluated as a place, for a write or a borrow of
+// mode `m`.
+fn Comp::place(ref<Comp, exclusive> c, ref<Expr, shared> e, Mode m, usize line)
+{
+    match (&e.k)
+    {
+        ExprK::Index { v, k } : Comp::index(c, v, *k, m, line),
+        // `*v[k]` written: the element by index_exclusive (D-0219 finding 6)
+        ExprK::Deref(a)       :
+        {
+            match (&Box::get(a).k)
+            {
+                ExprK::Index { v, k } :
+                {
+                    if (m == Mode::Excl)
+                    {
+                        Comp::index(c, v, *k, Mode::Excl, line);
+                        Comp::emit(c, Ins::Deref, line);
+                        return;
+                    }
+                },
+                _                     : {},
+            }
+            Comp::expr(c, e, line, false);
+        },
+        _                     : Comp::expr(c, e, line, false),
+    }
+}
+
+fn Comp::stmt(ref<Comp, exclusive> c, ref<Stmt, shared> s)
+{
+    usize line = s.line;
+    Comp::emit(c, Ins::StmtEnter, line);
+    Vec::push(&mut c.unw, Unw::Stmt);
+    if (c.licensing)
+    {
+        Vec<String> names = Vec::new();
+        String fname = clone(&c.fname);
+        ref<HashMap<ProvenKey, bool>, shared> lic = &c.licensed;
+        foreach (k, ok in lic)
+        {
+            if (*ok && k.f == fname && k.line == line)
+            {
+                Vec::push(&mut names, clone(&k.x));
+            }
+        }
+        Vec::sort(&mut names);
+        if (Vec::len(&names) > 0)
+        {
+            Comp::emit(c, Ins::Licensed(names), line);
+        }
+    }
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              :
+        {
+            Comp::expr(c, init, line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Let(clone(name)), line);
+        },
+        StmtK::Assign { place, value }             :
+        {
+            Comp::place(c, place, Mode::Excl, line);
+            Comp::expr(c, value, line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Assign, line);
+        },
+        StmtK::Expr(e)                             :
+        {
+            Comp::expr(c, e, line, false);
+            Comp::emit(c, Ins::Pop, line);
+        },
+        StmtK::Print(e)                            :
+        {
+            Comp::expr(c, e, line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Print, line);
+        },
+        StmtK::Block(b)                            : Comp::block(c, b, None),
+        StmtK::Discard(e)                          :
+        {
+            Comp::expr(c, e, line, false);
+            Comp::emit(c, Ins::Read, line);
+            Comp::emit(c, Ins::Pop, line);
+        },
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            Comp::expr(c, scrut, line, false);
+            Comp::emit(c, Ins::Read, line);
+            usize m = Vec::len(&c.out);
+            Comp::emit(c, Ins::MatchSome(0), line);
+            Comp::block(c, some, Some(clone(binder)));
+            usize j = Vec::len(&c.out);
+            Comp::emit(c, Ins::Jump(0), line);
+            usize l1 = Vec::len(&c.out);
+            Comp::block(c, none, None);
+            usize l2 = Vec::len(&c.out);
+            c.out[m].ins = Ins::MatchSome(l1);
+            c.out[j].ins = Ins::Jump(l2);
+        },
+        StmtK::While { cond, body }                :
+        {
+            usize top = Vec::len(&c.out);
+            Comp::expr(c, cond, line, false);
+            Comp::emit(c, Ins::Read, line);
+            usize jf = Vec::len(&c.out);
+            Comp::emit(c, Ins::JumpIfFalse(0), line);
+            Vec::push(&mut c.unw, Unw::Loop { .top = top, .breaks = Vec::new() });
+            Comp::block(c, body, None);
+            Vec<usize> breaks = match (Vec::pop(&mut c.unw))
+            {
+                Some(Unw::Loop { top: _, breaks }) : breaks,
+                _                                  : Vec::new(),
+            };
+            Comp::emit(c, Ins::Jump(top), line);
+            usize end = Vec::len(&c.out);
+            c.out[jf].ins = Ins::JumpIfFalse(end);
+            foreach (j in &breaks)
+            {
+                c.out[*j].ins = Ins::Jump(end);
+            }
+        },
+        StmtK::Break                               : Comp::leave_loop(c, true, line),
+        StmtK::Continue                            : Comp::leave_loop(c, false, line),
+        StmtK::If { cond, thn, els }               :
+        {
+            Comp::expr(c, cond, line, false);
+            Comp::emit(c, Ins::Read, line);
+            usize jf = Vec::len(&c.out);
+            Comp::emit(c, Ins::JumpIfFalse(0), line);
+            Comp::block(c, thn, None);
+            usize j = Vec::len(&c.out);
+            Comp::emit(c, Ins::Jump(0), line);
+            usize l1 = Vec::len(&c.out);
+            match (els)
+            {
+                Some(e) : Comp::block(c, e, None),
+                None    : {},
+            }
+            usize l2 = Vec::len(&c.out);
+            c.out[jf].ins = Ins::JumpIfFalse(l1);
+            c.out[j].ins = Ins::Jump(l2);
+        },
+    }
+    _ = Vec::pop(&mut c.unw);
+    Comp::emit(c, Ins::StmtExit(false), line);
+}
+
+// A block; `binder` is a pattern binder its region declares, bound from
+// the value on the operand stack (a `match` arm's).
+fn Comp::block(ref<Comp, exclusive> c, ref<Block, shared> b, Option<String> binder)
+{
+    usize me = c.block_no;
+    c.block_no += 1;
+    usize first = b.end_line;
+    if (Vec::len(&b.stmts) > 0)
+    {
+        first = b.stmts[0].line;
+    }
+    Comp::emit(c, Ins::BlockEnter, first);
+    match (&binder)
+    {
+        Some(n) : Comp::emit(c, Ins::Let(clone(n)), first),
+        None    : {},
+    }
+    Vec<String> names = Vec::new();
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init } : Vec::push(&mut names, clone(name)),
+            _                             : {},
+        }
+    }
+    match (binder)
+    {
+        Some(n) : Vec::push(&mut names, n),
+        None    : {},
+    }
+    Vec::push(&mut c.unw, Unw::Block(clone(&names)));
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        ref<Stmt, shared> s = &b.stmts[i];
+        Comp::stmt(c, s);
+        EndKey key = EndKey { .f = clone(&c.fname), .block = me, .stmt = i };
+        ref<HashMap<EndKey, Vec<String>>, shared> ends = &c.ends;
+        Vec<String> ending = match (HashMap::get(ends, &key))
+        {
+            Some(ns) : clone(ns),
+            None     : Vec::new(),
+        };
+        foreach (n in &ending)
+        {
+            match (StringView::strip_prefix(n, "\u{1}"))
+            {
+                Some(r) : Comp::emit(c, Ins::ReleaseRef(String::copy(r)), s.line),
+                None    : Comp::emit(c, Ins::EndBinding(clone(n)), s.line),
+            }
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) :
+        {
+            Comp::emit(c, Ins::StmtEnter, b.tail_line);
+            Comp::expr(c, t, b.tail_line, false);
+            Comp::emit(c, Ins::StmtExit(true), b.tail_line);
+        },
+        None    :
+        {
+            Comp::emit(c, Ins::Int(0), b.end_line);
+            Comp::emit(c, Ins::Pop, b.end_line);
+        },
+    }
+    _ = Vec::pop(&mut c.unw);
+    // A fault at the exit (a destructor's wait, a handle's failure) is
+    // reported at the block's last statement, as the tools report it
+    // (the reporting form of an outcome is the implementation's,
+    // `spec/22` §5).
+    usize exit_line = b.end_line;
+    match (&b.tail)
+    {
+        Some(_) : exit_line = b.tail_line,
+        None    :
+        {
+            usize n = Vec::len(&b.stmts);
+            if (n > 0)
+            {
+                exit_line = last_line(&b.stmts[n - 1]);
+            }
+        },
+    }
+    Comp::emit(c, Ins::BlockExit(names), exit_line);
+}
+
+// The line of a statement's last line of code (a nested block's last
+// statement, recursively).
+fn last_line(ref<Stmt, shared> s) : usize
+{
+    match (&s.k)
+    {
+        StmtK::Block(b) :
+        {
+            usize n = Vec::len(&b.stmts);
+            if (n > 0)
+            {
+                return last_line(&b.stmts[n - 1]);
+            }
+            s.line
+        },
+        _               : s.line,
+    }
+}
+
+export fn compile(ref<Program, shared> prog, ref<HashMap<EndKey, Vec<String>>, shared> ends) : Code
+{
+    HashMap<ProvenKey, bool> none = HashMap::new();
+    compile_with(prog, ends, false, &none)
+}
+
+fn new_comp(ref<Program, shared> prog, ref<HashMap<EndKey, Vec<String>>, shared> ends, bool licensing, ref<HashMap<ProvenKey, bool>, shared> licensed, String fname, Vec<String> names, HashMap<String, CapField> caps) : Comp
+{
+    Comp { .prog = clone(prog), .ends = clone(ends), .licensing = licensing, .licensed = clone(licensed), .fname = fname, .out = Vec::new(), .block_no = 0, .names = names, .caps = caps, .unw = Vec::new() }
+}
+
+// D-0241: `licensing`, each statement first names the bindings whose
+// accesses there the discharge table proves (`Ins::Licensed`).
+export fn compile_with(ref<Program, shared> prog, ref<HashMap<EndKey, Vec<String>>, shared> ends, bool licensing, ref<HashMap<ProvenKey, bool>, shared> licensed) : Code
+{
+    Vec<String> names = Vec::new();
+    foreach (f in &prog.funcs)
+    {
+        Vec::push(&mut names, clone(&f.name));
+    }
+    Vec<CodeFn> funcs = Vec::new();
+    foreach (f in &prog.funcs)
+    {
+        Comp c = new_comp(prog, ends, licensing, licensed, clone(&f.name), clone(&names), HashMap::new());
+        Comp::block(&mut c, &f.body, None);
+        Comp::emit(&mut c, Ins::Ret, f.body.end_line);
+        Vec::push(&mut funcs, CodeFn { .f = clone(f), .code = replace(&mut c.out, Vec::new()) });
+    }
+    // Each closure's body, a function of its own after the program's,
+    // numbered by the closure's id; `self` is its one parameter.
+    Vec<Clo> clos = Vec::new();
+    foreach (f in &prog.funcs)
+    {
+        block_closures(&f.body, &mut clos);
+    }
+    Vec::sort_by(&mut clos, [](ref<Clo, shared> a, ref<Clo, shared> b) : bool { a.id < b.id });
+    foreach (cl in &clos)
+    {
+        String fname = sprintf("$clo%d", cl.id);
+        HashMap<String, CapField> caps = HashMap::new();
+        for (usize i = 0; i < Vec::len(&cl.caps); i += 1)
+        {
+            _ = HashMap::insert(&mut caps, clone(&cl.caps[i]), CapField { .field = narrow_wrapping<u8>(i), .borrow = !cl.mv });
+        }
+        Comp c = new_comp(prog, ends, licensing, licensed, clone(&fname), clone(&names), caps);
+        Comp::block(&mut c, &cl.body, None);
+        Comp::emit(&mut c, Ins::Ret, cl.body.end_line);
+        usize line = cl.body.end_line;
+        if (Vec::len(&cl.body.stmts) > 0)
+        {
+            line = cl.body.stmts[0].line;
+        }
+        Func f = Func { .name = fname, .params = Vec::new(), .ret = clone(&cl.ret), .body = clone(&cl.body), .line = line, .src = 0 };
+        Vec::push(&mut funcs, CodeFn { .f = f, .code = replace(&mut c.out, Vec::new()) });
+    }
+    usize n = Vec::len(&funcs);
+    Code { .funcs = funcs, .statics = clone(&prog.statics), .decided = Vec::filled(n, false), .all_decided = false }
+}
+
+// D-0299: the code with the certificate's verdicts applied: every function
+// whose name `decided` holds, and every closure written in one, is marked;
+// `all` (the certificate's program verdict is `decided`: no record of
+// references at all) marks every body.
+export fn compile_certified(ref<Program, shared> prog, ref<HashMap<EndKey, Vec<String>>, shared> ends, ref<SSet<String>, shared> decided, bool all) : Code
+{
+    Code code = compile(prog, ends);
+    SSet<String> marked = clone(decided);
+    foreach (f in &prog.funcs)
+    {
+        if (all || sset_has(decided, &f.name))
+        {
+            _ = SSet::insert(&mut marked, clone(&f.name));
+            Vec<Clo> clos = Vec::new();
+            block_closures(&f.body, &mut clos);
+            foreach (cl in &clos)
+            {
+                _ = SSet::insert(&mut marked, sprintf("$clo%d", cl.id));
+            }
+        }
+    }
+    for (usize i = 0; i < Vec::len(&code.funcs); i += 1)
+    {
+        code.decided[i] = all || sset_has(&marked, &code.funcs[i].f.name);
+    }
+    code.all_decided = all;
+    code
+}
+
+// ---------------------------------------------------------------- running
+
+fn replace_ref(ref<Val, exclusive> v, u32 from, u32 to)
+{
+    match (v)
+    {
+        Val::Ref(t)                     :
+        {
+            if (*t == from)
+            {
+                *t = to;
+            }
+        },
+        Val::Hold(t)                    :
+        {
+            if (*t == from)
+            {
+                *t = to;
+            }
+        },
+        Val::Guard(t)                   :
+        {
+            if (*t == from)
+            {
+                *t = to;
+            }
+        },
+        Val::Slice { tok, start, len }  :
+        {
+            if (*tok == from)
+            {
+                *tok = to;
+            }
+        },
+        Val::Opt(o) : match (o)
+        {
+            Some(b) : replace_ref(Box::get_mut(b), from, to),
+            None    : {},
+        },
+        Val::Res(o) : match (o)
+        {
+            Some(b) : replace_ref(Box::get_mut(b), from, to),
+            None    : {},
+        },
+        Val::Chan { q, closed, cap }    :
+        {
+            foreach (x in q)
+            {
+                replace_ref(x, from, to);
+            }
+        },
+        Val::Clo { func, caps, mv, ws } :
+        {
+            foreach (x in caps)
+            {
+                replace_ref(x, from, to);
+            }
+        },
+        _                               : {},
+    }
+}
+
+export enum Step
+{
+    Next(State),
+    Blocked,
+    Fault { State s; Fault f; },
+    Exit(State), // the program ended normally
+}
+
+export struct Machine
+{
+    export ref<Code, shared> code;
+    // The reading of `[Object-End]`'s Dead set at a block's exit: literally
+    // (false), or sparing the references in the block's own result (true),
+    // as `unwind-to` and `[Stmt-Exit]` spare the result `r` (D-0219,
+    // finding 2: `fn pass(ref<i32, exclusive> p) : ref<i32, exclusive> { p }`).
+    export bool spare_result;
+}
+
+fn mk_fault(str diag, usize line) : Fault
+{
+    Fault { .diag = diag, .line = line, .tok = None, .value = false }
+}
+
+// A fault at an access through `tok` (D-0299).
+fn fault_at(str diag, usize line, u32 tok) : Fault
+{
+    Fault { .diag = diag, .line = line, .tok = Some(tok), .value = false }
+}
+
+// A fault that is a check of a value's own state (D-0299).
+fn fault_value(str diag, usize line) : Fault
+{
+    Fault { .diag = diag, .line = line, .tok = None, .value = true }
+}
+
+fn new_act(usize func, u32 pf) : Act
+{
+    Act { .func = func, .pc = 0, .stack = Vec::new(), .slots = SMap::new(), .frames = Vec::new(), .param_frame = pf, .exiting = None }
+}
+
+fn new_thread(usize func, u32 pf) : Thread
+{
+    Vec<Act> acts = Vec::new();
+    Vec::push(&mut acts, new_act(func, pf));
+    Thread { .acts = acts, .scopes = Vec::new(), .status = Status::Running, .waiting = false, .lent = false, .licensed = SSet::new() }
+}
+
+export fn State::new(ref<Code, shared> code) : State
+{
+    usize main = Code::index(code, "main");
+    State s = State
+    {
+        .tracing = false,
+        .trace = Vec::new(),
+        .pend_next = false,
+        .lend_next = false,
+        .quiet_store = false,
+        .quiet_end = 0,
+        .emit_end = false,
+        .moving = None,
+        .handle_obj = SMap::new(),
+        .guard_obj = SMap::new(),
+        .objs = SMap::new(),
+        .paths = SMap::new(),
+        .holder = SMap::new(),
+        .bufs = SMap::new(),
+        .elems = SMap::new(),
+        .threads = SMap::new(),
+        .out = Vec::new(),
+        .next = 1,
+        .clock = 0,
+        .sync = SMap::new(),
+        .statics = Vec::new(),
+    };
+    u32 pf = State::fresh(&mut s);
+    _ = SMap::insert(&mut s.threads, 0, new_thread(main, pf));
+    // D-0258: the statics' objects, established in Σ_0 (`[Program]`):
+    // resources that no frame owns and no scope ends, each with a
+    // shared root path (the main thread's) every thread borrows from.
+    foreach (st in &code.statics)
+    {
+        u32 o = State::fresh(&mut s);
+        _ = SMap::insert(&mut s.objs, o, Obj { .is_res = true, .val = Some(Val::Atomic { .v = st.k, .w = 0 }), .elem = None, .scope = None, .origin = 0 });
+        u32 root = State::new_path(&mut s, o, Vec::new(), Mode::Shared, 0, None);
+        Vec::push(&mut s.statics, root);
+    }
+    s
+}
+
+// A line of the trace (`machine::tr`), kept when tracing.
+export fn State::tr(ref<State, exclusive> s, String line)
+{
+    if (s.tracing)
+    {
+        Vec::push(&mut s.trace, line);
+    }
+}
+
+fn State::fresh(ref<State, exclusive> s) : u32
+{
+    s.next += 1;
+    s.next
+}
+
+fn State::tick(ref<State, exclusive> s) : u64
+{
+    s.clock += 1;
+    s.clock
+}
+
+fn State::ti(ref<State, shared> s, u32 t) : usize
+{
+    Option::unwrap(SMap::find(&s.threads, &t))
+}
+
+export fn State::thread(ref<State, shared> s, u32 t) : ref<Thread, shared>
+{
+    &s.threads.vals[State::ti(s, t)]
+}
+
+fn State::th(ref<State, exclusive> s, u32 t) : ref<Thread, exclusive>
+{
+    usize i = State::ti(s, t);
+    &mut s.threads.vals[i]
+}
+
+export fn State::act_of(ref<State, shared> s, u32 t) : ref<Act, shared>
+{
+    ref<Thread, shared> th = State::thread(s, t);
+    &th.acts[Vec::len(&th.acts) - 1]
+}
+
+fn State::act(ref<State, exclusive> s, u32 t) : ref<Act, exclusive>
+{
+    usize i = State::ti(s, t);
+    usize n = Vec::len(&s.threads.vals[i].acts);
+    &mut s.threads.vals[i].acts[n - 1]
+}
+
+fn State::cur_frame(ref<State, shared> s, u32 t) : u32
+{
+    ref<Act, shared> a = State::act_of(s, t);
+    usize n = Vec::len(&a.frames);
+    if (n > 0)
+    {
+        return a.frames[n - 1];
+    }
+    a.param_frame
+}
+
+fn State::cur_scope(ref<State, shared> s, u32 t) : Option<u32>
+{
+    ref<Thread, shared> th = State::thread(s, t);
+    usize n = Vec::len(&th.scopes);
+    if (n > 0)
+    {
+        return Some(th.scopes[n - 1].sc);
+    }
+    None
+}
+
+fn State::alive(ref<State, shared> s, u32 o) : bool
+{
+    SMap::contains(&s.objs, &o)
+}
+
+fn State::pidx(ref<State, shared> s, u32 a) : usize
+{
+    Option::unwrap(SMap::find(&s.paths, &a))
+}
+
+export fn State::path(ref<State, shared> s, u32 a) : ref<Path, shared>
+{
+    &s.paths.vals[State::pidx(s, a)]
+}
+
+fn State::path_mut(ref<State, exclusive> s, u32 a) : ref<Path, exclusive>
+{
+    usize i = State::pidx(s, a);
+    &mut s.paths.vals[i]
+}
+
+fn State::oidx(ref<State, shared> s, u32 o) : usize
+{
+    Option::unwrap(SMap::find(&s.objs, &o))
+}
+
+fn State::obj(ref<State, shared> s, u32 o) : ref<Obj, shared>
+{
+    &s.objs.vals[State::oidx(s, o)]
+}
+
+fn State::buf_cell(ref<State, shared> s, u32 b, u32 i) : ref<Val, shared>
+{
+    usize k = Option::unwrap(SMap::find(&s.bufs, &b));
+    &s.bufs.vals[k][widen<usize>(i)]
+}
+
+export fn State::temporally_valid(ref<State, shared> s, u32 a) : bool
+{
+    match (SMap::find(&s.paths, &a))
+    {
+        Some(i) : s.paths.vals[i].valid && State::alive(s, s.paths.vals[i].of),
+        None    : false,
+    }
+}
+
+fn State::ancestors(ref<State, shared> s, u32 a) : Vec<u32>
+{
+    Vec<u32> v = Vec::new();
+    Option<u32> cur = Some(a);
+    while (true)
+    {
+        match (cur)
+        {
+            Some(x) :
+            {
+                Vec::push(&mut v, x);
+                cur = match (SMap::find(&s.paths, &x))
+                {
+                    Some(i) : s.paths.vals[i].base,
+                    None    : None,
+                };
+            },
+            None    : break,
+        }
+    }
+    v
+}
+
+fn u32_max(u32 a, u32 b) : u32
+{
+    if (a > b)
+    {
+        return a;
+    }
+    b
+}
+
+fn u32_min(u32 a, u32 b) : u32
+{
+    if (a < b)
+    {
+        return a;
+    }
+    b
+}
+
+// `overlap` by steps: `meet` (D-0238) -- the lists agree step by step
+// over the shorter one's length; a range and an index inside it, two
+// intersecting ranges (an empty one meets nothing), equal indices and
+// equal fields agree.
+fn psteps_overlap(ref<Vec<PStep>, shared> a, ref<Vec<PStep>, shared> b) : bool
+{
+    usize n = Vec::len(a);
+    if (Vec::len(b) < n)
+    {
+        n = Vec::len(b);
+    }
+    for (usize k = 0; k < n; k += 1)
+    {
+        bool meet = match (a[k])
+        {
+            PStep::F(i) : match (b[k])
+            {
+                PStep::F(j) : i == j,
+                _           : false,
+            },
+            PStep::I(i) : match (b[k])
+            {
+                PStep::I(j)         : i == j,
+                PStep::R { lo, hi } : lo <= i && i < hi,
+                _                   : false,
+            },
+            PStep::R { lo, hi } : match (b[k])
+            {
+                PStep::I(x)                   : lo <= x && x < hi,
+                PStep::R { lo: lo2, hi: hi2 } : u32_max(lo, lo2) < u32_min(hi, hi2),
+                _                             : false,
+            },
+        };
+        if (!meet)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// `clash(a, m, Σ)` (`spec/04` §2).
+export fn State::clash(ref<State, shared> s, u32 a, Mode m) : bool
+{
+    ref<Path, shared> p = State::path(s, a);
+    Vec<u32> anc = State::ancestors(s, a);
+    bool ld = State::lock_derived(s, a);
+    for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+    {
+        u32 t2 = s.paths.keys[i];
+        ref<Path, shared> q = &s.paths.vals[i];
+        if (q.valid && State::alive(s, q.of) && !q.pending && q.of == p.of && !Vec::contains(&anc, t2) && psteps_overlap(&p.steps, &q.steps) && !(m == Mode::Shared && q.mode == Mode::Shared) && !State::sync_exempt(s, ld, m, t2))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn State::lock_derived(ref<State, shared> s, u32 a) : bool
+{
+    Vec<u32> anc = State::ancestors(s, a);
+    foreach (t in &anc)
+    {
+        if (State::path(s, *t).lockp)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// `sync-exempt(a, m, a', Σ)` (`spec/19` §2).
+fn State::sync_exempt(ref<State, shared> s, bool a_ld, Mode m, u32 a2) : bool
+{
+    bool b_ld = State::lock_derived(s, a2);
+    (a_ld && !b_ld && State::path(s, a2).mode == Mode::Shared) || (b_ld && !a_ld && m == Mode::Shared)
+}
+
+fn State::running(ref<State, shared> s, u32 t) : bool
+{
+    match (SMap::find(&s.threads, &t))
+    {
+        Some(i) : Status::is_running(&s.threads.vals[i].status),
+        None    : false,
+    }
+}
+
+fn State::slot_tops(ref<Act, shared> act) : Vec<u32>
+{
+    Vec<u32> v = Vec::new();
+    foreach (x in &act.slots.vals)
+    {
+        usize n = Vec::len(x);
+        if (n > 0)
+        {
+            Vec::push(&mut v, x[n - 1]);
+        }
+    }
+    v
+}
+
+// D-0299 (`cobmodel certify`): whether an access through `a` by thread
+// `t` is one a compiler that keeps no record of a decided body's
+// frame-held references makes unchecked (D-0292): `a`, up through its
+// projections, is a binding's own path in the thread's current call, or
+// the reference a binding of reference type holds (its value, one
+// dereference away); a reference reached through data (a field, an
+// element, an `Option`'s payload), a slice's or a guard's path, and a
+// parameter a thread was lent (the call is the thread's first) are
+// recorded in every function.
+export fn State::frame_held(ref<State, shared> s, u32 a, u32 t) : bool
+{
+    usize ti = match (SMap::find(&s.threads, &t))
+    {
+        Some(i) : i,
+        None    : return false,
+    };
+    ref<Thread, shared> th = &s.threads.vals[ti];
+    usize na = Vec::len(&th.acts);
+    if (na == 0)
+    {
+        return false;
+    }
+    ref<Act, shared> act = &th.acts[na - 1];
+    bool entry = t != 0 && na == 1;
+    Vec<u32> slots = State::slot_tops(act);
+    u32 r = a;
+    while (true)
+    {
+        if (Vec::contains(&slots, r))
+        {
+            return true;
+        }
+        if (!entry)
+        {
+            foreach (x in &slots)
+            {
+                match (State::value_at(s, *x))
+                {
+                    Some(Val::Ref(y)) :
+                    {
+                        if (y == r)
+                        {
+                            return true;
+                        }
+                    },
+                    _                 : {},
+                }
+            }
+        }
+        usize pi = match (SMap::find(&s.paths, &r))
+        {
+            Some(i) : i,
+            None    : return false,
+        };
+        ref<Path, shared> p = &s.paths.vals[pi];
+        match (p.base)
+        {
+            Some(b) :
+            {
+                bool longer = match (SMap::find(&s.paths, &b))
+                {
+                    Some(j) : Vec::len(&p.steps) > Vec::len(&s.paths.vals[j].steps),
+                    None    : false,
+                };
+                if (!longer)
+                {
+                    return false;
+                }
+                r = b;
+            },
+            None    : return false,
+        }
+    }
+    false
+}
+
+// D-0241: the diagnostic for a failed `¬clash` at an access through
+// `a`: under `--as-licensed`, an access the discharge table proved
+// (its root path named by `Ins::Licensed`) is the distinct outcome
+// `model.proven-but-false` -- an implementation the text licenses to
+// omit the check would have gone on.
+fn State::unlicensed(ref<State, shared> s, u32 a, u32 me) : str
+{
+    // Up through projections only (each adds a step); a borrow keeps its
+    // base's steps and is another place of the table (`*q`).
+    u32 r = a;
+    while (true)
+    {
+        match (State::path(s, r).base)
+        {
+            Some(b) :
+            {
+                if (Vec::len(&State::path(s, r).steps) <= Vec::len(&State::path(s, b).steps))
+                {
+                    return "diag.aliasing-conflict";
+                }
+                r = b;
+            },
+            None    : break,
+        }
+    }
+    match (SMap::find(&s.threads, &me))
+    {
+        Some(i) :
+        {
+            if (SSet::contains(&s.threads.vals[i].licensed, &r))
+            {
+                return "model.proven-but-false";
+            }
+        },
+        None    : {},
+    }
+    "diag.aliasing-conflict"
+}
+
+// `[Thread-Affine]` (D-0213), with the take-over it allows; D-0237: a
+// spawned thread that takes a path over is no longer contained.
+fn State::affine(ref<State, exclusive> s, u32 a, u32 me, usize line) : Result<void, Fault>
+{
+    ref<Path, shared> p = State::path(s, a);
+    if (p.mode != Mode::Excl)
+    {
+        return Ok(());
+    }
+    match (p.thread)
+    {
+        Owner::T(t)    :
+        {
+            if (t == me)
+            {
+                return Ok(());
+            }
+            if (State::running(s, t))
+            {
+                return Err(mk_fault("diag.aliasing-conflict", line));
+            }
+        },
+        Owner::Transit : {},
+    }
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("tak %d %d", me, a));
+    }
+    State::path_mut(s, a).thread = Owner::T(me);
+    if (me != 0)
+    {
+        State::th(s, me).lent = true;
+    }
+    Ok(())
+}
+
+fn State::obj_holds(ref<State, shared> s, usize oi, u32 a) : bool
+{
+    ref<Obj, shared> o = &s.objs.vals[oi];
+    match (o.elem)
+    {
+        Some(e) :
+        {
+            match (SMap::find(&s.bufs, &e.buf))
+            {
+                Some(k) :
+                {
+                    usize i = widen<usize>(e.i);
+                    if (i < Vec::len(&s.bufs.vals[k]))
+                    {
+                        return Val::has_ref(&s.bufs.vals[k][i], a);
+                    }
+                    false
+                },
+                None    : false,
+            }
+        },
+        None : match (&o.val)
+        {
+            Some(v) : Val::has_ref(v, a),
+            None    : false,
+        },
+    }
+}
+
+// Whether a live object's stored value holds path `a` (`held-by` not empty).
+fn State::held(ref<State, shared> s, u32 a) : bool
+{
+    for (usize i = 0; i < Vec::len(&s.objs.keys); i += 1)
+    {
+        if (State::obj_holds(s, i, a))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether `held-by(a)` is exactly {o}.
+fn State::held_only_by(ref<State, shared> s, u32 a, u32 o) : bool
+{
+    bool by_o = false;
+    for (usize i = 0; i < Vec::len(&s.objs.keys); i += 1)
+    {
+        if (State::obj_holds(s, i, a))
+        {
+            if (s.objs.keys[i] != o)
+            {
+                return false;
+            }
+            by_o = true;
+        }
+    }
+    by_o
+}
+
+fn State::new_path(ref<State, exclusive> s, u32 of, Vec<PStep> steps, Mode mode, u32 me, Option<u32> base) : u32
+{
+    u32 t = State::fresh(s);
+    u32 frame = State::cur_frame(s, me);
+    Option<u32> scope = State::cur_scope(s, me);
+    _ = SMap::insert(&mut s.paths, t, Path { .of = of, .steps = steps, .mode = mode, .thread = Owner::T(me), .valid = true, .frame = frame, .scope = scope, .base = base, .pending = false, .transient = false, .lockp = false });
+    t
+}
+
+fn bit(bool b) : i32
+{
+    if (b)
+    {
+        return 1;
+    }
+    0
+}
+
+// `[Borrow]`.
+fn State::borrow(ref<State, exclusive> s, u32 a0, Mode m, u32 me, usize line) : Result<u32, Fault>
+{
+    if (!State::temporally_valid(s, a0))
+    {
+        return Err(fault_at("diag.stale-binding", line, a0));
+    }
+    if (m == Mode::Excl && State::path(s, a0).mode != Mode::Excl)
+    {
+        return Err(mk_fault("diag.borrow-exceeds-source", line));
+    }
+    State::affine(s, a0, me, line)?;
+    if (State::clash(s, a0, m))
+    {
+        return Err(fault_at(State::unlicensed(s, a0, me), line, a0));
+    }
+    u32 of = State::path(s, a0).of;
+    Vec<PStep> steps = clone(&State::path(s, a0).steps);
+    u32 a = State::new_path(s, of, steps, m, me, Some(a0));
+    if (s.tracing)
+    {
+        if (s.lend_next)
+        {
+            State::tr(s, sprintf("lnd %d %d %d", me, a0, a));
+        }
+        else
+        {
+            State::tr(s, sprintf("brw %d %d %d %d %d", me, a0, a, bit(m == Mode::Excl), bit(s.pend_next)));
+        }
+        s.lend_next = false;
+        s.pend_next = false;
+    }
+    State::consume(s, a0);
+    Ok(a)
+}
+
+// A projection's one access is done: it ends, and so do the
+// projections and element borrows it was formed through.
+fn State::consume(ref<State, exclusive> s, u32 a)
+{
+    Option<u32> cur = Some(a);
+    while (true)
+    {
+        u32 x = match (cur)
+        {
+            Some(x) : x,
+            None    : break,
+        };
+        usize i = match (SMap::find(&s.paths, &x))
+        {
+            Some(i) : i,
+            None    : break,
+        };
+        if (!s.paths.vals[i].transient)
+        {
+            break;
+        }
+        s.paths.vals[i].valid = false;
+        cur = s.paths.vals[i].base;
+        if (s.tracing)
+        {
+            State::tr(s, sprintf("set 0 %d", x));
+        }
+    }
+}
+
+// D-0242: a path formed for one access -- a projection, `[Index-Vec]`'s
+// element borrow, the element place reached through it or through a
+// slice -- is pending until that access: no other access meets it, and
+// the access ends it (`consume`).
+fn State::one_access(ref<State, exclusive> s, u32 a)
+{
+    ref<Path, exclusive> p = State::path_mut(s, a);
+    p.transient = true;
+    p.pending = true;
+}
+
+fn last_step(ref<Vec<PStep>, shared> v) : Option<PStep>
+{
+    usize n = Vec::len(v);
+    if (n > 0)
+    {
+        return Some(v[n - 1]);
+    }
+    None
+}
+
+export fn State::value_at(ref<State, shared> s, u32 a) : Option<Val>
+{
+    ref<Path, shared> p = State::path(s, a);
+    ref<Obj, shared> o = State::obj(s, p.of);
+    match (o.elem)
+    {
+        Some(e) : return Some(clone(State::buf_cell(s, e.buf, e.i))),
+        None    : {},
+    }
+    ref<Val, shared> v = match (&o.val)
+    {
+        Some(v) : v,
+        None    : return None,
+    };
+    if (Vec::len(&p.steps) == 0)
+    {
+        return Some(clone(v));
+    }
+    Option<PStep> last = last_step(&p.steps);
+    match (v)
+    {
+        Val::Hold(t)  : Some(Val::Ref(*t)),
+        Val::Mutex(k) : Some(Val::Int(*k)),
+        Val::Clo { func, caps, mv, ws } : match (last)
+        {
+            Some(PStep::F(i)) :
+            {
+                usize k = widen<usize>(i);
+                if (k < Vec::len(caps))
+                {
+                    return Some(clone(&caps[k]));
+                }
+                None
+            },
+            _                 : None,
+        },
+        Val::Arr(xs) : match (last)
+        {
+            Some(PStep::I(k)) :
+            {
+                usize j = widen<usize>(k);
+                if (j < Vec::len(xs))
+                {
+                    return Some(Val::Int(xs[j]));
+                }
+                None
+            },
+            _                 : None,
+        },
+        _             : None,
+    }
+}
+
+// `[Read]`, and D-0218's `[Read-Ref-Through-Shared]`: an exclusive
+// reference read through a shared path is a shared borrow of it.
+fn State::read(ref<State, exclusive> s, u32 a, u32 me, usize line) : Result<Val, Fault>
+{
+    if (!State::temporally_valid(s, a))
+    {
+        return Err(fault_at("diag.stale-binding", line, a));
+    }
+    {
+        ref<Obj, shared> o = State::obj(s, State::path(s, a).of);
+        bool uninit = match (&o.val)
+        {
+            Some(_) : false,
+            None : match (o.elem)
+            {
+                Some(_) : false,
+                None    : true,
+            },
+        };
+        if (uninit)
+        {
+            return Err(mk_fault("diag.use-of-uninitialized", line));
+        }
+    }
+    State::affine(s, a, me, line)?;
+    if (State::clash(s, a, Mode::Shared))
+    {
+        return Err(fault_at(State::unlicensed(s, a, me), line, a));
+    }
+    Val v = Option::unwrap(State::value_at(s, a));
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("rd %d %d", me, a));
+    }
+    // `[Read-Fn-Through-Shared]` (D-0218, D-0239): a closure read
+    // through a shared path that holds an exclusive capture, or writes
+    // itself.
+    if (State::path(s, a).mode == Mode::Shared && State::fn_writes(s, &v))
+    {
+        return Err(mk_fault("diag.borrow-exceeds-source", line));
+    }
+    State::consume(s, a);
+    // `[Fn-Value-Read]` (D-0089): a closure that owns a resource moves
+    // to the result, and the place's `fn` value is left empty.
+    bool owning_clo = match (&v)
+    {
+        Val::Clo { .. } : Val::owns_resource(&v),
+        _               : false,
+    };
+    if (owning_clo)
+    {
+        u32 o = State::path(s, a).of;
+        Vec<PStep> steps = clone(&State::path(s, a).steps);
+        State::store_raw(s, o, &steps, Val::Unit);
+    }
+    if (State::path(s, a).mode == Mode::Shared)
+    {
+        match (v)
+        {
+            Val::Ref(t) :
+            {
+                bool excl = match (SMap::find(&s.paths, &t))
+                {
+                    Some(i) : s.paths.vals[i].mode == Mode::Excl,
+                    None    : false,
+                };
+                if (excl)
+                {
+                    u32 b = State::borrow(s, t, Mode::Shared, me, line)?;
+                    return Ok(Val::Ref(b));
+                }
+            },
+            _           : {},
+        }
+    }
+    Ok(v)
+}
+
+// A closure with a capture that is an exclusive reference (a borrow
+// capture its body writes, or a moved exclusive one), or one that writes
+// itself (D-0239).
+fn State::fn_writes(ref<State, shared> s, ref<Val, shared> v) : bool
+{
+    match (v)
+    {
+        Val::Clo { func, caps, mv, ws } :
+        {
+            if (*ws)
+            {
+                return true;
+            }
+            foreach (c in caps)
+            {
+                match (c)
+                {
+                    Val::Ref(t) :
+                    {
+                        match (SMap::find(&s.paths, t))
+                        {
+                            Some(i) :
+                            {
+                                if (s.paths.vals[i].mode == Mode::Excl)
+                                {
+                                    return true;
+                                }
+                            },
+                            None    : {},
+                        }
+                    },
+                    _           : {},
+                }
+            }
+            false
+        },
+        _                               : false,
+    }
+}
+
+// The threads the destructor of what `o` holds waits for, in its
+// order (`[Handle-Destructor]`; a `Vec`'s elements first to last).
+fn State::handles_in(ref<State, shared> s, u32 o) : Vec<u32>
+{
+    Vec<u32> out = Vec::new();
+    usize oi = match (SMap::find(&s.objs, &o))
+    {
+        Some(i) : i,
+        None    : return out,
+    };
+    match (&s.objs.vals[oi].val)
+    {
+        Some(Val::Handle(h))             : Vec::push(&mut out, *h),
+        Some(Val::Job(h))                : Vec::push(&mut out, *h),
+        Some(Val::Vec { buf, len, cap }) :
+        {
+            match (SMap::find(&s.bufs, buf))
+            {
+                Some(k) :
+                {
+                    ref<Vec<Val>, shared> cells = &s.bufs.vals[k];
+                    usize n = widen<usize>(*len);
+                    for (usize i = 0; i < n && i < Vec::len(cells); i += 1)
+                    {
+                        match (&cells[i])
+                        {
+                            Val::Handle(h) : Vec::push(&mut out, *h),
+                            _              : {},
+                        }
+                    }
+                },
+                None    : {},
+            }
+        },
+        _                                : {},
+    }
+    out
+}
+
+// The thread the next step of `o`'s destruction waits for: its first
+// handle not yet taken, while that thread runs.
+export fn State::first_wait(ref<State, shared> s, u32 o) : Option<u32>
+{
+    Vec<u32> hs = State::handles_in(s, o);
+    foreach (h in &hs)
+    {
+        ref<Thread, shared> th = State::thread(s, *h);
+        if (!Status::is_taken(&th.status))
+        {
+            if (Status::is_running(&th.status))
+            {
+                return Some(*h);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+// A place's value replaced with no access and no bookkeeping: the empty
+// `fn` value a move out of it leaves.
+fn State::store_raw(ref<State, exclusive> s, u32 o, ref<Vec<PStep>, shared> steps, Val v)
+{
+    usize oi = State::oidx(s, o);
+    Option<PStep> last = last_step(steps);
+    bool into_cap = false;
+    match (&mut s.objs.vals[oi].val)
+    {
+        Some(Val::Clo { func, caps, mv, ws }) : match (last)
+        {
+            Some(PStep::F(i)) :
+            {
+                caps[widen<usize>(i)] = clone(&v);
+                into_cap = true;
+            },
+            _                 : {},
+        },
+        _ : {},
+    }
+    if (!into_cap)
+    {
+        s.objs.vals[oi].val = Some(v);
+    }
+}
+
+// `[Write]`, with D-0215's held-by bookkeeping.
+fn State::write(ref<State, exclusive> s, u32 a, Val v, u32 me, usize line) : Result<void, Fault>
+{
+    if (!State::temporally_valid(s, a))
+    {
+        return Err(fault_at("diag.stale-binding", line, a));
+    }
+    if (State::path(s, a).mode != Mode::Excl)
+    {
+        return Err(mk_fault("diag.write-through-shared", line));
+    }
+    State::affine(s, a, me, line)?;
+    if (State::clash(s, a, Mode::Excl))
+    {
+        return Err(fault_at(State::unlicensed(s, a, me), line, a));
+    }
+    State::store(s, a, v, me);
+    State::consume(s, a);
+    Ok(())
+}
+
+// For each old reference, whether `o` alone held it before the write.
+fn State::held_before(ref<State, shared> s, ref<Vec<u32>, shared> old, u32 o) : Vec<bool>
+{
+    Vec<bool> v = Vec::new();
+    foreach (t in old)
+    {
+        Vec::push(&mut v, State::held_only_by(s, *t, o));
+    }
+    v
+}
+
+fn join_toks(ref<Vec<u32>, shared> v) : String
+{
+    String s = String::new();
+    for (usize i = 0; i < Vec::len(v); i += 1)
+    {
+        if (i > 0)
+        {
+            String::push_ascii(&mut s, b' ');
+        }
+        String::appendf(&mut s, "%d", v[i]);
+    }
+    s
+}
+
+// The cells written, and the references the write drops released.
+fn State::store(ref<State, exclusive> s, u32 a, Val v, u32 me)
+{
+    u32 o = State::path(s, a).of;
+    Vec<PStep> psteps = clone(&State::path(s, a).steps);
+    usize oi = State::oidx(s, o);
+    match (s.objs.vals[oi].elem)
+    {
+        Some(e) :
+        {
+            Vec<u32> old = ref_set(State::buf_cell(s, e.buf, e.i));
+            Vec<bool> before = State::held_before(s, &old, o);
+            usize k = Option::unwrap(SMap::find(&s.bufs, &e.buf));
+            s.bufs.vals[k][widen<usize>(e.i)] = v;
+            Vec<u32> kept = ref_set(State::buf_cell(s, e.buf, e.i));
+            State::release_gone(s, &old, &kept, &before, o, me);
+            return;
+        },
+        None    : {},
+    }
+    Vec<u32> old_refs = opt_ref_set(&s.objs.vals[oi].val);
+    Vec<bool> before = State::held_before(s, &old_refs, o);
+    Val newval = Val::Unit;
+    if (Vec::len(&psteps) == 0)
+    {
+        newval = v;
+    }
+    else
+    {
+        Option<PStep> last = last_step(&psteps);
+        Option<Val> cur = clone(&s.objs.vals[oi].val);
+        bool done = false;
+        match (&cur)
+        {
+            Some(Val::Clo { func, caps, mv, ws }) :
+            {
+                match (last)
+                {
+                    Some(PStep::F(i)) :
+                    {
+                        Vec<Val> nc = clone(caps);
+                        nc[widen<usize>(i)] = clone(&v);
+                        newval = Val::Clo { .func = *func, .caps = nc, .mv = *mv, .ws = *ws };
+                        done = true;
+                    },
+                    _                 : {},
+                }
+            },
+            Some(Val::Arr(xs))                    :
+            {
+                match (last)
+                {
+                    Some(PStep::I(k)) :
+                    {
+                        match (&v)
+                        {
+                            Val::Int(x) :
+                            {
+                                Vec<i64> nx = clone(xs);
+                                nx[widen<usize>(k)] = *x;
+                                newval = Val::Arr(nx);
+                                done = true;
+                            },
+                            _           : {},
+                        }
+                    },
+                    _                 : {},
+                }
+            },
+            Some(Val::Mutex(_))                   :
+            {
+                match (&v)
+                {
+                    Val::Int(k) :
+                    {
+                        newval = Val::Mutex(*k);
+                        done = true;
+                    },
+                    _           : {},
+                }
+            },
+            _                                     : {},
+        }
+        if (!done)
+        {
+            match (&v)
+            {
+                Val::Ref(t) :
+                {
+                    newval = Val::Hold(*t);
+                    done = true;
+                },
+                _           : {},
+            }
+        }
+        if (!done)
+        {
+            newval = v;
+        }
+    }
+    s.objs.vals[oi].val = Some(newval);
+    Vec<u32> kept = opt_ref_set(&s.objs.vals[oi].val);
+    if (s.tracing)
+    {
+        if (s.quiet_store)
+        {
+            s.quiet_store = false;
+        }
+        else
+        {
+            State::tr(s, sprintf("wr %d %d %d %s %d %s", me, a, Vec::len(&old_refs), &join_toks(&old_refs), Vec::len(&kept), &join_toks(&kept)));
+        }
+    }
+    State::release_gone(s, &old_refs, &kept, &before, o, me);
+}
+
+// `[Write]`: a reference the write drops whose only holder was o, and
+// whose statement has ended, is invalid.
+fn State::release_gone(ref<State, exclusive> s, ref<Vec<u32>, shared> old_refs, ref<Vec<u32>, shared> kept, ref<Vec<bool>, shared> before, u32 o, u32 me)
+{
+    Vec<u32> open = Vec::new();
+    foreach (x in &State::thread(s, me).scopes)
+    {
+        Vec::push(&mut open, x.sc);
+    }
+    for (usize i = 0; i < Vec::len(old_refs); i += 1)
+    {
+        u32 g = old_refs[i];
+        if (Vec::contains(kept, g))
+        {
+            continue;
+        }
+        if (before[i])
+        {
+            Option<u32> sc = State::path(s, g).scope;
+            bool ended = match (sc)
+            {
+                Some(x) : !Vec::contains(&open, x),
+                None    : true,
+            };
+            if (ended)
+            {
+                if (s.tracing && State::path(s, g).valid)
+                {
+                    State::tr(s, sprintf("inv %d", g));
+                }
+                State::path_mut(s, g).valid = false;
+            }
+        }
+    }
+}
+
+fn Val::kind_name(ref<Val, shared> v) : str
+{
+    match (v)
+    {
+        Val::Job(_)       : "out job",
+        Val::Vec { .. }   : "out vec",
+        Val::Chan { .. }  : "out channel",
+        Val::Clo { .. }   : "out closure",
+        Val::Slice { .. } : "out slice",
+        Val::Arr(_)       : "out array",
+        _                 : "",
+    }
+}
+
+// `[Object-Establish-*]` and `[Binding-Form]`, then the first write.
+fn State::bind(ref<State, exclusive> s, StringView name, Val v, u32 me) : u32
+{
+    bool is_res = Val::owns_resource(&v);
+    bool is_mutex = match (&v)
+    {
+        Val::Mutex(_) : true,
+        _             : false,
+    };
+    u32 o = State::fresh(s);
+    u64 origin = State::tick(s);
+    Option<u32> scope = State::cur_scope(s, me);
+    _ = SMap::insert(&mut s.objs, o, Obj { .is_res = is_res, .val = None, .elem = None, .scope = scope, .origin = origin });
+    u32 a = State::new_path(s, o, Vec::new(), Mode::Excl, me, None);
+    _ = SMap::insert(&mut s.holder, o, a);
+    {
+        ref<Act, exclusive> act = State::act(s, me);
+        Vec::push(slot_entry(&mut act.slots, name), a);
+    }
+    if (s.tracing)
+    {
+        bool moved = match (&s.moving)
+        {
+            Some(mv) : Val::eq(&mv.v, &v),
+            None     : false,
+        };
+        if (moved)
+        {
+            Moving mv = Option::unwrap(replace(&mut s.moving, None));
+            State::tr(s, sprintf("xfr %d %d %d %d %d %d", mv.t, me, mv.a, mv.o, o, a));
+            s.quiet_store = true;
+        }
+        else
+        {
+            match (&v)
+            {
+                Val::Handle(h) :
+                {
+                    match (SMap::find(&s.handle_obj, h))
+                    {
+                        Some(i) :
+                        {
+                            u32 ho = s.handle_obj.vals[i];
+                            State::tr(s, sprintf("bnh %d %d %d %d", me, o, a, ho));
+                            s.quiet_store = true;
+                        },
+                        None    : State::tr(s, "out a handle or guard the trace did not see made"),
+                    }
+                },
+                Val::Guard(g)  :
+                {
+                    match (SMap::find(&s.guard_obj, g))
+                    {
+                        Some(i) :
+                        {
+                            u32 go = s.guard_obj.vals[i];
+                            State::tr(s, sprintf("bnh %d %d %d %d", me, o, a, go));
+                            s.quiet_store = true;
+                        },
+                        None    : State::tr(s, "out a handle or guard the trace did not see made"),
+                    }
+                },
+                _              :
+                {
+                    str k = Val::kind_name(&v);
+                    if (str_len(k) > 0)
+                    {
+                        State::tr(s, String::copy(k));
+                    }
+                    else
+                    {
+                        State::tr(s, sprintf("est %d %d %d", me, o, bit(is_res)));
+                        State::tr(s, sprintf("bnd %d %d %d", me, o, a));
+                    }
+                },
+            }
+        }
+    }
+    State::store(s, a, v, me);
+    if (is_mutex)
+    {
+        _ = SMap::insert(&mut s.sync, o, Sync::Unlocked);
+    }
+    a
+}
+
+// The slot list of `name`, made empty first if it has none.
+fn slot_entry(ref<SMap<String, Vec<u32>>, exclusive> slots, StringView name) : ref<Vec<u32>, exclusive> from slots
+{
+    String key = String::copy(name);
+    usize i = match (SMap::search(slots, &key))
+    {
+        Ok(i)  : i,
+        Err(i) :
+        {
+            Vec::insert(&mut slots.keys, i, key);
+            Vec::insert(&mut slots.vals, i, Vec::new());
+            i
+        },
+    };
+    &mut slots.vals[i]
+}
+
+// The top of `name`'s slot list.
+fn slot_top(ref<SMap<String, Vec<u32>>, shared> slots, StringView name) : Option<u32>
+{
+    usize lo = 0;
+    usize hi = Vec::len(&slots.keys);
+    while (lo < hi)
+    {
+        usize mid = lo + (hi - lo) / 2;
+        StringView x = &slots.keys[mid];
+        if (x < name)
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    if (lo < Vec::len(&slots.keys))
+    {
+        StringView x = &slots.keys[lo];
+        if (x == name)
+        {
+            usize n = Vec::len(&slots.vals[lo]);
+            if (n > 0)
+            {
+                return Some(slots.vals[lo][n - 1]);
+            }
+        }
+    }
+    None
+}
+
+fn slot_find(ref<SMap<String, Vec<u32>>, shared> slots, StringView name) : Option<usize>
+{
+    usize lo = 0;
+    usize hi = Vec::len(&slots.keys);
+    while (lo < hi)
+    {
+        usize mid = lo + (hi - lo) / 2;
+        StringView x = &slots.keys[mid];
+        if (x < name)
+        {
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    if (lo < Vec::len(&slots.keys))
+    {
+        StringView x = &slots.keys[lo];
+        if (x == name)
+        {
+            return Some(lo);
+        }
+    }
+    None
+}
+
+// `[Object-End]`.
+fn State::end_object(ref<State, exclusive> s, u32 o, ref<Vec<u32>, shared> exempt)
+{
+    usize oi = State::oidx(s, o);
+    if (s.tracing && s.emit_end && s.quiet_end == 0)
+    {
+        if (s.objs.vals[oi].is_res)
+        {
+            State::tr(s, sprintf("dst 0 %d", o));
+        }
+        else
+        {
+            State::tr(s, sprintf("epl 0 %d", o));
+        }
+    }
+    // The paths held by `o` and by no other live object: `held-by(t)` is
+    // {o} exactly (only the paths `o` holds are looked at: `held-by` of a
+    // path `o` does not hold does not contain `o`).
+    Vec<u32> mine = Vec::new();
+    match (s.objs.vals[oi].elem)
+    {
+        Some(e) :
+        {
+            match (SMap::find(&s.bufs, &e.buf))
+            {
+                Some(k) :
+                {
+                    usize i = widen<usize>(e.i);
+                    if (i < Vec::len(&s.bufs.vals[k]))
+                    {
+                        mine = ref_set(&s.bufs.vals[k][i]);
+                    }
+                },
+                None    : {},
+            }
+        },
+        None    : mine = opt_ref_set(&s.objs.vals[oi].val),
+    }
+    Vec<u32> alone = Vec::new();
+    foreach (t in &mine)
+    {
+        if (SMap::contains(&s.paths, t) && State::held_only_by(s, *t, o))
+        {
+            Vec::push(&mut alone, *t);
+        }
+    }
+    for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+    {
+        if (s.paths.vals[i].of == o)
+        {
+            s.paths.vals[i].valid = false;
+        }
+    }
+    foreach (t in &alone)
+    {
+        if (!Vec::contains(exempt, *t))
+        {
+            usize pi = State::pidx(s, *t);
+            if (s.paths.vals[pi].valid && s.tracing)
+            {
+                State::tr(s, sprintf("inv %d", *t));
+            }
+            s.paths.vals[pi].valid = false;
+        }
+    }
+    match (s.objs.vals[oi].elem)
+    {
+        Some(e) : { _ = SMap::remove(&mut s.elems, &e); },
+        None    : {},
+    }
+    _ = SMap::remove_at(&mut s.objs, oi);
+    _ = SMap::remove(&mut s.holder, &o);
+    _ = SMap::remove(&mut s.sync, &o);
+}
+
+// The reclaimed object over a buffer slot: re-attached, or established
+// (`[Reclaim]`; `[Rawptr-Write]` when a reference is written there).
+fn State::elem_obj(ref<State, exclusive> s, u32 buf, u32 i, u32 me) : u32
+{
+    Elem key = Elem { .buf = buf, .i = i };
+    match (SMap::find(&s.elems, &key))
+    {
+        Some(k) : return s.elems.vals[k],
+        None    : {},
+    }
+    u32 o = State::fresh(s);
+    u64 origin = State::tick(s);
+    Option<u32> scope = State::cur_scope(s, me);
+    _ = SMap::insert(&mut s.objs, o, Obj { .is_res = false, .val = None, .elem = Some(key), .scope = scope, .origin = origin });
+    _ = SMap::insert(&mut s.elems, key, o);
+    o
+}
+
+// `foreign-held(o, ℓ, Σ)` (`spec/20` §2, D-0214).
+fn State::foreign_held(ref<State, shared> s, u32 o, u32 me) : bool
+{
+    for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+    {
+        ref<Path, shared> p = &s.paths.vals[i];
+        bool has_base = match (p.base)
+        {
+            Some(_) : true,
+            None    : false,
+        };
+        if (p.valid && p.of == o && has_base && p.mode == Mode::Excl && State::held(s, s.paths.keys[i]))
+        {
+            bool other = match (p.thread)
+            {
+                Owner::Transit : true,
+                Owner::T(x)    : x != me && State::running(s, x),
+            };
+            if (other)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// `[Release]` over every element object of buffer `b` at index ≥ from.
+fn State::release_elems(ref<State, exclusive> s, u32 b, u32 from, u32 to, u32 me, usize line) : Result<void, Fault>
+{
+    Vec<u32> objs = Vec::new();
+    for (usize k = 0; k < Vec::len(&s.elems.keys); k += 1)
+    {
+        Elem e = s.elems.keys[k];
+        if (e.buf == b && e.i >= from && e.i < to)
+        {
+            Vec::push(&mut objs, s.elems.vals[k]);
+        }
+    }
+    foreach (o in &objs)
+    {
+        if (State::foreign_held(s, *o, me))
+        {
+            return Err(mk_fault("diag.aliasing-conflict", line));
+        }
+    }
+    Vec<u32> none = Vec::new();
+    foreach (o in &objs)
+    {
+        State::end_object(s, *o, &none);
+    }
+    Ok(())
+}
+
+fn Machine::ins_at(ref<Machine, shared> m, usize func, usize pc) : ref<InsL, shared>
+{
+    &m.code.funcs[func].code[pc]
+}
+
+export fn Machine::line(ref<Machine, shared> m, ref<State, shared> s, u32 t) : usize
+{
+    ref<Act, shared> a = State::act_of(s, t);
+    ref<Vec<InsL>, shared> code = &m.code.funcs[a.func].code;
+    if (a.pc < Vec::len(code))
+    {
+        return code[a.pc].line;
+    }
+    0
+}
+
+// What thread t's next instruction waits on, if it cannot go on now:
+// the thread it joins (or whose handle it ends), or the holder of the
+// mutex it locks.
+fn Machine::wait_target(ref<Machine, shared> m, ref<State, shared> s, u32 t) : Option<u32>
+{
+    match (Machine::wait_on(m, s, t))
+    {
+        Some(Wait::Thread(h)) : Some(h),
+        _                     : None,
+    }
+}
+
+// D-0253: a thread at the end of a chain of waits (`[Deadlock]` (b)):
+// one waiting on a channel or on an atomic, not on a thread or a mutex.
+export fn Machine::waits_at_chain_end(ref<Machine, shared> m, ref<State, shared> s, u32 t) : bool
+{
+    match (Machine::wait_on(m, s, t))
+    {
+        Some(Wait::Chan)   : true,
+        Some(Wait::Atomic) : true,
+        _                  : false,
+    }
+}
+
+// Is thread t's next instruction a wait that cannot end now?
+export fn Machine::waits(ref<Machine, shared> m, ref<State, shared> s, u32 t) : bool
+{
+    match (Machine::wait_on(m, s, t))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+export fn Machine::waits_on_channel(ref<Machine, shared> m, ref<State, shared> s, u32 t) : bool
+{
+    match (Machine::wait_on(m, s, t))
+    {
+        Some(Wait::Chan) : true,
+        _                : false,
+    }
+}
+
+struct ChanInfo
+{
+    bool closed;
+    usize n;
+    u32 cap;
+}
+
+fn chan_of(ref<State, shared> s, ref<Act, shared> a, usize back) : Option<ChanInfo>
+{
+    usize n = Vec::len(&a.stack);
+    if (n < back)
+    {
+        return None;
+    }
+    u32 r = match (&a.stack[n - back])
+    {
+        SVal::V(Val::Ref(r)) : *r,
+        _                    : return None,
+    };
+    usize pi = match (SMap::find(&s.paths, &r))
+    {
+        Some(i) : i,
+        None    : return None,
+    };
+    usize oi = match (SMap::find(&s.objs, &s.paths.vals[pi].of))
+    {
+        Some(i) : i,
+        None    : return None,
+    };
+    match (&s.objs.vals[oi].val)
+    {
+        Some(Val::Chan { q, closed, cap }) : Some(ChanInfo { .closed = *closed, .n = Vec::len(q), .cap = *cap }),
+        _                                  : None,
+    }
+}
+
+fn Machine::wait_on(ref<Machine, shared> m, ref<State, shared> s, u32 t) : Option<Wait>
+{
+    ref<Thread, shared> th = State::thread(s, t);
+    usize na = Vec::len(&th.acts);
+    if (na == 0)
+    {
+        return None;
+    }
+    ref<Act, shared> a = &th.acts[na - 1];
+    ref<Ins, shared> ins = &m.code.funcs[a.func].code[a.pc].ins;
+    match (ins)
+    {
+        Ins::ChanSend           :
+        {
+            // stack: …, Ref(channel), value
+            ChanInfo c = chan_of(s, a, 2)?;
+            if (!c.closed && narrow_wrapping<u32>(c.n) >= c.cap)
+            {
+                return Some(Wait::Chan);
+            }
+            None
+        },
+        Ins::ChanRecv           :
+        {
+            ChanInfo c = chan_of(s, a, 1)?;
+            if (!c.closed && c.n == 0)
+            {
+                return Some(Wait::Chan);
+            }
+            None
+        },
+        Ins::Join               :
+        {
+            usize n = Vec::len(&a.stack);
+            if (n == 0)
+            {
+                return None;
+            }
+            match (&a.stack[n - 1])
+            {
+                SVal::Place(p) :
+                {
+                    usize oi = match (SMap::find(&s.objs, &State::path(s, *p).of))
+                    {
+                        Some(i) : i,
+                        None    : return None,
+                    };
+                    match (&s.objs.vals[oi].val)
+                    {
+                        Some(Val::Handle(h)) :
+                        {
+                            if (Status::is_running(&State::thread(s, *h).status))
+                            {
+                                return Some(Wait::Thread(*h));
+                            }
+                            None
+                        },
+                        _                    : None,
+                    }
+                },
+                _              : None,
+            }
+        },
+        Ins::AtomicWaitSleep(_) :
+        {
+            // stack: …, Ref(atomic), expected, seen
+            usize n = Vec::len(&a.stack);
+            if (n < 3)
+            {
+                return None;
+            }
+            u32 r = match (&a.stack[n - 3])
+            {
+                SVal::V(Val::Ref(r)) : *r,
+                _                    : return None,
+            };
+            i64 seen = match (&a.stack[n - 1])
+            {
+                SVal::V(Val::Int(k)) : *k,
+                _                    : return None,
+            };
+            usize pi = match (SMap::find(&s.paths, &r))
+            {
+                Some(i) : i,
+                None    : return None,
+            };
+            usize oi = match (SMap::find(&s.objs, &s.paths.vals[pi].of))
+            {
+                Some(i) : i,
+                None    : return None,
+            };
+            match (&s.objs.vals[oi].val)
+            {
+                Some(Val::Atomic { v, w }) :
+                {
+                    if (reinterpret<i64>(*w) == seen)
+                    {
+                        return Some(Wait::Atomic);
+                    }
+                    None
+                },
+                _                          : None,
+            }
+        },
+        Ins::Lock               :
+        {
+            usize n = Vec::len(&a.stack);
+            if (n == 0)
+            {
+                return None;
+            }
+            match (&a.stack[n - 1])
+            {
+                SVal::V(Val::Ref(r)) :
+                {
+                    usize pi = match (SMap::find(&s.paths, r))
+                    {
+                        Some(i) : i,
+                        None    : return None,
+                    };
+                    match (SMap::find(&s.sync, &s.paths.vals[pi].of))
+                    {
+                        Some(k) : match (s.sync.vals[k])
+                        {
+                            Sync::LockedBy(h) :
+                            {
+                                if (h != t)
+                                {
+                                    return Some(Wait::Thread(h));
+                                }
+                                None
+                            },
+                            _                 : None,
+                        },
+                        None : None,
+                    }
+                },
+                _                    : None,
+            }
+        },
+        Ins::BlockExit(_)       :
+        {
+            // Only once the exit has ended what comes before the handle
+            // (`[Block-Exit]`'s order) does it wait on the handle -- a
+            // handle held by a binding, a `Job` or a `Vec`.
+            u32 first = match (&a.exiting)
+            {
+                Some(l) :
+                {
+                    if (Vec::len(l) == 0)
+                    {
+                        return None;
+                    }
+                    l[0]
+                },
+                None    : return None,
+            };
+            match (State::first_wait(s, first))
+            {
+                Some(h) : Some(Wait::Thread(h)),
+                None    : None,
+            }
+        },
+        _                       : None,
+    }
+}
+
+// Does thread t's wait close a cycle of waits (`[Deadlock]` (a))?
+fn Machine::closes_cycle(ref<Machine, shared> m, ref<State, shared> s, u32 t) : bool
+{
+    Option<u32> cur = Machine::wait_target(m, s, t);
+    Vec<u32> seen = Vec::new();
+    while (true)
+    {
+        u32 u = match (cur)
+        {
+            Some(u) : u,
+            None    : break,
+        };
+        if (u == t)
+        {
+            return true;
+        }
+        if (Vec::contains(&seen, u) || !State::thread(s, u).waiting)
+        {
+            return false;
+        }
+        Vec::push(&mut seen, u);
+        cur = Machine::wait_target(m, s, u);
+    }
+    false
+}
+
+// Can thread t take a step now? A thread at a wait steps to begin it
+// (or to fault, when it closes a cycle), and once waiting steps again
+// only when the wait can end.
+export fn Machine::enabled(ref<Machine, shared> m, ref<State, shared> s, u32 t) : bool
+{
+    ref<Thread, shared> th = State::thread(s, t);
+    if (!Status::is_running(&th.status))
+    {
+        return false;
+    }
+    if (Machine::waits(m, s, t))
+    {
+        return !th.waiting;
+    }
+    true
+}
+
+export fn Machine::step(ref<Machine, shared> m, State s, u32 t) : Step
+{
+    usize line = Machine::line(m, &s, t);
+    match (Machine::exec(m, &mut s, t))
+    {
+        Ok(Some(true))  : Step::Exit(s),
+        Ok(Some(false)) : Step::Blocked,
+        Ok(None)        : Step::Next(s),
+        Err(f0)         :
+        {
+            Fault f = f0;
+            if (f.line == 0)
+            {
+                f.line = line;
+            }
+            if (t == 0 || State::thread(&s, t).lent)
+            {
+                return Step::Fault { .s = s, .f = f };
+            }
+            Machine::contain(m, &mut s, t, f);
+            Step::Next(s)
+        },
+    }
+}
+
+// `[Fault-Contain]`: every mutex the thread holds is poisoned, then its
+// frames unwind and it has failed.
+export fn Machine::contain(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, Fault f)
+{
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("fct %d", t));
+        s.quiet_end += 1;
+    }
+    for (usize i = 0; i < Vec::len(&s.sync.vals); i += 1)
+    {
+        match (s.sync.vals[i])
+        {
+            Sync::LockedBy(h) :
+            {
+                if (h == t)
+                {
+                    s.sync.vals[i] = Sync::Poisoned(t);
+                }
+            },
+            _                 : {},
+        }
+    }
+    State::th(s, t).waiting = false;
+    Machine::unwind(m, s, t);
+    State::th(s, t).status = Status::Failed(f);
+}
+
+struct Owned
+{
+    u32 a;
+    u32 o;
+}
+
+fn owned_desc(ref<State, shared> s, ref<Vec<u32>, shared> frames) : Vec<Owned>
+{
+    Vec<Owned> owned = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.holder.keys); i += 1)
+    {
+        u32 a = s.holder.vals[i];
+        if (Vec::contains(frames, State::path(s, a).frame))
+        {
+            Vec::push(&mut owned, Owned { .a = a, .o = s.holder.keys[i] });
+        }
+    }
+    // Last bound first (`[Block-Exit]`): by when each object's holder was
+    // formed, so a moved object goes where it was moved to (D-0233).
+    Vec::sort(&mut owned);
+    Vec::reverse(&mut owned);
+    owned
+}
+
+fn Machine::unwind(ref<Machine, shared> m, ref<State, exclusive> s, u32 t)
+{
+    // End every object the thread's frames own, innermost first.
+    Vec<u32> frames = Vec::new();
+    foreach (a in &State::thread(s, t).acts)
+    {
+        foreach (f in &a.frames)
+        {
+            Vec::push(&mut frames, *f);
+        }
+        Vec::push(&mut frames, a.param_frame);
+    }
+    Vec<Owned> owned = owned_desc(s, &frames);
+    Vec<u32> none = Vec::new();
+    foreach (x in &owned)
+    {
+        u32 o = x.o;
+        if (!State::alive(s, o))
+        {
+            continue;
+        }
+        // The unwind runs every destructor D-0008 would run (`spec/18`
+        // §1): a vector releases its elements, a guard unlocks (a
+        // poisoned mutex stays poisoned).
+        Option<Val> v = clone(&State::obj(s, o).val);
+        match (v)
+        {
+            Some(Val::Vec { buf, len, cap }) :
+            {
+                Vec<u32> objs = Vec::new();
+                for (usize k = 0; k < Vec::len(&s.elems.keys); k += 1)
+                {
+                    if (s.elems.keys[k].buf == buf)
+                    {
+                        Vec::push(&mut objs, s.elems.vals[k]);
+                    }
+                }
+                foreach (e in &objs)
+                {
+                    State::end_object(s, *e, &none);
+                }
+                _ = SMap::remove(&mut s.bufs, &buf);
+            },
+            Some(Val::Guard(g))              :
+            {
+                u32 mo = State::path(s, g).of;
+                match (SMap::find(&s.sync, &mo))
+                {
+                    Some(k) : match (s.sync.vals[k])
+                    {
+                        Sync::LockedBy(_) : s.sync.vals[k] = Sync::Unlocked,
+                        _                 : {},
+                    },
+                    None : {},
+                }
+                State::path_mut(s, g).valid = false;
+            },
+            _                                : {},
+        }
+        State::end_object(s, o, &none);
+    }
+    Vec<u32> scopes = Vec::new();
+    foreach (x in &State::thread(s, t).scopes)
+    {
+        Vec::push(&mut scopes, x.sc);
+    }
+    for (usize i = 0; i < Vec::len(&s.paths.vals); i += 1)
+    {
+        bool inside = match (s.paths.vals[i].scope)
+        {
+            Some(x) : Vec::contains(&scopes, x),
+            None    : false,
+        };
+        if (inside && s.paths.vals[i].valid)
+        {
+            s.paths.vals[i].valid = false;
+        }
+    }
+    Vec::clear(&mut State::th(s, t).scopes);
+    if (s.tracing)
+    {
+        s.quiet_end -= 1;
+    }
+}
+
+fn Machine::pop(ref<State, exclusive> s, u32 t) : SVal
+{
+    Option::expect(Vec::pop(&mut State::act(s, t).stack), "stack")
+}
+
+// `[Atomic-Op]`'s checks on `a`: temporally valid, `[Thread-Affine]`,
+// and a shared access that clashes with nothing (its ancestors
+// excluded); the operation forms no path. The atomic's object.
+fn Machine::atomic_access(ref<State, exclusive> s, u32 t, u32 am, usize line) : Result<u32, Fault>
+{
+    match (SMap::find(&s.paths, &am))
+    {
+        Some(i) : s.paths.vals[i].pending = false,
+        None    : {},
+    }
+    if (!State::temporally_valid(s, am))
+    {
+        return Err(mk_fault("diag.stale-binding", line));
+    }
+    State::affine(s, am, t, line)?;
+    if (State::clash(s, am, Mode::Shared))
+    {
+        return Err(mk_fault("diag.aliasing-conflict", line));
+    }
+    Ok(State::path(s, am).of)
+}
+
+fn Machine::pop_val(ref<State, exclusive> s, u32 t) : Val
+{
+    match (Machine::pop(s, t))
+    {
+        SVal::V(v)     : v,
+        SVal::Place(_) : Option::expect(None, "a place where a value was compiled"),
+    }
+}
+
+fn Machine::push(ref<State, exclusive> s, u32 t, SVal v)
+{
+    Vec::push(&mut State::act(s, t).stack, v);
+}
+
+fn Machine::push_v(ref<State, exclusive> s, u32 t, Val v)
+{
+    Vec::push(&mut State::act(s, t).stack, SVal::V(v));
+}
+
+fn val_int(Val v, str what) : i64
+{
+    match (v)
+    {
+        Val::Int(k) : k,
+        _           : Option::expect(None, what),
+    }
+}
+
+fn val_ref(Val v, str what) : u32
+{
+    match (v)
+    {
+        Val::Ref(r) : r,
+        _           : Option::expect(None, what),
+    }
+}
+
+fn sval_place(SVal v, str what) : u32
+{
+    match (v)
+    {
+        SVal::Place(a) : a,
+        _              : Option::expect(None, what),
+    }
+}
+
+fn exempt_of(ref<Val, shared> v) : Vec<u32>
+{
+    ref_set(v)
+}
+
+fn sc_trace(Option<u32> sc) : u32
+{
+    match (sc)
+    {
+        Some(x) : x + 1,
+        None    : 0,
+    }
+}
+
+// One instruction. Ok(None): a step was taken; Ok(Some(false)): blocked
+// (no step); Ok(Some(true)): the program ended.
+fn Machine::exec(ref<Machine, shared> m, ref<State, exclusive> s, u32 t) : Result<Option<bool>, Fault>
+{
+    usize func = State::act_of(s, t).func;
+    usize pc = State::act_of(s, t).pc;
+    ref<InsL, shared> il = &m.code.funcs[func].code[pc];
+    ref<Ins, shared> ins = &il.ins;
+    usize line = il.line;
+    if (Machine::waits(m, s, t))
+    {
+        // The instruction cannot go on: its wait closes a cycle and
+        // faults, or the thread begins to wait (a step that changes
+        // nothing else).
+        if (Machine::closes_cycle(m, s, t))
+        {
+            return Err(mk_fault("diag.deadlock", line));
+        }
+        if (t == 0 && Machine::waits_on_channel(m, s, t))
+        {
+            bool others = false;
+            for (usize i = 0; i < Vec::len(&s.threads.keys); i += 1)
+            {
+                if (s.threads.keys[i] != 0 && Status::is_running(&s.threads.vals[i].status))
+                {
+                    others = true;
+                }
+            }
+            if (!others)
+            {
+                return Err(mk_fault("diag.channel-deadlock", line)); // `[Channel-Deadlock]`
+            }
+        }
+        // `recv` and `send` lock the channel's state before they wait.
+        match (ins)
+        {
+            Ins::ChanSend : State::th(s, t).lent = true,
+            Ins::ChanRecv : State::th(s, t).lent = true,
+            _             : {},
+        }
+        State::th(s, t).waiting = true;
+        return Ok(None);
+    }
+    State::th(s, t).waiting = false;
+    State::act(s, t).pc += 1;
+    match (ins)
+    {
+        Ins::StmtEnter                       :
+        {
+            u32 sc = State::fresh(s);
+            u32 f = State::cur_frame(s, t);
+            Vec::push(&mut State::th(s, t).scopes, ScopeAt { .sc = sc, .frame = f });
+            SSet::clear(&mut State::th(s, t).licensed);
+            if (s.tracing)
+            {
+                State::tr(s, sprintf("sen %d %d", t, sc));
+            }
+        },
+        Ins::Licensed(names)                 :
+        {
+            Vec<u32> toks = Vec::new();
+            foreach (n in names)
+            {
+                match (slot_top(&State::act_of(s, t).slots, n))
+                {
+                    Some(a) : Vec::push(&mut toks, a),
+                    None    : {},
+                }
+            }
+            foreach (a in &toks)
+            {
+                _ = SSet::insert(&mut State::th(s, t).licensed, *a);
+            }
+        },
+        Ins::StmtExit(keep)                  :
+        {
+            // `[Stmt-Exit]`
+            Option<Val> r = None;
+            if (*keep)
+            {
+                Val v = match (Machine::pop(s, t))
+                {
+                    SVal::V(v)     : v,
+                    SVal::Place(a) : State::read(s, a, t, line)?,
+                };
+                r = Some(v);
+            }
+            ref<Thread, shared> th = State::thread(s, t);
+            u32 sc = th.scopes[Vec::len(&th.scopes) - 1].sc;
+            Vec<u32> rrefs = opt_ref_set(&r);
+            Vec<u32> owners = clone(&s.holder.vals);
+            Vec::sort(&mut owners);
+            Vec<u32> unheld = Vec::new();
+            for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+            {
+                u32 k = s.paths.keys[i];
+                ref<Path, shared> p = &s.paths.vals[i];
+                bool here = match (p.scope)
+                {
+                    Some(x) : x == sc,
+                    None    : false,
+                };
+                if (here && p.valid && !sorted_has(&owners, k) && !Vec::contains(&rrefs, k) && !State::held(s, k))
+                {
+                    Vec::push(&mut unheld, k);
+                }
+            }
+            foreach (k in &unheld)
+            {
+                State::path_mut(s, *k).valid = false;
+            }
+            _ = Vec::pop(&mut State::th(s, t).scopes);
+            Option<u32> parent = State::cur_scope(s, t);
+            foreach (k in &rrefs)
+            {
+                if (!State::held(s, *k))
+                {
+                    match (SMap::find(&s.paths, k))
+                    {
+                        Some(i) :
+                        {
+                            s.paths.vals[i].scope = parent;
+                            if (s.tracing)
+                            {
+                                State::tr(s, sprintf("rsc %d %d", *k, sc_trace(parent)));
+                            }
+                        },
+                        None    : {},
+                    }
+                }
+            }
+            if (s.tracing)
+            {
+                State::tr(s, sprintf("sex %d", t));
+            }
+            match (r)
+            {
+                Some(v) : Machine::push_v(s, t, v),
+                None    : {},
+            }
+        },
+        Ins::BlockEnter                      :
+        {
+            u32 f = State::fresh(s);
+            Vec::push(&mut State::act(s, t).frames, f);
+            if (s.tracing)
+            {
+                State::tr(s, sprintf("ben %d %d", t, f));
+            }
+        },
+        Ins::BlockExit(names)                : return Machine::exec_block_exit(m, s, t, names, line),
+        Ins::ReleaseRef(n)                   :
+        {
+            Option<u32> top = None;
+            {
+                ref<Act, exclusive> act = State::act(s, t);
+                match (slot_find(&act.slots, n))
+                {
+                    Some(i) :
+                    {
+                        usize k = Vec::len(&act.slots.vals[i]);
+                        if (k > 0)
+                        {
+                            top = Some(act.slots.vals[i][k - 1]);
+                        }
+                    },
+                    None    : {},
+                }
+            }
+            match (top)
+            {
+                Some(a) : State::store(s, a, Val::Unit, t),
+                None    : {},
+            }
+        },
+        Ins::EndBinding(n)                   :
+        {
+            // `[Ref-Binding-Last-Use]`: as at the block's exit, for one
+            // binding that owns no resource.
+            Option<u32> top = None;
+            {
+                ref<Act, exclusive> act = State::act(s, t);
+                match (slot_find(&act.slots, n))
+                {
+                    Some(i) : top = Vec::pop(&mut act.slots.vals[i]),
+                    None    : {},
+                }
+            }
+            match (top)
+            {
+                Some(a) :
+                {
+                    u32 o = State::path(s, a).of;
+                    bool holds = match (SMap::find(&s.holder, &o))
+                    {
+                        Some(i) : s.holder.vals[i] == a,
+                        None    : false,
+                    };
+                    if (State::alive(s, o) && holds)
+                    {
+                        s.emit_end = true;
+                        Vec<u32> none = Vec::new();
+                        State::end_object(s, o, &none);
+                        s.emit_end = false;
+                    }
+                },
+                None    : {},
+            }
+        },
+        Ins::Int(k)                          : Machine::push_v(s, t, Val::Int(*k)),
+        Ins::Static(k)                       :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out static");
+            }
+            u32 a = s.statics[*k];
+            Machine::push(s, t, SVal::Place(a));
+        },
+        Ins::Var(n)                          :
+        {
+            // `[Binding-Lookup]`
+            u32 a = match (slot_top(&State::act_of(s, t).slots, n))
+            {
+                Some(a) : a,
+                None    : return Err(mk_fault("diag.stale-binding", line)),
+            };
+            if (!State::temporally_valid(s, a))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            Machine::push(s, t, SVal::Place(a));
+        },
+        Ins::Read                            :
+        {
+            // `[LValue-To-RValue]`: a place in value position is read; a
+            // value stays as it is.
+            Val v = match (Machine::pop(s, t))
+            {
+                SVal::Place(a) : State::read(s, a, t, line)?,
+                SVal::V(v)     : v,
+            };
+            Machine::push_v(s, t, v);
+        },
+        Ins::Deref                           :
+        {
+            // `[Ref-Deref-Place]`: the operand is read to its reference;
+            // `[Guard-Deref]`: a guard is not read, its lock path is the place.
+            Val v = match (Machine::pop(s, t))
+            {
+                SVal::V(v) : v,
+                SVal::Place(a) : match (State::value_at(s, a))
+                {
+                    Some(Val::Guard(g)) :
+                    {
+                        if (!State::temporally_valid(s, a))
+                        {
+                            return Err(mk_fault("diag.stale-binding", line));
+                        }
+                        Machine::push(s, t, SVal::Place(g));
+                        return Ok(None);
+                    },
+                    _                   : State::read(s, a, t, line)?,
+                },
+            };
+            u32 r = val_ref(v, "deref of a non-reference");
+            Machine::push(s, t, SVal::Place(r));
+        },
+        Ins::Field(fi)                       :
+        {
+            // `[Field-Access]`, through a reference by
+            // `[Field-Access-Auto-Deref]`.
+            u32 base = 0;
+            match (Machine::pop(s, t))
+            {
+                SVal::Place(a)       :
+                {
+                    bool through = false;
+                    match (State::value_at(s, a))
+                    {
+                        Some(Val::Ref(_)) :
+                        {
+                            bool hold_obj = match (&State::obj(s, State::path(s, a).of).val)
+                            {
+                                Some(Val::Hold(_)) : true,
+                                _                  : false,
+                            };
+                            through = Vec::len(&State::path(s, a).steps) == 0 && !hold_obj;
+                        },
+                        _                 : {},
+                    }
+                    if (through)
+                    {
+                        base = val_ref(State::read(s, a, t, line)?, "unreachable");
+                    }
+                    else
+                    {
+                        base = a;
+                    }
+                },
+                SVal::V(Val::Ref(r)) : base = r,
+                SVal::V(_)           : bug("field of a value"),
+            }
+            if (!State::temporally_valid(s, base))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            State::affine(s, base, t, line)?;
+            u32 of = State::path(s, base).of;
+            Mode mode = State::path(s, base).mode;
+            Vec<PStep> steps = Vec::new();
+            Vec::push(&mut steps, PStep::F(*fi));
+            u32 a = State::new_path(s, of, steps, mode, t, Some(base));
+            State::one_access(s, a);
+            if (s.tracing)
+            {
+                State::tr(s, sprintf("prj %d %d %d %d", t, base, a, *fi));
+            }
+            Machine::push(s, t, SVal::Place(a));
+        },
+        Ins::CapRef                          :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out closure");
+            }
+            // The field holding a borrow capture is read as stored: no
+            // `[Read-Ref-Through-Shared]` borrow (D-0239); the place is
+            // `*a_i`.
+            u32 a = sval_place(Machine::pop(s, t), "capture of a value");
+            if (!State::temporally_valid(s, a))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            State::affine(s, a, t, line)?;
+            if (State::clash(s, a, Mode::Shared))
+            {
+                return Err(fault_at(State::unlicensed(s, a, t), line, a));
+            }
+            u32 r = match (State::value_at(s, a))
+            {
+                Some(Val::Ref(r)) : r,
+                _                 : Option::expect(None, "a borrow capture holds a reference"),
+            };
+            State::consume(s, a);
+            Machine::push(s, t, SVal::Place(r));
+        },
+        Ins::MkArr(n)                        :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out array");
+            }
+            Vec<i64> xs = Vec::new();
+            for (usize i = 0; i < *n; i += 1)
+            {
+                Vec::push(&mut xs, val_int(Machine::pop_val(s, t), "array element"));
+            }
+            Vec::reverse(&mut xs);
+            Machine::push_v(s, t, Val::Arr(xs));
+        },
+        Ins::MkClo { func, n, mv, ws }       :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out closure");
+            }
+            Vec<Val> caps = Vec::new();
+            for (usize i = 0; i < *n; i += 1)
+            {
+                Vec::push(&mut caps, Machine::pop_val(s, t));
+            }
+            Vec::reverse(&mut caps);
+            Machine::push_v(s, t, Val::Clo { .func = *func, .caps = caps, .mv = *mv, .ws = *ws });
+        },
+        Ins::CallClo                         :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out closure");
+            }
+            // `[Closure-Call]`: `self` is a borrow of the closure's place,
+            // shared, or exclusive for one that writes itself (D-0239).
+            u32 a_c = match (Machine::pop(s, t))
+            {
+                SVal::Place(a)       : a,
+                SVal::V(Val::Ref(r)) : r,
+                SVal::V(_)           : Option::expect(None, "call of a value"),
+            };
+            if (!State::temporally_valid(s, a_c))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            Val v = match (State::value_at(s, a_c))
+            {
+                Some(v) : v,
+                None    : return Err(mk_fault("diag.use-of-uninitialized", line)),
+            };
+            // `[Fn-Value-Empty-Call]`: its closure was moved out.
+            match (&v)
+            {
+                Val::Unit : return Err(fault_value("diag.stale-binding", line)),
+                _         : {},
+            }
+            usize cf = 0;
+            bool cws = false;
+            match (&v)
+            {
+                Val::Clo { func, caps, mv, ws } :
+                {
+                    cf = *func;
+                    cws = *ws;
+                },
+                _                               : bug("call of a non-closure"),
+            }
+            if (State::path(s, a_c).mode == Mode::Shared && State::fn_writes(s, &v))
+            {
+                return Err(mk_fault("diag.borrow-exceeds-source", line)); // `[Read-Fn-Through-Shared]`
+            }
+            Mode md = Mode::Shared;
+            if (cws)
+            {
+                md = Mode::Excl;
+            }
+            u32 a_self = State::borrow(s, a_c, md, t, line)?;
+            u32 pf = State::fresh(s);
+            Vec::push(&mut State::th(s, t).acts, new_act(cf, pf));
+            _ = State::bind(s, "$self", Val::Ref(a_self), t);
+        },
+        Ins::SpawnClo                        :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out closure");
+            }
+            // `[Spawn]` of a `move` closure: its captures are lent
+            // (`[Thread-Lend]`); the thread holds the closure in its
+            // parameter frame and calls it.
+            Val v = Machine::pop_val(s, t);
+            Vec<u32> lent = Machine::lend(m, s, t, &mut v, line)?;
+            usize cf = 0;
+            bool cws = false;
+            match (&v)
+            {
+                Val::Clo { func, caps, mv, ws } :
+                {
+                    cf = *func;
+                    cws = *ws;
+                },
+                _                               : bug("spawn of a non-closure"),
+            }
+            u32 nt = State::fresh(s);
+            u32 pf = State::fresh(s);
+            _ = SMap::insert(&mut s.threads, nt, new_thread(cf, pf));
+            u32 a_c = State::bind(s, "$clo", v, nt);
+            Mode md = Mode::Shared;
+            if (cws)
+            {
+                md = Mode::Excl;
+            }
+            u32 a_self = State::borrow(s, a_c, md, nt, line)?;
+            _ = State::bind(s, "$self", Val::Ref(a_self), nt);
+            if (Vec::len(&lent) > 0)
+            {
+                State::th(s, nt).lent = true;
+            }
+            foreach (a2 in &lent)
+            {
+                State::path_mut(s, *a2).thread = Owner::Transit;
+            }
+            Machine::push_v(s, t, Val::Handle(nt));
+        },
+        Ins::JobLit                          :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out job");
+            }
+            u32 h = match (Machine::pop_val(s, t))
+            {
+                Val::Handle(h) : h,
+                _              : Option::expect(None, "job"),
+            };
+            Machine::push_v(s, t, Val::Job(h));
+        },
+        Ins::ArgVal                          :
+        {
+            // A resource is moved from its place (`[Store-Binding-Place-
+            // Transfer]`), anything else read.
+            Val v = match (Machine::pop(s, t))
+            {
+                SVal::V(v)     : v,
+                SVal::Place(a) :
+                {
+                    if (State::temporally_valid(s, a) && State::obj(s, State::path(s, a).of).is_res && Vec::len(&State::path(s, a).steps) == 0)
+                    {
+                        Machine::push(s, t, SVal::Place(a));
+                        Machine::exec_move(m, s, t, line)?;
+                        return Ok(None);
+                    }
+                    State::read(s, a, t, line)?
+                },
+            };
+            Machine::push_v(s, t, v);
+        },
+        Ins::SliceForm { mode, lo, hi, arg } : Machine::exec_slice_form(m, s, t, *mode, *lo, *hi, *arg, line)?,
+        Ins::IndexVec(md)                    : Machine::exec_index_vec(m, s, t, *md, line)?,
+        Ins::Borrow { mode, arg }            :
+        {
+            u32 a0 = sval_place(Machine::pop(s, t), "borrow of a value");
+            if (s.tracing)
+            {
+                s.pend_next = *arg;
+            }
+            u32 a = State::borrow(s, a0, *mode, t, line)?;
+            if (*arg)
+            {
+                State::path_mut(s, a).pending = true; // D-0107
+            }
+            Machine::push_v(s, t, Val::Ref(a));
+        },
+        Ins::Add                             :
+        {
+            i64 b = val_int(Machine::pop_val(s, t), "add");
+            i64 a = val_int(Machine::pop_val(s, t), "add");
+            i64 r = a + b;
+            if (r > 2147483647 || r < -2147483648)
+            {
+                return Err(mk_fault("diag.arith-overflow", line));
+            }
+            Machine::push_v(s, t, Val::Int(r));
+        },
+        Ins::Gt                              :
+        {
+            i64 b = val_int(Machine::pop_val(s, t), "gt");
+            i64 a = val_int(Machine::pop_val(s, t), "gt");
+            Machine::push_v(s, t, Val::Bool(a > b));
+        },
+        Ins::Let(n)                          :
+        {
+            Val v = Machine::pop_val(s, t);
+            _ = State::bind(s, n, v, t);
+        },
+        Ins::Assign                          :
+        {
+            Val v = Machine::pop_val(s, t);
+            u32 a = sval_place(Machine::pop(s, t), "assign to a value");
+            State::write(s, a, v, t, line)?;
+        },
+        Ins::Call { f, n }                   :
+        {
+            Vec<Val> args = Vec::new();
+            for (usize i = 0; i < *n; i += 1)
+            {
+                Vec::push(&mut args, Machine::pop_val(s, t));
+            }
+            Vec::reverse(&mut args);
+            Machine::call(m, s, t, *f, args, line)?;
+        },
+        Ins::Ret                             : return Machine::exec_ret(m, s, t),
+        Ins::VecNew                          :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out vec");
+            }
+            u32 b = State::fresh(s);
+            _ = SMap::insert(&mut s.bufs, b, Vec::new());
+            Machine::push_v(s, t, Val::Vec { .buf = b, .len = 0, .cap = 0 });
+        },
+        Ins::VecPush                         : Machine::exec_vec_push(m, s, t, line)?,
+        Ins::Swap                            : Machine::exec_swap(m, s, t, true, line)?,
+        Ins::Replace                         : Machine::exec_swap(m, s, t, false, line)?,
+        Ins::VecPop                          :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out vec");
+            }
+            u32 av = val_ref(Machine::pop_val(s, t), "pop");
+            u32 pf = Machine::enter_std(m, s, t, av)?;
+            Val hdr = State::read(s, av, t, line)?;
+            Val r = Val::Opt(None);
+            match (hdr)
+            {
+                Val::Vec { buf, len, cap } :
+                {
+                    if (len > 0)
+                    {
+                        State::write(s, av, Val::Vec { .buf = buf, .len = len - 1, .cap = cap }, t, line)?;
+                        Val x = clone(State::buf_cell(s, buf, len - 1));
+                        State::release_elems(s, buf, len - 1, len, t, line)?;
+                        r = Val::Opt(Some(Box::new(x)));
+                    }
+                },
+                _                          : bug("vec"),
+            }
+            Machine::leave_std(m, s, t, pf);
+            Machine::push_v(s, t, r);
+        },
+        Ins::VecIndex(md)                    : Machine::exec_vec_index(m, s, t, *md, line)?,
+        Ins::Spawn { f, n }                  : Machine::exec_spawn(m, s, t, *f, *n, line)?,
+        Ins::Join                            :
+        {
+            u32 a = sval_place(Machine::pop(s, t), "join");
+            u32 o = State::path(s, a).of;
+            u32 h = match (&State::obj(s, o).val)
+            {
+                Some(Val::Handle(h)) : *h,
+                _                    : Option::expect(None, "join of a non-handle"),
+            };
+            Status st = clone(&State::thread(s, h).status);
+            match (st)
+            {
+                Status::Running   : bug("a join that must wait is handled before"),
+                Status::Failed(f) :
+                {
+                    State::th(s, h).status = Status::Taken;
+                    return Err(f); // `[Join-Failed]`: raised again, at its own location
+                },
+                Status::Done(v)   :
+                {
+                    State::th(s, h).status = Status::Taken;
+                    if (s.tracing)
+                    {
+                        State::tr(s, sprintf("jon %d %d", t, h));
+                    }
+                    s.quiet_end += 1;
+                    Vec<u32> none = Vec::new();
+                    Result<bool, Fault> r = Machine::destroy_owned(m, s, o, t, line, &none);
+                    s.quiet_end -= 1;
+                    _ = r?;
+                    Machine::push_v(s, t, v);
+                },
+                Status::Taken     : return Err(fault_value("diag.stale-binding", line)),
+            }
+        },
+        Ins::MutexNew                        :
+        {
+            i64 k = val_int(Machine::pop_val(s, t), "mutex");
+            Machine::push_v(s, t, Val::Mutex(k));
+        },
+        Ins::Lock                            :
+        {
+            // `[Lock]`, `[Lock-Reentrant]`, `[Lock-Poisoned]`.
+            u32 am = val_ref(Machine::pop_val(s, t), "lock");
+            match (SMap::find(&s.paths, &am))
+            {
+                Some(i) : s.paths.vals[i].pending = false,
+                None    : {},
+            }
+            if (!State::temporally_valid(s, am))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            u32 o = State::path(s, am).of;
+            match (SMap::find(&s.sync, &o))
+            {
+                Some(k) : match (s.sync.vals[k])
+                {
+                    Sync::LockedBy(h) :
+                    {
+                        if (h == t)
+                        {
+                            return Err(mk_fault("diag.mutex-reentrant-lock", line));
+                        }
+                        bug("a lock that must wait is handled before");
+                    },
+                    Sync::Poisoned(_) : return Err(mk_fault("diag.mutex-poisoned", line)),
+                    Sync::Unlocked    : {},
+                },
+                None : {},
+            }
+            _ = SMap::insert(&mut s.sync, o, Sync::LockedBy(t));
+            Vec<PStep> steps = Vec::new();
+            Vec::push(&mut steps, PStep::F(1));
+            u32 ag = State::new_path(s, o, steps, Mode::Excl, t, Some(am));
+            State::path_mut(s, ag).lockp = true;
+            if (s.tracing)
+            {
+                u32 g = State::fresh(s);
+                _ = SMap::insert(&mut s.guard_obj, ag, g);
+                State::tr(s, sprintf("lck %d %d %d %d", t, am, ag, g));
+            }
+            Machine::push_v(s, t, Val::Guard(ag));
+        },
+        Ins::AtomicNew                       :
+        {
+            i64 k = val_int(Machine::pop_val(s, t), "atomic");
+            Machine::push_v(s, t, Val::Atomic { .v = k, .w = 0 });
+        },
+        Ins::AtomicOp(op)                    :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out atomic");
+            }
+            i64 x = 0;
+            if (*op != 0)
+            {
+                x = val_int(Machine::pop_val(s, t), "atomic operand");
+            }
+            u32 am = val_ref(Machine::pop_val(s, t), "atomic");
+            u32 o = Machine::atomic_access(s, t, am, line)?;
+            usize oi = State::oidx(s, o);
+            i64 old = 0;
+            u64 w = 0;
+            match (&s.objs.vals[oi].val)
+            {
+                Some(Val::Atomic { v, w: ww }) :
+                {
+                    old = *v;
+                    w = *ww;
+                },
+                _                              : bug("not an atomic"),
+            }
+            i64 nv = old;
+            if (*op == 1)
+            {
+                nv = x;
+            }
+            else if (*op != 0)
+            {
+                i64 sum = old + x;
+                if (sum > 2147483647 || sum < -2147483648)
+                {
+                    return Err(mk_fault("diag.arith-overflow", line));
+                }
+                nv = sum;
+            }
+            s.objs.vals[oi].val = Some(Val::Atomic { .v = nv, .w = w });
+            if (*op == 1)
+            {
+                Machine::push_v(s, t, Val::Unit);
+            }
+            else
+            {
+                Machine::push_v(s, t, Val::Int(old));
+            }
+        },
+        Ins::AtomicNotify                    :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out atomic");
+            }
+            u32 am = val_ref(Machine::pop_val(s, t), "atomic");
+            u32 o = Machine::atomic_access(s, t, am, line)?;
+            usize oi = State::oidx(s, o);
+            match (&mut s.objs.vals[oi].val)
+            {
+                Some(Val::Atomic { v, w }) : *w = *w + 1,
+                _                          : bug("not an atomic"),
+            }
+            Machine::push_v(s, t, Val::Unit);
+        },
+        Ins::AtomicWaitCheck(end)            :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out atomic");
+            }
+            // stack: …, Ref(atomic), expected -- kept for the sleep.
+            ref<Act, shared> act = State::act_of(s, t);
+            usize n = Vec::len(&act.stack);
+            u32 am = match (&act.stack[n - 2])
+            {
+                SVal::V(Val::Ref(r)) : *r,
+                _                    : Option::expect(None, "atomic wait"),
+            };
+            i64 want = match (&act.stack[n - 1])
+            {
+                SVal::V(Val::Int(k)) : *k,
+                _                    : Option::expect(None, "atomic wait"),
+            };
+            u32 o = Machine::atomic_access(s, t, am, line)?;
+            i64 v = 0;
+            u64 w = 0;
+            match (&State::obj(s, o).val)
+            {
+                Some(Val::Atomic { v: vv, w: ww }) :
+                {
+                    v = *vv;
+                    w = *ww;
+                },
+                _                                  : bug("not an atomic"),
+            }
+            if (v != want)
+            {
+                _ = Machine::pop_val(s, t);
+                _ = Machine::pop_val(s, t);
+                Machine::push_v(s, t, Val::Unit);
+                State::act(s, t).pc = *end;
+            }
+            else
+            {
+                Machine::push_v(s, t, Val::Int(reinterpret<i64>(w)));
+            }
+        },
+        Ins::AtomicWaitSleep(check)          :
+        {
+            // Woken: the count moved. Check the value again.
+            _ = Machine::pop_val(s, t);
+            State::act(s, t).pc = *check;
+        },
+        Ins::ChanNew                         :
+        {
+            i64 k = val_int(Machine::pop_val(s, t), "channel");
+            if (k == 0)
+            {
+                return Err(mk_fault("diag.channel-zero-capacity", line));
+            }
+            Machine::push_v(s, t, Val::Chan { .q = Vec::new(), .closed = false, .cap = narrow_wrapping<u32>(k) });
+        },
+        Ins::ChanLend                        :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out channel");
+            }
+            // `[Send]`: v := lend(v) (`[Thread-Lend]`).
+            Val v = Machine::pop_val(s, t);
+            _ = Machine::lend(m, s, t, &mut v, line)?;
+            auto each1 = Val::refs(&v);
+            foreach (r in &each1)
+            {
+                match (SMap::find(&s.paths, r))
+                {
+                    Some(i) : s.paths.vals[i].pending = false,
+                    None    : {},
+                }
+            }
+            Machine::push_v(s, t, v);
+        },
+        Ins::ChanSend                        :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out channel");
+            }
+            Val v = Machine::pop_val(s, t);
+            // The channel's state is a mutex whose interior may hold an
+            // exclusive reference: the thread is lent (`spec/18`).
+            State::th(s, t).lent = true;
+            u32 ac = val_ref(Machine::pop_val(s, t), "send");
+            u32 o = Machine::chan_obj(m, s, ac, line)?;
+            usize oi = State::oidx(s, o);
+            Val r = Val::Res(None);
+            match (&mut s.objs.vals[oi].val)
+            {
+                Some(Val::Chan { q, closed, cap }) :
+                {
+                    if (*closed)
+                    {
+                        r = Val::Res(Some(Box::new(v))); // given back
+                    }
+                    else
+                    {
+                        Vec::push(q, v);
+                    }
+                },
+                _                                  : bug("chan"),
+            }
+            Machine::push_v(s, t, r);
+        },
+        Ins::ChanRecv                        :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out channel");
+            }
+            u32 ac = val_ref(Machine::pop_val(s, t), "recv");
+            // The channel's state is a mutex whose interior may hold an
+            // exclusive reference: the thread is lent (`spec/18`).
+            State::th(s, t).lent = true;
+            u32 o = Machine::chan_obj(m, s, ac, line)?;
+            usize oi = State::oidx(s, o);
+            Val r = Val::Opt(None);
+            match (&mut s.objs.vals[oi].val)
+            {
+                Some(Val::Chan { q, closed, cap }) :
+                {
+                    if (Vec::len(q) > 0)
+                    {
+                        r = Val::Opt(Some(Box::new(Vec::remove(q, 0))));
+                    }
+                },
+                _                                  : bug("chan"),
+            }
+            // The value moves into the receiver's statement: its unheld
+            // paths are re-stamped to that statement's scope, as `[Join]`
+            // does for a result. `[Recv]` does not say so; read literally,
+            // the sender's statement exit could end a path the receiver
+            // has taken (D-0219, finding 4).
+            Option<u32> sc = State::cur_scope(s, t);
+            auto each2 = Val::refs(&r);
+            foreach (a in &each2)
+            {
+                if (!State::held(s, *a))
+                {
+                    match (SMap::find(&s.paths, a))
+                    {
+                        Some(i) : s.paths.vals[i].scope = sc,
+                        None    : {},
+                    }
+                }
+            }
+            Machine::push_v(s, t, r);
+        },
+        Ins::ChanClose                       :
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "out channel");
+            }
+            u32 ac = val_ref(Machine::pop_val(s, t), "close");
+            // The channel's state is a mutex whose interior may hold an
+            // exclusive reference: the thread is lent (`spec/18`).
+            State::th(s, t).lent = true;
+            u32 o = Machine::chan_obj(m, s, ac, line)?;
+            usize oi = State::oidx(s, o);
+            match (&mut s.objs.vals[oi].val)
+            {
+                Some(Val::Chan { q, closed, cap }) : *closed = true,
+                _                                  : {},
+            }
+            Machine::push_v(s, t, Val::Unit);
+        },
+        Ins::Move                            : Machine::exec_move(m, s, t, line)?,
+        Ins::MatchSome(l)                    :
+        {
+            match (Machine::pop_val(s, t))
+            {
+                Val::Opt(Some(v)) : Machine::push_v(s, t, Box::into_inner(v)),
+                Val::Opt(None)    : State::act(s, t).pc = *l,
+                _                 : bug("match on a non-Option"),
+            }
+        },
+        Ins::HoldLit                         :
+        {
+            u32 r = val_ref(Machine::pop_val(s, t), "hold");
+            Machine::push_v(s, t, Val::Hold(r));
+        },
+        Ins::Print                           :
+        {
+            i64 k = val_int(Machine::pop_val(s, t), "print");
+            Vec::push(&mut s.out, k);
+        },
+        Ins::Pop                             : { _ = Machine::pop(s, t); },
+        Ins::JumpIfFalse(l)                  :
+        {
+            bool b = match (Machine::pop_val(s, t))
+            {
+                Val::Bool(b) : b,
+                _            : Option::expect(None, "if"),
+            };
+            if (!b)
+            {
+                State::act(s, t).pc = *l;
+            }
+        },
+        Ins::Jump(l)                         : State::act(s, t).pc = *l,
+    }
+    Ok(None)
+}
+
+fn sorted_has(ref<Vec<u32>, shared> v, u32 k) : bool
+{
+    match (Vec::binary_search(v, k))
+    {
+        Ok(_)  : true,
+        Err(_) : false,
+    }
+}
+
+fn Machine::exec_block_exit(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, ref<Vec<String>, shared> names, usize line) : Result<Option<bool>, Fault>
+{
+    // `[Block-Exit]`: end what the frame owns, last bound first (the
+    // holder formed last; D-0233); a handle waits for its thread.
+    ref<Act, shared> a0 = State::act_of(s, t);
+    u32 f = a0.frames[Vec::len(&a0.frames) - 1];
+    bool started = match (&a0.exiting)
+    {
+        Some(_) : true,
+        None    : false,
+    };
+    if (!started)
+    {
+        Vec<u32> frames = Vec::new();
+        Vec::push(&mut frames, f);
+        Vec<Owned> owned = owned_desc(s, &frames);
+        Vec<u32> os = Vec::new();
+        foreach (x in &owned)
+        {
+            Vec::push(&mut os, x.o);
+        }
+        State::act(s, t).exiting = Some(os);
+    }
+    while (true)
+    {
+        Option<u32> next = match (&State::act_of(s, t).exiting)
+        {
+            Some(l) :
+            {
+                if (Vec::len(l) > 0)
+                {
+                    Some(l[0])
+                }
+                else
+                {
+                    None
+                }
+            },
+            None    : None,
+        };
+        u32 o = match (next)
+        {
+            Some(o) : o,
+            None    : break,
+        };
+        if (State::alive(s, o))
+        {
+            match (State::first_wait(s, o))
+            {
+                Some(_) :
+                {
+                    // Wait here: the next step begins the wait.
+                    State::act(s, t).pc -= 1;
+                    return Ok(None);
+                },
+                None    : {},
+            }
+            Vec<u32> exempt = Vec::new();
+            if (m.spare_result)
+            {
+                ref<Act, shared> a = State::act_of(s, t);
+                usize n = Vec::len(&a.stack);
+                if (n > 0)
+                {
+                    match (&a.stack[n - 1])
+                    {
+                        SVal::V(v) : exempt = exempt_of(v),
+                        _          : {},
+                    }
+                }
+            }
+            s.quiet_end += 1;
+            Result<bool, Fault> done = Machine::destroy_owned(m, s, o, t, line, &exempt);
+            s.quiet_end -= 1;
+            if (!done?)
+            {
+                // A later handle's thread still runs: wait for it.
+                State::act(s, t).pc -= 1;
+                return Ok(None);
+            }
+        }
+        match (&mut State::act(s, t).exiting)
+        {
+            Some(l) : { _ = Vec::remove(l, 0); },
+            None    : {},
+        }
+    }
+    State::act(s, t).exiting = None;
+    _ = Vec::pop(&mut State::act(s, t).frames);
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("bex %d", t));
+    }
+    // Unbind the block's names; one already ended at its last use
+    // (`EndBinding`) is unbound already.
+    foreach (n in names)
+    {
+        Option<u32> top = slot_top(&State::act_of(s, t).slots, n);
+        match (top)
+        {
+            Some(a) :
+            {
+                if (State::path(s, a).frame == f)
+                {
+                    ref<Act, exclusive> act = State::act(s, t);
+                    usize i = Option::unwrap(slot_find(&act.slots, n));
+                    _ = Vec::pop(&mut act.slots.vals[i]);
+                    if (Vec::len(&act.slots.vals[i]) == 0)
+                    {
+                        _ = SMap::remove_at(&mut act.slots, i);
+                    }
+                }
+            },
+            None    : {},
+        }
+    }
+    Ok(None)
+}
+
+fn Machine::exec_ret(ref<Machine, shared> m, ref<State, exclusive> s, u32 t) : Result<Option<bool>, Fault>
+{
+    // The body's value; `[Call]` exits the parameter frame.
+    Val v = Val::Unit;
+    u32 pf = 0;
+    {
+        ref<Act, shared> a = State::act_of(s, t);
+        usize n = Vec::len(&a.stack);
+        if (n > 0)
+        {
+            match (&a.stack[n - 1])
+            {
+                SVal::V(x) : v = clone(x),
+                _          : {},
+            }
+        }
+        pf = a.param_frame;
+    }
+    // Last bound first, as `[Block-Exit]` (D-0233).
+    Vec<u32> frames = Vec::new();
+    Vec::push(&mut frames, pf);
+    Vec<Owned> owned = owned_desc(s, &frames);
+    // The parameter frame's exit spares the result's references.
+    Vec<u32> exempt = Vec::new();
+    if (m.spare_result)
+    {
+        exempt = exempt_of(&v);
+    }
+    bool last = Vec::len(&State::thread(s, t).acts) == 1;
+    if (s.tracing && last && t != 0)
+    {
+        // `[Thread-Body-Done]`: the result's objects stay; the rest of the parameter frame ends.
+        Vec<u32> res = Vec::new();
+        match (&v)
+        {
+            Val::Handle(h) :
+            {
+                match (SMap::find(&s.handle_obj, h))
+                {
+                    Some(i) : Vec::push(&mut res, s.handle_obj.vals[i]),
+                    None    : {},
+                }
+            },
+            Val::Guard(g)  :
+            {
+                match (SMap::find(&s.guard_obj, g))
+                {
+                    Some(i) : Vec::push(&mut res, s.guard_obj.vals[i]),
+                    None    : {},
+                }
+            },
+            _              : {},
+        }
+        State::tr(s, sprintf("tdn %d %d %s", t, Vec::len(&res), &join_toks(&res)));
+    }
+    s.quiet_end += 1;
+    foreach (x in &owned)
+    {
+        State::end_object(s, x.o, &exempt);
+    }
+    s.quiet_end -= 1;
+    _ = Vec::pop(&mut State::th(s, t).acts);
+    if (Vec::len(&State::thread(s, t).acts) == 0)
+    {
+        if (t == 0)
+        {
+            if (s.tracing)
+            {
+                State::tr(s, "end");
+            }
+            return Ok(Some(true));
+        }
+        State::th(s, t).status = Status::Done(v); // `[Thread-Body-Done]`
+    }
+    else
+    {
+        if (s.tracing)
+        {
+            State::tr(s, sprintf("bex %d", t));
+        }
+        // The result flows into the caller's statement.
+        Option<u32> sc = State::cur_scope(s, t);
+        auto each3 = Val::refs(&v);
+        foreach (r in &each3)
+        {
+            if (!State::held(s, *r))
+            {
+                match (SMap::find(&s.paths, r))
+                {
+                    Some(i) :
+                    {
+                        s.paths.vals[i].scope = sc;
+                        if (s.tracing)
+                        {
+                            State::tr(s, sprintf("rsc %d %d", *r, sc_trace(sc)));
+                        }
+                    },
+                    None    : {},
+                }
+            }
+        }
+        Machine::push_v(s, t, v);
+    }
+    Ok(None)
+}
+
+fn Machine::exec_slice_form(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, Mode mode, u32 lo, u32 hi, bool arg, usize line) : Result<void, Fault>
+{
+    if (s.tracing)
+    {
+        State::tr(s, "out slice");
+    }
+    // `[Slice-Form]`: the range [lo, hi) of a `Vec`, or of a
+    // slice's source, offset by its start.
+    u32 a0 = sval_place(Machine::pop(s, t), "slice of a value");
+    if (!State::temporally_valid(s, a0))
+    {
+        return Err(mk_fault("diag.stale-binding", line));
+    }
+    u32 a_s = a0;
+    u32 start = 0;
+    u32 len = 0;
+    match (State::value_at(s, a0))
+    {
+        Some(Val::Vec { buf, len: l, cap }) : len = l,
+        Some(Val::Arr(xs))                  : len = narrow_wrapping<u32>(Vec::len(&xs)),
+        Some(Val::Slice { .. })             :
+        {
+            match (State::read(s, a0, t, line)?)
+            {
+                Val::Slice { tok, start: st, len: l } :
+                {
+                    if (!State::temporally_valid(s, tok))
+                    {
+                        return Err(mk_fault("diag.stale-binding", line));
+                    }
+                    a_s = tok;
+                    start = st;
+                    len = l;
+                },
+                _                                     : bug("unreachable"),
+            }
+        },
+        _                                   : bug("slice source"),
+    }
+    if (lo > hi || hi > len)
+    {
+        return Err(mk_fault("diag.index-out-of-bounds", line));
+    }
+    if (mode == Mode::Excl && State::path(s, a_s).mode != Mode::Excl)
+    {
+        return Err(mk_fault("diag.borrow-exceeds-source", line));
+    }
+    State::affine(s, a_s, t, line)?;
+    Vec<PStep> steps = clone(&State::path(s, a_s).steps);
+    Vec::push(&mut steps, PStep::R { .lo = start + lo, .hi = start + hi });
+    u32 of = State::path(s, a_s).of;
+    u32 a_r = State::new_path(s, of, steps, mode, t, Some(a_s));
+    if (State::clash(s, a_r, mode))
+    {
+        return Err(fault_at(State::unlicensed(s, a_r, t), line, a_r));
+    }
+    if (arg)
+    {
+        State::path_mut(s, a_r).pending = true; // D-0107
+    }
+    Machine::push_v(s, t, Val::Slice { .tok = a_r, .start = start + lo, .len = hi - lo });
+    Ok(())
+}
+
+fn Machine::exec_index_vec(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, Mode md, usize line) : Result<void, Fault>
+{
+    if (s.tracing)
+    {
+        State::tr(s, "out vec");
+    }
+    i64 k = val_int(Machine::pop_val(s, t), "index");
+    u32 a0 = sval_place(Machine::pop(s, t), "index of a value");
+    if (!State::temporally_valid(s, a0))
+    {
+        return Err(mk_fault("diag.stale-binding", line));
+    }
+    u32 a_e = 0;
+    match (State::value_at(s, a0))
+    {
+        Some(Val::Vec { buf, len, cap }) :
+        {
+            // `[Index-Vec]` (D-0238): the element borrow a_k, its
+            // last step index(k); the element object reached
+            // through a path whose base is a_k.
+            State::affine(s, a0, t, line)?;
+            if (k < 0 || narrow_wrapping<u32>(k) >= len)
+            {
+                return Err(mk_fault("diag.index-out-of-bounds", line));
+            }
+            Vec<PStep> steps = clone(&State::path(s, a0).steps);
+            Vec::push(&mut steps, PStep::I(narrow_wrapping<u32>(k)));
+            u32 of = State::path(s, a0).of;
+            u32 a_k = State::new_path(s, of, steps, md, t, Some(a0));
+            if (State::clash(s, a_k, md))
+            {
+                return Err(mk_fault("diag.aliasing-conflict", line));
+            }
+            State::one_access(s, a_k);
+            u32 o = State::elem_obj(s, buf, narrow_wrapping<u32>(k), t);
+            a_e = State::new_path(s, o, Vec::new(), md, t, Some(a_k));
+            State::one_access(s, a_e);
+        },
+        Some(Val::Arr(xs))               :
+        {
+            // `[Index-Checked]`: a projection of the array's path.
+            if (k < 0 || narrow_wrapping<usize>(k) >= Vec::len(&xs))
+            {
+                return Err(mk_fault("diag.index-out-of-bounds", line));
+            }
+            Vec<PStep> steps = clone(&State::path(s, a0).steps);
+            Vec::push(&mut steps, PStep::I(narrow_wrapping<u32>(k)));
+            u32 of = State::path(s, a0).of;
+            Mode mode = State::path(s, a0).mode;
+            a_e = State::new_path(s, of, steps, mode, t, Some(a0));
+            State::one_access(s, a_e);
+        },
+        Some(Val::Slice { .. })          :
+        {
+            // `[Slice-Index]`: element start + k of the source,
+            // reached through the slice's borrow.
+            u32 tok = 0;
+            u32 start = 0;
+            u32 len = 0;
+            match (State::read(s, a0, t, line)?)
+            {
+                Val::Slice { tok: tk, start: st, len: l } :
+                {
+                    tok = tk;
+                    start = st;
+                    len = l;
+                },
+                _                                         : bug("unreachable"),
+            }
+            if (!State::temporally_valid(s, tok))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            State::affine(s, tok, t, line)?;
+            // D-0248: the slice's own path is checked too, against
+            // what lives on the vector -- a lent reborrow of it, a
+            // borrow of the whole vector.
+            Mode am = Mode::Shared;
+            if (md == Mode::Excl)
+            {
+                am = Mode::Excl;
+            }
+            if (State::clash(s, tok, am))
+            {
+                return Err(mk_fault("diag.aliasing-conflict", line));
+            }
+            if (k < 0 || narrow_wrapping<u32>(k) >= len)
+            {
+                return Err(mk_fault("diag.index-out-of-bounds", line));
+            }
+            Mode mode = State::path(s, tok).mode;
+            Option<Val> src = clone(&State::obj(s, State::path(s, tok).of).val);
+            match (src)
+            {
+                Some(Val::Vec { buf, .. }) :
+                {
+                    u32 o = State::elem_obj(s, buf, start + narrow_wrapping<u32>(k), t);
+                    a_e = State::new_path(s, o, Vec::new(), mode, t, Some(tok));
+                },
+                // An array source: a projection of the slice's path
+                // onto the element's cells.
+                Some(Val::Arr(_))          :
+                {
+                    Vec<PStep> steps = clone(&State::path(s, tok).steps);
+                    Vec::push(&mut steps, PStep::I(start + narrow_wrapping<u32>(k)));
+                    u32 of = State::path(s, tok).of;
+                    a_e = State::new_path(s, of, steps, mode, t, Some(tok));
+                },
+                _                          : bug("slice of a non-vector"),
+            }
+            State::one_access(s, a_e);
+        },
+        _                                : bug("index of a non-vector"),
+    }
+    Machine::push(s, t, SVal::Place(a_e));
+    Ok(())
+}
+
+fn Machine::exec_vec_push(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, usize line) : Result<void, Fault>
+{
+    if (s.tracing)
+    {
+        State::tr(s, "out vec");
+    }
+    Val x = Machine::pop_val(s, t);
+    u32 av = val_ref(Machine::pop_val(s, t), "push");
+    auto each4 = Val::refs(&x);
+    foreach (r in &each4)
+    {
+        match (SMap::find(&s.paths, r))
+        {
+            Some(i) : s.paths.vals[i].pending = false,
+            None    : {},
+        }
+    }
+    u32 pf = Machine::enter_std(m, s, t, av)?;
+    Val hdr = State::read(s, av, t, line)?;
+    u32 buf = 0;
+    u32 len = 0;
+    u32 cap = 0;
+    match (hdr)
+    {
+        Val::Vec { buf: b, len: l, cap: c } :
+        {
+            buf = b;
+            len = l;
+            cap = c;
+        },
+        _                                   : bug("vec"),
+    }
+    if (len == cap)
+    {
+        // `Vec::grow`: a new buffer, the cells copied (`copy_raw`),
+        // the old one deallocated, ending every element object
+        // over it (`[Release]`). A cell holding a reference keeps
+        // a holder: an element object over its new slot. Read
+        // literally, `[Copy-Raw]` gives the copy none, and the
+        // release would end every reference the vector holds
+        // (D-0219, finding 5); the tools keep them.
+        u32 nc = 4;
+        if (cap != 0)
+        {
+            nc = cap * 2;
+        }
+        u32 nb = State::fresh(s);
+        usize bk = Option::unwrap(SMap::find(&s.bufs, &buf));
+        Vec<Val> cells = clone(&s.bufs.vals[bk]);
+        while (Vec::len(&cells) < widen<usize>(nc))
+        {
+            Vec::push(&mut cells, Val::Int(0));
+        }
+        Vec::truncate(&mut cells, widen<usize>(nc));
+        Vec<bool> with_refs = Vec::new();
+        foreach (c in &cells)
+        {
+            Vec::push(&mut with_refs, Val::has_any_ref(c));
+        }
+        _ = SMap::insert(&mut s.bufs, nb, cells);
+        for (usize i = 0; i < Vec::len(&with_refs); i += 1)
+        {
+            if (with_refs[i])
+            {
+                _ = State::elem_obj(s, nb, narrow_wrapping<u32>(i), t);
+            }
+        }
+        State::release_elems(s, buf, 0, 4294967295, t, line)?;
+        _ = SMap::remove(&mut s.bufs, &buf);
+        buf = nb;
+        cap = nc;
+    }
+    bool has_refs = Val::has_any_ref(&x);
+    usize bk = Option::unwrap(SMap::find(&s.bufs, &buf));
+    s.bufs.vals[bk][widen<usize>(len)] = x;
+    if (has_refs)
+    {
+        _ = State::elem_obj(s, buf, len, t); // `[Rawptr-Write]`: the holder
+    }
+    State::write(s, av, Val::Vec { .buf = buf, .len = len + 1, .cap = cap }, t, line)?;
+    Machine::leave_std(m, s, t, pf);
+    Machine::push_v(s, t, Val::Unit);
+    Ok(())
+}
+
+fn Machine::exec_swap(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, bool is_swap, usize line) : Result<void, Fault>
+{
+    if (s.tracing)
+    {
+        State::tr(s, "out swap");
+    }
+    // `[Swap-Places]` (D-0235): for distinct places, `[Write]`'s
+    // premises of each reference, all checked before either
+    // place changes; the same place twice is no access.
+    Val second = Machine::pop_val(s, t);
+    u32 a = val_ref(Machine::pop_val(s, t), "swap");
+    Option<u32> b = None;
+    if (is_swap)
+    {
+        match (&second)
+        {
+            Val::Ref(x) : b = Some(*x),
+            _           : {},
+        }
+    }
+    bool same = match (b)
+    {
+        Some(bb) : State::path(s, a).of == State::path(s, bb).of && Vec::eq(&State::path(s, a).steps, &State::path(s, bb).steps),
+        None     : false,
+    };
+    Val result = Val::Unit;
+    if (!same)
+    {
+        Vec<u32> toks = Vec::new();
+        Vec::push(&mut toks, a);
+        match (b)
+        {
+            Some(bb) : Vec::push(&mut toks, bb),
+            None     : {},
+        }
+        foreach (x in &toks)
+        {
+            if (!State::temporally_valid(s, *x))
+            {
+                return Err(mk_fault("diag.stale-binding", line));
+            }
+            State::affine(s, *x, t, line)?;
+            if (State::clash(s, *x, Mode::Excl))
+            {
+                return Err(fault_at(State::unlicensed(s, *x, t), line, *x));
+            }
+        }
+        Val va = Option::unwrap(State::value_at(s, a));
+        match (b)
+        {
+            Some(bb) :
+            {
+                Val vb = Option::unwrap(State::value_at(s, bb));
+                State::store(s, a, vb, t);
+                State::store(s, bb, va, t);
+            },
+            None     :
+            {
+                State::store(s, a, second, t);
+                result = va;
+            },
+        }
+    }
+    Machine::push_v(s, t, result);
+    Ok(())
+}
+
+fn Machine::exec_vec_index(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, Mode md, usize line) : Result<void, Fault>
+{
+    if (s.tracing)
+    {
+        State::tr(s, "out vec");
+    }
+    // `Vec::index_shared` / `index_exclusive`: bounds, then
+    // `&_m reclaim<T>(ptr + i)`.
+    i64 k = val_int(Machine::pop_val(s, t), "index");
+    u32 av = val_ref(Machine::pop_val(s, t), "index vec");
+    u32 pf = Machine::enter_std(m, s, t, av)?;
+    u32 buf = 0;
+    u32 len = 0;
+    match (State::read(s, av, t, line)?)
+    {
+        Val::Vec { buf: b, len: l, cap } :
+        {
+            buf = b;
+            len = l;
+        },
+        _                                : bug("vec"),
+    }
+    if (k < 0 || narrow_wrapping<u32>(k) >= len)
+    {
+        return Err(mk_fault("diag.index-out-of-bounds", line));
+    }
+    if (md == Mode::Excl)
+    {
+        // D-0222: `_ = &mut (*v)[i .. i + 1];`, element i
+        // exclusively through `v`, a slice borrow ended with
+        // its statement.
+        State::affine(s, av, t, line)?;
+        Vec<PStep> steps = clone(&State::path(s, av).steps);
+        u32 ku = narrow_wrapping<u32>(k);
+        Vec::push(&mut steps, PStep::R { .lo = ku, .hi = ku + 1 });
+        u32 of = State::path(s, av).of;
+        u32 a = State::new_path(s, of, steps, Mode::Excl, t, Some(av));
+        if (State::clash(s, a, Mode::Excl))
+        {
+            return Err(mk_fault("diag.aliasing-conflict", line));
+        }
+        State::path_mut(s, a).valid = false;
+    }
+    u32 o = State::elem_obj(s, buf, narrow_wrapping<u32>(k), t);
+    // The callee's statement: the reclaim's root path, the borrow
+    // from it; the root ends with that statement.
+    u32 sc = State::fresh(s);
+    u32 f = State::cur_frame(s, t);
+    Vec::push(&mut State::th(s, t).scopes, ScopeAt { .sc = sc, .frame = f });
+    u32 a0 = State::new_path(s, o, Vec::new(), Mode::Excl, t, None);
+    u32 a1 = State::borrow(s, a0, md, t, line)?;
+    State::path_mut(s, a0).valid = false;
+    _ = Vec::pop(&mut State::th(s, t).scopes);
+    Machine::leave_std(m, s, t, pf);
+    Option<u32> sc2 = State::cur_scope(s, t);
+    State::path_mut(s, a1).scope = sc2;
+    Machine::push_v(s, t, Val::Ref(a1));
+    Ok(())
+}
+
+fn Machine::exec_spawn(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, usize fi, usize n, usize line) : Result<void, Fault>
+{
+    Vec<Val> args = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        Vec::push(&mut args, Machine::pop_val(s, t));
+    }
+    Vec::reverse(&mut args);
+    // `[Thread-Lend]`: each exclusive path in the arguments is
+    // replaced by a path borrowed from it, in transit.
+    Vec<u32> lent = Vec::new();
+    for (usize i = 0; i < Vec::len(&args); i += 1)
+    {
+        Vec<u32> l = Machine::lend(m, s, t, &mut args[i], line)?;
+        Vec::append(&mut lent, l);
+    }
+    Vec<u32> pending_before = Vec::new();
+    foreach (v in &args)
+    {
+        auto each5 = Val::refs(v);
+        foreach (r in &each5)
+        {
+            match (SMap::find(&s.paths, r))
+            {
+                Some(i) :
+                {
+                    if (s.paths.vals[i].pending)
+                    {
+                        Vec::push(&mut pending_before, *r);
+                    }
+                },
+                None    : {},
+            }
+        }
+    }
+    foreach (v in &args)
+    {
+        auto each6 = Val::refs(v);
+        foreach (r in &each6)
+        {
+            match (SMap::find(&s.paths, r))
+            {
+                Some(i) : s.paths.vals[i].pending = false,
+                None    : {},
+            }
+        }
+    }
+    u32 nt = State::fresh(s);
+    u32 pf = State::fresh(s);
+    _ = SMap::insert(&mut s.threads, nt, new_thread(fi, pf));
+    bool pseudo = false;
+    if (s.tracing)
+    {
+        // `[Spawn]`: the handle object the fragment establishes, and
+        // a statement scope of the new thread for its parameters' binding.
+        u32 h = State::fresh(s);
+        _ = SMap::insert(&mut s.handle_obj, nt, h);
+        State::tr(s, sprintf("spn %d %d %d %d", t, nt, pf, h));
+        u32 sc = State::fresh(s);
+        State::tr(s, sprintf("sen %d %d", nt, sc));
+        pseudo = true;
+    }
+    // The parameters are bound by the spawn step itself, in the
+    // new thread (`rule.fn.bind-param`).
+    ref<Vec<ParamDecl>, shared> params = &m.code.funcs[fi].f.params;
+    usize k = 0;
+    foreach (v0 in args)
+    {
+        if (k >= Vec::len(params))
+        {
+            break;
+        }
+        ref<ParamDecl, shared> p = &params[k];
+        k += 1;
+        Val v = Machine::param_value(m, s, nt, &p.ty, v0, line)?;
+        if (s.tracing)
+        {
+            match (&v)
+            {
+                Val::Ref(a) :
+                {
+                    if (Vec::contains(&pending_before, *a) && is_ref_ty(&p.ty))
+                    {
+                        u32 aa = *a;
+                        Machine::bind_param_traced(m, s, nt, &p.name, aa, clone(&v));
+                        continue;
+                    }
+                },
+                _           : {},
+            }
+        }
+        _ = State::bind(s, &p.name, v, nt);
+    }
+    if (pseudo)
+    {
+        State::tr(s, sprintf("sex %d", nt));
+    }
+    if (Vec::len(&lent) > 0)
+    {
+        State::th(s, nt).lent = true;
+    }
+    foreach (a2 in &lent)
+    {
+        // The lent path stays in transit until the thread uses it.
+        State::path_mut(s, *a2).thread = Owner::Transit;
+    }
+    Machine::push_v(s, t, Val::Handle(nt));
+    Ok(())
+}
+
+// The whole object at the place on the stack moves; every other path to
+// it would be left dangling (`solitary`, `diag.move-while-aliased`).
+fn Machine::exec_move(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, usize line) : Result<void, Fault>
+{
+    u32 a = sval_place(Machine::pop(s, t), "move of a value");
+    if (!State::temporally_valid(s, a))
+    {
+        return Err(mk_fault("diag.stale-binding", line));
+    }
+    u32 o = State::path(s, a).of;
+    for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+    {
+        if (s.paths.keys[i] != a && s.paths.vals[i].of == o && s.paths.vals[i].valid)
+        {
+            return Err(mk_fault("diag.move-while-aliased", line));
+        }
+    }
+    Val v = Option::unwrap(clone(&State::obj(s, o).val));
+    Vec<u32> exempt = exempt_of(&v);
+    if (s.tracing)
+    {
+        s.moving = Some(Moving { .o = o, .a = a, .t = t, .v = clone(&v) });
+        s.quiet_end += 1;
+    }
+    State::end_object(s, o, &exempt);
+    if (s.tracing)
+    {
+        s.quiet_end -= 1;
+    }
+    Machine::push_v(s, t, v);
+    Ok(())
+}
+
+// `[Thread-Lend]` of one value: every exclusive path in it is replaced
+// by an exclusive path borrowed from it, in transit.
+fn Machine::lend(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, ref<Val, exclusive> v, usize line) : Result<Vec<u32>, Fault>
+{
+    Vec<u32> lent = Vec::new();
+    Vec<u32> rs = Val::refs(v);
+    foreach (r in &rs)
+    {
+        // A lock path is not lent, and stays its locking thread's (D-0240).
+        bool lendable = match (SMap::find(&s.paths, r))
+        {
+            Some(i) : s.paths.vals[i].mode == Mode::Excl && !s.paths.vals[i].lockp,
+            None    : false,
+        };
+        if (lendable)
+        {
+            if (s.tracing)
+            {
+                s.lend_next = true;
+            }
+            u32 a2 = State::borrow(s, *r, Mode::Excl, t, line)?;
+            State::path_mut(s, a2).thread = Owner::Transit;
+            replace_ref(v, *r, a2);
+            Vec::push(&mut lent, a2);
+        }
+    }
+    Ok(lent)
+}
+
+// The channel object a shared reference reaches.
+fn Machine::chan_obj(ref<Machine, shared> m, ref<State, exclusive> s, u32 ac, usize line) : Result<u32, Fault>
+{
+    match (SMap::find(&s.paths, &ac))
+    {
+        Some(i) : s.paths.vals[i].pending = false,
+        None    : {},
+    }
+    if (!State::temporally_valid(s, ac))
+    {
+        return Err(mk_fault("diag.stale-binding", line));
+    }
+    Ok(State::path(s, ac).of)
+}
+
+// `rule.fn.bind-param`: a shared reference parameter given an exclusive
+// reference borrows shared through it first (D-0049).
+fn Machine::param_value(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, ref<Ty, shared> pt, Val v, usize line) : Result<Val, Fault>
+{
+    match (pt)
+    {
+        Ty::Ref { t: _, m: pm } :
+        {
+            if (*pm == Mode::Shared)
+            {
+                match (&v)
+                {
+                    Val::Ref(a) :
+                    {
+                        if (State::path(s, *a).mode == Mode::Excl)
+                        {
+                            u32 b = State::borrow(s, *a, Mode::Shared, t, line)?;
+                            return Ok(Val::Ref(b));
+                        }
+                    },
+                    _           : {},
+                }
+            }
+        },
+        _                       : {},
+    }
+    Ok(v)
+}
+
+fn Machine::call(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, usize fi, Vec<Val> args, usize line) : Result<void, Fault>
+{
+    u32 pf = State::fresh(s);
+    Vec::push(&mut State::th(s, t).acts, new_act(fi, pf));
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("ben %d %d", t, pf));
+    }
+    // D-0270: an argument's pending path is bound by `[Call]` (`bindParam`);
+    // the trace keeps the pending ones apart before the flags are cleared.
+    Vec<u32> pending_before = Vec::new();
+    foreach (v in &args)
+    {
+        auto each7 = Val::refs(v);
+        foreach (r in &each7)
+        {
+            match (SMap::find(&s.paths, r))
+            {
+                Some(i) :
+                {
+                    if (s.paths.vals[i].pending)
+                    {
+                        Vec::push(&mut pending_before, *r);
+                    }
+                },
+                None    : {},
+            }
+        }
+    }
+    ref<Vec<ParamDecl>, shared> params = &m.code.funcs[fi].f.params;
+    foreach (v in &args)
+    {
+        auto each8 = Val::refs(v);
+        foreach (r in &each8)
+        {
+            match (SMap::find(&s.paths, r))
+            {
+                Some(i) : s.paths.vals[i].pending = false,
+                None    : {},
+            }
+        }
+    }
+    usize k = 0;
+    foreach (v0 in args)
+    {
+        if (k >= Vec::len(params))
+        {
+            break;
+        }
+        ref<ParamDecl, shared> p = &params[k];
+        k += 1;
+        Val v = Machine::param_value(m, s, t, &p.ty, v0, line)?;
+        if (s.tracing)
+        {
+            match (&v)
+            {
+                Val::Ref(a) :
+                {
+                    if (Vec::contains(&pending_before, *a) && is_ref_ty(&p.ty))
+                    {
+                        u32 aa = *a;
+                        Machine::bind_param_traced(m, s, t, &p.name, aa, clone(&v));
+                        continue;
+                    }
+                },
+                _           : {},
+            }
+        }
+        _ = State::bind(s, &p.name, v, t);
+    }
+    Ok(())
+}
+
+// D-0270: the binding as `[Call]` and `[Spawn]` make it of a pending
+// argument path: the parameter object and its root, the argument's
+// path pending no longer (the fragment's `bindParam`).
+fn Machine::bind_param_traced(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, StringView pn, u32 a, Val v)
+{
+    u32 o = State::fresh(s);
+    u64 origin = State::tick(s);
+    Option<u32> scope = State::cur_scope(s, t);
+    bool is_res = Val::owns_resource(&v);
+    _ = SMap::insert(&mut s.objs, o, Obj { .is_res = is_res, .val = None, .elem = None, .scope = scope, .origin = origin });
+    u32 ar = State::new_path(s, o, Vec::new(), Mode::Excl, t, None);
+    _ = SMap::insert(&mut s.holder, o, ar);
+    {
+        ref<Act, exclusive> act = State::act(s, t);
+        Vec::push(slot_entry(&mut act.slots, pn), ar);
+    }
+    State::tr(s, sprintf("bpa %d %d %d %d", t, a, o, ar));
+    s.quiet_store = true;
+    State::store(s, ar, v, t);
+}
+
+// A `std` call's parameter frame holding the vector reference `av`.
+fn Machine::enter_std(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, u32 av) : Result<u32, Fault>
+{
+    match (SMap::find(&s.paths, &av))
+    {
+        Some(i) : s.paths.vals[i].pending = false,
+        None    : {},
+    }
+    u32 pf = State::fresh(s);
+    Vec::push(&mut State::act(s, t).frames, pf);
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("ben %d %d", t, pf));
+    }
+    _ = State::bind(s, "$v", Val::Ref(av), t);
+    Ok(pf)
+}
+
+fn Machine::leave_std(ref<Machine, shared> m, ref<State, exclusive> s, u32 t, u32 pf)
+{
+    Vec<u32> owned = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.holder.keys); i += 1)
+    {
+        if (State::path(s, s.holder.vals[i]).frame == pf)
+        {
+            Vec::push(&mut owned, s.holder.keys[i]);
+        }
+    }
+    s.quiet_end += 1;
+    Vec<u32> none = Vec::new();
+    foreach (o in &owned)
+    {
+        State::end_object(s, *o, &none);
+    }
+    s.quiet_end -= 1;
+    {
+        ref<Act, exclusive> act = State::act(s, t);
+        match (slot_find(&act.slots, "$v"))
+        {
+            Some(i) : { _ = Vec::pop(&mut act.slots.vals[i]); },
+            None    : {},
+        }
+    }
+    _ = Vec::pop(&mut State::act(s, t).frames);
+    if (s.tracing)
+    {
+        State::tr(s, sprintf("bex %d", t));
+    }
+}
+
+// `rule.resauth.destroy` of an object a frame owns: `solitary`, then
+// the destructor (a Vec's releases its buffer), then the object ends.
+// Ok(false): a handle it holds names a thread that still runs; the
+// destruction goes on once it is done (the handles before it taken).
+fn Machine::destroy_owned(ref<Machine, shared> m, ref<State, exclusive> s, u32 o, u32 t, usize line, ref<Vec<u32>, shared> exempt) : Result<bool, Fault>
+{
+    if (State::obj(s, o).is_res)
+    {
+        u32 a = s.holder.vals[Option::unwrap(SMap::find(&s.holder, &o))];
+        for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+        {
+            if (s.paths.keys[i] != a && s.paths.vals[i].of == o && s.paths.vals[i].valid)
+            {
+                return Err(mk_fault("diag.destroy-while-aliased", line));
+            }
+        }
+        // `[Handle-Destructor]` of each handle it holds, in order: a
+        // finished thread's result is discarded, a failed one's
+        // failure raised again (`[Join-Failed]`).
+        Vec<u32> hs = State::handles_in(s, o);
+        foreach (h in &hs)
+        {
+            Status st = clone(&State::thread(s, *h).status);
+            match (st)
+            {
+                Status::Taken     : {},
+                Status::Running   : return Ok(false),
+                Status::Failed(f) :
+                {
+                    State::th(s, *h).status = Status::Taken;
+                    return Err(f);
+                },
+                Status::Done(_)   :
+                {
+                    State::th(s, *h).status = Status::Taken;
+                    if (s.tracing)
+                    {
+                        State::tr(s, sprintf("hds %d %d", t, *h));
+                    }
+                },
+            }
+        }
+        // A closure that owns a resource: its captures' destructors
+        // (`spec/16` §1, the struct rules).
+        Option<Val> cv = clone(&State::obj(s, o).val);
+        match (&cv)
+        {
+            Some(Val::Clo { func, caps, mv, ws }) :
+            {
+                foreach (c in caps)
+                {
+                    match (c)
+                    {
+                        Val::Vec { buf, len, cap } :
+                        {
+                            State::release_elems(s, *buf, 0, 4294967295, t, line)?;
+                            _ = SMap::remove(&mut s.bufs, buf);
+                        },
+                        _                          : {},
+                    }
+                }
+            },
+            _                                     : {},
+        }
+        Option<Val> v2 = clone(&State::obj(s, o).val);
+        match (v2)
+        {
+            Some(Val::Vec { buf, len, cap }) :
+            {
+                if (s.tracing)
+                {
+                    State::tr(s, "out vec");
+                }
+                State::release_elems(s, buf, 0, 4294967295, t, line)?;
+                _ = SMap::remove(&mut s.bufs, &buf);
+            },
+            Some(Val::Guard(g))              :
+            {
+                if (s.tracing)
+                {
+                    State::tr(s, sprintf("gdp %d %d", t, o));
+                }
+                // `[Guard-Drop]`: unlock a mutex some thread holds; a
+                // poisoned one stays poisoned.
+                u32 mo = State::path(s, g).of;
+                match (SMap::find(&s.sync, &mo))
+                {
+                    Some(k) : match (s.sync.vals[k])
+                    {
+                        Sync::LockedBy(_) : s.sync.vals[k] = Sync::Unlocked,
+                        _                 : {},
+                    },
+                    None : {},
+                }
+                State::path_mut(s, g).valid = false;
+            },
+            _                                : {},
+        }
+    }
+    State::end_object(s, o, exempt);
+    Ok(true)
+}
+
+// A state the model never reaches: the run stops, saying which.
+fn bug(str what)
+{
+    assert(false, "%s", what);
+}

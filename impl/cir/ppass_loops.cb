@@ -1,0 +1,601 @@
+// Protocol CIR (step T4; see `ppass.cb`): the passes that rewrite loops and
+// blocks, on a body's nodes.
+
+import std;
+import proto;
+import passes;
+
+// D-0309: each loop `lower_while` marked (`VER_MARK`: the bound of its
+// variable, fixed for the loop, and the fixed vector lengths its tagged bounds
+// checks compare that variable with) as two: where the bound is at most every
+// length, a copy without the tagged checks (each would pass: the variable is
+// below the bound wherever the body reads it), its labels renamed; otherwise
+// the loop as it was. A nested loop, marked after the loop around it, is
+// copied first, its checks no longer tagged when the outer one is.
+//
+// D-0320: a loop marked `GRD_MARK` (its length guard) as two the same way,
+// under the guard, its copy the loop as it is: no check is left out of
+// either, so the guard decides nothing but which of two equal loops runs.
+export fn version_loops_nodes(ref<PBuf, shared> src) : PBuf
+{
+    if (!pbuf_has(src, VER_MARK) && !pbuf_has(src, GRD_MARK))
+    {
+        return pbuf_clone(src);
+    }
+    PBuf lines = pbuf_clone(src);
+    usize copies = 0;
+    while (true)
+    {
+        usize m = FL_NONE;
+        usize q = pbuf_count(&lines);
+        while (q > 0)
+        {
+            q -= 1;
+            StringView lt = StringView::trim_start(pbuf_view(&lines, q));
+            if (StringView::starts_with(lt, VER_MARK) || StringView::starts_with(lt, GRD_MARK))
+            {
+                m = q;
+                break;
+            }
+        }
+        if (m == FL_NONE)
+        {
+            break;
+        }
+        Option<String> grd = match (StringView::strip_prefix(StringView::trim(pbuf_view(&lines, m)), GRD_MARK))
+        {
+            Some(r) :
+            {
+                match (StringView::strip_suffix(r, "*/"))
+                {
+                    Some(r2) : Some(String::copy(r2)),
+                    None     : None,
+                }
+            },
+            None    : None,
+        };
+        String spec = String::new();
+        match (StringView::strip_prefix(StringView::trim(pbuf_view(&lines, m)), VER_MARK))
+        {
+            Some(r) :
+            {
+                match (StringView::strip_suffix(r, "*/"))
+                {
+                    Some(r2) : String::append(&mut spec, r2),
+                    None     : {},
+                }
+            },
+            None    : {},
+        }
+        Vec<StringView> parts = Vec::new();
+        foreach (p in StringView::split(&spec, " "))
+        {
+            if (StringView::len(p) > 0)
+            {
+                Vec::push(&mut parts, p);
+            }
+        }
+        usize count = pbuf_count(&lines);
+        usize start = m + 1;
+        // The loop: its `for` to the matching `}`.
+        usize end = FL_NONE;
+        if ((Option::is_some(&grd) || Vec::len(&parts) >= 2) && start < count
+            && StringView::trim(pbuf_view(&lines, start)) == "for (;;) {")
+        {
+            i64 depth = 0;
+            for (usize i = start; i < count; i += 1)
+            {
+                StringView t = StringView::trim(pbuf_view(&lines, i));
+                if (StringView::starts_with(t, "}"))
+                {
+                    depth -= 1;
+                }
+                if (StringView::ends_with(t, "{"))
+                {
+                    depth += 1;
+                }
+                if (depth == 0)
+                {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        if (end == FL_NONE)
+        {
+            pbuf_remove(&mut lines, m, m + 1);
+            continue;
+        }
+        StringView bound = "";
+        Vec<StringView> lens = Vec::new();
+        if (Option::is_none(&grd))
+        {
+            bound = parts[0];
+            for (usize i = 1; i < Vec::len(&parts); i += 1)
+            {
+                Vec::push(&mut lens, parts[i]);
+            }
+        }
+        // The copy without the tagged checks: the loop's lines that carry
+        // no tag of `lens`; its labels, and what each is renamed to.
+        Vec<usize> fast = Vec::new();
+        for (usize i = start; i <= end; i += 1)
+        {
+            if (Option::is_none(&ver_tag_end(StringView::trim_start(pbuf_view(&lines, i)), &lens)))
+            {
+                Vec::push(&mut fast, i);
+            }
+        }
+        Vec<String> labels = Vec::new();
+        Vec<String> renamed = Vec::new();
+        foreach (fi in &fast)
+        {
+            match (label_of(pbuf_view(&lines, *fi)))
+            {
+                Some(nm) :
+                {
+                    Vec::push(&mut labels, String::copy(nm));
+                    Vec::push(&mut renamed, sprintf("%v_v%v", nm, copies));
+                },
+                None     : {},
+            }
+        }
+        copies += 1;
+        usize ind = pbuf_ind(&lines, m);
+        // The guard's copy is the one meant to run: laid out as the likely
+        // branch.
+        String test = String::new();
+        match (&grd)
+        {
+            Some(gt) : String::appendf(&mut test, "__builtin_expect(%s, 1)", gt),
+            None     :
+            {
+                for (usize i = 0; i < Vec::len(&lens); i += 1)
+                {
+                    if (i > 0)
+                    {
+                        String::append(&mut test, " && ");
+                    }
+                    String::appendf(&mut test, "%s <= %s", bound, lens[i]);
+                }
+            },
+        }
+        PBuf next = pbuf_like(&lines);
+        for (usize i = 0; i < m; i += 1)
+        {
+            pbuf_copy(&mut next, &lines, i);
+        }
+        pbuf_push(&mut next, ind, &sprintf("if (%s) {", &test));
+        foreach (fi in &fast)
+        {
+            usize i = *fi;
+            // Each label renamed in turn, in the line as the renamings
+            // before it left it.
+            String text = String::new();
+            bool changed = false;
+            for (usize k = 0; k < Vec::len(&labels); k += 1)
+            {
+                if (changed)
+                {
+                    if (StringView::contains(&text, &labels[k]))
+                    {
+                        String r = replace_word(&text, &labels[k], &renamed[k]);
+                        text = r;
+                    }
+                }
+                else
+                {
+                    StringView tv = pbuf_view(&lines, i);
+                    if (StringView::contains(tv, &labels[k]))
+                    {
+                        text = replace_word(tv, &labels[k], &renamed[k]);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+            {
+                pbuf_push(&mut next, pbuf_ind(&lines, i), &text);
+            }
+            else
+            {
+                pbuf_copy(&mut next, &lines, i);
+            }
+        }
+        pbuf_push(&mut next, ind, "} else {");
+        for (usize i = start; i <= end; i += 1)
+        {
+            StringView t = StringView::trim_start(pbuf_view(&lines, i));
+            match (ver_tag_end(t, &lens))
+            {
+                Some(at) : pbuf_push(&mut next, pbuf_ind(&lines, i), &t[at..$]),
+                None     : pbuf_copy(&mut next, &lines, i),
+            }
+        }
+        pbuf_push(&mut next, ind, "}");
+        for (usize i = end + 1; i < count; i += 1)
+        {
+            pbuf_copy(&mut next, &lines, i);
+        }
+        lines = next;
+    }
+    // As `fold_zero_tokens_nodes`: of a body whose every line went, an
+    // empty line is left.
+    if (pbuf_count(&lines) == 0 && pbuf_count(src) > 0)
+    {
+        pbuf_push(&mut lines, 0, "");
+    }
+    lines
+}
+
+// D-0309: a loop whose one use of a vector is a confined push
+// (`native_vec_push`'s `_nc` form, `f_std__Vec__push_T_nc(V, x, F, L)`), the
+// same `V` each time, and which calls nothing else, can fault nowhere and
+// leaves only through its end or a `break` (no `return`, no `goto` out, no
+// label reached from outside), keeps the vector's header in locals: its
+// pointer, length and capacity, the length stored back before `grow` and
+// after the loop.
+export fn keep_push_headers_nodes(ref<PBuf, shared> src) : PBuf
+{
+    if (!pbuf_has(src, "f_std__Vec__push_") || !pbuf_has(src, "_nc("))
+    {
+        return pbuf_clone(src);
+    }
+    HashSet<String> pure = name_set(LOCATION_PURE);
+    PBuf lines = pbuf_clone(src);
+    usize kept = 0;
+    usize s = 0;
+    while (s < pbuf_count(&lines))
+    {
+        if (StringView::trim(pbuf_view(&lines, s)) != "for (;;) {")
+        {
+            s += 1;
+            continue;
+        }
+        usize count = pbuf_count(&lines);
+        // The loop: its `for` to the matching `}`.
+        usize e = FL_NONE;
+        i64 depth = 0;
+        for (usize i = s; i < count; i += 1)
+        {
+            StringView t = StringView::trim(pbuf_view(&lines, i));
+            if (StringView::starts_with(t, "}"))
+            {
+                depth -= 1;
+            }
+            if (StringView::ends_with(t, "{"))
+            {
+                depth += 1;
+            }
+            if (depth == 0)
+            {
+                e = i;
+                break;
+            }
+        }
+        if (e == FL_NONE)
+        {
+            break;
+        }
+        // The pushes: their lines and arguments (V, x, F, L).
+        String name = String::new();
+        String v = String::new();
+        bool have = false;
+        Vec<usize> push_at = Vec::new();
+        Vec<Vec<String>> push_args = Vec::new();
+        bool ok = true;
+        for (usize i = s + 1; i < e; i += 1)
+        {
+            StringView t = StringView::trim(pbuf_view(&lines, i));
+            if (StringView::starts_with(t, "f_std__Vec__push_"))
+            {
+                usize name_end = match (StringView::find(t, "("))
+                {
+                    Some(k) : k,
+                    None    : 0,
+                };
+                StringView nm = &t[0..name_end];
+                bool good = false;
+                match (split_call(t, name_end))
+                {
+                    Some(ca) :
+                    {
+                        if (StringView::ends_with(nm, "_nc") && Vec::len(&ca.args) == 4 && &t[ca.close + 1..$] == ";")
+                        {
+                            bool same = !have || ((name == nm) && (v == ca.args[0]));
+                            bool clean = !calls_impure(&ca.args[1], &pure) && !calls_impure(&ca.args[2], &pure)
+                                && !calls_impure(&ca.args[3], &pure);
+                            if (same && clean)
+                            {
+                                if (!have)
+                                {
+                                    name = String::copy(nm);
+                                    v = String::clone(&ca.args[0]);
+                                    have = true;
+                                }
+                                Vec<String> args = Vec::new();
+                                foreach (a in &ca.args)
+                                {
+                                    Vec::push(&mut args, String::clone(a));
+                                }
+                                Vec::push(&mut push_at, i);
+                                Vec::push(&mut push_args, args);
+                                good = true;
+                            }
+                        }
+                    },
+                    None     : {},
+                }
+                if (!good)
+                {
+                    ok = false;
+                    break;
+                }
+                continue;
+            }
+            if (calls_impure(t, &pure) || has_word(t, "return") || StringView::contains(t, VER_MARK)
+                || StringView::contains(t, VER_TAG))
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok || !have)
+        {
+            s += 1;
+            continue;
+        }
+        // `V`'s variables named nowhere else in the loop; every `goto` to a
+        // label of the loop, and every label of the loop reached from it.
+        Vec<String> vars = expr_vars(&v);
+        Vec<String> labels = Vec::new();
+        for (usize i = s; i <= e; i += 1)
+        {
+            match (label_of(pbuf_view(&lines, i)))
+            {
+                Some(nm) : Vec::push(&mut labels, String::copy(nm)),
+                None     : {},
+            }
+        }
+        for (usize i = 0; i < count; i += 1)
+        {
+            StringView t = StringView::trim(pbuf_view(&lines, i));
+            bool inside = s < i && i < e;
+            usize pk = FL_NONE;
+            for (usize q = 0; q < Vec::len(&push_at); q += 1)
+            {
+                if (push_at[q] == i)
+                {
+                    pk = q;
+                }
+            }
+            if (inside && pk == FL_NONE)
+            {
+                foreach (w in &vars)
+                {
+                    if (has_word(t, w))
+                    {
+                        ok = false;
+                    }
+                }
+            }
+            if (pk != FL_NONE)
+            {
+                for (usize a = 1; a < Vec::len(&push_args[pk]); a += 1)
+                {
+                    foreach (w in &vars)
+                    {
+                        if (has_word(&push_args[pk][a], w))
+                        {
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            match (StringView::find(t, "goto "))
+            {
+                Some(g) :
+                {
+                    StringView rest = &t[g + 5..$];
+                    match (StringView::find(rest, "goto "))
+                    {
+                        Some(g2) : rest = &rest[0..g2],
+                        None     : {},
+                    }
+                    while (StringView::ends_with(rest, ";"))
+                    {
+                        rest = &rest[0..StringView::len(rest) - 1];
+                    }
+                    StringView target = StringView::trim(rest);
+                    bool known = false;
+                    foreach (nm in &labels)
+                    {
+                        if (nm == target)
+                        {
+                            known = true;
+                        }
+                    }
+                    if (inside != known)
+                    {
+                        ok = false;
+                    }
+                },
+                None    : {},
+            }
+        }
+        if (!ok)
+        {
+            s += 1;
+            continue;
+        }
+        String ty = String::copy(&name[StringView::len("f_std__Vec__push_")..StringView::len(&name) - 3]);
+        usize ind = pbuf_ind(&lines, s);
+        usize k = kept;
+        kept += 1;
+        for (usize q = 0; q < Vec::len(&push_at); q += 1)
+        {
+            usize i = push_at[q];
+            usize pi = pbuf_ind(&lines, i);
+            String at = String::new();
+            if (push_args[q][2] != "CB_NOLOC")
+            {
+                String::appendf(&mut at, "cb_at(%s, %s); ", &push_args[q][2], &push_args[q][3]);
+            }
+            String line = sprintf("{ if (__builtin_expect(kh%v_n == kh%v_c, 0)) { kh%v_v->len = kh%v_n; ", k, k, k, k);
+            String::appendf(
+                &mut line,
+                "%sf_std__Vec__grow_%s(%s); kh%v_p = kh%v_v->ptr; kh%v_c = kh%v_v->cap; } ",
+                &at,
+                &ty,
+                &v,
+                k,
+                k,
+                k,
+                k,
+            );
+            String::appendf(&mut line, "kh%v_p[kh%v_n] = %s; kh%v_n += 1; }", k, k, &push_args[q][1], k);
+            pbuf_replace(&mut lines, i, pi, &line);
+        }
+        pbuf_insert(&mut lines, e + 1, ind, &sprintf("kh%v_v->len = kh%v_n; }", k, k));
+        String head = sprintf("{ struct s_std__Vec_%s *kh%v_v = (struct s_std__Vec_%s *)(%s).p; ", &ty, k, &ty, &v);
+        String::appendf(
+            &mut head,
+            "__typeof__(kh%v_v->ptr) kh%v_p = kh%v_v->ptr; uint64_t kh%v_n = kh%v_v->len; ",
+            k,
+            k,
+            k,
+            k,
+            k,
+        );
+        String::appendf(&mut head, "uint64_t kh%v_c = kh%v_v->cap;", k, k);
+        pbuf_insert(&mut lines, s, ind, &head);
+        s = e + 3;
+    }
+    // As `fold_zero_tokens_nodes`: an empty text with a line end is one
+    // empty line.
+    if (pbuf_count(&lines) == 0 && pbuf_count(src) > 0)
+    {
+        pbuf_push(&mut lines, 0, "");
+    }
+    lines
+}
+
+// Bug 020: a bare block (a line `{` where a statement may begin, to its `}`)
+// loses its braces, and its statements are indented one level less. A branch of an
+// `if`, a block, a loop's body, a `foreach`'s desugaring each lowers to a
+// block of its own inside its `if`, loop or enclosing block: with those kept
+// the C nested two to four braces for each level of the source, and Clang's
+// limit of 256 was met at about 128 nested `if`s. C gives a block no meaning
+// but the reach of the names declared in it, and a body's C declares each
+// name once (the copies of a loop `version_loops_nodes` makes are the two branches
+// of an `if`): the block's names then reach to the end of the enclosing
+// scope, where nothing else names them. Kept: a block right after a label
+// (whose statement it is) or any line that does not end a statement, and one
+// whose nearest kept enclosing scope is a statement expression `({`, whose
+// value is its last statement. Lines open and close as the other passes read
+// them: a line ending in `{` opens, one starting with `}` closes.
+export fn merge_sole_scopes_nodes(ref<PBuf, shared> src) : PBuf
+{
+    Vec<StringView> lines = pbuf_views(src);
+    usize n = Vec::len(&lines);
+    Vec<usize> close = Vec::filled(n, n);
+    Vec<usize> stack = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        StringView t = StringView::trim(lines[i]);
+        if (StringView::starts_with(t, "}"))
+        {
+            match (Vec::pop(&mut stack))
+            {
+                Some(o) : close[o] = i,
+                None    : return pbuf_clone(src),
+            }
+        }
+        if (StringView::ends_with(t, "{"))
+        {
+            Vec::push(&mut stack, i);
+        }
+    }
+    if (Vec::len(&stack) != 0)
+    {
+        return pbuf_clone(src);
+    }
+    Vec<bool> drop = Vec::filled(n, false);
+    // The levels of indentation the lines from `i` on lose (`loss`) and
+    // regain (`gain`).
+    Vec<usize> gain = Vec::filled(n + 1, 0);
+    Vec<usize> loss = Vec::filled(n + 1, 0);
+    bool any = false;
+    // The open scopes, each with whether it is dropped.
+    Vec<usize> open = Vec::new();
+    // The last line that is not a directive or a comment.
+    Option<usize> last = None;
+    for (usize i = 0; i < n; i += 1)
+    {
+        StringView t = StringView::trim(lines[i]);
+        if (StringView::starts_with(t, "}"))
+        {
+            Vec::pop(&mut open);
+        }
+        if (t == "{" && close[i] < n && StringView::trim(lines[close[i]]) == "}")
+        {
+            bool after_statement = match (last)
+            {
+                Some(p) :
+                {
+                    StringView pt = StringView::trim(lines[p]);
+                    StringView::ends_with(pt, ";") || StringView::ends_with(pt, "{") || StringView::ends_with(pt, "}")
+                },
+                None    : true,
+            };
+            bool in_expression = false;
+            for (usize k = Vec::len(&open); k > 0; k -= 1)
+            {
+                usize o = open[k - 1];
+                if (!drop[o])
+                {
+                    in_expression = StringView::ends_with(StringView::trim(lines[o]), "({");
+                    break;
+                }
+            }
+            if (after_statement && !in_expression)
+            {
+                drop[i] = true;
+                drop[close[i]] = true;
+                loss[i + 1] += 1;
+                gain[close[i]] += 1;
+                any = true;
+            }
+        }
+        if (StringView::ends_with(t, "{"))
+        {
+            Vec::push(&mut open, i);
+        }
+        // (A directive or a line mark, `LINE_MARK`, is no statement.)
+        if (!StringView::starts_with(t, "#") && !(StringView::starts_with(t, "/*") && StringView::ends_with(t, "*/")))
+        {
+            last = Some(i);
+        }
+    }
+    if (!any)
+    {
+        return pbuf_clone(src);
+    }
+    PBuf res = pbuf_like(src);
+    usize level = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        level = level + loss[i] - gain[i];
+        if (drop[i])
+        {
+            continue;
+        }
+        // Up to four spaces of its indentation go for each level lost.
+        usize ind = pbuf_ind(src, i);
+        usize cut = if (4 * level < ind) { 4 * level } else { ind };
+        usize at = pbuf_count(&res);
+        pbuf_copy(&mut res, src, i);
+        pbuf_set_ind(&mut res, at, ind - cut);
+    }
+    res
+}

@@ -1,0 +1,75 @@
+// CONFORMANCE-CASE
+// spec: 20-trust-boundaries
+// facility: rule.trust.extern-call [Extern-Entry] (D-0257); conf.extern-entry-from-foreign-thread
+// kind: positive
+// expect: ok
+// cobc-only: links the program's own C code, which starts threads
+// expect-stdout-hex: 6d61696e20343030363839300a666f75722074727565203130383839300a7468726565207472756520737061776e656420747275650a
+//
+// In a program with a `main`, C threads the program did not start call an
+// entry point: the program's own C starts four, then three more, each
+// calling `tally` 2,000 times (each call allocates), while `main` goes on
+// allocating, and a thread the program spawns calls `tally` too. Every
+// call gives the same sums as on the main thread.
+
+import std;
+
+extern "./extern_code/entry_threads.c";
+
+unsafe extern fn start_threads(u32 n);
+
+unsafe extern fn join_threads() : u64;
+
+extern fn tally(u64 k) : u64
+{
+    Vec<u64> v = Vec::new();
+    Vec::push(&mut v, k);
+    Vec::push(&mut v, k + 1);
+    String s = sprintf("%v", k);
+    v[0] + v[1] + widen<u64>(StringView::len(&s))
+}
+
+fn calls() : u64
+{
+    u64 s = 0;
+    foreach (k in 0..2000)
+    {
+        s += tally(widen<u64>(k));
+    }
+    s
+}
+
+fn busy() : usize
+{
+    Vec<String> words = Vec::new();
+    foreach (i in 0..20000)
+    {
+        Vec::push(&mut words, sprintf("w%v", i));
+    }
+    usize n = 0;
+    foreach (w in &words)
+    {
+        n += StringView::len(w);
+    }
+    n
+}
+
+fn main()
+{
+    u64 one = calls();
+    printf("main %v\n", one);
+    unsafe
+    {
+        start_threads(4);
+    }
+    usize b = busy();
+    u64 four = unsafe { join_threads() };
+    printf("four %v %v\n", four == 4 * one, b);
+    unsafe
+    {
+        start_threads(3);
+    }
+    handle<u64> h = spawn(calls);
+    u64 three = unsafe { join_threads() };
+    printf("three %v spawned %v\n", three == 3 * one, join(h) == one);
+}

@@ -1,0 +1,186 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.http [Http-Request] [Http-Respond] (D-0174); conf.http-server-hostile-framing
+// kind: positive
+// expect: ok
+//
+// What `HttpServer` refuses and what `respond` will not write, each from
+// a raw client on loopback: a method with control bytes, a `Host` that is
+// not a host, an HTTP/1.0 request with `Transfer-Encoding`, chunked framing
+// with a bare LF, a CR or NUL in an extension, a size with a leading space,
+// a trailer that is not a field, and trailers past the head's limit (all
+// BadMessage or TooLarge, the connection closed); `close` in a
+// `Connection` list; no `100 Continue` to HTTP/1.0 nor for a declared
+// length over `max_body`; a header value with CR LF, a status outside 100
+// to 599 refused by `respond`, and a handler's `Transfer-Encoding` dropped.
+
+import std;
+
+const usize PROBES = 16;
+
+fn line_of(ref<String, exclusive> log, StringView s)
+{
+    String::append(log, "  ");
+    String::append(log, s);
+    String::append(log, "\n");
+}
+
+// The handler's answers: /inject and /status try what `respond` refuses
+// first, /te passes a Transfer-Encoding header, every request ends with a
+// plain 200.
+fn answer(ref<HttpConnection, exclusive> c, ref<Request, shared> r, ref<String, exclusive> log)
+{
+    Vec<Header> none = Vec::new();
+    Vec<u8> empty = Vec::new();
+    if (r.url == "/inject")
+    {
+        Vec<Header> h = Vec::new();
+        Vec::push(&mut h, Header::new("Location", "/home\r\nSet-Cookie: session=evil"));
+        match (HttpConnection::respond(c, 302, &h, &empty))
+        {
+            Ok(_)  : line_of(log, "respond with CR LF in a value: written"),
+            Err(e) : line_of(log, &sprintf("respond with CR LF in a value: %s", HttpError::text(&e))),
+        }
+    }
+    if (r.url == "/status")
+    {
+        foreach (st in [1000: u16, 42: u16])
+        {
+            match (HttpConnection::respond(c, st, &none, &empty))
+            {
+                Ok(_)  : line_of(log, &sprintf("respond(%v): written", st)),
+                Err(e) : line_of(log, &sprintf("respond(%v): %s", st, HttpError::text(&e))),
+            }
+        }
+    }
+    Vec<Header> h = Vec::new();
+    if (r.url == "/te")
+    {
+        Vec::push(&mut h, Header::new("Transfer-Encoding", "chunked"));
+    }
+    _ = HttpConnection::respond(c, 200, &h, b"ok");
+}
+
+fn serve(HttpServer s) : String
+{
+    String log = String::new();
+    for (usize k = 0; k < PROBES; k += 1)
+    {
+        HttpConnection c = Result::unwrap(HttpServer::accept(&mut s));
+        String::append(&mut log, &sprintf("connection %v\n", k + 1));
+        while (true)
+        {
+            match (HttpConnection::request(&mut c))
+            {
+                Ok(Some(r)) :
+                {
+                    String host = String::copy(Option::unwrap_or(Request::header(&r, "host"), StringView::of("-")));
+                    line_of(&mut log, &sprintf("request %s %s body=%v host=[%s]", &r.method, &r.url, Vec::len(&r.body), &host));
+                    answer(&mut c, &r, &mut log);
+                },
+                Ok(None)    :
+                {
+                    line_of(&mut log, "no more requests");
+                    break;
+                },
+                Err(e)      :
+                {
+                    line_of(&mut log, &sprintf("refused: %s", HttpError::text(&e)));
+                    Vec<Header> none = Vec::new();
+                    Vec<u8> empty = Vec::new();
+                    u16 st = match (e)
+                    {
+                        TooLarge : 413,
+                        _        : 400,
+                    };
+                    _ = HttpConnection::respond(&mut c, st, &none, &empty);
+                    break;
+                },
+            }
+        }
+        HttpConnection::close(&mut c);
+    }
+    log
+}
+
+// Sends `bytes` on a connection of its own, ends its side, and prints the
+// lines that came back, CRs dropped.
+fn probe(SocketAddr a, str name, slice<u8, shared> bytes)
+{
+    printf("%s:\n", name);
+    TcpStream t = Result::unwrap(TcpStream::connect(a));
+    TcpStream::set_read_timeout_ms(&mut t, 20000);
+    _ = TcpStream::write(&mut t, bytes);
+    _ = TcpStream::shutdown_write(&mut t);
+    Vec<u8> got = Vec::new();
+    while (true)
+    {
+        match (TcpStream::read(&mut t, &mut got, 65536))
+        {
+            Ok(n)  : if (n == 0) { break; },
+            Err(_) : break,
+        }
+    }
+    String text = Result::unwrap_or(String::from_utf8(got), String::new());
+    foreach (l in StringView::split(&text, "\n"))
+    {
+        StringView v = StringView::trim(l);
+        // The `Date` the server sends (CHG-0484) is the time now: its
+        // presence is printed, not its value.
+        if (StringView::starts_with(v, "Date: "))
+        {
+            printf("  Date: (present)\n");
+        }
+        else if (StringView::len(v) > 0)
+        {
+            printf("  %s\n", v);
+        }
+    }
+}
+
+fn big_trailers() : Vec<u8>
+{
+    Vec<u8> v = Vec::new();
+    Vec::extend_from(&mut v, b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n");
+    for (usize i = 0; i < 800; i += 1)
+    {
+        Vec::extend_from(&mut v, b"X-Trailer: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    Vec::extend_from(&mut v, b"\r\n");
+    v
+}
+
+fn main() : u8
+{
+    HttpServer s = Result::unwrap(HttpServer::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    s.max_body = 1000;
+    s.timeout_ms = 20000;
+    SocketAddr a = HttpServer::local_addr(&s);
+    auto h = spawn(serve, s);
+    probe(a, "a method with control bytes", b"G\rE\x01T /a HTTP/1.1\r\nHost: h\r\n\r\n");
+    probe(a, "a Host that is not a host", b"GET /a HTTP/1.1\r\nHost: evil.com/x?y@z w\r\n\r\n");
+    probe(a, "a Host with an IPv6 address and a port", b"GET /a HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n");
+    probe(
+        a,
+        "HTTP/1.0 with Transfer-Encoding",
+        b"POST /a HTTP/1.0\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /smuggled HTTP/1.0\r\n\r\n",
+    );
+    probe(a, "a chunk ended by bare LF", b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\n0\n\n");
+    probe(a, "a CR and a NUL in a chunk extension", b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n2;a\rX\x00\r\nab\r\n0\r\n\r\n");
+    probe(a, "a chunk size after a space", b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n 3\r\nabc\r\n0\r\n\r\n");
+    probe(a, "a trailer without a colon", b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\x01junk no colon\r\n\r\n");
+    probe(a, "trailers past the head's limit", &big_trailers());
+    probe(
+        a,
+        "a chunk extension and a trailer",
+        b"POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3;name=\"v\"\r\nabc\r\n0\r\nX-T: 1\r\n\r\n",
+    );
+    probe(a, "close in a Connection list", b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\nGET /second HTTP/1.1\r\nHost: h\r\n\r\n");
+    probe(a, "100-continue from HTTP/1.0", b"POST /a HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc");
+    probe(a, "100-continue past max_body", b"POST /a HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 5000\r\n\r\n");
+    probe(a, "a header value with CR LF", b"GET /inject HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    probe(a, "a handler's Transfer-Encoding", b"GET /te HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    probe(a, "statuses outside 100 to 599", b"GET /status HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    printf("the server saw:\n%s", &join(h));
+    0
+}

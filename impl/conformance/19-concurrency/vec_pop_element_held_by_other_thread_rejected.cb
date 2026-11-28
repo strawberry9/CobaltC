@@ -1,0 +1,46 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: conf.vec-pop-element-held-by-other-thread; spec/20 [Release] (D-0214, CHG-0252), spec/19 [Thread-Lend]
+// kind: negative
+// expect: diag.aliasing-conflict (dynamic)
+//
+// A thread is lent an exclusive reference to a vector's last element (in a
+// struct, which the analysis does not follow) and writes through it; the
+// vector's owner then pops that element. The element is an object of its
+// own over the vector's buffer, so the exclusive borrow `pop` takes of the
+// vector does not clash with the thread's path to it; `pop` reads the
+// element out and releases its cells. Releasing an object another running
+// thread holds an exclusive path to is diag.aliasing-conflict, in the
+// popping thread, before anything is read: the thread is still holding it
+// (it waits for `go`, then writes again).
+
+import std;
+
+struct Slot
+{
+    ref<i32, exclusive> at;
+}
+
+fn work(Slot s, ref<Channel<i32>, shared> go, ref<Channel<i32>, shared> ready)
+{
+    *s.at = *s.at + 10;
+    _ = Channel::send(ready, 1);
+    _ = Channel::recv(go);
+    *s.at = *s.at + 10;
+}
+
+fn main()
+{
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 2);
+    Vec::push(&mut v, 3);
+    Channel<i32> go = Channel::new(1);
+    Channel<i32> ready = Channel::new(1);
+    auto h = spawn(work, Slot { .at = &mut v[2] }, &go, &ready);
+    _ = Channel::recv(&ready);
+    auto last = Vec::pop(&mut v);
+    _ = Channel::send(&go, 1);
+    join(h);
+    printf("%v\n", Option::unwrap(last));
+}

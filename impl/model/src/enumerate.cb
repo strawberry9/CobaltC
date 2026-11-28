@@ -1,0 +1,1486 @@
+// The fragment's programs, enumerated: every sequence of up to N
+// statements drawn from a fixed alphabet of statement templates over a
+// fixed name space, each well-scoped (a name is used only after the
+// statement that declares it). `x` and `y` are declared first and printed
+// last, so a lost or misplaced write shows in the output.
+//
+//   cobmodel enum --size N --out DIR [--max K] [--random M --len L --seed S]
+//
+// Writes DIR/pNNNNNN.cb, each with its model outcome set in a header
+// comment (`// MODEL: …`), and DIR/index.tsv. Every program is run through
+// the model; when there are more than K, the K written are every program
+// with more than one outcome or a dynamic fault, then an even sample of
+// the rest. `--random M --len L` adds M random programs of L statements.
+
+import std;
+import ast;
+import maps;
+import explore;
+import parse;
+import print;
+
+struct Env
+{
+    SMap<String, Ty> names;
+}
+
+fn Env::has(ref<Env, shared> e, StringView n) : bool
+{
+    SMap::contains(&e.names, &String::copy(n))
+}
+
+fn Env::get(ref<Env, shared> e, StringView n) : Option<Ty>
+{
+    match (SMap::find(&e.names, &String::copy(n)))
+    {
+        Some(i) : Some(clone(&e.names.vals[i])),
+        None    : None,
+    }
+}
+
+fn Env::is(ref<Env, shared> e, StringView n, ref<Ty, shared> t) : bool
+{
+    opt_ty_is(&Env::get(e, n), t)
+}
+
+fn Env::excl_refs(ref<Env, shared> e) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    Ty r = Ty::refi(Mode::Excl);
+    for (usize i = 0; i < Vec::len(&e.names.keys); i += 1)
+    {
+        if (ty_eq(&e.names.vals[i], &r))
+        {
+            Vec::push(&mut v, clone(&e.names.keys[i]));
+        }
+    }
+    v
+}
+
+fn Env::any_refs(ref<Env, shared> e) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.names.keys); i += 1)
+    {
+        match (&e.names.vals[i])
+        {
+            Ty::Ref { t, m } :
+            {
+                if (ty_eq(Box::get(t), &Ty::I32))
+                {
+                    Vec::push(&mut v, clone(&e.names.keys[i]));
+                }
+            },
+            _                : {},
+        }
+    }
+    v
+}
+
+struct NamedTy
+{
+    String n;
+    Ty t;
+}
+
+// Closure bindings: `cl…` without `move`, `mk…` with; (name, result type).
+fn Env::closures(ref<Env, shared> e, StringView prefix) : Vec<NamedTy>
+{
+    Vec<NamedTy> v = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.names.keys); i += 1)
+    {
+        match (&e.names.vals[i])
+        {
+            Ty::Fn(r) :
+            {
+                if (StringView::starts_with(&e.names.keys[i], prefix))
+                {
+                    Vec::push(&mut v, NamedTy { .n = clone(&e.names.keys[i]), .t = clone(Box::get(r)) });
+                }
+            },
+            _         : {},
+        }
+    }
+    v
+}
+
+struct NamedMode
+{
+    String n;
+    Mode m;
+}
+
+fn Env::slices(ref<Env, shared> e) : Vec<NamedMode>
+{
+    Vec<NamedMode> v = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.names.keys); i += 1)
+    {
+        match (&e.names.vals[i])
+        {
+            Ty::Slice(m) : Vec::push(&mut v, NamedMode { .n = clone(&e.names.keys[i]), .m = *m }),
+            _            : {},
+        }
+    }
+    v
+}
+
+fn Env::void_handles(ref<Env, shared> e) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    Ty h = Ty::handle_of(Ty::Unit);
+    for (usize i = 0; i < Vec::len(&e.names.keys); i += 1)
+    {
+        if (ty_eq(&e.names.vals[i], &h))
+        {
+            Vec::push(&mut v, clone(&e.names.keys[i]));
+        }
+    }
+    v
+}
+
+fn var(StringView n) : Expr
+{
+    ex_var(n)
+}
+
+fn int(i64 k) : Expr
+{
+    ex_int(k)
+}
+
+fn de(Expr e) : Expr
+{
+    mk(ExprK::Deref(Box::new(e)))
+}
+
+fn bor(Mode m, Expr e) : Expr
+{
+    mk(ExprK::Borrow { .m = m, .e = Box::new(e) })
+}
+
+fn add1(Expr e) : Expr
+{
+    mk(ExprK::Add { .a = Box::new(e), .b = Box::new(int(1)) })
+}
+
+fn call(StringView f, Vec<Expr> xs) : Expr
+{
+    mk(ExprK::Call { .f = String::copy(f), .xs = xs })
+}
+
+fn spawn_f(StringView f, Vec<Expr> xs) : Expr
+{
+    mk(ExprK::Spawn { .f = String::copy(f), .xs = xs })
+}
+
+fn idx(StringView v, i64 k) : Expr
+{
+    mk(ExprK::Index { .v = String::copy(v), .k = k })
+}
+
+fn field(Expr e) : Expr
+{
+    mk(ExprK::Field(Box::new(e)))
+}
+
+fn gt(Expr a, Expr b) : Expr
+{
+    mk(ExprK::Gt { .a = Box::new(a), .b = Box::new(b) })
+}
+
+fn st(StmtK kind) : Stmt
+{
+    Stmt { .id = 0, .k = kind, .line = 0 }
+}
+
+fn let_(StringView n, Option<Ty> ty, Expr e) : Stmt
+{
+    st(StmtK::Let { .name = String::copy(n), .ty = ty, .init = e })
+}
+
+fn assign(Expr p, Expr v) : Stmt
+{
+    st(StmtK::Assign { .place = p, .value = v })
+}
+
+fn ex(Expr e) : Stmt
+{
+    st(StmtK::Expr(e))
+}
+
+fn pr(Expr e) : Stmt
+{
+    st(StmtK::Print(e))
+}
+
+fn discard(Expr e) : Stmt
+{
+    st(StmtK::Discard(e))
+}
+
+fn block_of(Vec<Stmt> xs) : Block
+{
+    Block { .stmts = xs, .tail = None, .tail_line = 0, .end_line = 0 }
+}
+
+fn blk(Vec<Stmt> xs) : Stmt
+{
+    st(StmtK::Block(block_of(xs)))
+}
+
+fn clo(bool mv, Vec<String> caps, Ty ret, Vec<Stmt> stmts, Option<Expr> tail) : Expr
+{
+    Block body = Block { .stmts = stmts, .tail = tail, .tail_line = 0, .end_line = 0 };
+    mk(ExprK::Closure(Box::new(Clo { .id = 0, .mv = mv, .caps = caps, .ret = ret, .body = body })))
+}
+
+fn callv(Expr e) : Expr
+{
+    mk(ExprK::CallVal(Box::new(e)))
+}
+
+fn spawn_clo(Expr e) : Expr
+{
+    mk(ExprK::SpawnClo(Box::new(e)))
+}
+
+fn slice_of(Mode m, StringView v, i64 lo, i64 hi) : Expr
+{
+    mk(ExprK::Slice { .m = m, .v = String::copy(v), .lo = lo, .hi = hi })
+}
+
+fn one(Expr a) : Vec<Expr>
+{
+    Vec<Expr> v = Vec::new();
+    Vec::push(&mut v, a);
+    v
+}
+
+fn two(Expr a, Expr b) : Vec<Expr>
+{
+    Vec<Expr> v = Vec::new();
+    Vec::push(&mut v, a);
+    Vec::push(&mut v, b);
+    v
+}
+
+fn none_e() : Vec<Expr>
+{
+    Vec::new()
+}
+
+fn s1(Stmt a) : Vec<Stmt>
+{
+    Vec<Stmt> v = Vec::new();
+    Vec::push(&mut v, a);
+    v
+}
+
+fn s2(Stmt a, Stmt b) : Vec<Stmt>
+{
+    Vec<Stmt> v = Vec::new();
+    Vec::push(&mut v, a);
+    Vec::push(&mut v, b);
+    v
+}
+
+fn caps1(StringView a) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, String::copy(a));
+    v
+}
+
+// A name a statement declares (or consumes, with the type `void`).
+struct Decl
+{
+    String n;
+    Ty t;
+}
+
+// A name the statement consumes: kept declared (it may not be declared
+// again in the block), no longer offered for a use.
+fn gone(StringView n) : Decl
+{
+    Decl { .n = String::copy(n), .t = Ty::Unit }
+}
+
+fn decl(StringView n, Ty t) : Decl
+{
+    Decl { .n = String::copy(n), .t = t }
+}
+
+struct Choice
+{
+    Stmt s;
+    Vec<Decl> decls;
+}
+
+fn d0() : Vec<Decl>
+{
+    Vec::new()
+}
+
+fn d1(Decl a) : Vec<Decl>
+{
+    Vec<Decl> v = Vec::new();
+    Vec::push(&mut v, a);
+    v
+}
+
+fn d2(Decl a, Decl b) : Vec<Decl>
+{
+    Vec<Decl> v = Vec::new();
+    Vec::push(&mut v, a);
+    Vec::push(&mut v, b);
+    v
+}
+
+fn push(ref<Vec<Choice>, exclusive> out, Stmt s, Vec<Decl> decls)
+{
+    Vec::push(out, Choice { .s = s, .decls = decls });
+}
+
+fn fresh(ref<Env, shared> env, StringView base) : Option<String>
+{
+    for (i64 i = 1; i <= 2; i += 1)
+    {
+        String n = sprintf("%s%d", base, i);
+        if (!Env::has(env, &n))
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn ints() : array<str, 2>
+{
+    ["x", "y"]
+}
+
+fn s_atomic() : Expr
+{
+    bor(Mode::Shared, var("S1"))
+}
+
+fn a_atomic() : Expr
+{
+    bor(Mode::Shared, var("at1"))
+}
+
+// `while (2 > i) { body; i = i + 1; }` after `i32 i = 0;`, in a block.
+fn lp(Vec<Stmt> body) : Stmt
+{
+    Vec<Stmt> stmts = body;
+    Vec::push(&mut stmts, assign(var("i"), add1(var("i"))));
+    Stmt w = st(StmtK::While { .cond = gt(int(2), var("i")), .body = block_of(stmts) });
+    blk(s2(let_("i", Some(Ty::I32), int(0)), w))
+}
+
+// `while (2 > i) { i = i + 1; A; if (i > 1) { B; break; } C; }` and its
+// `continue`.
+fn lpj(Vec<Stmt> pre, Vec<Stmt> inner, Vec<Stmt> post, bool brk) : Stmt
+{
+    Vec<Stmt> b = inner;
+    if (brk)
+    {
+        Vec::push(&mut b, st(StmtK::Break));
+    }
+    else
+    {
+        Vec::push(&mut b, st(StmtK::Continue));
+    }
+    Vec<Stmt> stmts = s1(assign(var("i"), add1(var("i"))));
+    Vec::append(&mut stmts, pre);
+    Vec::push(&mut stmts, st(StmtK::If { .cond = gt(var("i"), int(1)), .thn = block_of(b), .els = None }));
+    Vec::append(&mut stmts, post);
+    Stmt w = st(StmtK::While { .cond = gt(int(2), var("i")), .body = block_of(stmts) });
+    blk(s2(let_("i", Some(Ty::I32), int(0)), w))
+}
+
+fn bump_x() : Stmt
+{
+    ex(call("bump", one(bor(Mode::Excl, var("x")))))
+}
+
+fn incr_deref(StringView r) : Stmt
+{
+    assign(de(var(r)), add1(de(var(r))))
+}
+
+// Every statement the alphabet offers in `env`, with the names it declares.
+fn alphabet(ref<Env, shared> env) : Vec<Choice>
+{
+    Vec<Choice> out = Vec::new();
+    Vec<String> excl = Env::excl_refs(env);
+    Vec<String> refs = Env::any_refs(env);
+    Ty hu = Ty::handle_of(Ty::Unit);
+    Ty fu = Ty::Fn(Box::new(Ty::Unit));
+    Ty fi = Ty::Fn(Box::new(Ty::I32));
+    // Declarations.
+    match (fresh(env, "r"))
+    {
+        Some(r) :
+        {
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&r, None, bor(Mode::Excl, var(x))), d1(decl(&r, Ty::refi(Mode::Excl))));
+            }
+            foreach (q in &excl)
+            {
+                push(&mut out, let_(&r, None, bor(Mode::Excl, de(var(q)))), d1(decl(&r, Ty::refi(Mode::Excl))));
+            }
+            if (Env::has(env, "v1"))
+            {
+                push(&mut out, let_(&r, None, bor(Mode::Excl, idx("v1", 0))), d1(decl(&r, Ty::refi(Mode::Excl))));
+            }
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&r, None, call("pass", one(bor(Mode::Excl, var(x))))), d1(decl(&r, Ty::refi(Mode::Excl))));
+            }
+        },
+        None    : {},
+    }
+    match (fresh(env, "s"))
+    {
+        Some(s) :
+        {
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&s, None, bor(Mode::Shared, var(x))), d1(decl(&s, Ty::refi(Mode::Shared))));
+            }
+            foreach (q in &excl)
+            {
+                push(&mut out, let_(&s, None, bor(Mode::Shared, de(var(q)))), d1(decl(&s, Ty::refi(Mode::Shared))));
+            }
+            if (Env::has(env, "v1"))
+            {
+                push(&mut out, let_(&s, None, bor(Mode::Shared, idx("v1", 0))), d1(decl(&s, Ty::refi(Mode::Shared))));
+            }
+            if (Env::has(env, "q1"))
+            {
+                push(&mut out, let_(&s, None, field(var("q1"))), d1(decl(&s, Ty::refi(Mode::Shared))));
+            }
+        },
+        None    : {},
+    }
+    if (!Env::has(env, "h1"))
+    {
+        push(&mut out, let_("h1", Some(Ty::Hold), mk(ExprK::HoldLit(Box::new(bor(Mode::Excl, var("x")))))), d1(decl("h1", Ty::Hold)));
+        foreach (q in &excl)
+        {
+            push(&mut out, let_("h1", Some(Ty::Hold), mk(ExprK::HoldLit(Box::new(var(q))))), d1(decl("h1", Ty::Hold)));
+        }
+    }
+    else if (!Env::has(env, "q1"))
+    {
+        push(&mut out, let_("q1", None, bor(Mode::Shared, var("h1"))), d1(decl("q1", Ty::ref_of(Ty::Hold, Mode::Shared))));
+    }
+    if (!Env::has(env, "v1"))
+    {
+        push(&mut out, let_("v1", Some(Ty::Vec), call("Vec::new", none_e())), d1(decl("v1", Ty::Vec)));
+    }
+    match (fresh(env, "t"))
+    {
+        Some(t) :
+        {
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&t, None, spawn_f("bump", one(bor(Mode::Excl, var(x))))), d1(decl(&t, clone(&hu))));
+            }
+            foreach (q in &excl)
+            {
+                push(&mut out, let_(&t, None, spawn_f("bump", one(var(q)))), d1(decl(&t, clone(&hu))));
+            }
+            if (Env::has(env, "h1"))
+            {
+                push(&mut out, let_(&t, None, spawn_f("bump_hold", one(var("h1")))), d1(decl(&t, clone(&hu))));
+            }
+            Ty hi = Ty::handle_of(Ty::I32);
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&t, None, spawn_f("peek", one(bor(Mode::Shared, var(x))))), d1(decl(&t, clone(&hi))));
+            }
+        },
+        None    : {},
+    }
+    // Mutexes (`spec/19` §2).
+    if (!Env::has(env, "m1"))
+    {
+        push(&mut out, let_("m1", Some(Ty::Mutex), call("Mutex::new", one(int(0)))), d1(decl("m1", Ty::Mutex)));
+    }
+    else
+    {
+        if (!Env::has(env, "g1"))
+        {
+            push(&mut out, let_("g1", None, call("lock", one(bor(Mode::Shared, var("m1"))))), d1(decl("g1", Ty::Guard)));
+        }
+        push(&mut out, blk(s2(let_("g9", None, call("lock", one(bor(Mode::Shared, var("m1"))))), incr_deref("g9"))), d0());
+        push(&mut out, pr(call("read_locked", one(bor(Mode::Shared, var("m1"))))), d0());
+        match (fresh(env, "t"))
+        {
+            Some(t) :
+            {
+                push(&mut out, let_(&t, None, spawn_f("add_locked", one(bor(Mode::Shared, var("m1"))))), d1(decl(&t, clone(&hu))));
+                if (Env::has(env, "h1"))
+                {
+                    push(&mut out, let_(&t, None, spawn_f("lock_add_hold", two(bor(Mode::Shared, var("m1")), bor(Mode::Shared, var("h1"))))), d1(decl(&t, clone(&hu))));
+                }
+            },
+            None    : {},
+        }
+    }
+    if (Env::has(env, "g1"))
+    {
+        push(&mut out, incr_deref("g1"), d0());
+        push(&mut out, pr(de(var("g1"))), d0());
+    }
+    if (Env::has(env, "h1"))
+    {
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_f("read_hold", one(bor(Mode::Shared, var("h1"))))), d1(decl(&t, Ty::handle_of(Ty::I32)))),
+            None    : {},
+        }
+    }
+    // Atomics (`spec/19` §2a, D-0249, D-0253): operations through a shared
+    // reference, a wait that a notification must end, and the accesses that
+    // conflict with a shared one.
+    Ty aty = Ty::ref_of(Ty::Atomic, Mode::Shared);
+    if (!Env::has(env, "at1"))
+    {
+        push(&mut out, let_("at1", Some(Ty::Atomic), call("Atomic::new", one(int(0)))), d1(decl("at1", Ty::Atomic)));
+    }
+    else if (Env::is(env, "at1", &Ty::Atomic))
+    {
+        push(&mut out, discard(call("Atomic::fetch_add", two(a_atomic(), int(1)))), d0());
+        push(&mut out, ex(call("Atomic::store", two(a_atomic(), int(1)))), d0());
+        push(&mut out, blk(s2(ex(call("Atomic::store", two(a_atomic(), int(1)))), ex(call("Atomic::notify_all", one(a_atomic()))))), d0());
+        push(&mut out, ex(call("Atomic::wait", two(a_atomic(), int(0)))), d0());
+        push(&mut out, pr(call("Atomic::load", one(a_atomic()))), d0());
+        if (!Env::has(env, "ar1"))
+        {
+            push(&mut out, let_("ar1", None, a_atomic()), d1(decl("ar1", clone(&aty))));
+        }
+        if (!Env::has(env, "ax1"))
+        {
+            push(&mut out, let_("ax1", None, bor(Mode::Excl, var("at1"))), d1(decl("ax1", Ty::ref_of(Ty::Atomic, Mode::Excl))));
+        }
+        if (!Env::has(env, "at2"))
+        {
+            push(&mut out, let_("at2", None, var("at1")), d2(decl("at2", Ty::Atomic), gone("at1")));
+        }
+    }
+    if (Env::is(env, "ar1", &aty))
+    {
+        Vec<Vec<Stmt>> bodies = Vec::new();
+        Vec::push(&mut bodies, s1(discard(call("Atomic::fetch_add", two(var("ar1"), int(1))))));
+        Vec::push(&mut bodies, s2(ex(call("Atomic::store", two(var("ar1"), int(1)))), ex(call("Atomic::notify_all", one(var("ar1"))))));
+        Vec::push(&mut bodies, s1(ex(call("Atomic::wait", two(var("ar1"), int(0))))));
+        foreach (body in bodies)
+        {
+            match (fresh(env, "t"))
+            {
+                Some(t) : push(&mut out, let_(&t, None, spawn_clo(clo(true, caps1("ar1"), Ty::Unit, body, None))), d1(decl(&t, clone(&hu)))),
+                None    : {},
+            }
+        }
+        push(&mut out, discard(call("Atomic::fetch_add", two(var("ar1"), int(1)))), d0());
+    }
+    // D-0258: a static atomic `S1`, every thread's by name: its operations,
+    // a wait, a shared reference kept, closures that reach it with no
+    // capture, and the refused exclusive borrow.
+    {
+        push(&mut out, discard(call("Atomic::fetch_add", two(s_atomic(), int(1)))), d0());
+        push(&mut out, blk(s2(ex(call("Atomic::store", two(s_atomic(), int(1)))), ex(call("Atomic::notify_all", one(s_atomic()))))), d0());
+        push(&mut out, ex(call("Atomic::wait", two(s_atomic(), int(0)))), d0());
+        push(&mut out, pr(call("Atomic::load", one(s_atomic()))), d0());
+        if (!Env::has(env, "sr1"))
+        {
+            push(&mut out, let_("sr1", None, s_atomic()), d1(decl("sr1", clone(&aty))));
+        }
+        if (!Env::has(env, "sx1"))
+        {
+            push(&mut out, let_("sx1", None, bor(Mode::Excl, var("S1"))), d1(decl("sx1", Ty::ref_of(Ty::Atomic, Mode::Excl))));
+        }
+        Vec<Vec<Stmt>> bodies = Vec::new();
+        Vec::push(&mut bodies, s1(discard(call("Atomic::fetch_add", two(s_atomic(), int(1))))));
+        Vec::push(&mut bodies, s2(ex(call("Atomic::store", two(s_atomic(), int(1)))), ex(call("Atomic::notify_all", one(s_atomic())))));
+        Vec::push(&mut bodies, s1(ex(call("Atomic::wait", two(s_atomic(), int(0))))));
+        foreach (body in bodies)
+        {
+            match (fresh(env, "t"))
+            {
+                Some(t) : push(&mut out, let_(&t, None, spawn_clo(clo(true, Vec::new(), Ty::Unit, body, None))), d1(decl(&t, clone(&hu)))),
+                None    : {},
+            }
+        }
+    }
+    // Channels of exclusive references (`spec/19` §3, D-0213's lend).
+    Ty cty = Ty::Chan(Box::new(Ty::refi(Mode::Excl)));
+    if (!Env::has(env, "c1"))
+    {
+        push(&mut out, let_("c1", Some(clone(&cty)), call("Channel::new", one(int(1)))), d1(decl("c1", clone(&cty))));
+    }
+    else
+    {
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_f("take_one", one(bor(Mode::Shared, var("c1"))))), d1(decl(&t, clone(&hu)))),
+            None    : {},
+        }
+        foreach (x in ints())
+        {
+            push(&mut out, discard(call("Channel::send", two(bor(Mode::Shared, var("c1")), bor(Mode::Excl, var(x))))), d0());
+        }
+        foreach (r in &excl)
+        {
+            push(&mut out, discard(call("Channel::send", two(bor(Mode::Shared, var("c1")), var(r)))), d0());
+        }
+        push(&mut out, ex(call("Channel::close", one(bor(Mode::Shared, var("c1"))))), d0());
+        Block some = block_of(s1(incr_deref("k")));
+        push(&mut out, st(StmtK::Match { .scrut = call("Channel::recv", one(bor(Mode::Shared, var("c1")))), .binder = "k", .some = some, .none = Block::empty() }), d0());
+    }
+    // A vector of exclusive references: references kept in storage the
+    // vector owns, not lent when the vector moves to a thread (`spec/19` §1).
+    if (!Env::has(env, "w1"))
+    {
+        push(&mut out, let_("w1", Some(Ty::VecR), call("Vec::new", none_e())), d1(decl("w1", Ty::VecR)));
+    }
+    else if (!Env::has(env, "w1moved"))
+    {
+        foreach (x in ints())
+        {
+            push(&mut out, ex(call("Vec::push", two(bor(Mode::Excl, var("w1")), bor(Mode::Excl, var(x))))), d0());
+        }
+        foreach (r in &excl)
+        {
+            push(&mut out, ex(call("Vec::push", two(bor(Mode::Excl, var("w1")), var(r)))), d0());
+        }
+        push(&mut out, assign(de(idx("w1", 0)), int(5)), d0());
+        push(&mut out, pr(de(idx("w1", 0))), d0());
+        push(&mut out, ex(call("Vec::pop", one(bor(Mode::Excl, var("w1"))))), d0());
+        match (fresh(env, "t"))
+        {
+            Some(t) :
+            {
+                push(&mut out, let_(&t, None, spawn_f("bump_first", one(var("w1")))), d2(decl(&t, clone(&hu)), decl("w1moved", Ty::Unit)));
+                push(&mut out, let_(&t, None, spawn_f("swap_first", one(var("w1")))), d2(decl(&t, clone(&hu)), decl("w1moved", Ty::Unit)));
+            },
+            None    : {},
+        }
+    }
+    // Closures (`rule.fn.closure`, `[Closure-Call]`, D-0239).
+    match (fresh(env, "cl"))
+    {
+        Some(c) :
+        {
+            foreach (x in ints())
+            {
+                push(&mut out, let_(&c, None, clo(false, caps1(x), Ty::Unit, s1(assign(var(x), add1(var(x)))), None)), d1(decl(&c, clone(&fu))));
+            }
+            push(&mut out, let_(&c, None, clo(false, caps1("y"), Ty::Unit, s1(pr(var("y"))), None)), d1(decl(&c, clone(&fu))));
+            foreach (r in &excl)
+            {
+                push(&mut out, let_(&c, None, clo(false, caps1(r), Ty::Unit, s1(incr_deref(r)), None)), d1(decl(&c, clone(&fu))));
+            }
+        },
+        None    : {},
+    }
+    match (fresh(env, "mk"))
+    {
+        Some(k) :
+        {
+            push(&mut out, let_(&k, None, clo(true, caps1("x"), Ty::I32, s1(assign(var("x"), add1(var("x")))), Some(var("x")))), d1(decl(&k, clone(&fi))));
+            foreach (r in &excl)
+            {
+                push(&mut out, let_(&k, None, clo(true, caps1(r), Ty::Unit, s1(incr_deref(r)), None)), d1(decl(&k, clone(&fu))));
+            }
+        },
+        None    : {},
+    }
+    Vec<NamedTy> all_clos = Env::closures(env, "cl");
+    Vec::append(&mut all_clos, Env::closures(env, "mk"));
+    foreach (c in &all_clos)
+    {
+        if (ty_eq(&c.t, &Ty::Unit))
+        {
+            push(&mut out, ex(callv(var(&c.n))), d0());
+            push(&mut out, ex(call("call_val", one(var(&c.n)))), d0());
+            push(&mut out, ex(call("call_shared", one(bor(Mode::Shared, var(&c.n))))), d0());
+        }
+        else
+        {
+            push(&mut out, pr(callv(var(&c.n))), d0());
+        }
+        if (!Env::has(env, "fr1"))
+        {
+            push(&mut out, let_("fr1", None, bor(Mode::Shared, var(&c.n))), d1(decl("fr1", Ty::ref_of(Ty::Fn(Box::new(clone(&c.t))), Mode::Shared))));
+        }
+    }
+    match (Env::get(env, "fr1"))
+    {
+        Some(Ty::Ref { t, m }) :
+        {
+            if (ty_eq(Box::get(&t), &fu))
+            {
+                push(&mut out, ex(callv(de(var("fr1")))), d0());
+            }
+            else
+            {
+                push(&mut out, pr(callv(de(var("fr1")))), d0());
+            }
+        },
+        _                      : {},
+    }
+    match (fresh(env, "t"))
+    {
+        Some(t) :
+        {
+            auto each1 = Env::closures(env, "mk");
+            foreach (k in &each1)
+            {
+                push(&mut out, let_(&t, None, spawn_clo(var(&k.n))), d1(decl(&t, Ty::handle_of(clone(&k.t)))));
+            }
+            foreach (r in &excl)
+            {
+                push(&mut out, let_(&t, None, spawn_clo(clo(true, caps1(r), Ty::Unit, s1(incr_deref(r)), None))), d1(decl(&t, clone(&hu))));
+            }
+        },
+        None    : {},
+    }
+    push(&mut out, blk(s2(let_("cl9", None, clo(false, caps1("x"), Ty::Unit, s1(assign(var("x"), add1(var("x")))), None)), ex(callv(var("cl9"))))), d0());
+    // Slices (`[Slice-Form]`, `[Slice-Index]`, D-0070, D-0238).
+    if (Env::has(env, "v1"))
+    {
+        match (fresh(env, "sl"))
+        {
+            Some(sl) :
+            {
+                push(&mut out, let_(&sl, None, slice_of(Mode::Excl, "v1", 0, 1)), d1(decl(&sl, Ty::Slice(Mode::Excl))));
+                push(&mut out, let_(&sl, None, slice_of(Mode::Excl, "v1", 1, 2)), d1(decl(&sl, Ty::Slice(Mode::Excl))));
+                push(&mut out, let_(&sl, None, slice_of(Mode::Shared, "v1", 0, 1)), d1(decl(&sl, Ty::Slice(Mode::Shared))));
+                auto each2 = Env::slices(env);
+                foreach (e in &each2)
+                {
+                    if (e.m == Mode::Excl)
+                    {
+                        push(&mut out, let_(&sl, None, slice_of(Mode::Excl, &e.n, 0, 1)), d1(decl(&sl, Ty::Slice(Mode::Excl))));
+                    }
+                }
+            },
+            None     : {},
+        }
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_f("bump_slice", one(slice_of(Mode::Excl, "v1", 0, 1)))), d1(decl(&t, clone(&hu)))),
+            None    : {},
+        }
+        push(&mut out, pr(call("first", one(slice_of(Mode::Shared, "v1", 0, 1)))), d0());
+        push(&mut out, ex(call("bump_slice", one(slice_of(Mode::Excl, "v1", 0, 1)))), d0());
+    }
+    auto each3 = Env::slices(env);
+    foreach (sm in &each3)
+    {
+        push(&mut out, pr(idx(&sm.n, 0)), d0());
+        if (sm.m == Mode::Excl)
+        {
+            push(&mut out, assign(idx(&sm.n, 0), add1(idx(&sm.n, 0))), d0());
+            push(&mut out, ex(call("bump_slice", one(var(&sm.n)))), d0());
+            match (fresh(env, "t"))
+            {
+                Some(t) : push(&mut out, let_(&t, None, spawn_f("bump_slice", one(var(&sm.n)))), d1(decl(&t, clone(&hu)))),
+                None    : {},
+            }
+        }
+    }
+    // Handles in a `Vec` and in a struct (`[Handle-Destructor]` where what
+    // holds them is destroyed).
+    if (!Env::has(env, "hv1"))
+    {
+        push(&mut out, let_("hv1", Some(Ty::VecH), call("Vec::new", none_e())), d1(decl("hv1", Ty::VecH)));
+    }
+    else
+    {
+        foreach (x in ints())
+        {
+            push(&mut out, ex(call("Vec::push", two(bor(Mode::Excl, var("hv1")), spawn_f("bump", one(bor(Mode::Excl, var(x))))))), d0());
+        }
+        auto each4 = Env::void_handles(env);
+        foreach (t in &each4)
+        {
+            push(&mut out, ex(call("Vec::push", two(bor(Mode::Excl, var("hv1")), var(t)))), d1(gone(t)));
+        }
+        Block some = block_of(s1(ex(mk(ExprK::Join("h")))));
+        push(&mut out, st(StmtK::Match { .scrut = call("Vec::pop", one(bor(Mode::Excl, var("hv1")))), .binder = "h", .some = some, .none = Block::empty() }), d0());
+    }
+    if (!Env::has(env, "j1"))
+    {
+        foreach (x in ints())
+        {
+            push(&mut out, let_("j1", Some(Ty::Job), mk(ExprK::JobLit(Box::new(spawn_f("bump", one(bor(Mode::Excl, var(x)))))))), d1(decl("j1", Ty::Job)));
+        }
+        auto each5 = Env::void_handles(env);
+        foreach (t in &each5)
+        {
+            push(&mut out, let_("j1", Some(Ty::Job), mk(ExprK::JobLit(Box::new(var(t))))), d2(decl("j1", Ty::Job), gone(t)));
+        }
+    }
+    push(&mut out, blk(s2(let_("hv9", Some(Ty::VecH), call("Vec::new", none_e())), ex(call("Vec::push", two(bor(Mode::Excl, var("hv9")), spawn_f("bump", one(bor(Mode::Excl, var("x"))))))))), d0());
+    push(&mut out, blk(s1(let_("j9", Some(Ty::Job), mk(ExprK::JobLit(Box::new(spawn_f("bump", one(bor(Mode::Excl, var("y")))))))))), d0());
+    // A channel of exclusive slices: a send lends the slice (`[Send]`).
+    Ty csty = Ty::Chan(Box::new(Ty::Slice(Mode::Excl)));
+    if (Env::has(env, "v1") && !Env::has(env, "cs1"))
+    {
+        push(&mut out, let_("cs1", Some(clone(&csty)), call("Channel::new", one(int(1)))), d1(decl("cs1", clone(&csty))));
+    }
+    else if (Env::has(env, "cs1"))
+    {
+        push(&mut out, discard(call("Channel::send", two(bor(Mode::Shared, var("cs1")), slice_of(Mode::Excl, "v1", 0, 1)))), d0());
+        auto each6 = Env::slices(env);
+        foreach (sm in &each6)
+        {
+            if (sm.m == Mode::Excl)
+            {
+                push(&mut out, discard(call("Channel::send", two(bor(Mode::Shared, var("cs1")), var(&sm.n)))), d0());
+            }
+        }
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_f("take_slice", one(bor(Mode::Shared, var("cs1"))))), d1(decl(&t, clone(&hu)))),
+            None    : {},
+        }
+    }
+    // Slices and guards inside closures, and in threads through them.
+    auto each7 = Env::slices(env);
+    foreach (sm in &each7)
+    {
+        if (sm.m == Mode::Excl)
+        {
+            match (fresh(env, "cl"))
+            {
+                Some(c) : push(&mut out, let_(&c, None, clo(false, caps1(&sm.n), Ty::Unit, s1(assign(idx(&sm.n, 0), add1(idx(&sm.n, 0)))), None)), d1(decl(&c, clone(&fu)))),
+                None    : {},
+            }
+            match (fresh(env, "t"))
+            {
+                Some(t) : push(&mut out, let_(&t, None, spawn_clo(clo(true, caps1(&sm.n), Ty::Unit, s1(assign(idx(&sm.n, 0), add1(idx(&sm.n, 0)))), None))), d1(decl(&t, clone(&hu)))),
+                None    : {},
+            }
+        }
+    }
+    if (Env::has(env, "g1"))
+    {
+        match (fresh(env, "cl"))
+        {
+            Some(c) : push(&mut out, let_(&c, None, clo(false, caps1("g1"), Ty::Unit, s1(incr_deref("g1")), None)), d1(decl(&c, clone(&fu)))),
+            None    : {},
+        }
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_clo(clo(true, caps1("g1"), Ty::Unit, s1(incr_deref("g1")), None))), d2(decl(&t, clone(&hu)), gone("g1"))),
+            None    : {},
+        }
+    }
+    if (Env::has(env, "m1"))
+    {
+        match (fresh(env, "cl"))
+        {
+            Some(c) :
+            {
+                Vec<Stmt> body = s2(let_("g9", None, call("lock", one(bor(Mode::Shared, var("m1"))))), incr_deref("g9"));
+                push(&mut out, let_(&c, None, clo(false, caps1("m1"), Ty::Unit, body, None)), d1(decl(&c, clone(&fu))));
+            },
+            None    : {},
+        }
+    }
+    // A closure that owns a resource (`[Fn-Value-Read]`: read, it moves,
+    // leaving the place empty; `[Fn-Value-Empty-Call]`).
+    if (!Env::has(env, "v2"))
+    {
+        push(&mut out, let_("v2", Some(Ty::Vec), call("Vec::new", none_e())), d1(decl("v2", Ty::Vec)));
+    }
+    else if (!Env::has(env, "mo1") && Env::is(env, "v2", &Ty::Vec))
+    {
+        Vec<Stmt> body = s1(ex(call("Vec::push", two(bor(Mode::Excl, var("v2")), int(1)))));
+        push(&mut out, let_("mo1", None, clo(true, caps1("v2"), Ty::Unit, body, None)), d2(decl("mo1", clone(&fu)), gone("v2")));
+    }
+    if (Env::is(env, "mo1", &fu))
+    {
+        push(&mut out, ex(callv(var("mo1"))), d0());
+        push(&mut out, ex(call("call_val", one(var("mo1")))), d1(gone("mo1")));
+        push(&mut out, ex(call("call_twice", one(var("mo1")))), d1(gone("mo1")));
+        push(&mut out, ex(call("call_shared", one(bor(Mode::Shared, var("mo1"))))), d0());
+        match (fresh(env, "t"))
+        {
+            Some(t) : push(&mut out, let_(&t, None, spawn_clo(var("mo1"))), d2(decl(&t, clone(&hu)), gone("mo1"))),
+            None    : {},
+        }
+    }
+    // Arrays: literal-index elements are places of the flow analysis
+    // (`[Index-Checked]`), unlike a `Vec`'s.
+    if (!Env::has(env, "a1"))
+    {
+        push(&mut out, let_("a1", Some(Ty::Arr), mk(ExprK::ArrLit(two(int(0), int(0))))), d1(decl("a1", Ty::Arr)));
+    }
+    else
+    {
+        for (i64 k = 0; k < 2; k += 1)
+        {
+            push(&mut out, assign(idx("a1", k), add1(idx("a1", k))), d0());
+            push(&mut out, pr(idx("a1", k)), d0());
+            push(&mut out, ex(call("bump", one(bor(Mode::Excl, idx("a1", k))))), d0());
+            match (fresh(env, "r"))
+            {
+                Some(r) : push(&mut out, let_(&r, None, bor(Mode::Excl, idx("a1", k))), d1(decl(&r, Ty::refi(Mode::Excl)))),
+                None    : {},
+            }
+            match (fresh(env, "s"))
+            {
+                Some(s2n) : push(&mut out, let_(&s2n, None, bor(Mode::Shared, idx("a1", k))), d1(decl(&s2n, Ty::refi(Mode::Shared)))),
+                None      : {},
+            }
+            match (fresh(env, "t"))
+            {
+                Some(t) :
+                {
+                    push(&mut out, let_(&t, None, spawn_f("bump", one(bor(Mode::Excl, idx("a1", k))))), d1(decl(&t, clone(&hu))));
+                    push(&mut out, let_(&t, None, spawn_f("bump_slice", one(slice_of(Mode::Excl, "a1", k, k + 1)))), d1(decl(&t, clone(&hu))));
+                },
+                None    : {},
+            }
+        }
+        match (fresh(env, "sl"))
+        {
+            Some(sl) :
+            {
+                push(&mut out, let_(&sl, None, slice_of(Mode::Excl, "a1", 0, 1)), d1(decl(&sl, Ty::Slice(Mode::Excl))));
+                push(&mut out, let_(&sl, None, slice_of(Mode::Shared, "a1", 0, 2)), d1(decl(&sl, Ty::Slice(Mode::Shared))));
+            },
+            None     : {},
+        }
+    }
+    // Loops: a counted `while` around one statement, run twice (the flow
+    // analysis' join at the back edge; a borrow or a thread of the first
+    // pass meeting the second).
+    push(&mut out, lp(s1(bump_x())), d0());
+    push(&mut out, lp(s2(let_("r9", None, bor(Mode::Excl, var("x"))), incr_deref("r9"))), d0());
+    push(&mut out, lp(s1(let_("t9", None, spawn_f("bump", one(bor(Mode::Excl, var("x"))))))), d0());
+    foreach (r in &excl)
+    {
+        push(&mut out, lp(s1(incr_deref(r))), d0());
+        push(&mut out, lp(s1(assign(var(r), bor(Mode::Excl, var("y"))))), d0());
+    }
+    if (Env::has(env, "v1"))
+    {
+        push(&mut out, lp(s1(ex(call("Vec::push", two(bor(Mode::Excl, var("v1")), int(7)))))), d0());
+    }
+    if (Env::has(env, "w1") && !Env::has(env, "w1moved"))
+    {
+        foreach (r in &excl)
+        {
+            push(&mut out, lp(s1(ex(call("Vec::push", two(bor(Mode::Excl, var("w1")), var(r)))))), d0());
+        }
+        push(&mut out, lp(s1(ex(call("Vec::push", two(bor(Mode::Excl, var("w1")), bor(Mode::Excl, var("x"))))))), d0());
+    }
+    if (Env::has(env, "hv1"))
+    {
+        push(&mut out, lp(s1(ex(call("Vec::push", two(bor(Mode::Excl, var("hv1")), spawn_f("bump", one(bor(Mode::Excl, var("x"))))))))), d0());
+    }
+    if (Env::has(env, "h1"))
+    {
+        push(&mut out, lp(s1(ex(call("bump_hold", one(var("h1")))))), d0());
+    }
+    auto each8 = Env::closures(env, "cl");
+    foreach (c in &each8)
+    {
+        if (ty_eq(&c.t, &Ty::Unit))
+        {
+            push(&mut out, lp(s1(ex(callv(var(&c.n))))), d0());
+        }
+    }
+    auto each9 = Env::slices(env);
+    foreach (sm in &each9)
+    {
+        if (sm.m == Mode::Excl)
+        {
+            push(&mut out, lp(s1(assign(idx(&sm.n, 0), add1(idx(&sm.n, 0))))), d0());
+        }
+    }
+    // Loops left early: `while (2 > i) { i = i + 1; A; if (i > 1) { B;
+    // break; } C; }` and its `continue` (the flow analysis' edges to the
+    // exit and the test; `[Break]` exits the blocks it leaves, ending their
+    // bindings and waiting for their handles).
+    foreach (brk in [true, false])
+    {
+        push(&mut out, lpj(s1(let_("t9", None, spawn_f("bump", one(bor(Mode::Excl, var("x")))))), Vec::new(), Vec::new(), brk), d0());
+        push(&mut out, lpj(Vec::new(), s1(let_("t9", None, spawn_f("bump", one(bor(Mode::Excl, var("x")))))), s1(bump_x()), brk), d0());
+        push(&mut out, lpj(s1(let_("r9", None, bor(Mode::Excl, var("x")))), Vec::new(), s1(incr_deref("r9")), brk), d0());
+        push(&mut out, lpj(Vec::new(), s2(let_("r9", None, bor(Mode::Excl, var("x"))), incr_deref("r9")), s1(bump_x()), brk), d0());
+        foreach (r in &excl)
+        {
+            push(&mut out, lpj(Vec::new(), s1(assign(var(r), bor(Mode::Excl, var("x")))), s1(incr_deref(r)), brk), d0());
+            push(&mut out, lpj(s1(incr_deref(r)), s1(assign(var(r), bor(Mode::Excl, var("y")))), Vec::new(), brk), d0());
+        }
+        if (Env::has(env, "w1") && !Env::has(env, "w1moved"))
+        {
+            push(&mut out, lpj(Vec::new(), s1(ex(call("Vec::push", two(bor(Mode::Excl, var("w1")), bor(Mode::Excl, var("x")))))), s1(bump_x()), brk), d0());
+        }
+        if (Env::has(env, "hv1"))
+        {
+            push(&mut out, lpj(Vec::new(), s1(ex(call("Vec::push", two(bor(Mode::Excl, var("hv1")), spawn_f("bump", one(bor(Mode::Excl, var("x")))))))), s1(bump_x()), brk), d0());
+        }
+        auto each10 = Env::closures(env, "cl");
+        foreach (c in &each10)
+        {
+            if (ty_eq(&c.t, &Ty::Unit))
+            {
+                push(&mut out, lpj(Vec::new(), s1(ex(callv(var(&c.n)))), s1(bump_x()), brk), d0());
+            }
+        }
+    }
+    // Uses.
+    foreach (x in ints())
+    {
+        push(&mut out, assign(var(x), add1(var(x))), d0());
+        push(&mut out, ex(call("bump", one(bor(Mode::Excl, var(x))))), d0());
+    }
+    push(&mut out, ex(call("two", two(bor(Mode::Excl, var("x")), bor(Mode::Excl, var("y"))))), d0());
+    push(&mut out, ex(call("swap", two(bor(Mode::Excl, var("x")), bor(Mode::Excl, var("y"))))), d0());
+    foreach (r in &excl)
+    {
+        push(&mut out, incr_deref(r), d0());
+        push(&mut out, ex(call("bump", one(var(r)))), d0());
+        push(&mut out, ex(call("two", two(var(r), var(r)))), d0());
+        push(&mut out, ex(call("two", two(var(r), bor(Mode::Excl, var("x"))))), d0());
+        // D-0235: `swap` and `replace` through a reference passed on whole.
+        push(&mut out, ex(call("swap", two(var(r), bor(Mode::Excl, var("y"))))), d0());
+        push(&mut out, discard(call("replace", two(var(r), int(9)))), d0());
+        foreach (x in ints())
+        {
+            push(&mut out, assign(var(r), bor(Mode::Excl, var(x))), d0());
+        }
+        push(&mut out, blk(s2(let_("z", Some(Ty::I32), int(3)), assign(var(r), bor(Mode::Excl, var("z"))))), d0());
+    }
+    foreach (r in &refs)
+    {
+        push(&mut out, pr(de(var(r))), d0());
+        push(&mut out, pr(call("peek", one(var(r)))), d0());
+    }
+    if (Env::has(env, "h1"))
+    {
+        push(&mut out, assign(de(field(var("h1"))), add1(de(field(var("h1"))))), d0());
+        push(&mut out, ex(call("bump_hold", one(var("h1")))), d0());
+        push(&mut out, pr(call("read_hold", one(bor(Mode::Shared, var("h1"))))), d0());
+    }
+    if (Env::has(env, "q1"))
+    {
+        push(&mut out, pr(de(field(var("q1")))), d0());
+        push(&mut out, assign(de(field(var("q1"))), int(1)), d0());
+        push(&mut out, ex(call("bump", one(field(var("q1"))))), d0());
+        push(&mut out, pr(call("peek", one(field(var("q1"))))), d0());
+    }
+    if (Env::has(env, "v1"))
+    {
+        push(&mut out, ex(call("Vec::push", two(bor(Mode::Excl, var("v1")), int(7)))), d0());
+        push(&mut out, ex(call("Vec::pop", one(bor(Mode::Excl, var("v1"))))), d0());
+        push(&mut out, assign(idx("v1", 0), int(3)), d0());
+        push(&mut out, pr(idx("v1", 0)), d0());
+    }
+    for (usize i = 0; i < Vec::len(&env.names.keys); i += 1)
+    {
+        match (&env.names.vals[i])
+        {
+            Ty::Handle(r) :
+            {
+                if (ty_eq(Box::get(r), &Ty::Unit))
+                {
+                    push(&mut out, ex(mk(ExprK::Join(clone(&env.names.keys[i])))), d0());
+                }
+                else
+                {
+                    push(&mut out, pr(mk(ExprK::Join(clone(&env.names.keys[i])))), d0());
+                }
+            },
+            _             : {},
+        }
+    }
+    // Compound statements.
+    push(&mut out, blk(s2(let_("w", None, bor(Mode::Excl, var("x"))), incr_deref("w"))), d0());
+    Stmt ifs = st(StmtK::If { .cond = gt(var("x"), int(1)), .thn = block_of(s1(ex(call("bump", one(bor(Mode::Excl, var("y"))))))), .els = Some(block_of(s1(assign(var("y"), add1(var("y")))))) });
+    push(&mut out, ifs, d0());
+    out
+}
+
+fn program(ref<Vec<Stmt>, shared> stmts) : Program
+{
+    Vec<Stmt> body = s2(let_("x", Some(Ty::I32), int(1)), let_("y", Some(Ty::I32), int(2)));
+    foreach (s in stmts)
+    {
+        Vec::push(&mut body, clone(s));
+    }
+    Vec::push(&mut body, pr(var("x")));
+    Vec::push(&mut body, pr(var("y")));
+    Func main = Func { .name = "main", .params = Vec::new(), .ret = Ty::Unit, .body = block_of(body), .line = 0, .src = 0 };
+    String text = String::new();
+    print::block(&main.body, 0, &mut text);
+    Vec<Func> funcs = Vec::new();
+    bool hold = StringView::contains(&text, "Hold");
+    bool job = StringView::contains(&text, "Job");
+    for (usize h = 0; h < NHELPERS; h += 1)
+    {
+        str name = helper_name(h);
+        bool used = StringView::contains(&text, &sprintf("%s(", name)) || StringView::contains(&text, &sprintf("spawn(%s,", name));
+        if (used)
+        {
+            Program p = Option::expect(Result::ok(parse::parse(&sprintf("%s\nfn main()\n{\n}\n", helper_src(h)))), "helper");
+            Vec::push(&mut funcs, clone(Option::unwrap(Program::func(&p, name))));
+            if (helper_needs_hold(name))
+            {
+                hold = true;
+            }
+        }
+    }
+    Vec::push(&mut funcs, main);
+    Vec<StaticDecl> statics = Vec::new();
+    if (StringView::contains(&text, "S1"))
+    {
+        Vec::push(&mut statics, StaticDecl { .name = "S1", .k = 0 });
+    }
+    Program { .hold = hold, .job = job, .funcs = funcs, .statics = statics, .nexprs = 0, .nstmts = 0 }
+}
+
+fn apply(ref<Env, exclusive> env, ref<Vec<Decl>, shared> decls)
+{
+    foreach (d in decls)
+    {
+        match (StringView::strip_prefix(&d.n, "-"))
+        {
+            Some(g) : { _ = SMap::remove(&mut env.names, &String::copy(g)); },
+            None    : { _ = SMap::insert(&mut env.names, clone(&d.n), clone(&d.t)); },
+        }
+    }
+}
+
+fn start_env() : Env
+{
+    Env e = Env { .names = SMap::new() };
+    _ = SMap::insert(&mut e.names, "x", Ty::I32);
+    _ = SMap::insert(&mut e.names, "y", Ty::I32);
+    e
+}
+
+fn go(ref<Env, shared> env, ref<Vec<Stmt>, exclusive> cur, usize n, ref<Vec<Vec<Stmt>>, exclusive> out)
+{
+    Vec::push(out, clone(cur));
+    if (Vec::len(cur) == n)
+    {
+        return;
+    }
+    foreach (c in alphabet(env))
+    {
+        Choice { s, decls } = c;
+        Env e2 = clone(env);
+        apply(&mut e2, &decls);
+        Vec::push(cur, s);
+        go(&e2, cur, n, out);
+        _ = Vec::pop(cur);
+    }
+}
+
+// Every well-scoped sequence of up to n statements.
+fn sequences(usize n) : Vec<Vec<Stmt>>
+{
+    Vec<Vec<Stmt>> out = Vec::new();
+    Env env = start_env();
+    Vec<Stmt> cur = Vec::new();
+    go(&env, &mut cur, n, &mut out);
+    out
+}
+
+struct Rng
+{
+    u64 x;
+}
+
+fn Rng::next(ref<Rng, exclusive> r) : u64
+{
+    u64 x = r.x;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    r.x = x;
+    wrapping_mul(x, 0x2545F4914F6CDD1D)
+}
+
+fn random_seq(ref<Rng, exclusive> rng, usize len) : Vec<Stmt>
+{
+    Env env = start_env();
+    Vec<Stmt> cur = Vec::new();
+    for (usize i = 0; i < len; i += 1)
+    {
+        Vec<Choice> a = alphabet(&env);
+        u64 n = narrow_wrapping<u64>(Vec::len(&a));
+        usize k = narrow_wrapping<usize>(Rng::next(rng) % n);
+        Choice c = clone(&a[k]);
+        Choice { s, decls } = c;
+        apply(&mut env, &decls);
+        Vec::push(&mut cur, s);
+    }
+    cur
+}
+
+struct Item
+{
+    String text;
+    Report report;
+}
+
+struct Rendered
+{
+    String text;
+    Program prog;
+}
+
+export fn render(ref<Vec<Stmt>, shared> stmts) : Option<Rendered>
+{
+    Program p = program(stmts);
+    String text = print::program(&p, "");
+    // Read back, so the model runs exactly the text the tools will.
+    match (parse::parse(&text))
+    {
+        Ok(parsed) : Some(Rendered { .text = text, .prog = parsed }),
+        Err(_)     : None,
+    }
+}
+
+fn interesting(ref<Report, shared> r) : bool
+{
+    if (SSet::len(&r.outcomes) > 1)
+    {
+        return true;
+    }
+    foreach (o in &r.outcomes.keys)
+    {
+        match (&o.end)
+        {
+            End::Fault { diag, phase, line } :
+            {
+                if (*phase == "dynamic")
+                {
+                    return true;
+                }
+            },
+            _                                : {},
+        }
+    }
+    false
+}
+
+fn parse_or(ref<Vec<String>, shared> args, usize i, usize dflt) : usize
+{
+    if (i < Vec::len(args))
+    {
+        match (StringView::parse<usize>(&args[i]))
+        {
+            Ok(n)  : return n,
+            Err(_) : {},
+        }
+    }
+    dflt
+}
+
+fn parse_u64_or(ref<Vec<String>, shared> args, usize i, u64 dflt) : u64
+{
+    if (i < Vec::len(args))
+    {
+        match (StringView::parse<u64>(&args[i]))
+        {
+            Ok(n)  : return n,
+            Err(_) : {},
+        }
+    }
+    dflt
+}
+
+export fn main(ref<Vec<String>, shared> args) : u8
+{
+    usize size = 2;
+    String out_dir = "model-programs";
+    usize max = max_value<usize>();
+    usize random = 0;
+    usize len = 6;
+    u64 seed = 1;
+    usize i = 1;
+    while (i < Vec::len(args))
+    {
+        StringView a = &args[i];
+        if (a == "--size")
+        {
+            size = parse_or(args, i + 1, 2);
+        }
+        else if (a == "--out")
+        {
+            if (i + 1 < Vec::len(args))
+            {
+                out_dir = clone(&args[i + 1]);
+            }
+            else
+            {
+                out_dir = String::new();
+            }
+        }
+        else if (a == "--max")
+        {
+            max = parse_or(args, i + 1, max_value<usize>());
+        }
+        else if (a == "--random")
+        {
+            random = parse_or(args, i + 1, 0);
+        }
+        else if (a == "--len")
+        {
+            len = parse_or(args, i + 1, 6);
+        }
+        else if (a == "--seed")
+        {
+            seed = parse_u64_or(args, i + 1, 1);
+        }
+        else
+        {
+            eprintf("enum: unknown option %s\n", a);
+            return 2;
+        }
+        i += 2;
+    }
+    Vec<Vec<Stmt>> seqs = sequences(size);
+    Rng rng = Rng { .x = wrapping_mul(seed, 0x9E3779B97F4A7C15) | 1 };
+    for (usize k = 0; k < random; k += 1)
+    {
+        Vec::push(&mut seqs, random_seq(&mut rng, len));
+    }
+    eprintf("enum: %d programs (size up to %d, %d random of %d)\n", Vec::len(&seqs), size, random, len);
+    Vec<Item> items = Vec::new();
+    HashSet<String> seen = HashSet::new();
+    SMap<String, usize> tally = SMap::new();
+    for (usize k = 0; k < Vec::len(&seqs); k += 1)
+    {
+        Rendered rd = match (render(&seqs[k]))
+        {
+            Some(r) : r,
+            None    :
+            {
+                eprintf("enum: program %d does not read back\n", k);
+                continue;
+            },
+        };
+        Rendered { text, prog } = rd;
+        if (!HashSet::insert(&mut seen, clone(&text)))
+        {
+            continue;
+        }
+        Report report = explore::run(&prog, true);
+        foreach (o in &report.outcomes.keys)
+        {
+            String key = match (&o.end)
+            {
+                End::Okay                        : "ok",
+                End::Fault { diag, phase, line } : sprintf("%s (%s)", diag, *phase),
+                End::TooBig                      : "too-big",
+            };
+            usize cur = match (SMap::find(&tally, &key))
+            {
+                Some(j) : tally.vals[j],
+                None    : 0,
+            };
+            _ = SMap::insert(&mut tally, key, cur + 1);
+        }
+        if (k % 5000 == 0)
+        {
+            eprintf("enum: %d / %d\n", k, Vec::len(&seqs));
+        }
+        Vec::push(&mut items, Item { .text = text, .report = report });
+    }
+    // Choose what to write.
+    Vec<usize> keep = Vec::new();
+    Vec<usize> rest = Vec::new();
+    for (usize j = 0; j < Vec::len(&items); j += 1)
+    {
+        if (interesting(&items[j].report))
+        {
+            Vec::push(&mut keep, j);
+        }
+        else
+        {
+            Vec::push(&mut rest, j);
+        }
+    }
+    if (Vec::len(&keep) > max)
+    {
+        f64 step = to_float<f64>(Vec::len(&keep)) / to_float<f64>(max);
+        Vec<usize> k2 = Vec::new();
+        for (usize j = 0; j < max; j += 1)
+        {
+            Vec::push(&mut k2, keep[to_int<usize>(to_float<f64>(j) * step)]);
+        }
+        keep = k2;
+    }
+    else if (Vec::len(&keep) + Vec::len(&rest) > max)
+    {
+        usize room = max - Vec::len(&keep);
+        usize den = room;
+        if (den < 1)
+        {
+            den = 1;
+        }
+        f64 step = to_float<f64>(Vec::len(&rest)) / to_float<f64>(den);
+        for (usize j = 0; j < room; j += 1)
+        {
+            Vec::push(&mut keep, rest[to_int<usize>(to_float<f64>(j) * step)]);
+        }
+    }
+    else
+    {
+        Vec::append(&mut keep, rest);
+    }
+    Vec::sort(&mut keep);
+    _ = Result::expect(make_dir_all(&out_dir), "out dir");
+    String index = "file\toutcomes\tstates\n";
+    for (usize j = 0; j < Vec::len(&keep); j += 1)
+    {
+        ref<Item, shared> it = &items[keep[j]];
+        String name = sprintf("p%06d.cb", j);
+        String header = String::new();
+        foreach (o in &it.report.outcomes.keys)
+        {
+            String::appendf(&mut header, "// MODEL: %s\n", &Outcome::text(o));
+        }
+        // The header shifts every line by its length; the model's lines are
+        // those of the text below it, so the header is one line per outcome
+        // and the outcome lines are corrected by reading the file back.
+        String full = sprintf("%s%s", &header, &it.text);
+        Program prog = Result::expect(parse::parse(&full), "reads back");
+        Report r = explore::run(&prog, true);
+        String header2 = String::new();
+        foreach (o in &r.outcomes.keys)
+        {
+            String::appendf(&mut header2, "// MODEL: %s\n", &Outcome::text(o));
+        }
+        String full2 = sprintf("%s%s", &header2, &it.text);
+        _ = Result::expect(write_file(&sprintf("%s/%s", &out_dir, &name), &full2), "write");
+        Vec<String> outs = Vec::new();
+        foreach (o in &r.outcomes.keys)
+        {
+            Vec::push(&mut outs, Outcome::text(o));
+        }
+        String::appendf(&mut index, "%s\t%s\t%d\n", &name, &String::join(&outs, " | "), r.states);
+    }
+    _ = Result::expect(write_file(&sprintf("%s/index.tsv", &out_dir), &index), "index");
+    eprintf("enum: %d distinct programs, %d written to %s\n", Vec::len(&items), Vec::len(&keep), &out_dir);
+    for (usize j = 0; j < Vec::len(&tally.keys); j += 1)
+    {
+        eprintf("  %7d  %s\n", tally.vals[j], &tally.keys[j]);
+    }
+    0
+}

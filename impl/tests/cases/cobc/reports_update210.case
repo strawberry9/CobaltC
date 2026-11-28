@@ -1,0 +1,322 @@
+# The reports of Update 209's round fixed in the checker and the lowering
+# (D-0339): programs `--check` accepted that read freed memory, gave wrong
+# results or crashed cobc are refused or run correctly; `drop` of an
+# element is a move; a variant literal is checked against the type
+# parameters the other arguments fix; assignments that change nothing are
+# refused; a shift's literal is an `i32`; a `spawn` statement is warned.
+# 392: a struct field holding views keeps its text borrowed: the write
+# faults in the default build instead of reading freed memory.
+file f392.cb
+import std;
+
+struct Doc
+{
+    String text;
+    Vec<StringView> lines;
+}
+
+fn main()
+{
+    Doc d = Doc { .text = "first line\nsecond line\n", .lines = Vec::new() };
+    d.lines = StringView::lines(&d.text);
+    String::append(&mut d.text, "a much longer tail, so that the String's buffer is reallocated and freed\n");
+    printf("%s|%s\n", d.lines[0], d.lines[1]);
+}
+end
+run $COBC --check f392.cb
+status 0
+run $COBC --run f392.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 407: `&b[0]` of a parameter `from a` leaves out is a kept use of `b`.
+file f407.cb
+import std;
+
+
+fn el(ref<Vec<u64>, shared> a, ref<Vec<u64>, shared> b) : ref<u64, shared> from a
+{
+    &b[0]
+}
+
+fn main()
+{
+    Vec<u64> a = Vec::from_slice(&[1: u64, 2, 3]);
+    ref<u64, shared> e = &a[0];
+    {
+        Vec<u64> b = Vec::from_slice(&[7: u64, 8, 9]);
+        e = el(&a, &b);
+    }
+    Vec<u64> c = Vec::from_slice(&[555: u64, 666, 777]);
+    printf("%v\n", *e);
+}
+end
+run $COBC --check f407.cb
+status 1
+stderr-has diag.result-source-kept
+# 439: `drop(v[0])` moves a `String` out of an element: refused.
+file f439.cb
+import std;
+
+fn main()
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, "a");
+    Vec::push(&mut v, "b");
+    drop(v[0]);
+    printf("%v %v\n", Vec::len(&v), &v[0]);
+}
+end
+run $COBC --check f439.cb
+status 1
+stderr-has diag.move-out-of-field
+# 408: `Ok(small)` is checked against the `T` the closure fixes.
+file f408.cb
+import std;
+
+fn map_ok<T, E, U>(Result<T, E> r, fn(T) : U f) : Result<U, E>
+{
+    match (r)
+    {
+        Ok(v) : Ok(f(v)),
+        Err(e) : Err(e),
+    }
+}
+
+fn main()
+{
+    u8 small = 200;
+    Result<f64, i32> m = map_ok(Ok(small), [](f64 x) : f64 { x * 2.0 });
+    printf("%v\n", Result::unwrap(m));
+}
+end
+run $COBC --check f408.cb
+status 1
+stderr-has `Ok` holds a `f64`, but this is `u8`
+file f408b.cb
+import std;
+
+fn map_ok<T, E, U>(Result<T, E> r, fn(T) : U f) : Result<U, E>
+{
+    match (r)
+    {
+        Ok(v) : Ok(f(v)),
+        Err(e) : Err(e),
+    }
+}
+
+fn main()
+{
+    Result<usize, i32> m = map_ok(Ok("hello"), [](String s) : usize { StringView::len(&s) });
+    printf("%v\n", Result::unwrap(m));
+}
+end
+run $COBC --run f408b.cb
+status 0
+stdout-is 5\n
+# 440, 441, 442, 443: assignments that change nothing, or a static.
+file f440.cb
+import std;
+
+const array<u8, 12> DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn days_in(i64 year, usize month) : u8
+{
+    if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))
+    {
+        DAYS[1] = 29;            // accepted by --check; changes nothing
+    }
+    DAYS[month - 1]
+}
+
+fn main()
+{
+    printf("%v\n", days_in(2024, 2));
+}
+end
+run $COBC --check f440.cb
+status 1
+stderr-has is a constant, which stands for its value
+file f441.cb
+import std;
+
+fn main()
+{
+    Option<i32> o = Some(3);
+    None = o;
+    printf("%v\n", Option::is_some(&o));
+}
+end
+run $COBC --check f441.cb
+status 1
+stderr-has `None` is a variant, a value, not a variable
+file f442.cb
+import std;
+
+static Atomic<u32> HITS = 0;
+
+fn main()
+{
+    Atomic::fetch_add(&HITS, 1);
+    HITS = Atomic::new(5: u32);
+    printf("%v\n", Atomic::load(&HITS));
+}
+end
+run $COBC --check f442.cb
+status 1
+stderr-has diag.static-assigned
+file f443.cb
+import std;
+
+fn less(ref<i32, shared> a, ref<i32, shared> b) : bool
+{
+    *a < *b
+}
+
+fn apply(ref<fn(ref<i32, shared>, ref<i32, shared>) : bool, shared> f, i32 x, i32 y) : bool
+{
+    (*f)(&x, &y)
+}
+
+fn main()
+{
+    printf("%v\n", apply(&less, 1, 2));
+}
+end
+run $COBC --check f443.cb
+status 1
+stderr-has is a function, a value of a `fn(…)` type, not a place
+# 409: what the lowering cannot infer is an error, not an assertion.
+file f409.cb
+import std;
+
+fn main()
+{
+    auto rs = [Ok(2: u8), Err("bad")];
+    printf("%v\n", Result::is_ok(&rs[0]));
+}
+end
+run $COBC --cc $CC -o f409 f409.cb
+status 1
+stderr-has diag.type-annotation-needed
+stderr-lacks assert-failed
+# 358: a shift's literal left operand is an `i32`.
+file f358.cb
+import std;
+
+fn main()
+{
+    u32 s = 1;
+    auto a = 1 << s;
+    printf("%v\n", a - 3);
+}
+end
+run $COBC --run f358.cb
+status 0
+stdout-is -1\n
+file f358b.cb
+import std;
+
+fn main()
+{
+    u32 s = 1;
+    auto b = -16 >> s;
+    printf("%v\n", b);
+}
+end
+run $COBC --run f358b.cb
+status 0
+stdout-is -8\n
+# 350, 380: a `spawn` statement; one whose thread gives a `Result`.
+file f350.cb
+import std;
+
+fn work(i32 i)
+{
+}
+
+fn save(i32 i) : Result<void, String>
+{
+    Err("lost")
+}
+
+fn main()
+{
+    spawn(work, 1);
+}
+end
+run $COBC --check f350.cb
+status 0
+stderr-has warning[diag.handle-discarded]: this statement ends the thread's handle at once
+file f380.cb
+import std;
+
+fn save(i32 i) : Result<void, String>
+{
+    Err("lost")
+}
+
+fn main()
+{
+    spawn(save, 1);
+}
+end
+run $COBC --check f380.cb
+status 1
+stderr-has diag.result-discarded
+# 374: `exit` in a test fails the run.
+file f374.cb
+import std;
+
+fn die_if_negative(i32 n) : i32
+{
+    if (n < 0)
+    {
+        eprintf("negative\n");
+        exit(0);
+    }
+    n
+}
+
+unittest "first"
+{
+    assert(die_if_negative(1) == 1);
+}
+
+unittest "calls exit"
+{
+    assert(die_if_negative(-1) == 99);
+}
+
+unittest "never runs?"
+{
+    assert(false);
+}
+end
+run $COBC --unittest --run f374.cb
+status 1
+stdout-has `exit(0)` was called during the test
+# 356: overwriting a live resource element of a `Vec` is refused.
+file f356.cb
+import std;
+
+resource struct Res
+{
+    i32 id;
+}
+
+fn Res::drop(ref<Res, exclusive> self)
+{
+    printf("drop %v\n", self.id);
+}
+
+fn main()
+{
+    Vec<Res> v = Vec::new();
+    Vec::push(&mut v, Res { .id = 1 });
+    v[0] = Res { .id = 2 };
+    printf("after element\n");
+}
+end
+run $COBC --check f356.cb
+status 1
+stderr-has diag.overwrite-of-live-resource

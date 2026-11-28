@@ -1,0 +1,1707 @@
+// The typer (`typer.cb`): places, operators and aggregate literals.
+//
+// Each function mirrors the typing half of the lowering function named in
+// its comment: what decides the type of the value the lowering returns, and
+// the expected type it hands each operand. Nothing here emits, names a
+// temporary, requests a function or asks for a type descriptor.
+//
+// A sub-expression the lowering lowers for real is asked with `type_of` (or
+// `place_ty`), also where its type decides nothing (its answer is then
+// dropped, a missing one too); one the lowering probes is asked with
+// `probed_type` or `probe_place_ty`.
+
+import std;
+import ast;
+import items;
+import typecheck;
+import state;
+import cnames;
+import typeops;
+import layout;
+import gen;
+import typer;
+import typer_call;
+import typer_flow;
+import reach;
+
+// ---- helpers ----
+
+// `probe_type`: the type the checker settled where nothing is expected, else
+// the type of `e` asked as a probe asks it.
+fn probed_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    if (Option::is_none(&expected))
+    {
+        match (HashMap::get(&g.prog.facts.settled, e.id))
+        {
+            Some(t) : return Some(clone(t)),
+            None    : {},
+        }
+    }
+    type_probe(g, x, e, expected)
+}
+
+// `type_of` where the expected type is held by value.
+fn type_of_opt(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    ref<Option<Type>, shared> expected,
+) : Option<Type>
+{
+    match (expected)
+    {
+        Some(t) : type_of(g, x, e, Some(t)),
+        None    : type_of(g, x, e, None),
+    }
+}
+
+// `probe_place_type`: the type of the place `e`, asked as a probe asks it
+// (the place not written).
+fn probe_place_ty(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    g.typer_probing += 1;
+    Option<Type> t = place_ty(g, x, e, false);
+    g.typer_probing -= 1;
+    t
+}
+
+// The operand's type as the comparisons beside `lower_binary_expr` find it:
+// a place's as a place, anything else's as a value, both probed.
+fn operand_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    if (is_place_syntax(e)) { probe_place_ty(g, x, e) } else { probed_type(g, x, e, None) }
+}
+
+// `auto_deref`: a reference place read through, at every level.
+fn through_all_refs(ref<Type, shared> t) : Type
+{
+    match (t)
+    {
+        Type::TRef(m) : through_all_refs(&Box::get(m).inner),
+        _             : clone(t),
+    }
+}
+
+// The base of a field or an element as `lower_place` reaches it: read
+// through its references (`auto_deref`), then through one guard
+// (`guard_through`).
+fn through_refs_and_guard(ref<Type, shared> t) : Type
+{
+    Type d = through_all_refs(t);
+    match (d)
+    {
+        Type::TGuard(i) : Box::into_inner(i),
+        other           : other,
+    }
+}
+
+// `lower_place`, `EField`: field `name` of a place of type `base`.
+fn place_field_type(ref<Gen, exclusive> g, ref<Type, shared> base, ref<String, shared> name) : Option<Type>
+{
+    if (is_never(base))
+    {
+        return Some(Type::TNever);
+    }
+    Type s = through_refs_and_guard(base);
+    match (&s)
+    {
+        Type::TNamed(n) : match (struct_field(g, &Box::get(n).name, &Box::get(n).args, name))
+        {
+            Some(fa) : Some(clone(&fa.ty)),
+            None     : typer_gap(g, "error:field-of-a-non-struct"),
+        },
+        _ : typer_gap(g, "error:field-of-a-non-struct"),
+    }
+}
+
+// `index_place`: an element of a place of type `base`.
+fn place_index_type(ref<Gen, exclusive> g, ref<Type, shared> base) : Option<Type>
+{
+    if (is_never(base))
+    {
+        return Some(Type::TNever);
+    }
+    Type s = through_refs_and_guard(base);
+    match (&s)
+    {
+        Type::TNamed(n) :
+        {
+            if (Box::get(n).name == "std::Vec")
+            {
+                return Some(if (Vec::len(&Box::get(n).args) > 0) { clone(&Box::get(n).args[0]) } else { Type::TVoid });
+            }
+            typer_gap(g, "error:index-of-a-non-array")
+        },
+        Type::TSlice(m) : Some(clone(&Box::get(m).inner)),
+        Type::TArray(a) : Some(clone(&Box::get(a).inner)),
+        Type::TSimd(a)  : Some(clone(&Box::get(a).inner)),
+        _               : typer_gap(g, "error:index-of-a-non-array"),
+    }
+}
+
+// A node the typer builds where the lowering builds one (`synth`): its id is
+// 0, which nothing memoises and no fact names.
+fn synth_node(ExprKind kind, usize line, usize col) : Expr
+{
+    bool lit = literal_kind(&kind);
+    Expr { .kind = kind, .line = line, .col = col, .id = 0, .lit = lit }
+}
+
+// `rebuild_alias`: `x.f…` over an aliased `foreach` element as the same
+// fields of the alias.
+fn alias_rebuilt(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Expr>
+{
+    match (&e.kind)
+    {
+        ExprKind::EField(f) :
+        {
+            Expr a = alias_rebuilt(x, &Box::get(f).e)?;
+            Some(synth_node(
+                ExprKind::EField(Box::new(FieldExpr { .e = a, .name = String::clone(&Box::get(f).name) })),
+                e.line,
+                e.col,
+            ))
+        },
+        ExprKind::EParen(a) : alias_rebuilt(x, Box::get(a)),
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) != 1)
+            {
+                return None;
+            }
+            match (HashMap::get(&x.elem_alias, &Box::get(p).segs[0]))
+            {
+                Some(a) : Some(clone(a)),
+                None    : None,
+            }
+        },
+        ExprKind::EDeref(a) :
+        {
+            match (&strip_parens(Box::get(a)).kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) != 1)
+                    {
+                        return None;
+                    }
+                    match (HashMap::get(&x.elem_alias, &Box::get(p).segs[0]))
+                    {
+                        Some(al) : Some(clone(al)),
+                        None     : None,
+                    }
+                },
+                _                  : None,
+            }
+        },
+        _                   : None,
+    }
+}
+
+// `alias_field_chain`.
+fn alias_chain(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Expr>
+{
+    if (HashMap::len(&x.elem_alias) == 0)
+    {
+        return None;
+    }
+    match (&e.kind)
+    {
+        ExprKind::EField(_) : alias_rebuilt(x, e),
+        _                   : None,
+    }
+}
+
+// What `vec_index_call` finds of `e[k]`: whether its base is a `Vec`, that
+// `Vec`'s element type, and the call the indexing is rewritten to
+// (`*Vec::index_shared(&e, k)`, the operands the program's own nodes). A
+// confined parameter's `Vec` has no call: the parameter has no binding, and
+// the lowering reaches its element in place, never through the call.
+struct VecIndex
+{
+    bool vec;
+    Option<Expr> call;
+    Type elem;
+}
+
+// `vec_index_call`; `None` where the base's type is not known.
+fn vec_index(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    ref<PairExpr, shared> ix,
+    bool write,
+) : Option<VecIndex>
+{
+    ref<Expr, shared> sb = strip_parens(&ix.a);
+    bool is_place = match (&sb.kind)
+    {
+        ExprKind::EPath(_)  : true,
+        ExprKind::EField(_) : true,
+        ExprKind::EIndex(_) : true,
+        ExprKind::EDeref(_) : true,
+        _                   : false,
+    };
+    bool confined = false;
+    Option<Type> local_ty = match (&sb.kind)
+    {
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                match (lookup_ref(x, &Box::get(p).segs[0]))
+                {
+                    Some(b) : Some(binding_place_ty(b)),
+                    None : match (HashMap::get(&x.confined_params, &Box::get(p).segs[0]))
+                    {
+                        Some(cv) :
+                        {
+                            confined = true;
+                            Vec<Type> va = one_type(clone(&cv.elem));
+                            Type vt = Type::TNamed(Box::new(NamedTy { .name = "std::Vec", .args = va }));
+                            Some(ref_ty(vt, Mode::Shared))
+                        },
+                        None     : None,
+                    },
+                }
+            }
+            else
+            {
+                None
+            }
+        },
+        ExprKind::EDeref(d) :
+        {
+            ref<Expr, shared> di = strip_parens(Box::get(d));
+            match (&di.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    if (Vec::len(&Box::get(p).segs) == 1 && !is_bound(x, &Box::get(p).segs[0]))
+                    {
+                        match (HashMap::get(&x.confined_params, &Box::get(p).segs[0]))
+                        {
+                            Some(cv) :
+                            {
+                                Type el = clone(&cv.elem);
+                                confined = true;
+                                Some(Type::TNamed(Box::new(NamedTy { .name = "std::Vec", .args = one_type(el) })))
+                            },
+                            None     : None,
+                        }
+                    }
+                    else
+                    {
+                        None
+                    }
+                },
+                _                  : None,
+            }
+        },
+        _                   : None,
+    };
+    Type bt = match (local_ty)
+    {
+        Some(t) : t,
+        None    :
+        {
+            Option<Type> o = if (is_place) { probe_place_ty(g, x, &ix.a) } else { probed_type(g, x, &ix.a, None) };
+            o?
+        },
+    };
+    bool through_ref = false;
+    Type inner = match (bt)
+    {
+        Type::TRef(m) :
+        {
+            through_ref = true;
+            ModedTy::take_inner(m)
+        },
+        other         : other,
+    };
+    Type elem = match (&inner)
+    {
+        Type::TNamed(n) :
+        {
+            if (Box::get(n).name != "std::Vec")
+            {
+                return Some(VecIndex { .vec = false, .call = None, .elem = Type::TVoid });
+            }
+            if (Vec::len(&Box::get(n).args) > 0) { clone(&Box::get(n).args[0]) } else { Type::TVoid }
+        },
+        _               : return Some(VecIndex { .vec = false, .call = None, .elem = Type::TVoid }),
+    };
+    if (confined)
+    {
+        return Some(VecIndex { .vec = true, .call = None, .elem = elem });
+    }
+    usize line = e.line;
+    usize col = e.col;
+    Expr base_c = clone(&ix.a);
+    Expr place = if (through_ref) { synth_node(ExprKind::EDeref(Box::new(base_c)), line, col) } else { base_c };
+    str fname = if (write) { "index_exclusive" } else { "index_shared" };
+    Mode mode = if (write) { Mode::Exclusive } else { Mode::Shared };
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, "std");
+    Vec::push(&mut segs, "Vec");
+    Vec::push(&mut segs, String::copy(fname));
+    Expr callee = synth_node(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), line, col);
+    Expr arg0 = synth_node(ExprKind::EBorrow(Box::new(BorrowExpr { .mode = mode, .e = place })), line, col);
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, arg0);
+    Vec::push(&mut args, clone(&ix.b));
+    Expr call = synth_node(ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = args })), line, col);
+    Expr rw = synth_node(ExprKind::EDeref(Box::new(call)), line, col);
+    Some(VecIndex { .vec = true, .call = Some(rw), .elem = elem })
+}
+
+// An element of a `Vec` where the rewritten call has no answer (not yet, or
+// a confined parameter's, which has no call): the `Vec`'s element type, as
+// `Vec::index_shared` and `Vec::index_exclusive` give it (a reference to it,
+// read through); `never` where the index diverges, as a call's argument
+// does.
+fn vec_elem_direct(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> idx,
+    ref<Type, shared> elem,
+) : Option<Type>
+{
+    Type us = usize_ty();
+    Type it = type_of(g, x, idx, Some(&us))?;
+    Some(if (is_never(&it)) { Type::TNever } else { clone(elem) })
+}
+
+// `bitfield_of`, from the base's probed type `bt0`: the type of field `f`
+// when the base's struct is a bitstruct.
+fn bit_field_type(ref<Gen, exclusive> g, ref<Type, shared> bt0, ref<String, shared> f) : Option<Type>
+{
+    ref<Type, shared> bt = match (bt0)
+    {
+        Type::TRef(m)   : &Box::get(m).inner,
+        Type::TGuard(i) : Box::get(i),
+        _               : bt0,
+    };
+    ref<NamedTy, shared> n = match (bt)
+    {
+        Type::TNamed(n) : Box::get(n),
+        _               : return None,
+    };
+    ref<StructDecl, shared> sd = HashMap::get(&g.prog.table.structs, &n.name)?;
+    if (Option::is_none(&sd.bits))
+    {
+        return None;
+    }
+    foreach (fd in &sd.fields)
+    {
+        if (Option::is_none(&fd.width))
+        {
+            return None;
+        }
+        if (fd.name == *f)
+        {
+            return Some(clone(&fd.ty));
+        }
+    }
+    None
+}
+
+// The result type of the `std` function `name` (`call_std_values`).
+fn std_fn_ret(ref<Gen, exclusive> g, StringView name) : Option<Type>
+{
+    String key = String::copy(name);
+    match (get_fn(g, &key))
+    {
+        Some(f) :
+        {
+            Type r = clone(&f.ret);
+            give_fn(g, &key, f);
+            // The walk (`reach.cb`): `call_std_values` requests it.
+            if (g.reach_on)
+            {
+                note_call(g, &key, &Vec::new());
+            }
+            Some(r)
+        },
+        None    : typer_gap(g, "error:unknown-std-function"),
+    }
+}
+
+// ---- paths ----
+
+// `lower_fn_item`: a function item as a value.
+fn fn_item_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> name,
+    ref<FnDecl, shared> f,
+    ref<Vec<Type>, shared> targs,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    HashMap<String, Type> m = HashMap::new();
+    for (usize i = 0; i < Vec::len(&f.type_params) && i < Vec::len(targs); i += 1)
+    {
+        HashMap::insert(&mut m, String::clone(&f.type_params[i]), apply(&targs[i], &x.subst));
+    }
+    match (expected)
+    {
+        Some(t) : match (t)
+        {
+            Type::TFn(ft) :
+            {
+                for (usize i = 0; i < Vec::len(&f.params) && i < Vec::len(&Box::get(ft).params); i += 1)
+                {
+                    unify(&f.params[i].ty, &Box::get(ft).params[i], &f.type_params, &mut m);
+                }
+                unify(&f.ret, &Box::get(ft).ret, &f.type_params, &mut m);
+            },
+            _             : {},
+        },
+        None : {},
+    }
+    Vec<Type> inst = Vec::new();
+    foreach (tp in &f.type_params)
+    {
+        match (HashMap::get(&m, tp))
+        {
+            Some(t) : Vec::push(&mut inst, clone(t)),
+            None    : return typer_gap(g, "error:fn-item-type-arguments"),
+        }
+    }
+    // The walk (`reach.cb`): the instance `lower_fn_item` requests.
+    if (g.reach_on)
+    {
+        note_call(g, name, &inst);
+    }
+    HashMap<String, Type> fsub = subst_of(&f.type_params, &inst);
+    Vec<Type> ps = Vec::new();
+    for (usize j = 0; j < Vec::len(&f.params); j += 1)
+    {
+        Vec::push(&mut ps, apply(&apply(&f.params[j].ty, &fsub), &x.subst));
+    }
+    Some(Type::TFn(Box::new(FnTy { .params = ps, .ret = apply(&apply(&f.ret, &fsub), &x.subst) })))
+}
+
+// `lower_expr_inner`, `ExprKind::EPath`.
+export fn type_path(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<PathExpr, shared> p = match (&e.kind)
+    {
+        ExprKind::EPath(p) : Box::get(p),
+        _                  : return typer_gap(g, "error:not-a-path"),
+    };
+    if (Vec::len(&p.segs) == 1)
+    {
+        // A bound name: its place, read (`lower_place`, `read_place`).
+        match (lookup_ref(x, &p.segs[0]))
+        {
+            Some(b) : return Some(binding_place_ty(b)),
+            None    : {},
+        }
+        // A `foreach` element aliased for a reader loop, used whole: a shared
+        // reference to the element.
+        Option<Expr> alias = match (HashMap::get(&x.elem_alias, &p.segs[0]))
+        {
+            Some(a0) : Some(clone(a0)),
+            None     : None,
+        };
+        match (&alias)
+        {
+            Some(a) :
+            {
+                Type ap = place_ty(g, x, a, false)?;
+                if (is_never(&ap))
+                {
+                    return Some(Type::TNever);
+                }
+                return Some(ref_ty(ap, Mode::Shared));
+            },
+            None    : {},
+        }
+    }
+    match (variant_of(g, &p.segs))
+    {
+        Some(vr) : return type_variant(g, x, &vr.ename, vr.vi, &p.targs, None, expected),
+        None     : {},
+    }
+    String name = String::join(&p.segs, "::");
+    match (get_fn(g, &name))
+    {
+        Some(f) :
+        {
+            Option<Type> t = fn_item_type(g, x, &name, &f, &p.targs, expected);
+            give_fn(g, &name, f);
+            return t;
+        },
+        None    : {},
+    }
+    typer_gap(g, "error:unresolved-path")
+}
+
+// ---- places ----
+
+// The type of `e` as a place (`lower_place(g, x, e).ty`), the place not
+// written.
+export fn type_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    place_ty(g, x, e, false)
+}
+
+// The type of `e` as a place written (`lower_place` under `place_write`: an
+// assignment's target, an exclusive borrow's operand): the same type; an
+// element of a `Vec` is reached through `Vec::index_exclusive`.
+export fn type_place_written(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    place_ty(g, x, e, true)
+}
+
+// `lower_place`; `write` is the lowering's `place_write`. A place that
+// diverges where it is reached (an element of a `Vec` whose index does) has
+// type `never`.
+fn place_ty(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e, bool write) : Option<Type>
+{
+    // `x.f…` over a `foreach` element alias, read in place.
+    match (alias_chain(x, e))
+    {
+        Some(r) : return place_ty(g, x, &r, write),
+        None    : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EPath(p)      :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                match (lookup_ref(x, &Box::get(p).segs[0]))
+                {
+                    Some(b) : return Some(binding_place_ty(b)),
+                    None    : {},
+                }
+            }
+        },
+        ExprKind::EParen(inner) : return place_ty(g, x, Box::get(inner), write),
+        ExprKind::ECall(ce)     :
+        {
+            match (&Box::get(ce).callee.kind)
+            {
+                ExprKind::EPath(cp) :
+                {
+                    bool reclaim = Vec::len(&Box::get(cp).segs) == 1 && Box::get(cp).segs[0] == "reclaim";
+                    if (reclaim && Vec::len(&Box::get(cp).targs) > 0 && Vec::len(&Box::get(ce).args) > 0)
+                    {
+                        // `[Reclaim]`: the object at a raw address.
+                        _ = type_of(g, x, &Box::get(ce).args[0], None);
+                        return Some(apply(&Box::get(cp).targs[0], &x.subst));
+                    }
+                },
+                _                   : {},
+            }
+        },
+        ExprKind::EField(fe)    :
+        {
+            Type base = place_ty(g, x, &Box::get(fe).e, write)?;
+            return place_field_type(g, &base, &Box::get(fe).name);
+        },
+        ExprKind::EIndex(ie)    :
+        {
+            VecIndex vi = vec_index(g, x, e, Box::get(ie), write)?;
+            if (!vi.vec)
+            {
+                return index_place_type(g, x, Box::get(ie), write);
+            }
+            // `[Index-Vec]`: the rewritten call's place.
+            match (&vi.call)
+            {
+                Some(rw) :
+                {
+                    match (place_ty(g, x, rw, false))
+                    {
+                        Some(t) : return Some(t),
+                        None    : {},
+                    }
+                },
+                None     : {},
+            }
+            return vec_elem_direct(g, x, &Box::get(ie).b, &vi.elem);
+        },
+        ExprKind::EDeref(inner) : return deref_place_type(g, x, Box::get(inner), write),
+        _                       : {},
+    }
+    // A temporary used as a place (`make().f`); a reference temporary stands
+    // for its referent.
+    Type t = type_of(g, x, e, None)?;
+    Some(through_all_refs(&t))
+}
+
+// `lower_place`, `EIndex`, where the base is no `Vec` (`index_place`): an
+// element of the base's place, the index lowered at `usize`.
+fn index_place_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<PairExpr, shared> ix, bool write) : Option<Type>
+{
+    Type base = place_ty(g, x, &ix.a, write)?;
+    Type us = usize_ty();
+    _ = type_of(g, x, &ix.b, Some(&us));
+    place_index_type(g, &base)
+}
+
+// `lower_place`, `EDeref`: `*inner`.
+fn deref_place_type(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> inner, bool write) : Option<Type>
+{
+    // `elem_access_place`: `*Vec::index_…(&v, k)` on a confined vector
+    // (`confined_local`: a confined local, parameter or holder; a parameter
+    // may have no binding) is its element in place, the index lowered at
+    // `usize`; the call itself is never lowered.
+    match (&inner.kind)
+    {
+        ExprKind::ECall(c) :
+        {
+            ref<CallExpr, shared> call = Box::get(c);
+            bool index = match (&call.callee.kind)
+            {
+                ExprKind::EPath(cp) :
+                {
+                    String k = String::join(&Box::get(cp).segs, "::");
+                    k == "std::Vec::index_shared" || k == "std::Vec::index_exclusive"
+                },
+                _                   : false,
+            };
+            if (index && Vec::len(&call.args) == 2)
+            {
+                match (confined_local(x, &call.args[0]))
+                {
+                    Some(cv) : return vec_elem_direct(g, x, &call.args[1], &cv.elem),
+                    None     : {},
+                }
+            }
+        },
+        _                  : {},
+    }
+    Type it = probed_type(g, x, inner, None)?;
+    if (is_guard(&it))
+    {
+        // `guard_place`: through the guard's place, or a temporary's.
+        bool is_place = match (&inner.kind)
+        {
+            ExprKind::EPath(_)  : true,
+            ExprKind::EField(_) : true,
+            ExprKind::EIndex(_) : true,
+            ExprKind::EDeref(_) : true,
+            ExprKind::EParen(_) : true,
+            _                   : false,
+        };
+        Type gt = if (is_place)
+        {
+            place_ty(g, x, inner, write)?
+        }
+        else
+        {
+            type_of(g, x, inner, None)?
+        };
+        return match (gt)
+        {
+            Type::TGuard(i) : Some(Box::into_inner(i)),
+            _               : typer_gap(g, "error:guard-deref-of-a-non-guard"),
+        };
+    }
+    Type v = type_of(g, x, inner, None)?;
+    match (v)
+    {
+        Type::TRef(m)    : Some(ModedTy::take_inner(m)),
+        Type::TRawptr(i) : Some(Box::into_inner(i)),
+        // The element of a `Vec` whose index diverges (`elem_access_place`).
+        Type::TNever     : Some(Type::TNever),
+        _                : typer_gap(g, "error:deref-of-a-non-pointer"),
+    }
+}
+
+// `lower_place_value`: a field, an element or a dereference read as a value
+// (`read_place` gives the place's type).
+export fn type_place_value(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    match (&e.kind)
+    {
+        // D-0103: a field moved out of a temporary.
+        ExprKind::EField(_) :
+        {
+            Option<Expr> moved = match (HashMap::get(&g.prog.facts.temp_moves, e.id))
+            {
+                Some(r0) : Some(clone(r0)),
+                None     : None,
+            };
+            match (&moved)
+            {
+                Some(r) : return type_of(g, x, r, expected),
+                None    : {},
+            }
+        },
+        _                   : {},
+    }
+    // `*x` for a `foreach` element aliased to `(*$c)[$i]`.
+    match (alias_of_deref(x, e))
+    {
+        Some(a) : return type_of(g, x, &a, expected),
+        None    : {},
+    }
+    match (alias_chain(x, e))
+    {
+        Some(r) : return type_of(g, x, &r, expected),
+        None    : {},
+    }
+    match (&e.kind)
+    {
+        ExprKind::EIndex(ie) :
+        {
+            // `[Index-Vec]`: the rewritten call, read.
+            VecIndex vi = vec_index(g, x, e, Box::get(ie), false)?;
+            if (!vi.vec)
+            {
+                // An element of an array, a slice or a `simd`: its place, read.
+                return index_place_type(g, x, Box::get(ie), false);
+            }
+            match (&vi.call)
+            {
+                Some(rw) :
+                {
+                    match (type_of(g, x, rw, expected))
+                    {
+                        Some(t) : return Some(t),
+                        None    : {},
+                    }
+                },
+                None     : {},
+            }
+            return vec_elem_direct(g, x, &Box::get(ie).b, &vi.elem);
+        },
+        ExprKind::EField(fe) :
+        {
+            // D-0118: a bit field is read out of the whole backing integer.
+            Type bt0 = probed_type(g, x, &Box::get(fe).e, None)?;
+            match (bit_field_type(g, &bt0, &Box::get(fe).name))
+            {
+                Some(t) :
+                {
+                    _ = place_ty(g, x, &Box::get(fe).e, false);
+                    return Some(t);
+                },
+                None    : {},
+            }
+        },
+        _                    : {},
+    }
+    place_ty(g, x, e, false)
+}
+
+// ---- borrows and slices ----
+
+// `lower_borrow`: `&e` / `&mut e`.
+export fn type_borrow(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<BorrowExpr, shared> b = match (&e.kind)
+    {
+        ExprKind::EBorrow(b) : Box::get(b),
+        _                    : return typer_gap(g, "error:not-a-borrow"),
+    };
+    Mode mode = b.mode;
+    ref<Expr, shared> inner = &b.e;
+    bool path_or_paren = match (&inner.kind)
+    {
+        ExprKind::EPath(_)  : true,
+        ExprKind::EParen(_) : true,
+        _                   : false,
+    };
+    bool bound_path = match (&inner.kind)
+    {
+        ExprKind::EPath(p) : Vec::len(&Box::get(p).segs) == 1 && is_bound(x, &Box::get(p).segs[0]),
+        _                  : false,
+    };
+    // D-0073: a temporary borrowed; D-0084: a borrowed literal takes the
+    // referent type expected.
+    bool temp_fact = path_or_paren && !bound_path && HashSet::contains(&g.prog.facts.temp_borrows, e.id);
+    if ((is_temp_value(inner) || temp_fact) && !is_global(g, inner))
+    {
+        Option<Type> pointee = match (expected)
+        {
+            Some(t) : match (t)
+            {
+                Type::TRef(m) : Some(clone(&Box::get(m).inner)),
+                _             : None,
+            },
+            None : None,
+        };
+        Type v = type_of_opt(g, x, inner, &pointee)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        return Some(ref_ty(v, mode));
+    }
+    // D-0258 (`global_borrow`): `&NAME` of a static, `&K` of an addressed
+    // constant: a shared reference whatever the mode written.
+    ref<Expr, shared> ge = strip_parens(inner);
+    match (&ge.kind)
+    {
+        ExprKind::EPath(p) :
+        {
+            String key = join_segs(&Box::get(p).segs);
+            match (HashMap::get(&g.prog.table.statics, &key))
+            {
+                Some(decl) : return Some(ref_ty(clone(&decl.ty), Mode::Shared)),
+                None       : {},
+            }
+        },
+        ExprKind::ECall(c) :
+        {
+            match (&Box::get(c).callee.kind)
+            {
+                ExprKind::EPath(p) :
+                {
+                    String key = join_segs(&Box::get(p).segs);
+                    if (Vec::len(&Box::get(c).args) == 0 && HashSet::contains(&g.prog.facts.const_addrs, &key))
+                    {
+                        Type r = std_fn_ret(g, &key)?;
+                        return Some(ref_ty(r, Mode::Shared));
+                    }
+                },
+                _                  : {},
+            }
+        },
+        _                  : {},
+    }
+    Type p = place_ty(g, x, inner, mode == Mode::Exclusive)?;
+    if (is_never(&p))
+    {
+        return typer_gap(g, "error:borrow-of-a-diverging-place");
+    }
+    Some(ref_ty(p, mode))
+}
+
+// `lower_slice_expr`, `lower_slice_string`, `lower_slice_of_as`:
+// `&m base[lo .. hi]`.
+export fn type_slice(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<SliceExpr, shared> sl = match (&e.kind)
+    {
+        ExprKind::ESliceOf(sl) : Box::get(sl),
+        _                      : return typer_gap(g, "error:not-a-slice"),
+    };
+    // 0: no view operation; 1: a view of a `String`; 2: of a `StringView`.
+    u8 view = match (HashMap::get(&g.prog.facts.view_ops, e.id))
+    {
+        Some(vo) : match (vo)
+        {
+            ViewOp::SliceString : 1,
+            ViewOp::SliceView   : 2,
+            _                   : 3,
+        },
+        None : 0,
+    };
+    Type us = usize_ty();
+    if (view == 1)
+    {
+        _ = place_ty(g, x, &sl.base, false);
+        bool lo0 = match (&sl.lo.kind)
+        {
+            ExprKind::EInt(l) : Box::get(l).v == 0,
+            _                 : false,
+        };
+        bool hi_dollar = match (&sl.hi.kind)
+        {
+            ExprKind::EDollar : true,
+            _                 : false,
+        };
+        // The whole text, `&s[0..$]`, is made in place.
+        if (lo0 && hi_dollar)
+        {
+            return Some(named_ty("std::StringView"));
+        }
+        _ = type_of(g, x, &sl.lo, Some(&us));
+        _ = type_of(g, x, &sl.hi, Some(&us));
+        return std_fn_ret(g, "std::String::part");
+    }
+    if (view == 2)
+    {
+        Type v = type_of(g, x, &sl.base, None)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        _ = type_of(g, x, &sl.lo, Some(&us));
+        _ = type_of(g, x, &sl.hi, Some(&us));
+        return std_fn_ret(g, "std::StringView::part");
+    }
+    if (view == 3)
+    {
+        return typer_gap(g, "error:slice-with-a-comparison-view-op");
+    }
+    // D-0070: a slice of an array, a `Vec` or a slice.
+    Type pb0 = place_ty(g, x, &sl.base, false)?;
+    Type pb = through_all_refs(&pb0);
+    Type elem = match (&pb)
+    {
+        Type::TArray(a)  : clone(&Box::get(a).inner),
+        Type::TNamed(n)  :
+        {
+            // A copy of the typer's own of a node the checker rewrote into
+            // a slice of a text has no `view_ops` entry (the typer writes no
+            // fact): it is known by its base's type.
+            if (Box::get(n).name == "std::String" && Vec::len(&Box::get(n).args) == 0)
+            {
+                return std_fn_ret(g, "std::String::part");
+            }
+            if (Box::get(n).name == "std::StringView" && Vec::len(&Box::get(n).args) == 0)
+            {
+                return std_fn_ret(g, "std::StringView::part");
+            }
+            if (Box::get(n).name != "std::Vec")
+            {
+                return typer_gap(g, "error:slice-of-a-non-array");
+            }
+            if (Vec::len(&Box::get(n).args) > 0) { clone(&Box::get(n).args[0]) } else { Type::TVoid }
+        },
+        Type::TSlice(ms) : clone(&Box::get(ms).inner),
+        _                : return typer_gap(g, "error:slice-of-a-non-array"),
+    };
+    _ = type_of(g, x, &sl.lo, Some(&us));
+    _ = type_of(g, x, &sl.hi, Some(&us));
+    Some(Type::TSlice(Box::new(ModedTy { .inner = elem, .mode = sl.mode })))
+}
+
+// ---- operators ----
+
+// `lower_unary`.
+export fn type_unary(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<UnaryExpr, shared> u = match (&e.kind)
+    {
+        ExprKind::EUnary(u) : Box::get(u),
+        _                   : return typer_gap(g, "error:not-a-unary"),
+    };
+    if (u.op == UnOp::Neg)
+    {
+        // A negated literal is a literal of the type its context gives.
+        match (&u.e.kind)
+        {
+            ExprKind::EInt(l) :
+            {
+                match (float_literal(g, &u.e, &Box::get(l).sfx, expected))
+                {
+                    Some(single) : return Some(if (single) { Type::TF32 } else { Type::TF64 }),
+                    None         : {},
+                }
+                return Some(Type::TInt(int_lit_type(&Box::get(l).sfx, expected)));
+            },
+            _                 : {},
+        }
+    }
+    Type v = type_of(g, x, &u.e, expected)?;
+    match (&v)
+    {
+        Type::TNever   : Some(Type::TNever),
+        Type::TSimd(_) : Some(v),
+        Type::TInt(_)  : Some(v),
+        Type::TF32     : Some(v),
+        Type::TF64     : Some(v),
+        Type::TBool    : Some(Type::TBool),
+        _              : typer_gap(g, "error:unary-operator-on-this-type"),
+    }
+}
+
+// `lower_borrowed_operand_as`: a comparison operand read where it stands;
+// its type decides nothing, it is asked as the lowering lowers it.
+fn borrowed_operand(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+)
+{
+    ref<Expr, shared> root = e;
+    bool moved = false;
+    while (true)
+    {
+        match (&root.kind)
+        {
+            ExprKind::EField(f)  :
+            {
+                root = &Box::get(f).e;
+                moved = true;
+            },
+            ExprKind::EIndex(ix) :
+            {
+                root = &Box::get(ix).a;
+                moved = true;
+            },
+            ExprKind::EParen(i)  :
+            {
+                root = Box::get(i);
+                moved = true;
+            },
+            _                    : break,
+        }
+    }
+    bool through_ref = false;
+    if (moved && !is_place_syntax(root))
+    {
+        match (probed_type(g, x, root, None))
+        {
+            Some(t) : through_ref = is_ref_type(&t),
+            None    : {},
+        }
+    }
+    if ((is_place_syntax(e) && !is_untyped_variant(g, x, e)) || through_ref)
+    {
+        _ = place_ty(g, x, e, false);
+        return;
+    }
+    _ = type_of(g, x, e, expected);
+}
+
+// `instance_view_op` and `lower_view_cmp`: a comparison the checker recorded
+// a view, text or key operation for; `vo` is 1 for `VEq` and `VLess`, 2 for
+// `TextCmp`, 3 for `KeyCmp`.
+fn view_cmp_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    u8 vo,
+    BinOp op,
+    ref<Expr, shared> a,
+    ref<Expr, shared> b,
+) : Option<Type>
+{
+    u8 v = vo;
+    // A generic body's instance: this instantiation's own operation.
+    if (HashMap::len(&x.subst) != 0)
+    {
+        Type at = operand_type(g, x, a)?;
+        Type bt = operand_type(g, x, b)?;
+        if (is_named(&at, "std::StringView") || is_named(&bt, "std::StringView"))
+        {
+            v = 1;
+        }
+        else if (vo == 1)
+        {
+            v = 2;
+        }
+    }
+    if (v == 1)
+    {
+        // `StringView::eq`, `same_str` or `less` over both operands.
+        _ = type_of(g, x, a, None);
+        _ = type_of(g, x, b, None);
+        // The walk (`reach.cb`): `call_std_values` requests the one called;
+        // an equality's two are both taken (which one depends on what the
+        // checker recorded of the other operand).
+        if (g.reach_on)
+        {
+            Vec<Type> none = Vec::new();
+            if (op == BinOp::Eq || op == BinOp::Ne)
+            {
+                note_call(g, &String::copy("std::StringView::eq"), &none);
+                note_call(g, &String::copy("std::StringView::same_str"), &none);
+            }
+            else
+            {
+                note_call(g, &String::copy("std::StringView::less"), &none);
+            }
+        }
+        return Some(Type::TBool);
+    }
+    if (v == 2)
+    {
+        Type lt = operand_type(g, x, a)?;
+        if (!is_named(&lt, "std::String"))
+        {
+            return binary_type(g, x, op, a, b, None);
+        }
+        borrowed_operand(g, x, a, None);
+        borrowed_operand(g, x, b, None);
+        return Some(Type::TBool);
+    }
+    // `KeyCmp`: the type is the operand's that is not a variant with nothing
+    // to fix its type arguments.
+    ref<Expr, shared> typed = if (is_untyped_variant(g, x, a) && !is_untyped_variant(g, x, b)) { b } else { a };
+    Type lt = operand_type(g, x, typed)?;
+    if (is_named(&lt, "std::String"))
+    {
+        borrowed_operand(g, x, a, None);
+        borrowed_operand(g, x, b, None);
+        return Some(Type::TBool);
+    }
+    bool named = match (&lt)
+    {
+        Type::TNamed(_) : true,
+        _               : false,
+    };
+    if (!named || !is_key_type(&g.prog.table, &lt))
+    {
+        return binary_type(g, x, op, a, b, None);
+    }
+    if (is_resource(g, &lt))
+    {
+        borrowed_operand(g, x, a, Some(&lt));
+        borrowed_operand(g, x, b, Some(&lt));
+    }
+    else
+    {
+        _ = type_of(g, x, a, Some(&lt));
+        _ = type_of(g, x, b, Some(&lt));
+    }
+    Some(Type::TBool)
+}
+
+// `lower_binary`.
+fn binary_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    BinOp op,
+    ref<Expr, shared> l,
+    ref<Expr, shared> r,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    if (op == BinOp::And || op == BinOp::Or)
+    {
+        Type tb = Type::TBool;
+        Type lv = type_of(g, x, l, Some(&tb))?;
+        if (is_never(&lv))
+        {
+            return Some(Type::TNever);
+        }
+        _ = type_of(g, x, r, Some(&tb));
+        return Some(Type::TBool);
+    }
+    bool float_arith = op == BinOp::Add || op == BinOp::Sub || op == BinOp::Mul || op == BinOp::Div || op == BinOp::Rem;
+    bool shift = op == BinOp::Shl || op == BinOp::Shr;
+    bool arith = float_arith || shift || op == BinOp::BitAnd || op == BinOp::BitOr || op == BinOp::BitXor;
+    Option<ref<Type, shared>> operand_expected = if (arith) { expected } else { None };
+    // `[Read-Resource-Rejected]`: decided before either operand runs, from
+    // the probed type of the operand that types the other.
+    bool eqne = op == BinOp::Eq || op == BinOp::Ne;
+    bool bare_left = eqne && is_untyped_variant(g, x, l) && !is_untyped_variant(g, x, r);
+    Type lt = if (is_literal_or_operator(l))
+    {
+        Type::TVoid
+    }
+    else if (bare_left)
+    {
+        probed_type(g, x, r, operand_expected)?
+    }
+    else
+    {
+        probed_type(g, x, l, operand_expected)?
+    };
+    if (is_resource(g, &lt))
+    {
+        return Some(Type::TNever);
+    }
+    bool left_takes = (is_literal_expr(l) && !shift) || (eqne && is_pure_variant_literal(g, x, l)) || bare_left;
+    Type lv = Type::TVoid;
+    if (left_takes && !is_literal_expr(r) && !is_pure_variant_literal(g, x, r))
+    {
+        // The left operand takes the right one's type.
+        Type rt = type_of(g, x, r, operand_expected)?;
+        if (is_never(&rt))
+        {
+            return Some(Type::TNever);
+        }
+        lv = type_of(g, x, l, Some(&rt))?;
+    }
+    else
+    {
+        Type i32_ty = Type::TInt(IntTy::I32);
+        bool default_left = shift && Option::is_none(&operand_expected) && is_literal_expr(l);
+        lv = type_of(g, x, l, if (default_left) { Some(&i32_ty) } else { operand_expected })?;
+        if (is_never(&lv))
+        {
+            return Some(Type::TNever);
+        }
+        Type rt = type_of(g, x, r, Some(&lv))?;
+        if (is_never(&rt))
+        {
+            return Some(Type::TNever);
+        }
+    }
+    match (&lv)
+    {
+        // D-0254: lane by lane; `==` and `!=` of the whole.
+        Type::TSimd(_)   : if (eqne) { Some(Type::TBool) } else { Some(lv) },
+        Type::TInt(_)    : if (arith) { Some(lv) } else { Some(Type::TBool) },
+        Type::TF32       : if (float_arith) { Some(lv) } else { Some(Type::TBool) },
+        Type::TF64       : if (float_arith) { Some(lv) } else { Some(Type::TBool) },
+        Type::TBool      : Some(Type::TBool),
+        Type::TStr       : Some(Type::TBool),
+        Type::TRawptr(_) : if (op == BinOp::Add) { Some(lv) } else { Some(Type::TBool) },
+        Type::TRef(_)    : Some(Type::TBool),
+        Type::TFn(_)     : Some(Type::TBool),
+        Type::TNamed(_)  : Some(Type::TBool),
+        Type::TArray(_)  : Some(Type::TBool),
+        Type::TVoid      : Some(Type::TBool),
+        _                : typer_gap(g, "error:binary-operator-on-this-type"),
+    }
+}
+
+// `lower_binary_expr`: a view, text or key comparison the checker recorded
+// (D-0053, D-0108), else the operator.
+export fn type_binary(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<BinaryExpr, shared> b = match (&e.kind)
+    {
+        ExprKind::EBinary(b) : Box::get(b),
+        _                    : return typer_gap(g, "error:not-a-binary"),
+    };
+    u8 vo = match (HashMap::get(&g.prog.facts.view_ops, e.id))
+    {
+        Some(v) : match (v)
+        {
+            ViewOp::VEq(_)   : 1,
+            ViewOp::VLess(_) : 1,
+            ViewOp::TextCmp  : 2,
+            ViewOp::KeyCmp   : 3,
+            _                : 4,
+        },
+        None : 0,
+    };
+    if (vo == 4)
+    {
+        return typer_gap(g, "error:comparison-with-a-slice-view-op");
+    }
+    if (vo != 0)
+    {
+        return view_cmp_type(g, x, vo, b.op, &b.a, &b.b);
+    }
+    binary_type(g, x, b.op, &b.a, &b.b, expected)
+}
+
+// `lower_assign`, the target `place` and the value `val`: unit, or `never`
+// where the value (or the target's index) diverges.
+fn assign_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> place,
+    ref<Expr, shared> val,
+) : Option<Type>
+{
+    // D-0118: a write into a bit field: the value at the field's type.
+    match (&strip_parens(place).kind)
+    {
+        ExprKind::EField(fe) :
+        {
+            Type bt0 = probed_type(g, x, &Box::get(fe).e, None)?;
+            match (bit_field_type(g, &bt0, &Box::get(fe).name))
+            {
+                Some(ft) :
+                {
+                    _ = place_ty(g, x, &Box::get(fe).e, true);
+                    Type v = type_of(g, x, val, Some(&ft))?;
+                    return Some(if (is_never(&v)) { Type::TNever } else { Type::TVoid });
+                },
+                None     : {},
+            }
+        },
+        _                    : {},
+    }
+    // The value is lowered at the place's type.
+    Type pty = place_ty(g, x, place, true)?;
+    if (is_never(&pty))
+    {
+        return Some(Type::TNever);
+    }
+    Type v = type_of(g, x, val, Some(&pty))?;
+    Some(if (is_never(&v)) { Type::TNever } else { Type::TVoid })
+}
+
+// `lower_assign`.
+export fn type_assign(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<PairExpr, shared> p = match (&e.kind)
+    {
+        ExprKind::EAssign(p) : Box::get(p),
+        _                    : return typer_gap(g, "error:not-an-assignment"),
+    };
+    // `*x = e` for a `foreach` element aliased to `(*$c)[$i]`: the write is
+    // to that element.
+    match (alias_of_deref(x, strip_parens(&p.a)))
+    {
+        Some(a) : return assign_type(g, x, &a, &p.b),
+        None    : {},
+    }
+    assign_type(g, x, &p.a, &p.b)
+}
+
+// ---- aggregate literals ----
+
+// `lower_array_lit` and `lower_simd_lit`.
+export fn type_array_lit(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<Vec<Expr>, shared> es = match (&e.kind)
+    {
+        ExprKind::EArrayLit(es) : es,
+        _                       : return typer_gap(g, "error:not-an-array-literal"),
+    };
+    match (simd_expected(expected))
+    {
+        Some(ty) :
+        {
+            Type lane = simd_lane(&ty);
+            foreach (el in es)
+            {
+                Type v = type_of(g, x, el, Some(&lane))?;
+                if (is_never(&v))
+                {
+                    return Some(Type::TNever);
+                }
+            }
+            return Some(ty);
+        },
+        None     : {},
+    }
+    Option<Type> elem_ty = expected_elem(expected);
+    foreach (el in es)
+    {
+        Type v = type_of_opt(g, x, el, &elem_ty)?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        if (Option::is_none(&elem_ty))
+        {
+            elem_ty = Some(v);
+        }
+    }
+    // CHG-0485: `[]` where nothing gives its element type is refused.
+    Type elem = match (elem_ty)
+    {
+        Some(t) : t,
+        None    : return typer_gap(g, "error:element-type-of-an-empty-array"),
+    };
+    Some(Type::TArray(Box::new(SizedTy { .inner = elem, .n = widen<u128>(Vec::len(es)) })))
+}
+
+// `lower_array_repeat` and `lower_simd_repeat`.
+export fn type_array_repeat(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<RepeatExpr, shared> r = match (&e.kind)
+    {
+        ExprKind::EArrayRepeat(r) : Box::get(r),
+        _                         : return typer_gap(g, "error:not-an-array-repeat"),
+    };
+    match (simd_expected(expected))
+    {
+        Some(ty) :
+        {
+            Type lane = simd_lane(&ty);
+            Type v = type_of(g, x, &r.value, Some(&lane))?;
+            if (is_never(&v))
+            {
+                return Some(Type::TNever);
+            }
+            return Some(ty);
+        },
+        None     : {},
+    }
+    Option<Type> elem_ty = expected_elem(expected);
+    Type v = type_of_opt(g, x, &r.value, &elem_ty)?;
+    if (is_never(&v))
+    {
+        return Some(Type::TNever);
+    }
+    Type elem = match (elem_ty)
+    {
+        Some(t) : t,
+        None    : v,
+    };
+    Some(Type::TArray(Box::new(SizedTy { .inner = elem, .n = r.n })))
+}
+
+// Whether `e` is a closure literal whose value, lowered with no type
+// expected, `box_unhinted_closure` boxes as a `fn` value of its signature.
+fn unhinted_closure(ref<Expr, shared> e, ref<Type, shared> t) : bool
+{
+    match (&strip_parens(e).kind)
+    {
+        ExprKind::EClosure(_) : is_closure(t),
+        _                     : false,
+    }
+}
+
+// `lower_struct_lit` after the constructor has taken `hp`, the callee's type
+// parameters its expected type may still name (`Gen::hint_params`).
+fn struct_lit_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<StructLitExpr, shared> sl,
+    Option<ref<Type, shared>> expected,
+    ref<Vec<String>, shared> hp,
+) : Option<Type>
+{
+    String name = join_segs(&sl.segs);
+    StructDecl sd = match (struct_decl(g, &name))
+    {
+        Some(d) : d,
+        None    : return typer_gap(g, "error:unknown-struct"),
+    };
+    HashMap<String, Type> m = HashMap::new();
+    for (usize k = 0; k < Vec::len(&sd.type_params) && k < Vec::len(&sl.targs); k += 1)
+    {
+        HashMap::insert(&mut m, String::clone(&sd.type_params[k]), apply(&sl.targs[k], &x.subst));
+    }
+    match (expected)
+    {
+        Some(t) :
+        {
+            match (t)
+            {
+                Type::TNamed(n) :
+                {
+                    if (Box::get(n).name == name)
+                    {
+                        for (usize k = 0; k < Vec::len(&sd.type_params) && k < Vec::len(&Box::get(n).args); k += 1)
+                        {
+                            if (!HashMap::contains(&m, &sd.type_params[k]) && resolved(&Box::get(n).args[k], hp))
+                            {
+                                HashMap::insert(&mut m, String::clone(&sd.type_params[k]), clone(&Box::get(n).args[k]));
+                            }
+                        }
+                    }
+                },
+                _               : {},
+            }
+        },
+        None    : {},
+    }
+    foreach (fi in &sl.fields)
+    {
+        usize k = 0;
+        while (k < Vec::len(&sd.fields) && sd.fields[k].name != fi.name)
+        {
+            k += 1;
+        }
+        if (k == Vec::len(&sd.fields))
+        {
+            return typer_gap(g, "error:unknown-struct-field");
+        }
+        // A field is lowered at its type where the type arguments known so
+        // far fix it; its own type fixes the rest.
+        Type hint = apply(&sd.fields[k].ty, &m);
+        bool known = resolved(&hint, &sd.type_params);
+        Option<Type> vo = if (known) { type_of(g, x, &fi.value, Some(&hint)) } else { type_of(g, x, &fi.value, None) };
+        Type v = vo?;
+        if (is_never(&v))
+        {
+            return Some(Type::TNever);
+        }
+        if (!known && unhinted_closure(&fi.value, &v))
+        {
+            // `box_unhinted_closure`: a `fn` value of the closure's signature.
+            match (closure_fn_ty(g, &v))
+            {
+                Some(dst) : v = dst,
+                None      : {},
+            }
+        }
+        unify(&sd.fields[k].ty, &v, &sd.type_params, &mut m);
+    }
+    Vec<Type> args = Vec::new();
+    foreach (tp in &sd.type_params)
+    {
+        match (HashMap::get(&m, tp))
+        {
+            Some(t) : Vec::push(&mut args, clone(t)),
+            None    : return typer_gap(g, "error:struct-type-arguments"),
+        }
+    }
+    Some(Type::TNamed(Box::new(NamedTy { .name = name, .args = args })))
+}
+
+// `lower_struct_lit`.
+export fn type_struct_lit(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<StructLitExpr, shared> sl = match (&e.kind)
+    {
+        ExprKind::EStructLit(sl) : Box::get(sl),
+        _                        : return typer_gap(g, "error:not-a-struct-literal"),
+    };
+    // The constructor takes (empties) `hint_params` as it begins: its parts
+    // see none. The typer puts them back as it found them.
+    Vec<String> hp = replace(&mut g.hint_params, Vec::new());
+    Option<Type> t = struct_lit_type(g, x, sl, expected, &hp);
+    g.hint_params = hp;
+    t
+}
+
+// `construct_variant` after the constructor has taken `hp`.
+fn variant_type(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> ename,
+    usize vi,
+    ref<Vec<Type>, shared> targs,
+    Option<ref<Expr, shared>> payload,
+    Option<ref<Type, shared>> expected,
+    ref<Vec<String>, shared> hp,
+) : Option<Type>
+{
+    EnumDecl ed = match (enum_decl(g, ename))
+    {
+        Some(d) : d,
+        None    : return typer_gap(g, "error:unknown-enum"),
+    };
+    if (vi >= Vec::len(&ed.variants))
+    {
+        return typer_gap(g, "error:unknown-variant");
+    }
+    HashMap<String, Type> m = HashMap::new();
+    for (usize k = 0; k < Vec::len(&ed.type_params) && k < Vec::len(targs); k += 1)
+    {
+        HashMap::insert(&mut m, String::clone(&ed.type_params[k]), apply(&targs[k], &x.subst));
+    }
+    match (expected)
+    {
+        Some(t) :
+        {
+            match (t)
+            {
+                Type::TNamed(n) :
+                {
+                    if (Box::get(n).name == *ename)
+                    {
+                        for (usize k = 0; k < Vec::len(&ed.type_params) && k < Vec::len(&Box::get(n).args); k += 1)
+                        {
+                            if (!HashMap::contains(&m, &ed.type_params[k]) && resolved(&Box::get(n).args[k], hp))
+                            {
+                                HashMap::insert(&mut m, String::clone(&ed.type_params[k]), clone(&Box::get(n).args[k]));
+                            }
+                        }
+                    }
+                },
+                _               : {},
+            }
+        },
+        None    : {},
+    }
+    match (&ed.variants[vi].payload)
+    {
+        Some(pty) :
+        {
+            ref<Expr, shared> pe = match (payload)
+            {
+                Some(p) : p,
+                None    : return typer_gap(g, "error:variant-payload-arity"),
+            };
+            // The payload is lowered at its type where the type arguments
+            // known so far fix it; its own type fixes the rest.
+            Type hint = apply(pty, &m);
+            bool known = resolved(&hint, &ed.type_params);
+            Option<Type> vo = if (known) { type_of(g, x, pe, Some(&hint)) } else { type_of(g, x, pe, None) };
+            Type v = vo?;
+            if (is_never(&v))
+            {
+                return Some(Type::TNever);
+            }
+            if (!known && unhinted_closure(pe, &v))
+            {
+                // `box_unhinted_closure`: a `fn` value of the closure's
+                // signature.
+                match (closure_fn_ty(g, &v))
+                {
+                    Some(dst) : v = dst,
+                    None      : {},
+                }
+            }
+            unify(pty, &v, &ed.type_params, &mut m);
+        },
+        None      :
+        {
+            if (Option::is_some(&payload))
+            {
+                return typer_gap(g, "error:variant-payload-arity");
+            }
+        },
+    }
+    Vec<Type> args = Vec::new();
+    foreach (tp in &ed.type_params)
+    {
+        match (HashMap::get(&m, tp))
+        {
+            Some(t) : Vec::push(&mut args, clone(t)),
+            None    : return typer_gap(g, "error:variant-type-arguments"),
+        }
+    }
+    Some(Type::TNamed(Box::new(NamedTy { .name = String::clone(ename), .args = args })))
+}
+
+// `construct_variant`: the type of variant `vi` of the enum `ename`
+// constructed with the type arguments `targs` and the payload `payload`.
+export fn type_variant(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<String, shared> ename,
+    usize vi,
+    ref<Vec<Type>, shared> targs,
+    Option<ref<Expr, shared>> payload,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    // As `type_struct_lit`: `hint_params` taken for the constructor's parts,
+    // and put back.
+    Vec<String> hp = replace(&mut g.hint_params, Vec::new());
+    Option<Type> t = variant_type(g, x, ename, vi, targs, payload, expected, &hp);
+    g.hint_params = hp;
+    t
+}

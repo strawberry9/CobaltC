@@ -1,0 +1,1292 @@
+// Protocol CIR (step T4, stage 0): a function body's statements as a list of
+// nodes, one for each statement the lowering emits, in the order it emits
+// them; a block's opening and closing lines are nodes of their own, so the
+// list is the body's tree written flat, and "cut back to this mark" and
+// "insert here" are operations on positions. A node is its C text, its
+// indentation, and what `classify` reads off the text: its kind and where
+// its parts are. Later stages have each place that emits a statement say
+// what it is, and move the passes from the text to the nodes.
+//
+// The texts lie end to end in one pool per buffer; a node names its part.
+
+import std;
+import rt;
+
+// What a statement is (`PNode::kind`), read off its text by `classify` until
+// the place that emits it says so itself.
+// Not classified: its text is all that is known.
+export const u8 PK_RAW = 0;
+// A scope marker (`state::scope_marker`): byte 1, the kind, the id, and a
+// location after byte 2.
+export const u8 PK_MARK = 1;
+// A `/*@...*/` mark for a later pass, on a line of its own.
+export const u8 PK_NOTE = 2;
+// `TYPE NAME;`
+export const u8 PK_DECL = 3;
+// `TYPE NAME = EXPR;`
+export const u8 PK_DECL_INIT = 4;
+// `LVALUE = EXPR;`
+export const u8 PK_SET = 5;
+// `CALLEE(ARGS);`, also under `(void)(...)` (`PF_VOID`).
+export const u8 PK_CALL = 6;
+// `TYPE NAME = CALLEE(ARGS);`
+export const u8 PK_DECL_CALL = 7;
+// `LVALUE = CALLEE(ARGS);`
+export const u8 PK_SET_CALL = 8;
+// `if (COND) {`
+export const u8 PK_IF = 9;
+// `} else if (COND) {`
+export const u8 PK_ELSE_IF = 10;
+// `} else {`
+export const u8 PK_ELSE = 11;
+// `for (;;) {`
+export const u8 PK_LOOP = 12;
+// `{`
+export const u8 PK_BLOCK = 13;
+// Another line that opens a block.
+export const u8 PK_OPEN = 14;
+// `}`
+export const u8 PK_CLOSE = 15;
+// `break;`, `continue;`, `return;` or `return EXPR;`, `goto LABEL;`, `LABEL:;`
+export const u8 PK_BREAK = 16;
+export const u8 PK_CONTINUE = 17;
+export const u8 PK_RETURN = 18;
+export const u8 PK_GOTO = 19;
+export const u8 PK_LABEL = 20;
+// `if (COND) break;`, `if (COND) continue;`, `if (COND) goto LABEL;`
+export const u8 PK_IF_JUMP = 21;
+// `if (COND) STATEMENT` on one line.
+export const u8 PK_IF_STMT = 22;
+export const usize PK_COUNT = 23;
+
+// `PNode::flags`: the call stands under `(void)(...)`; the jump of an
+// `if (COND) jump;` is a `break`, a `continue` (else a `goto`).
+export const u8 PF_VOID = 1;
+export const u8 PF_BREAK = 2;
+export const u8 PF_CONTINUE = 4;
+// The node was built by a constructor (`pemit.cb`): the place that emits it
+// said what it is. Without it, `classify` read the node off its text.
+export const u8 PF_BUILT = 8;
+// A built node whose value's shape the place did not know: the constructor
+// asked the value whether it is one call (`call_open`).
+export const u8 PF_ASKED = 16;
+
+export fn pk_name(u8 k) : str
+{
+    if (k == PK_RAW) { return "raw"; }
+    if (k == PK_MARK) { return "mark"; }
+    if (k == PK_NOTE) { return "note"; }
+    if (k == PK_DECL) { return "decl"; }
+    if (k == PK_DECL_INIT) { return "decl-init"; }
+    if (k == PK_SET) { return "set"; }
+    if (k == PK_CALL) { return "call"; }
+    if (k == PK_DECL_CALL) { return "decl-call"; }
+    if (k == PK_SET_CALL) { return "set-call"; }
+    if (k == PK_IF) { return "if"; }
+    if (k == PK_ELSE_IF) { return "else-if"; }
+    if (k == PK_ELSE) { return "else"; }
+    if (k == PK_LOOP) { return "loop"; }
+    if (k == PK_BLOCK) { return "block"; }
+    if (k == PK_OPEN) { return "open"; }
+    if (k == PK_CLOSE) { return "close"; }
+    if (k == PK_BREAK) { return "break"; }
+    if (k == PK_CONTINUE) { return "continue"; }
+    if (k == PK_RETURN) { return "return"; }
+    if (k == PK_GOTO) { return "goto"; }
+    if (k == PK_LABEL) { return "label"; }
+    if (k == PK_IF_JUMP) { return "if-jump"; }
+    if (k == PK_IF_STMT) { return "if-stmt"; }
+    "?"
+}
+
+// One statement. Its text lies in the pool at `off`, `len` bytes, without
+// its indentation. The parts are positions in that text (from its start):
+// `pre` bytes of a `/*@vck ...*/ ` tag come first; a declaration's type is
+// the `ty_len` bytes after the tag; `a` is the declared name, the assigned
+// lvalue, or a jump's label; `b` the callee of a call; `c` a call's
+// arguments, an initialiser or assigned expression, a returned value, a
+// condition; for `PK_IF_STMT`, `a` is the statement after the condition.
+// A program's nodes are all kept to the end, so the record is small (40
+// bytes): a pool holds less than 4 GB, a line is indented less than 65,536
+// columns, and a node whose tag, type or callee's name is longer than that
+// is `PK_RAW`.
+// `pn_*` and `pbuf_ind` give the fields as `usize`.
+export struct PNode
+{
+    export u32 off;
+    export u32 len;
+    export u32 a_at;
+    export u32 a_len;
+    export u32 b_at;
+    export u32 c_at;
+    export u32 c_len;
+    // A callee's name is shorter than 65,536 bytes.
+    export u16 b_len;
+    // The indentation, in spaces.
+    export u16 ind;
+    export u16 pre;
+    export u16 ty_len;
+    // The runtime entry a call node calls (`rt.cb`), `RT_NONE` for any other
+    // callee and for a node that is no call.
+    export u16 rt;
+    export u8 kind;
+    export u8 flags;
+}
+
+export fn pn_off(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.off)
+}
+
+export fn pn_len(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.len)
+}
+
+export fn pn_ind(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.ind)
+}
+
+export fn pn_pre(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.pre)
+}
+
+export fn pn_ty_len(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.ty_len)
+}
+
+export fn pn_a_at(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.a_at)
+}
+
+export fn pn_a_len(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.a_len)
+}
+
+export fn pn_b_at(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.b_at)
+}
+
+export fn pn_b_len(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.b_len)
+}
+
+export fn pn_c_at(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.c_at)
+}
+
+export fn pn_c_len(ref<PNode, shared> n) : usize
+{
+    widen<usize>(n.c_len)
+}
+
+// What `parts_of` reads off a statement's text, each position at full
+// width; `pack` makes the node of it.
+struct Parts
+{
+    usize len;
+    u8 kind;
+    u8 flags;
+    usize pre;
+    usize ty_len;
+    usize a_at;
+    usize a_len;
+    usize b_at;
+    usize b_len;
+    usize c_at;
+    usize c_len;
+    u16 rt;
+}
+
+export struct PBuf
+{
+    export String pool;
+    export Vec<PNode> nodes;
+}
+
+fn is_ident_start(u8 c) : bool
+{
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_'
+}
+
+fn is_ident(u8 c) : bool
+{
+    is_ident_start(c) || (c >= b'0' && c <= b'9')
+}
+
+// Past the string or character literal that opens at `i`: the position
+// after its closing quote, or `n`.
+fn skip_literal(slice<u8, shared> t, usize i, usize n) : usize
+{
+    u8 q = t[i];
+    usize k = i + 1;
+    while (k < n)
+    {
+        if (t[k] == b'\\')
+        {
+            k += 2;
+            continue;
+        }
+        if (t[k] == q)
+        {
+            return k + 1;
+        }
+        k += 1;
+    }
+    n
+}
+
+// The `)` that closes the `(` at `open`, before `n`.
+fn close_of(slice<u8, shared> t, usize open, usize n) : Option<usize>
+{
+    usize depth = 0;
+    usize k = open;
+    while (k < n)
+    {
+        u8 c = t[k];
+        if (c == b'"' || c == b'\'')
+        {
+            k = skip_literal(t, k, n);
+            continue;
+        }
+        if (c == b'(')
+        {
+            depth += 1;
+        }
+        else if (c == b')')
+        {
+            depth -= 1;
+            if (depth == 0)
+            {
+                return Some(k);
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
+// The first ` = ` of `t[from..to]` outside brackets and literals: the
+// position of its space.
+fn assign_at(slice<u8, shared> t, usize from, usize to) : Option<usize>
+{
+    usize depth = 0;
+    usize k = from;
+    while (k + 2 < to)
+    {
+        u8 c = t[k];
+        if (c == b'"' || c == b'\'')
+        {
+            k = skip_literal(t, k, to);
+            continue;
+        }
+        if (c == b'(' || c == b'[' || c == b'{')
+        {
+            depth += 1;
+        }
+        else if (c == b')' || c == b']' || c == b'}')
+        {
+            if (depth > 0)
+            {
+                depth -= 1;
+            }
+        }
+        else if (depth == 0 && c == b' ' && t[k + 1] == b'=' && t[k + 2] == b' ')
+        {
+            return Some(k);
+        }
+        k += 1;
+    }
+    None
+}
+
+// Whether `t[from..to]` has a `;` outside brackets, braces and literals: a
+// statement's end before the line's.
+fn semi_inside(slice<u8, shared> t, usize from, usize to) : bool
+{
+    usize depth = 0;
+    usize k = from;
+    while (k < to)
+    {
+        u8 c = t[k];
+        if (c == b'"' || c == b'\'')
+        {
+            k = skip_literal(t, k, to);
+            continue;
+        }
+        if (c == b'(' || c == b'[' || c == b'{')
+        {
+            depth += 1;
+        }
+        else if (c == b')' || c == b']' || c == b'}')
+        {
+            if (depth > 0)
+            {
+                depth -= 1;
+            }
+        }
+        else if (c == b';' && depth == 0)
+        {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+// `t[from..to]` as `CALLEE(ARGS)` and nothing else: where the `(` is.
+fn exact_call(slice<u8, shared> t, usize from, usize to) : Option<usize>
+{
+    if (from >= to || !is_ident_start(t[from]))
+    {
+        return None;
+    }
+    usize k = from;
+    while (k < to && is_ident(t[k]))
+    {
+        k += 1;
+    }
+    if (k >= to || t[k] != b'(')
+    {
+        return None;
+    }
+    match (close_of(t, k, to))
+    {
+        Some(c) : if (c + 1 == to) { Some(k) } else { None },
+        None    : None,
+    }
+}
+
+// `t[from..to]` as a declarator `TYPE NAME` or `TYPE NAME[N]`: where the
+// name starts, or `to` when it is not one. The type is identifiers, spaces
+// and `*`; the name follows a space or a `*`.
+fn decl_name_at(slice<u8, shared> t, usize from, usize to) : usize
+{
+    if (from >= to || !is_ident_start(t[from]))
+    {
+        return to;
+    }
+    usize e = to;
+    if (t[e - 1] == b']')
+    {
+        while (e > from && t[e - 1] != b'[')
+        {
+            e -= 1;
+        }
+        if (e <= from + 1)
+        {
+            return to;
+        }
+        e -= 1;
+    }
+    usize s = e;
+    while (s > from && is_ident(t[s - 1]))
+    {
+        s -= 1;
+    }
+    if (s == e || s == from || !is_ident_start(t[s]))
+    {
+        return to;
+    }
+    if (t[s - 1] != b' ' && t[s - 1] != b'*')
+    {
+        return to;
+    }
+    for (usize k = from; k < s; k += 1)
+    {
+        if (!is_ident(t[k]) && t[k] != b' ' && t[k] != b'*')
+        {
+            return to;
+        }
+    }
+    s
+}
+
+// Whether `t[from..to]` has a space outside brackets (an lvalue has none).
+fn open_space(slice<u8, shared> t, usize from, usize to) : bool
+{
+    usize depth = 0;
+    for (usize k = from; k < to; k += 1)
+    {
+        u8 c = t[k];
+        if (c == b'(' || c == b'[')
+        {
+            depth += 1;
+        }
+        else if ((c == b')' || c == b']') && depth > 0)
+        {
+            depth -= 1;
+        }
+        else if (c == b' ' && depth == 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn bytes_are(slice<u8, shared> t, usize from, usize to, str w) : bool
+{
+    slice<u8, shared> wb = StringView::as_bytes(w);
+    if (to - from != slice_len(wb))
+    {
+        return false;
+    }
+    for (usize k = 0; k < slice_len(wb); k += 1)
+    {
+        if (t[from + k] != wb[k])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn bytes_start(slice<u8, shared> t, usize from, usize to, str w) : bool
+{
+    slice<u8, shared> wb = StringView::as_bytes(w);
+    to - from >= slice_len(wb) && bytes_are(t, from, from + slice_len(wb), w)
+}
+
+// The kind and the parts of the statement `s` (no indentation, no newline).
+fn parts_of(StringView s) : Parts
+{
+    slice<u8, shared> t = StringView::as_bytes(s);
+    usize n = slice_len(t);
+    Parts nd = Parts {
+        .len = n,
+        .kind = PK_RAW,
+        .flags = 0,
+        .pre = 0,
+        .ty_len = 0,
+        .a_at = 0,
+        .a_len = 0,
+        .b_at = 0,
+        .b_len = 0,
+        .c_at = 0,
+        .c_len = 0,
+        .rt = RT_NONE,
+    };
+    if (n == 0)
+    {
+        return nd;
+    }
+    if (t[0] == 1)
+    {
+        nd.kind = PK_MARK;
+        return nd;
+    }
+    // A `/*@...*/` mark: a line of its own, or a tag before a statement.
+    usize b = 0;
+    if (bytes_start(t, 0, n, "/*@"))
+    {
+        usize k = 3;
+        while (k + 1 < n && !(t[k] == b'*' && t[k + 1] == b'/'))
+        {
+            k += 1;
+        }
+        if (k + 2 >= n)
+        {
+            nd.kind = PK_NOTE;
+            return nd;
+        }
+        b = k + 2;
+        while (b < n && t[b] == b' ')
+        {
+            b += 1;
+        }
+        nd.pre = b;
+    }
+    if (t[b] == b'}')
+    {
+        if (n - b == 1)
+        {
+            nd.kind = PK_CLOSE;
+        }
+        else if (bytes_are(t, b, n, "} else {"))
+        {
+            nd.kind = PK_ELSE;
+        }
+        else if (bytes_start(t, b, n, "} else if (") && t[n - 3] == b')' && t[n - 2] == b' ' && t[n - 1] == b'{')
+        {
+            nd.kind = PK_ELSE_IF;
+            nd.c_at = b + 11;
+            nd.c_len = n - 3 - (b + 11);
+        }
+        return nd;
+    }
+    if (t[n - 1] == b'{')
+    {
+        if (bytes_start(t, b, n, "if (") && n - b > 7 && t[n - 3] == b')' && t[n - 2] == b' ')
+        {
+            nd.kind = PK_IF;
+            nd.c_at = b + 4;
+            nd.c_len = n - 3 - (b + 4);
+        }
+        else if (bytes_are(t, b, n, "for (;;) {"))
+        {
+            nd.kind = PK_LOOP;
+        }
+        else if (n - b == 1)
+        {
+            nd.kind = PK_BLOCK;
+        }
+        else
+        {
+            nd.kind = PK_OPEN;
+        }
+        return nd;
+    }
+    if (bytes_are(t, b, n, "break;"))
+    {
+        nd.kind = PK_BREAK;
+        return nd;
+    }
+    if (bytes_are(t, b, n, "continue;"))
+    {
+        nd.kind = PK_CONTINUE;
+        return nd;
+    }
+    if (bytes_are(t, b, n, "return;"))
+    {
+        nd.kind = PK_RETURN;
+        return nd;
+    }
+    if (t[n - 1] == b';' && bytes_start(t, b, n, "return "))
+    {
+        nd.kind = PK_RETURN;
+        nd.c_at = b + 7;
+        nd.c_len = n - 1 - (b + 7);
+        return nd;
+    }
+    if (t[n - 1] == b';' && bytes_start(t, b, n, "goto "))
+    {
+        nd.kind = PK_GOTO;
+        nd.a_at = b + 5;
+        nd.a_len = n - 1 - (b + 5);
+        return nd;
+    }
+    // `LABEL:;` or `LABEL: ;` (not `default:` or a `case`).
+    if (is_ident_start(t[b]))
+    {
+        usize k = b;
+        while (k < n && is_ident(t[k]))
+        {
+            k += 1;
+        }
+        if (k < n && t[k] == b':' && !bytes_are(t, b, k, "default"))
+        {
+            usize r = k + 1;
+            while (r < n && t[r] == b' ')
+            {
+                r += 1;
+            }
+            if (r == n || (r + 1 == n && t[r] == b';'))
+            {
+                nd.kind = PK_LABEL;
+                nd.a_at = b;
+                nd.a_len = k - b;
+                return nd;
+            }
+        }
+    }
+    // `if (COND) ...` on one line.
+    if (bytes_start(t, b, n, "if ("))
+    {
+        match (close_of(t, b + 3, n))
+        {
+            Some(c) :
+            {
+                usize r = c + 1;
+                while (r < n && t[r] == b' ')
+                {
+                    r += 1;
+                }
+                if (r < n)
+                {
+                    nd.c_at = b + 4;
+                    nd.c_len = c - (b + 4);
+                    if (bytes_are(t, r, n, "break;"))
+                    {
+                        nd.kind = PK_IF_JUMP;
+                        nd.flags = PF_BREAK;
+                    }
+                    else if (bytes_are(t, r, n, "continue;"))
+                    {
+                        nd.kind = PK_IF_JUMP;
+                        nd.flags = PF_CONTINUE;
+                    }
+                    else if (t[n - 1] == b';' && bytes_start(t, r, n, "goto "))
+                    {
+                        nd.kind = PK_IF_JUMP;
+                        nd.a_at = r + 5;
+                        nd.a_len = n - 1 - (r + 5);
+                    }
+                    else
+                    {
+                        nd.kind = PK_IF_STMT;
+                        nd.a_at = r;
+                        nd.a_len = n - r;
+                    }
+                }
+            },
+            None    : {},
+        }
+        return nd;
+    }
+    if (t[n - 1] != b';')
+    {
+        return nd;
+    }
+    // A statement `...;`. Several statements on one line (a `;` before the
+    // last, outside brackets and literals) are a line no kind fits.
+    usize e = n - 1;
+    if (semi_inside(t, b, e))
+    {
+        return nd;
+    }
+    if (bytes_start(t, b, e, "(void)(") && t[e - 1] == b')')
+    {
+        match (exact_call(t, b + 7, e - 1))
+        {
+            Some(open) :
+            {
+                nd.kind = PK_CALL;
+                nd.flags = PF_VOID;
+                nd.b_at = b + 7;
+                nd.b_len = open - (b + 7);
+                nd.c_at = open + 1;
+                nd.c_len = e - 2 - (open + 1);
+                nd.rt = rt_lookup(&s[b + 7..open]);
+            },
+            None       : {},
+        }
+        return nd;
+    }
+    match (assign_at(t, b, e))
+    {
+        None     :
+        {
+            match (exact_call(t, b, e))
+            {
+                Some(open) :
+                {
+                    nd.kind = PK_CALL;
+                    nd.b_at = b;
+                    nd.b_len = open - b;
+                    nd.c_at = open + 1;
+                    nd.c_len = e - 1 - (open + 1);
+                    nd.rt = rt_lookup(&s[b..open]);
+                    return nd;
+                },
+                None       : {},
+            }
+            usize name = decl_name_at(t, b, e);
+            if (name < e)
+            {
+                nd.kind = PK_DECL;
+                nd.ty_len = name - b;
+                nd.a_at = name;
+                nd.a_len = e - name;
+            }
+        },
+        Some(eq) :
+        {
+            usize name = decl_name_at(t, b, eq);
+            bool decl = name < eq;
+            if (!decl && open_space(t, b, eq))
+            {
+                return nd;
+            }
+            if (decl)
+            {
+                nd.ty_len = name - b;
+                nd.a_at = name;
+                nd.a_len = eq - name;
+            }
+            else
+            {
+                nd.a_at = b;
+                nd.a_len = eq - b;
+            }
+            usize r = eq + 3;
+            match (exact_call(t, r, e))
+            {
+                Some(open) :
+                {
+                    nd.kind = if (decl) { PK_DECL_CALL } else { PK_SET_CALL };
+                    nd.b_at = r;
+                    nd.b_len = open - r;
+                    nd.c_at = open + 1;
+                    nd.c_len = e - 1 - (open + 1);
+                    nd.rt = rt_lookup(&s[r..open]);
+                },
+                None       :
+                {
+                    nd.kind = if (decl) { PK_DECL_INIT } else { PK_SET };
+                    nd.c_at = r;
+                    nd.c_len = e - r;
+                },
+            }
+        },
+    }
+    nd
+}
+
+// The node of the parts `p`, its text at `off` in a pool, at the indentation
+// `ind`. A tag or a type too long for its field: the node is its text only.
+fn pack(ref<Parts, shared> p, usize off, usize ind) : PNode
+{
+    assert(off + p.len < 4294967296, "cobc: a buffer of C statements of 4 GB or more");
+    assert(ind < 65536, "cobc: a C statement indented 65,536 columns or more");
+    bool fits = p.pre < 65536 && p.ty_len < 65536 && p.b_len < 65536;
+    if (!fits)
+    {
+        return PNode {
+            .off = narrow<u32>(off),
+            .len = narrow<u32>(p.len),
+            .a_at = 0,
+            .a_len = 0,
+            .b_at = 0,
+            .c_at = 0,
+            .c_len = 0,
+            .b_len = 0,
+            .ind = narrow<u16>(ind),
+            .pre = 0,
+            .ty_len = 0,
+            .rt = RT_NONE,
+            .kind = PK_RAW,
+            .flags = p.flags & (PF_BUILT | PF_ASKED),
+        };
+    }
+    PNode {
+        .off = narrow<u32>(off),
+        .len = narrow<u32>(p.len),
+        .a_at = narrow<u32>(p.a_at),
+        .a_len = narrow<u32>(p.a_len),
+        .b_at = narrow<u32>(p.b_at),
+        .c_at = narrow<u32>(p.c_at),
+        .c_len = narrow<u32>(p.c_len),
+        .b_len = narrow<u16>(p.b_len),
+        .ind = narrow<u16>(ind),
+        .pre = narrow<u16>(p.pre),
+        .ty_len = narrow<u16>(p.ty_len),
+        .rt = p.rt,
+        .kind = p.kind,
+        .flags = p.flags,
+    }
+}
+
+// Whether the expression `v` is one call and nothing else, `CALLEE(ARGS)`:
+// where its `(` is. What `classify` asks of an initialiser or an assigned
+// value; a constructor asks it of a value whose place does not know its
+// shape (`pemit.cb`).
+export fn call_open(StringView v) : Option<usize>
+{
+    exact_call(StringView::as_bytes(v), 0, StringView::len(v))
+}
+
+// A node a constructor built (`pemit.cb`): its text is the pool's bytes from
+// `off` on, which the constructor wrote, and its kind, flags, runtime entry
+// and parts are as given: nothing is read off the text.
+export fn pbuf_push_built(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    usize off,
+    u8 kind,
+    u8 flags,
+    u16 entry,
+    usize ty_len,
+    usize a_at,
+    usize a_len,
+    usize b_at,
+    usize b_len,
+    usize c_at,
+    usize c_len,
+)
+{
+    Parts p = Parts {
+        .len = StringView::len(&b.pool) - off,
+        .kind = kind,
+        .flags = flags | PF_BUILT,
+        .pre = 0,
+        .ty_len = ty_len,
+        .a_at = a_at,
+        .a_len = a_len,
+        .b_at = b_at,
+        .b_len = b_len,
+        .c_at = c_at,
+        .c_len = c_len,
+        .rt = entry,
+    };
+    PNode nd = pack(&p, off, ind);
+    Vec::push(&mut b.nodes, nd);
+}
+
+// The statement `s` (no indentation, no newline) as a node with no place in
+// a pool yet: its kind and its parts.
+export fn classify(StringView s) : PNode
+{
+    Parts p = parts_of(s);
+    pack(&p, 0, 0)
+}
+
+export fn pbuf_new() : PBuf
+{
+    PBuf { .pool = String::new(), .nodes = Vec::new() }
+}
+
+// Emptied, its room kept.
+export fn pbuf_clear(ref<PBuf, exclusive> b)
+{
+    String::clear(&mut b.pool);
+    Vec::clear(&mut b.nodes);
+}
+
+// How many nodes: the position the next one gets.
+export fn pbuf_count(ref<PBuf, shared> b) : usize
+{
+    Vec::len(&b.nodes)
+}
+
+// The indentation of the node at `i`, in spaces.
+export fn pbuf_ind(ref<PBuf, shared> b, usize i) : usize
+{
+    widen<usize>(b.nodes[i].ind)
+}
+
+// The node at `i` moved to the indentation `ind`.
+export fn pbuf_set_ind(ref<PBuf, exclusive> b, usize i, usize ind)
+{
+    assert(ind < 65536, "cobc: a C statement indented 65,536 columns or more");
+    b.nodes[i].ind = narrow<u16>(ind);
+}
+
+// The statement `s0` at the indentation `ind0` as a node, its text put at
+// the pool's end. Spaces at the text's start are indentation: they count
+// into `ind`, so a node's text never starts with one.
+fn node_of(ref<PBuf, exclusive> b, usize ind0, StringView s0) : PNode
+{
+    slice<u8, shared> t = StringView::as_bytes(s0);
+    usize lead = 0;
+    while (lead < slice_len(t) && t[lead] == b' ')
+    {
+        lead += 1;
+    }
+    StringView s = &s0[lead..slice_len(t)];
+    Parts p = parts_of(s);
+    PNode nd = pack(&p, StringView::len(&b.pool), ind0 + lead);
+    String::append(&mut b.pool, s);
+    nd
+}
+
+// One more statement at the end.
+export fn pbuf_push(ref<PBuf, exclusive> b, usize ind, StringView s)
+{
+    PNode nd = node_of(b, ind, s);
+    Vec::push(&mut b.nodes, nd);
+}
+
+// The text `s` as the lowering emits it at the indentation `ind`: one
+// statement, or several lines, each a node. A line after the first is
+// written as it stands: its own leading spaces are its indentation.
+export fn pbuf_emit(ref<PBuf, exclusive> b, usize ind, StringView s)
+{
+    slice<u8, shared> t = StringView::as_bytes(s);
+    usize n = slice_len(t);
+    usize from = 0;
+    usize at = ind;
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (t[k] == b'\n')
+        {
+            pbuf_push(b, at, &s[from..k]);
+            from = k + 1;
+            at = 0;
+            while (from < n && t[from] == b' ')
+            {
+                from += 1;
+                at += 1;
+            }
+        }
+    }
+    pbuf_push(b, at, &s[from..n]);
+}
+
+// C text whose lines each end in a line end (a function written whole, a
+// signature, a prologue), at the end: each line a node, its leading spaces
+// its indentation. A last line with no line end is a node too, and gets its
+// line end when it is rendered.
+export fn pbuf_add_text(ref<PBuf, exclusive> b, StringView s)
+{
+    slice<u8, shared> t = StringView::as_bytes(s);
+    usize n = slice_len(t);
+    usize from = 0;
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (t[k] == b'\n')
+        {
+            pbuf_push(b, 0, &s[from..k]);
+            from = k + 1;
+        }
+    }
+    if (from < n)
+    {
+        pbuf_push(b, 0, &s[from..n]);
+    }
+}
+
+// The lines of the C text `s` as nodes (`pbuf_add_text`): `pbuf_render`
+// gives `s` back when it is empty or ends in a line end.
+export fn pbuf_from_text(StringView s) : PBuf
+{
+    PBuf b = pbuf_new();
+    pbuf_add_text(&mut b, s);
+    b
+}
+
+// A statement put before the one at `at`.
+export fn pbuf_insert(ref<PBuf, exclusive> b, usize at, usize ind, StringView s)
+{
+    PNode nd = node_of(b, ind, s);
+    Vec::insert(&mut b.nodes, at, nd);
+}
+
+// The statement at `at` replaced by `s` at the indentation `ind`.
+export fn pbuf_replace(ref<PBuf, exclusive> b, usize at, usize ind, StringView s)
+{
+    PNode nd = node_of(b, ind, s);
+    b.nodes[at] = nd;
+}
+
+// The nodes from `n` on are dropped.
+export fn pbuf_truncate(ref<PBuf, exclusive> b, usize n)
+{
+    Vec::truncate(&mut b.nodes, n);
+}
+
+// Cut back to its first `n` nodes, the dropped nodes' texts with them: for
+// a buffer that got nodes only at its end since it had `n` (each node's text
+// then lies after the texts of the nodes before it).
+export fn pbuf_cut(ref<PBuf, exclusive> b, usize n)
+{
+    if (n < Vec::len(&b.nodes))
+    {
+        usize off = pn_off(&b.nodes[n]);
+        Vec::truncate(&mut b.nodes, n);
+        String::truncate(&mut b.pool, off);
+    }
+}
+
+// The nodes at `from` up to `to` (not included) are dropped.
+export fn pbuf_remove(ref<PBuf, exclusive> b, usize from, usize to)
+{
+    usize k = to;
+    while (k > from)
+    {
+        k -= 1;
+        _ = Vec::remove(&mut b.nodes, k);
+    }
+}
+
+// The nodes marked in `gone` (one mark for each node) are dropped, the rest
+// kept in their order.
+export fn pbuf_drop_marked(ref<PBuf, exclusive> b, ref<Vec<bool>, shared> gone)
+{
+    usize n = Vec::len(&b.nodes);
+    usize w = 0;
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (!gone[i])
+        {
+            if (w != i)
+            {
+                b.nodes[w] = b.nodes[i];
+            }
+            w += 1;
+        }
+    }
+    Vec::truncate(&mut b.nodes, w);
+}
+
+// The text of the node at `i`, in place: no copy.
+export fn pbuf_view(ref<PBuf, shared> b, usize i) : StringView from b
+{
+    usize off = pn_off(&b.nodes[i]);
+    usize len = pn_len(&b.nodes[i]);
+    &b.pool[off..off + len]
+}
+
+// Whether the node at `i` is the line `w`: at the left margin, `w` its text.
+export fn pbuf_line_is(ref<PBuf, shared> b, usize i, StringView w) : bool
+{
+    b.nodes[i].ind == 0 && pbuf_view(b, i) == w
+}
+
+// Whether the node at `i` is a line that starts with `w` at the left margin.
+export fn pbuf_line_starts(ref<PBuf, shared> b, usize i, StringView w) : bool
+{
+    b.nodes[i].ind == 0 && StringView::starts_with(pbuf_view(b, i), w)
+}
+
+// What the node at `i` is (`PK_…`).
+export fn pbuf_kind(ref<PBuf, shared> b, usize i) : u8
+{
+    b.nodes[i].kind
+}
+
+// Whether the node at `i` has a `/*@vck …*/` tag before its statement.
+export fn pbuf_tagged(ref<PBuf, shared> b, usize i) : bool
+{
+    b.nodes[i].pre != 0
+}
+
+// The runtime entry the node at `i` calls, as a statement or for the value
+// it declares or assigns (no tag before it), `RT_NONE` for any other node.
+export fn pbuf_rt(ref<PBuf, shared> b, usize i) : u16
+{
+    if (b.nodes[i].pre != 0)
+    {
+        return RT_NONE;
+    }
+    b.nodes[i].rt
+}
+
+// The runtime entry the node at `i` calls as a statement of its own
+// (`cb_…(ARGS);`, no tag before it, not under `(void)`), `RT_NONE` for any
+// other node.
+export fn pbuf_stmt_rt(ref<PBuf, shared> b, usize i) : u16
+{
+    if (b.nodes[i].kind != PK_CALL || b.nodes[i].pre != 0 || (b.nodes[i].flags & PF_VOID) != 0)
+    {
+        return RT_NONE;
+    }
+    b.nodes[i].rt
+}
+
+// The node's part `c` in place: a call's arguments, an initialiser or
+// assigned value, a returned value, a condition.
+export fn pbuf_part_c(ref<PBuf, shared> b, usize i) : StringView from b
+{
+    usize at = pn_off(&b.nodes[i]) + pn_c_at(&b.nodes[i]);
+    &b.pool[at..at + pn_c_len(&b.nodes[i])]
+}
+
+// Every node's text, in place: the lines of the rendered text, each without
+// its indentation.
+export fn pbuf_views(ref<PBuf, shared> b) : Vec<StringView> from b
+{
+    Vec<StringView> out = Vec::new();
+    Vec::reserve(&mut out, Vec::len(&b.nodes));
+    for (usize i = 0; i < Vec::len(&b.nodes); i += 1)
+    {
+        usize off = pn_off(&b.nodes[i]);
+        usize len = pn_len(&b.nodes[i]);
+        Vec::push(&mut out, &b.pool[off..off + len]);
+    }
+    out
+}
+
+// The node `i` of `src` at the end of `dst` as it is: its kind and parts are
+// not read off the text again.
+export fn pbuf_copy(ref<PBuf, exclusive> dst, ref<PBuf, shared> src, usize i)
+{
+    PNode nd = src.nodes[i];
+    usize off = pn_off(&nd);
+    usize len = pn_len(&nd);
+    usize at = StringView::len(&dst.pool);
+    assert(at + len < 4294967296, "cobc: a buffer of C statements of 4 GB or more");
+    nd.off = narrow<u32>(at);
+    String::append(&mut dst.pool, &src.pool[off..off + len]);
+    Vec::push(&mut dst.nodes, nd);
+}
+
+// Every node of `src` at the end of `dst`, as it is; a node whose text holds
+// a line end as a node for each of its lines (`pbuf_emit`), so that `dst`
+// has one node for each line of its text.
+export fn pbuf_append(ref<PBuf, exclusive> dst, ref<PBuf, shared> src)
+{
+    Vec::reserve(&mut dst.nodes, Vec::len(&src.nodes));
+    for (usize i = 0; i < Vec::len(&src.nodes); i += 1)
+    {
+        if (StringView::contains(pbuf_view(src, i), "\n"))
+        {
+            pbuf_emit(dst, pbuf_ind(src, i), pbuf_view(src, i));
+        }
+        else
+        {
+            pbuf_copy(dst, src, i);
+        }
+    }
+}
+
+// Room in `b` for `nodes` more nodes and `bytes` more of their text.
+export fn pbuf_reserve(ref<PBuf, exclusive> b, usize nodes, usize bytes)
+{
+    String::reserve(&mut b.pool, bytes);
+    Vec::reserve(&mut b.nodes, nodes);
+}
+
+// Whether the node at `i` is a line at the left margin that ends in `)`: a
+// definition's first line, as the passes over the program read it.
+fn margin_head(ref<PBuf, shared> b, usize i) : bool
+{
+    if (b.nodes[i].ind != 0 || b.nodes[i].len < 2)
+    {
+        return false;
+    }
+    usize end = pn_off(&b.nodes[i]) + pn_len(&b.nodes[i]);
+    StringView::as_bytes(&b.pool)[end - 1] == b')'
+}
+
+// The room the definitions' first lines of `b`, from `from` on, take when
+// each is written once more a little longer (given `static`): a buffer kept
+// to the end is given that much beyond its text, so that these few rewrites
+// do not double it.
+export fn pbuf_margin_room(ref<PBuf, shared> b, usize from) : usize
+{
+    usize room = 0;
+    for (usize i = from; i < Vec::len(&b.nodes); i += 1)
+    {
+        if (margin_head(b, i))
+        {
+            room += pn_len(&b.nodes[i]) + 48;
+        }
+    }
+    room
+}
+
+// The nodes from `from` on in a buffer of their own, with room for just
+// them and `pbuf_margin_room`.
+export fn pbuf_from_node(ref<PBuf, shared> b, usize from) : PBuf
+{
+    PBuf out = pbuf_new();
+    usize n = Vec::len(&b.nodes);
+    if (from >= n)
+    {
+        return out;
+    }
+    usize room = pbuf_margin_room(b, from);
+    for (usize i = from; i < n; i += 1)
+    {
+        room += pn_len(&b.nodes[i]);
+    }
+    String::reserve(&mut out.pool, room);
+    Vec::reserve(&mut out.nodes, n - from);
+    for (usize i = from; i < n; i += 1)
+    {
+        pbuf_copy(&mut out, b, i);
+    }
+    out
+}
+
+// The same nodes in a buffer of their own.
+export fn pbuf_clone(ref<PBuf, shared> b) : PBuf
+{
+    PBuf { .pool = String::clone(&b.pool), .nodes = Vec::clone(&b.nodes) }
+}
+
+// An empty buffer with room for what `b` holds.
+export fn pbuf_like(ref<PBuf, shared> b) : PBuf
+{
+    PBuf out = pbuf_new();
+    String::reserve(&mut out.pool, StringView::len(&b.pool));
+    Vec::reserve(&mut out.nodes, Vec::len(&b.nodes));
+    out
+}
+
+// Whether a node's text contains `w` (a text with no space at its start and
+// no line end in it: what `StringView::contains` finds in the rendered
+// text). The pool holds every node's text, and may hold more.
+export fn pbuf_has(ref<PBuf, shared> b, StringView w) : bool
+{
+    if (!StringView::contains(&b.pool, w))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(&b.nodes); i += 1)
+    {
+        usize off = pn_off(&b.nodes[i]);
+        usize len = pn_len(&b.nodes[i]);
+        if (StringView::contains(&b.pool[off..off + len], w))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// The text of the node at `i`.
+export fn pbuf_text(ref<PBuf, shared> b, usize i) : String
+{
+    usize off = pn_off(&b.nodes[i]);
+    usize len = pn_len(&b.nodes[i]);
+    String::copy(&b.pool[off..off + len])
+}
+
+// The length of the rendered text: each node's indentation, text and line
+// end.
+export fn pbuf_text_len(ref<PBuf, shared> b) : usize
+{
+    usize n = 0;
+    for (usize i = 0; i < Vec::len(&b.nodes); i += 1)
+    {
+        n += pn_ind(&b.nodes[i]) + pn_len(&b.nodes[i]) + 1;
+    }
+    n
+}
+
+const str SPACES = "                                                                ";
+
+// The node at `i` as a line of C text at the end of `out`: its indentation,
+// its text, a newline.
+export fn pbuf_render_node(ref<String, exclusive> out, ref<PBuf, shared> b, usize i)
+{
+    StringView sp = SPACES;
+    usize left = pn_ind(&b.nodes[i]);
+    while (left > 0)
+    {
+        usize k = if (left > 64) { 64 } else { left };
+        String::append(out, &sp[0..k]);
+        left -= k;
+    }
+    usize off = pn_off(&b.nodes[i]);
+    usize len = pn_len(&b.nodes[i]);
+    String::append(out, &b.pool[off..off + len]);
+    String::push_ascii(out, b'\n');
+}
+
+// The C text of the nodes from `from` on, at the end of `out`: each at its
+// indentation, each ended by a newline.
+export fn pbuf_render_onto(ref<String, exclusive> out, ref<PBuf, shared> b, usize from)
+{
+    for (usize i = from; i < Vec::len(&b.nodes); i += 1)
+    {
+        pbuf_render_node(out, b, i);
+    }
+}
+
+// The C text of the nodes from `from` on.
+export fn pbuf_render_from(ref<PBuf, shared> b, usize from) : String
+{
+    String out = String::new();
+    if (from == 0)
+    {
+        String::reserve(&mut out, pbuf_text_len(b));
+    }
+    pbuf_render_onto(&mut out, b, from);
+    out
+}
+
+export fn pbuf_render(ref<PBuf, shared> b) : String
+{
+    pbuf_render_from(b, 0)
+}

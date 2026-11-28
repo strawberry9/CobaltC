@@ -1,0 +1,182 @@
+// D-0307: the gate's store of results. With a store directory and a
+// toolchain key (the hash of everything that builds the tools, which the
+// gate computes), a run is kept under a key made of that toolchain key and
+// everything the run depends on; a later run with the same key reads it
+// instead of running again. Only runs that met their check are kept.
+
+import std;
+
+export struct Store
+{
+    // Empty: nothing is stored.
+    export String dir;
+    export String tool_key;
+}
+
+export fn Store::off() : Store
+{
+    Store { .dir = "", .tool_key = "" }
+}
+
+export fn Store::enabled(ref<Store, shared> s) : bool
+{
+    StringView::len(&s.dir) > 0 && StringView::len(&s.tool_key) > 0
+}
+
+// Two FNV-1a hashes of 64 bits with different offsets over each part, its
+// length first (8 bytes, little-endian): a key of 128 bits.
+export struct Hasher
+{
+    u64 a;
+    u64 b;
+}
+
+export fn Hasher::new() : Hasher
+{
+    Hasher { .a = 14695981039346656037, .b = 7809847782465536322 }
+}
+
+fn eat(ref<Hasher, exclusive> h, u8 x)
+{
+    h.a = wrapping_mul(h.a ^ widen<u64>(x), 1099511628211);
+    h.b = rotate_left(wrapping_mul(h.b ^ widen<u64>(x), 1099511628211), 5);
+}
+
+export fn Hasher::part(ref<Hasher, exclusive> h, slice<u8, shared> p)
+{
+    u64 n = widen<u64>(slice_len(p));
+    for (u64 i = 0; i < 8; i += 1)
+    {
+        eat(h, narrow_wrapping<u8>(n >> narrow<u32>(i * 8)));
+    }
+    for (usize i = 0; i < slice_len(p); i += 1)
+    {
+        eat(h, p[i]);
+    }
+}
+
+export fn Hasher::text(ref<Hasher, exclusive> h, StringView t)
+{
+    Hasher::part(h, StringView::as_bytes(t));
+}
+
+export fn Hasher::finish(ref<Hasher, shared> h) : String
+{
+    sprintf("%016x%016x", h.a, h.b)
+}
+
+// The key of one run: the toolchain key, `what` (the kind of result), the
+// case's path as given, its text, and `extra` (a C compiler, the input);
+// empty when nothing is stored.
+export fn Store::key(ref<Store, shared> s, str what, StringView path, slice<u8, shared> src, ref<Vec<Vec<u8>>, shared> extra) : String
+{
+    if (!Store::enabled(s))
+    {
+        return "";
+    }
+    Hasher h = Hasher::new();
+    Hasher::text(&mut h, &s.tool_key);
+    Hasher::text(&mut h, what);
+    Hasher::text(&mut h, path);
+    Hasher::part(&mut h, src);
+    foreach (e in extra)
+    {
+        Hasher::part(&mut h, e);
+    }
+    Hasher::finish(&h)
+}
+
+fn file_of(ref<Store, shared> s, StringView key) : String
+{
+    path_join(&path_join(&s.dir, &key[0..2]), key)
+}
+
+// A kept run: its exit status, standard output and error.
+export struct Kept
+{
+    export i64 status;
+    export Vec<u8> out;
+    export Vec<u8> err;
+}
+
+export fn Store::get(ref<Store, shared> s, StringView key) : Option<Kept>
+{
+    if (StringView::len(key) == 0)
+    {
+        return None;
+    }
+    Vec<u8> bytes = match (read_bytes(&file_of(s, key)))
+    {
+        Ok(b)  : b,
+        Err(_) : return None,
+    };
+    usize nl = 0;
+    while (nl < Vec::len(&bytes) && bytes[nl] != b'\n')
+    {
+        nl += 1;
+    }
+    if (nl == Vec::len(&bytes))
+    {
+        return None;
+    }
+    StringView head = match (StringView::from_utf8(&bytes[0..nl]))
+    {
+        Ok(h)  : h,
+        Err(_) : return None,
+    };
+    Vec<StringView> parts = StringView::split(head, " ");
+    if (Vec::len(&parts) != 3)
+    {
+        return None;
+    }
+    i64 status = match (StringView::parse<i64>(parts[0]))
+    {
+        Ok(v)  : v,
+        Err(_) : return None,
+    };
+    usize no = match (StringView::parse<usize>(parts[1]))
+    {
+        Ok(v)  : v,
+        Err(_) : return None,
+    };
+    usize ne = match (StringView::parse<usize>(parts[2]))
+    {
+        Ok(v)  : v,
+        Err(_) : return None,
+    };
+    if (Vec::len(&bytes) - nl - 1 != no + ne)
+    {
+        return None;
+    }
+    Vec<u8> out = Vec::new();
+    Vec::extend_from(&mut out, &bytes[nl + 1..nl + 1 + no]);
+    Vec<u8> err = Vec::new();
+    Vec::extend_from(&mut err, &bytes[nl + 1 + no..$]);
+    Some(Kept { .status = status, .out = out, .err = err })
+}
+
+// Keeps a run, written aside and renamed so that a reader never sees half
+// a record.
+export fn Store::put(ref<Store, shared> s, StringView key, i64 status, slice<u8, shared> out, slice<u8, shared> err)
+{
+    if (StringView::len(key) == 0)
+    {
+        return;
+    }
+    String f = file_of(s, key);
+    _ = make_dir_all(&path_join(&s.dir, &key[0..2]));
+    String head = sprintf("%v %v %v\n", status, slice_len(out), slice_len(err));
+    Vec<u8> v = Vec::new();
+    Vec::extend_from(&mut v, StringView::as_bytes(&head));
+    Vec::extend_from(&mut v, out);
+    Vec::extend_from(&mut v, err);
+    String tmp = sprintf("%s.tmp%v", &f, process_id());
+    match (write_bytes(&tmp, &v))
+    {
+        Ok(_)  :
+        {
+            _ = rename(&tmp, &f);
+        },
+        Err(_) : {},
+    }
+}

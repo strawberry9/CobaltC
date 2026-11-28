@@ -1,0 +1,987 @@
+// Protocol CIR (step T4): the passes over the program's C, on the units'
+// nodes. A unit (`state::Unit`) is one requested function with every C form
+// of it and the helpers written beside it: a list of nodes, one for each
+// line of its C (`proto.cb`), kept as nodes from the lowering to the one
+// render at the end (`gen::combined`). A node is one line (`ind` spaces,
+// then the node's text): a line at the left margin is a node with no
+// indentation. A pass asks a node its kind and its runtime entry where they
+// say enough, and reads its text in place with the recognisers of
+// `back/passes.cb`, `back/flights.cb` and `back/stack_checks.cb`; where a
+// pass writes or drops a line it writes or drops a node.
+//
+// Here: the passes of `gen::generate_parts` and the searches of the units'
+// lines. `pprog_stack.cb` has the passes of the stack-check rule.
+
+import std;
+import proto;
+import rt;
+import passes;
+import flights;
+import stack_checks;
+import state;
+import gen;
+import ppass;
+
+// A function's length in lines for the size limits (the nodes from `from`
+// on), `LINE_MARK`s (at the left margin) not counted: the directives change
+// no decision.
+export fn code_lines_nodes(ref<PBuf, shared> b, usize from) : usize
+{
+    usize n = 0;
+    for (usize i = from; i < pbuf_count(b); i += 1)
+    {
+        if (!pbuf_line_starts(b, i, LINE_MARK))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// A receive `ground_native_nodes` found: the object's name and the parameter
+// received.
+struct Got
+{
+    String x;
+    String p;
+}
+
+// A native body's fixed text, made for a decided program (D-0286). Its
+// parameters arrive with no object and its result leaves with none, so:
+// an object received for a parameter (`cb_recv(&p_x)`) that the body only
+// ends, sends on or moves (`cb_forget_obj`, `cb_send`, `cb_move_to`,
+// `cb_raw_move_in`) is not made, and those uses go with it, as in the
+// natives' `_raw` forms; one the body uses otherwise is made where it
+// would have been received (`cb_new`, of the parameter's type, `tids`).
+// Every other send ends its object's record instead, and an object made
+// only to be ended at once is not made (`pair_at`). A receive of
+// anything else is an error: the text is one this rule does not know.
+// A removed statement leaves an empty one where it stood, so that an `if`
+// it was the body of keeps one.
+// Each edit lies within one line but the pair `pair_at` takes out (an object
+// made and ended at once, the two statements on two lines), which is one
+// node changed and the nodes after it dropped. `Ok(None)`: a statement that
+// runs on past its line's end (a call's `)` on a later line), which is not
+// followed: the caller refuses the text.
+export fn ground_native_nodes(ref<PBuf, shared> src, ref<Vec<ParamTid>, shared> tids) : Result<Option<PBuf>, String>
+{
+    Vec<String> ls = Vec::new();
+    Vec<usize> ind = Vec::new();
+    for (usize i = 0; i < pbuf_count(src); i += 1)
+    {
+        Vec::push(&mut ls, pbuf_text(src, i));
+        Vec::push(&mut ind, pbuf_ind(src, i));
+    }
+    // A result received and ended at once (a call's, in a `__raw` form).
+    for (usize k = 0; k < Vec::len(&ls); k += 1)
+    {
+        while (true)
+        {
+            Option<usize> at = StringView::find(&ls[k], "cb_forget_obj(cb_recv(&");
+            if (Option::is_none(&at))
+            {
+                break;
+            }
+            usize i = Option::unwrap(at);
+            Option<usize> end = find_from(&ls[k], i, "));");
+            if (Option::is_none(&end))
+            {
+                return Ok(None);
+            }
+            String t = splice(&ls[k], i, Option::unwrap(end) + 3, ";");
+            ls[k] = t;
+        }
+    }
+    Vec<Got> recvs = Vec::new();
+    for (usize k = 0; k < Vec::len(&ls); k += 1)
+    {
+        usize at = 0;
+        while (true)
+        {
+            Option<usize> found = find_from(&ls[k], at, "uint64_t ");
+            if (Option::is_none(&found))
+            {
+                break;
+            }
+            usize i = Option::unwrap(found);
+            at = i + 9;
+            StringView line = &ls[k];
+            StringView rest = &line[i + 9..$];
+            Option<usize> eqo = StringView::find(rest, " = cb_recv(&");
+            if (Option::is_none(&eqo))
+            {
+                continue;
+            }
+            usize eq = Option::unwrap(eqo);
+            StringView name = &rest[0..eq];
+            if (!ident_name(name))
+            {
+                continue;
+            }
+            StringView after = &rest[eq + 12..$];
+            Option<usize> close = StringView::find(after, ");");
+            if (Option::is_none(&close))
+            {
+                return Ok(None);
+            }
+            Vec::push(
+                &mut recvs,
+                Got { .x = String::copy(name), .p = String::copy(&after[0..Option::unwrap(close)]) },
+            );
+        }
+    }
+    foreach (r in &recvs)
+    {
+        String decl = sprintf("uint64_t %s = cb_recv(&%s);", &r.x, &r.p);
+        Vec<String> ends = Vec::new();
+        Vec::push(&mut ends, sprintf("cb_forget_obj(%s);", &r.x));
+        Vec::push(&mut ends, sprintf("cb_send(%s);", &r.x));
+        Vec<String> moves = Vec::new();
+        Vec::push(&mut moves, sprintf("cb_move_to(%s, ", &r.x));
+        Vec::push(&mut moves, sprintf("cb_raw_move_in(%s, ", &r.x));
+        // Every mention of `x` is one of these statements (each written
+        // `call(x…`, so the mention is preceded by the call's name).
+        bool only = true;
+        for (usize k = 0; k < Vec::len(&ls) && only; k += 1)
+        {
+            Vec<usize> positions = ident_positions(&ls[k], &r.x);
+            StringView line = &ls[k];
+            foreach (i in &positions)
+            {
+                bool ok = *i >= 9 && StringView::starts_with(&line[*i - 9..$], &decl);
+                foreach (e in &ends)
+                {
+                    ok = ok || stmt_at(&ls[k], *i, e);
+                }
+                foreach (m in &moves)
+                {
+                    ok = ok || stmt_at(&ls[k], *i, m);
+                }
+                if (!ok)
+                {
+                    only = false;
+                    break;
+                }
+            }
+        }
+        if (only)
+        {
+            replace_in(&mut ls, &decl, ";");
+            foreach (e in &ends)
+            {
+                replace_in(&mut ls, e, ";");
+            }
+            foreach (m in &moves)
+            {
+                for (usize k = 0; k < Vec::len(&ls); k += 1)
+                {
+                    while (true)
+                    {
+                        Option<usize> at = StringView::find(&ls[k], m);
+                        if (Option::is_none(&at))
+                        {
+                            break;
+                        }
+                        usize i = Option::unwrap(at);
+                        Option<usize> end = find_from(&ls[k], i, ");");
+                        if (Option::is_none(&end))
+                        {
+                            return Ok(None);
+                        }
+                        String t = splice(&ls[k], i, Option::unwrap(end) + 2, ";");
+                        ls[k] = t;
+                    }
+                }
+            }
+        }
+        else
+        {
+            Option<u32> tid = None;
+            foreach (t in tids)
+            {
+                if (t.name == r.p)
+                {
+                    tid = Some(t.tid);
+                }
+            }
+            if (Option::is_none(&tid))
+            {
+                return Err(sprintf("a receive of `%s`, no parameter", &r.p));
+            }
+            String made = sprintf("uint64_t %s = cb_new(&%s, %vu, CB_NOLOC, 0);", &r.x, &r.p, Option::unwrap(tid));
+            replace_in(&mut ls, &decl, &made);
+        }
+    }
+    foreach (l in &ls)
+    {
+        if (StringView::contains(l, "cb_recv("))
+        {
+            return Err("a native receives what is no parameter");
+        }
+    }
+    // Each send ends its object's record, and an object made only to be
+    // ended at once is not made.
+    replace_in(&mut ls, "cb_send(", "cb_forget_obj(");
+    usize k = 0;
+    while (k < Vec::len(&ls))
+    {
+        usize at = 0;
+        while (true)
+        {
+            Pair p = pair_at(&ls, k, at);
+            if (p.what == PAIR_NONE)
+            {
+                break;
+            }
+            if (p.what == PAIR_OFF)
+            {
+                return Ok(None);
+            }
+            at = p.at;
+            if (p.what == PAIR_JOIN)
+            {
+                usize last = p.last;
+                Pair { text, .. } = p;
+                ls[k] = text;
+                for (usize d = last; d > k; d -= 1)
+                {
+                    _ = Vec::remove(&mut ls, d);
+                    _ = Vec::remove(&mut ind, d);
+                }
+            }
+        }
+        k += 1;
+    }
+    // Last, each line tidied (`flights::tidy_line`).
+    PBuf sent = pbuf_new();
+    for (usize i = 0; i < Vec::len(&ls); i += 1)
+    {
+        match (tidy_line(&ls[i]))
+        {
+            Some(l) : pbuf_push(&mut sent, ind[i], &l),
+            None    : {},
+        }
+    }
+    // D-0294: the body's own records that nothing reads.
+    PBuf chained = elide_record_chains_nodes(&sent);
+    PBuf out = pbuf_like(&chained);
+    for (usize i = 0; i < pbuf_count(&chained); i += 1)
+    {
+        match (tidy_line(pbuf_view(&chained, i)))
+        {
+            Some(l) : pbuf_push(&mut out, pbuf_ind(&chained, i), &l),
+            None    : {},
+        }
+    }
+    Ok(Some(out))
+}
+
+// What `pair_at` finds at the next `uint64_t ` of a line: no more of them;
+// no pair there (the search goes on at `at`); a statement that runs on past
+// the line's end; or the pair that is taken out, an object made and
+// ended at once: `text` is the line with an empty statement for the pair,
+// the lines after it up to `last` go with it, and the search goes on at
+// `at`.
+const u8 PAIR_NONE = 0;
+const u8 PAIR_SKIP = 1;
+const u8 PAIR_OFF = 2;
+const u8 PAIR_JOIN = 3;
+
+struct Pair
+{
+    u8 what;
+    usize at;
+    String text;
+    usize last;
+}
+
+// Text made for a decided program that sends what it made (a helper's
+// result): each send ends its object's record instead, and an object made
+// only to be ended at once is not made. This is the search's step from `at`
+// in the line `k` of `ls`: `uint64_t o = cb_new(&v, Tu, CB_NOLOC, 0);` then
+// `cb_forget_obj(o);` with nothing between, on the same line or the next
+// line that has a statement.
+fn pair_at(ref<Vec<String>, shared> ls, usize k, usize at) : Pair
+{
+    Option<usize> found = find_from(&ls[k], at, "uint64_t ");
+    if (Option::is_none(&found))
+    {
+        return Pair { .what = PAIR_NONE, .at = at, .text = String::new(), .last = k };
+    }
+    usize i = Option::unwrap(found);
+    Pair skip = Pair { .what = PAIR_SKIP, .at = i + 9, .text = String::new(), .last = k };
+    StringView line = &ls[k];
+    StringView rest = &line[i + 9..$];
+    Option<usize> eqo = StringView::find(rest, " = cb_new(&");
+    if (Option::is_none(&eqo))
+    {
+        return skip;
+    }
+    String name = String::copy(&rest[0..Option::unwrap(eqo)]);
+    if (!ident_name(&name))
+    {
+        return skip;
+    }
+    Option<usize> close = StringView::find(rest, ");");
+    if (Option::is_none(&close))
+    {
+        return Pair { .what = PAIR_OFF, .at = at, .text = String::new(), .last = k };
+    }
+    usize end = i + 9 + Option::unwrap(close) + 2;
+    String forget = sprintf("cb_forget_obj(%s);", &name);
+    StringView tail = &line[end..$];
+    usize gap = StringView::len(tail) - StringView::len(StringView::trim_start(tail));
+    if (gap < StringView::len(tail))
+    {
+        // The next statement stands on this line.
+        if (!StringView::starts_with(&tail[gap..$], &forget))
+        {
+            return skip;
+        }
+        String cut = splice(&ls[k], i, end + gap + StringView::len(&forget), ";");
+        return Pair { .what = PAIR_JOIN, .at = i, .text = cut, .last = k };
+    }
+    // Nothing more on this line: the next line with a statement.
+    usize m = k + 1;
+    while (m < Vec::len(ls) && StringView::len(StringView::trim_start(&ls[m])) == 0)
+    {
+        m += 1;
+    }
+    if (m >= Vec::len(ls))
+    {
+        return skip;
+    }
+    StringView next = StringView::trim_start(&ls[m]);
+    if (!StringView::starts_with(next, &forget))
+    {
+        return skip;
+    }
+    // The two lines become one: this line up to the declaration, an empty
+    // statement, and what follows the end on its line.
+    String joined = String::copy(&line[0..i]);
+    String::append(&mut joined, ";");
+    String::append(&mut joined, &next[StringView::len(&forget)..$]);
+    Pair { .what = PAIR_JOIN, .at = i, .text = joined, .last = m }
+}
+
+// Each `from` in each of `ls` replaced by `to` (`StringView::replace` on the
+// unit's text, for a `from` with no line end in it).
+fn replace_in(ref<Vec<String>, exclusive> ls, StringView from, StringView to)
+{
+    for (usize k = 0; k < Vec::len(ls); k += 1)
+    {
+        if (StringView::contains(&ls[k], from))
+        {
+            String t = StringView::replace(&ls[k], from, to);
+            ls[k] = t;
+        }
+    }
+}
+
+// `passes::frame_line` of a node: a frame's push or pop, a statement of its
+// own. The node names its runtime entry; a push or pop takes no argument
+// (`cb_frame_push_at` takes its location).
+fn frame_line_node(ref<PBuf, shared> b, usize i) : bool
+{
+    u16 entry = pbuf_stmt_rt(b, i);
+    rt_is(entry, RP_FRAME_LINE) && (entry == RT_FRAME_PUSH_AT || StringView::len(pbuf_part_c(b, i)) == 0)
+}
+
+// D-0315: in a decided program, a function whose lines push a frame but makes
+// no call that binds into one, stamps an object or ends one has nothing in that
+// frame: its frame lines go. Functions are the unit's parts between lines `}` at the left margin (such a
+// line is no end as a part's first line).
+export fn elide_empty_frames_nodes(ref<PBuf, exclusive> b)
+{
+    if (!pbuf_has(b, "cb_frame_"))
+    {
+        return;
+    }
+    Vec<StringView> uses = StringView::split_whitespace(FRAME_USE_NAMES);
+    usize n = pbuf_count(b);
+    Vec<bool> gone = Vec::filled(n, false);
+    // A part before a `}` whose every line goes leaves an empty line.
+    Vec<usize> blank = Vec::new();
+    bool any = false;
+    usize from = 0;
+    while (from < n)
+    {
+        usize to = from + 1;
+        while (to < n && !pbuf_line_is(b, to, "}"))
+        {
+            to += 1;
+        }
+        bool has_frame = false;
+        bool blocked = false;
+        for (usize i = from; i < to && !blocked; i += 1)
+        {
+            // Every name looked for starts `cb_`: each place of the line
+            // that does is tried.
+            StringView v = pbuf_view(b, i);
+            usize at = 0;
+            bool frame_named = false;
+            while (!blocked)
+            {
+                Option<usize> found = StringView::find(&v[at..$], "cb_");
+                if (Option::is_none(&found))
+                {
+                    break;
+                }
+                usize p = at + Option::unwrap(found);
+                StringView here = &v[p..$];
+                frame_named = frame_named || StringView::starts_with(here, "cb_frame_");
+                foreach (u in &uses)
+                {
+                    if (StringView::starts_with(here, *u))
+                    {
+                        blocked = true;
+                    }
+                }
+                at = p + 3;
+            }
+            if (frame_named)
+            {
+                has_frame = true;
+                if (!frame_line_node(b, i))
+                {
+                    blocked = true;
+                }
+            }
+        }
+        if (has_frame && !blocked)
+        {
+            usize kept = 0;
+            for (usize i = from; i < to; i += 1)
+            {
+                if (frame_line_node(b, i))
+                {
+                    gone[i] = true;
+                    any = true;
+                }
+                else
+                {
+                    kept += 1;
+                }
+            }
+            if (kept == 0 && to < n)
+            {
+                Vec::push(&mut blank, from);
+            }
+        }
+        from = to + 1;
+    }
+    if (!any)
+    {
+        return;
+    }
+    foreach (i in &blank)
+    {
+        gone[*i] = false;
+        pbuf_replace(b, *i, 0, "");
+    }
+    pbuf_drop_marked(b, &gone);
+}
+
+// D-0219: each call's `ARRIVE_MARK` names the callee's `__arrive` twin
+// where it has one, and the callee itself where it has none. A mark and the
+// name before it stand on one line: `passes::resolve_arrive` (the thunks'
+// pass, on text) is run on each line that has a mark.
+export fn resolve_arrive_nodes(ref<PBuf, exclusive> b, ref<HashSet<String>, shared> twins)
+{
+    if (!has_arrive(&b.pool))
+    {
+        return;
+    }
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (has_arrive(pbuf_view(b, i)))
+        {
+            String line = pbuf_text(b, i);
+            String named = resolve_arrive(&line, twins);
+            pbuf_replace(b, i, pbuf_ind(b, i), &named);
+        }
+    }
+}
+
+// Every function defined in a unit gets `static`, so the
+// C compiler may inline it wherever it is called and drop it where it is
+// not; not `main`'s C name (`main_c`). CHG-0433: pure `std` units too, which
+// kept external linkage for the object cache D-0277 removed. A signature in
+// `sigs` (`Gen::inline_sigs`, D-0209: a direct-parameter dispatcher) is made
+// `static inline __attribute__((always_inline))`. The prototype of each
+// function made `static` gets `static` too (`passes::localize_protos`). A
+// definition's first line stands at the left margin with the line `{` after
+// it.
+export fn localize_nodes(
+    ref<Vec<Unit>, exclusive> units,
+    ref<String, exclusive> protos,
+    ref<HashSet<String>, shared> inline_sigs,
+    StringView main_c,
+)
+{
+    HashSet<String> local = HashSet::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        usize n = pbuf_count(&units[u].nodes);
+        for (usize k = 0; k + 1 < n; k += 1)
+        {
+            if (pbuf_ind(&units[u].nodes, k) != 0 || !pbuf_line_is(&units[u].nodes, k + 1, "{"))
+            {
+                continue;
+            }
+            String sig = pbuf_text(&units[u].nodes, k);
+            StringView brace = "{";
+            if (!is_definition(&sig, Some(brace)))
+            {
+                continue;
+            }
+            bool named = match (name_before_paren(&sig))
+            {
+                Some(nm) : nm != main_c,
+                None     : false,
+            };
+            if (!named)
+            {
+                continue;
+            }
+            // D-0209: a direct-parameter dispatcher is inlined at every
+            // call (`lower_fn_direct`).
+            String line = if (HashSet::contains(inline_sigs, &sig))
+            {
+                sprintf("static inline __attribute__((always_inline)) %s", &sig)
+            }
+            else
+            {
+                sprintf("static %s", &sig)
+            };
+            pbuf_replace(&mut units[u].nodes, k, 0, &line);
+            HashSet::insert(&mut local, sig);
+        }
+    }
+    localize_protos(protos, &local);
+}
+
+// What `directives_walk` writes: how many nodes, and their texts' bytes.
+struct Room
+{
+    usize nodes;
+    usize bytes;
+}
+
+fn decimal_digits(usize v) : usize
+{
+    usize n = 1;
+    usize rest = v / 10;
+    while (rest > 0)
+    {
+        n += 1;
+        rest = rest / 10;
+    }
+    n
+}
+
+// `line_directives_nodes`' walk (WI-11): a `#line` before each line of the C
+// of the program's own statements, naming the `.cb` line its `cb_at` gives;
+// `LINE_RESET` where a function's code ends. The dropped locations' marks
+// (`LINE_MARK`) go. The walk is made twice: once to measure the result
+// (`write` false: nothing is written), once to write it into a buffer of
+// that size, since the result is kept to the end. `names`: the files' names
+// as C writes them (`c_escape`).
+fn directives_walk(ref<PBuf, shared> src, ref<Vec<String>, shared> names, ref<PBuf, exclusive> res, bool write) : Room
+{
+    Room room = Room { .nodes = 0, .bytes = 0 };
+    usize reset = StringView::len(LINE_RESET);
+    bool has_cur = false;
+    LineAt cur = LineAt { .file = 0, .line = 0 };
+    bool dirty = false;
+    for (usize i = 0; i < pbuf_count(src); i += 1)
+    {
+        StringView v = pbuf_view(src, i);
+        StringView t = StringView::trim_start(v);
+        // A line that starts at the left margin and is no brace, directive
+        // or comment starts a definition.
+        bool starts_definition = pbuf_ind(src, i) == 0 && StringView::len(v) > 0
+            && StringView::len(v) == StringView::len(t) && !starts_with_any(t, "{}#/");
+        if (starts_definition)
+        {
+            if (dirty)
+            {
+                if (write)
+                {
+                    pbuf_push(res, 0, LINE_RESET);
+                }
+                room.nodes += 1;
+                room.bytes += reset;
+                dirty = false;
+            }
+            has_cur = false;
+        }
+        // A dropped location's mark is a note; a location store is a call
+        // of `cb_at`: the node says which it is, the positions are read off
+        // its text.
+        Option<LineAt> mark = if (pbuf_kind(src, i) == PK_NOTE) { line_mark(t) } else { None };
+        match (mark)
+        {
+            Some(at) :
+            {
+                has_cur = at.file < Vec::len(names);
+                cur = at;
+                continue;
+            },
+            None     : {},
+        }
+        Option<LineAt> stored = if (pbuf_stmt_rt(src, i) == RT_AT) { at_of(t) } else { None };
+        match (stored)
+        {
+            Some(at) :
+            {
+                if (at.file < Vec::len(names))
+                {
+                    has_cur = true;
+                    cur = at;
+                }
+            },
+            None     : {},
+        }
+        if (has_cur && StringView::len(t) > 0 && !StringView::starts_with(t, "#"))
+        {
+            if (write)
+            {
+                pbuf_push(res, 0, &sprintf("#line %v \"%s\"", cur.line, &names[cur.file]));
+            }
+            room.nodes += 1;
+            room.bytes += 9 + decimal_digits(cur.line) + StringView::len(&names[cur.file]);
+            dirty = true;
+        }
+        if (write)
+        {
+            pbuf_copy(res, src, i);
+        }
+        room.nodes += 1;
+        room.bytes += StringView::len(v);
+    }
+    if (dirty)
+    {
+        if (write)
+        {
+            pbuf_push(res, 0, LINE_RESET);
+        }
+        room.nodes += 1;
+        room.bytes += reset;
+    }
+    room
+}
+
+// WI-11: a `#line` before each line of the C of the program's own
+// statements, naming the `.cb` line its `cb_at` gives; `LINE_RESET` where
+// a function's code ends.
+// Made in two walks of the unit's nodes (`directives_walk`): the result's
+// size, then the result in a buffer of that size.
+export fn line_directives_nodes(ref<PBuf, shared> src, ref<Vec<String>, shared> files) : PBuf
+{
+    Vec<String> names = Vec::new();
+    foreach (f in files)
+    {
+        Vec::push(&mut names, c_escape(f));
+    }
+    PBuf res = pbuf_new();
+    Room room = directives_walk(src, &names, &mut res, false);
+    // Room too for the definitions' first lines written again (`CB_SMALL`,
+    // an anchor).
+    pbuf_reserve(&mut res, room.nodes, room.bytes + pbuf_margin_room(src, 0));
+    _ = directives_walk(src, &names, &mut res, true);
+    res
+}
+
+// Whether a line of `b` declares a local of one of `zero`'s types
+// (`stack_checks::declares_zero_sized`, asked of the pool first).
+export fn declares_zero_sized_nodes(ref<PBuf, shared> b, ref<HashSet<String>, shared> zero) : bool
+{
+    // The pool holds every line's text: what no part of it declares, no
+    // line does.
+    if (!declares_zero_sized(&b.pool, zero))
+    {
+        return false;
+    }
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (declares_zero_sized(pbuf_view(b, i), zero))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// F193-1: the unit's zero-sized locals each declared with an anchor of its
+// own, and named through it on every line after, from its declaration to the
+// end of its function (a `}` at the left margin).
+export fn anchor_unit_nodes(ref<PBuf, exclusive> b, ref<HashSet<String>, shared> zero)
+{
+    Vec<String> names = Vec::new();
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        usize ind = pbuf_ind(b, i);
+        String line = pbuf_text(b, i);
+        StringView t = StringView::trim_start(&line);
+        match (anchored_decl(t, zero))
+        {
+            Some(a) :
+            {
+                Anchored { name, decl } = a;
+                StringView whole = &line;
+                String d = sprintf("%v%s", &whole[0..StringView::len(whole) - StringView::len(t)], &decl);
+                pbuf_replace(b, i, ind, &d);
+                Vec::push(&mut names, name);
+                continue;
+            },
+            None    : {},
+        }
+        if (Vec::len(&names) == 0)
+        {
+            continue;
+        }
+        String renamed = rename_anchored(&line, &names);
+        if (StringView::len(&renamed) != StringView::len(&line))
+        {
+            pbuf_replace(b, i, ind, &renamed);
+        }
+        // The names end with the function (`pprog::anchor_unit_nodes`): a
+        // node's text has no indentation, so the margin is the node's.
+        if (ind == 0 && line == "}")
+        {
+            names = Vec::new();
+        }
+    }
+}
+
+// The lines of the definitions of `std::Box::drop`'s instances in one buffer
+// (a signature at the left margin, its `{`, to the next `}` there), marked;
+// their names onto `names`. `no_makers_nodes` leaves these bodies out: one
+// runs only through its Box's descriptor, which the runtime never calls (a
+// Box is `box_drop`'s, `cbrt`), unless the program's own C names it.
+export fn box_drop_lines(ref<PBuf, shared> b, ref<Vec<String>, exclusive> names) : Vec<bool>
+{
+    usize n = pbuf_count(b);
+    Vec<bool> skip = Vec::filled(n, false);
+    if (!StringView::contains(&b.pool, "void f_std__Box__drop_"))
+    {
+        return skip;
+    }
+    usize i = 0;
+    while (i < n)
+    {
+        usize end = i;
+        if (i + 1 < n && pbuf_ind(b, i) == 0 && pbuf_line_is(b, i + 1, "{"))
+        {
+            StringView l = pbuf_view(b, i);
+            StringView head = Option::unwrap_or(StringView::strip_prefix(l, "static "), l);
+            Option<StringView> rest = if (StringView::ends_with(l, ")"))
+            {
+                StringView::strip_prefix(head, "void f_std__Box__drop_")
+            }
+            else
+            {
+                None
+            };
+            match (rest)
+            {
+                Some(r) :
+                {
+                    match (StringView::find(r, "("))
+                    {
+                        Some(open) :
+                        {
+                            usize k = i;
+                            while (k < n && !pbuf_line_is(b, k, "}"))
+                            {
+                                k += 1;
+                            }
+                            if (k < n)
+                            {
+                                Vec::push(names, sprintf("f_std__Box__drop_%s", &r[0..open]));
+                                end = k + 1;
+                            }
+                        },
+                        None       : {},
+                    }
+                },
+                None    : {},
+            }
+        }
+        if (end > i)
+        {
+            for (usize m = i; m < end; m += 1)
+            {
+                skip[m] = true;
+            }
+            i = end;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+    skip
+}
+
+// Whether a line of `b` not marked in `skip` names one of `words` as a whole
+// identifier (`gen::names_ident`); `stem`, when not empty, is a text every
+// word has. With `reclaims`, the `cb_reclaim` a `Vec` drop's loop makes
+// behind `cb_live_at(e)` is not read (the line after that test): it runs
+// only where an entry lies over the element already, which some other maker
+// put there, so it makes none of its own.
+export fn names_any_nodes(
+    ref<PBuf, shared> b,
+    ref<Vec<bool>, shared> skip,
+    ref<Vec<String>, shared> words,
+    StringView stem,
+    bool reclaims,
+) : bool
+{
+    // The words the pool has at all: the pool holds every line's text.
+    if (StringView::len(stem) > 0 && !StringView::contains(&b.pool, stem))
+    {
+        return false;
+    }
+    Vec<StringView> present = Vec::new();
+    foreach (w in words)
+    {
+        StringView wv = w;
+        if (StringView::contains(&b.pool, wv))
+        {
+            Vec::push(&mut present, wv);
+        }
+    }
+    if (Vec::len(&present) == 0)
+    {
+        return false;
+    }
+    bool guarded = false;
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (skip[i])
+        {
+            continue;
+        }
+        StringView l = pbuf_view(b, i);
+        if (reclaims)
+        {
+            StringView s = StringView::trim_start(l);
+            bool dropped = guarded && StringView::starts_with(s, "uint64_t root = cb_reclaim(e, ");
+            guarded = s == "if (cb_live_at(e)) {";
+            if (dropped)
+            {
+                continue;
+            }
+        }
+        foreach (w in &present)
+        {
+            if (names_ident(l, *w))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// `gen::quiet_cells`' search: whether no line of the units (`units`) or of
+// the texts `others` (the program's tail and thunks) names one of `makers`,
+// the bodies of `std::Box::drop`'s instances left out unless a line outside
+// them names one (`box_drop_lines`), and the guarded reclaims left out
+// (`names_any_nodes`).
+export fn no_makers_nodes(
+    ref<Vec<Unit>, shared> units,
+    ref<Vec<String>, shared> others,
+    ref<Vec<String>, shared> makers,
+) : bool
+{
+    Vec<PBuf> rest = Vec::new();
+    foreach (t in others)
+    {
+        Vec::push(&mut rest, pbuf_from_text(t));
+    }
+    usize nu = Vec::len(units);
+    Vec<String> names = Vec::new();
+    Vec<Vec<bool>> skips = Vec::new();
+    for (usize k = 0; k < nu; k += 1)
+    {
+        Vec::push(&mut skips, box_drop_lines(&units[k].nodes, &mut names));
+    }
+    for (usize k = 0; k < Vec::len(&rest); k += 1)
+    {
+        Vec::push(&mut skips, box_drop_lines(&rest[k], &mut names));
+    }
+    // A Box drop the program's own C names: the texts as they are.
+    bool named = false;
+    for (usize k = 0; k < nu && !named; k += 1)
+    {
+        named = names_any_nodes(&units[k].nodes, &skips[k], &names, "f_std__Box__drop_", false);
+    }
+    for (usize k = 0; k < Vec::len(&rest) && !named; k += 1)
+    {
+        named = names_any_nodes(&rest[k], &skips[nu + k], &names, "f_std__Box__drop_", false);
+    }
+    if (named)
+    {
+        for (usize k = 0; k < Vec::len(&skips); k += 1)
+        {
+            Vec<bool> none = Vec::filled(Vec::len(&skips[k]), false);
+            skips[k] = none;
+        }
+    }
+    for (usize k = 0; k < nu; k += 1)
+    {
+        if (names_any_nodes(&units[k].nodes, &skips[k], makers, "", true))
+        {
+            return false;
+        }
+    }
+    for (usize k = 0; k < Vec::len(&rest); k += 1)
+    {
+        if (names_any_nodes(&rest[k], &skips[nu + k], makers, "", true))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The room `render_settled` needs at most for `b`: its rendered text, and
+// for each `LINE_RESET` its directive (`name_len`: the file name's length).
+export fn settled_len(ref<PBuf, shared> b, usize name_len) : usize
+{
+    usize n = pbuf_text_len(b);
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (pbuf_line_is(b, i, LINE_RESET))
+        {
+            n += name_len + 32;
+        }
+    }
+    n
+}
+
+// `passes::settle_lines` in the render: the nodes of `b` as C text at the
+// end of `out`, each `LINE_RESET` line as the directive that numbers the
+// next line as what it is in the file `name` (its name as C writes it,
+// `c_escape`). `line`: how many lines the file has before these nodes; the
+// result: how many with them.
+export fn render_settled(ref<String, exclusive> out, ref<PBuf, shared> b, usize line, ref<String, shared> name) : usize
+{
+    usize at = line;
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (pbuf_line_is(b, i, LINE_RESET))
+        {
+            String::append(out, &sprintf("#line %v \"%s\"\n", at + 2, name));
+        }
+        else
+        {
+            pbuf_render_node(out, b, i);
+        }
+        at += 1;
+    }
+    at
+}

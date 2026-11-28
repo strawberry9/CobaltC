@@ -1,0 +1,282 @@
+// Protocol CIR as text (`cobc --emit-cir=proto`) and back (`cobc --from-cir`).
+//
+// The text is the lowered program as the emitter takes it (`gen::Generated`,
+// after every pass): the parts kept as C text (forward declarations, types,
+// string literals, prototypes, thunks, descriptors, the tail, a library's
+// header), each framed by its length, and the units' statements, one node
+// each with its kind, its indentation and its text. `proto_read` builds the
+// same `Generated` from it, and `gen::combined` then prints the same C: a
+// program's protocol CIR can be written by one run of the compiler, or by
+// another tool, and printed by another run.
+//
+//   (cir proto 1)
+//   (decided 0|1)
+//   (kept N)            N bytes follow, and a line end: why the paths are kept
+//   (text NAME N)       N bytes follow, and a line end
+//   (unit P K)          P: 1 for a unit that is all `std`; K nodes follow
+//   KIND IND N          a node; N bytes of text follow, and a line end
+//   (end)
+
+import std;
+import state;
+import proto;
+import gen;
+
+fn framed(ref<String, exclusive> o, str name, ref<String, shared> text)
+{
+    String::appendf(o, "(text %s %v)\n", name, StringView::len(text));
+    String::append(o, text);
+    String::append(o, "\n");
+}
+
+// The program `gen` as protocol CIR text.
+export fn proto_text(ref<Generated, shared> gen) : String
+{
+    String o = "(cir proto 1)\n";
+    String::reserve(&mut o, units_text_len(gen) * 2 + StringView::len(&gen.types) + StringView::len(&gen.descs) + 4096);
+    String::appendf(&mut o, "(decided %v)\n", if (gen.decided) { 1 } else { 0 });
+    match (&gen.kept)
+    {
+        Some(why) :
+        {
+            String::appendf(&mut o, "(kept %v)\n", StringView::len(why));
+            String::append(&mut o, why);
+            String::append(&mut o, "\n");
+        },
+        None      : {},
+    }
+    framed(&mut o, "fwd", &gen.fwd);
+    framed(&mut o, "types", &gen.types);
+    framed(&mut o, "strings", &gen.strings);
+    framed(&mut o, "protos", &gen.protos);
+    framed(&mut o, "thunks", &gen.thunks);
+    framed(&mut o, "descs", &gen.descs);
+    framed(&mut o, "tail", &gen.tail);
+    framed(&mut o, "header", &gen.header_text);
+    foreach (u in &gen.units)
+    {
+        usize k = pbuf_count(&u.nodes);
+        String::appendf(&mut o, "(unit %v %v)\n", if (u.pure_std) { 1 } else { 0 }, k);
+        for (usize i = 0; i < k; i += 1)
+        {
+            StringView t = pbuf_view(&u.nodes, i);
+            String::appendf(&mut o, "%s %v %v\n", pk_name(u.nodes.nodes[i].kind), pbuf_ind(&u.nodes, i), StringView::len(t));
+            String::append(&mut o, t);
+            String::append(&mut o, "\n");
+        }
+    }
+    String::append(&mut o, "(end)\n");
+    o
+}
+
+// A place in the text being read.
+struct Cur
+{
+    usize at;
+    usize line;
+}
+
+// The line at the cursor, without its end; the cursor moves past it.
+fn next_line(StringView s, ref<Cur, exclusive> c) : Option<StringView> from s
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    usize n = slice_len(b);
+    if (c.at >= n)
+    {
+        return None;
+    }
+    usize e = c.at;
+    while (e < n && b[e] != b'\n')
+    {
+        e += 1;
+    }
+    StringView l = &s[c.at..e];
+    c.at = if (e < n) { e + 1 } else { e };
+    c.line += 1;
+    Some(l)
+}
+
+// The `n` bytes at the cursor and the line end after them.
+fn take(StringView s, ref<Cur, exclusive> c, usize n) : Option<StringView> from s
+{
+    slice<u8, shared> b = StringView::as_bytes(s);
+    if (c.at + n >= slice_len(b) || b[c.at + n] != b'\n')
+    {
+        return None;
+    }
+    StringView t = &s[c.at..c.at + n];
+    for (usize i = c.at; i < c.at + n; i += 1)
+    {
+        if (b[i] == b'\n')
+        {
+            c.line += 1;
+        }
+    }
+    c.at += n + 1;
+    c.line += 1;
+    Some(t)
+}
+
+fn bad(ref<Cur, shared> c, str what) : String
+{
+    sprintf("line %v: %s", c.line, what)
+}
+
+fn number(StringView w) : Option<usize>
+{
+    match (StringView::parse<usize>(w))
+    {
+        Ok(v)  : Some(v),
+        Err(_) : None,
+    }
+}
+
+// `(NAME A B)` as its words, or a node's `KIND IND N`.
+fn words_of(StringView l) : Vec<StringView> from l
+{
+    StringView inner = l;
+    if (StringView::starts_with(l, "(") && StringView::ends_with(l, ")"))
+    {
+        inner = &l[1..StringView::len(l) - 1];
+    }
+    StringView::split(inner, " ")
+}
+
+// The program a protocol CIR text describes, or what is wrong with the text.
+export fn proto_read(StringView s) : Result<Generated, String>
+{
+    Cur c = Cur { .at = 0, .line = 0 };
+    match (next_line(s, &mut c))
+    {
+        Some(l) :
+        {
+            if (l != "(cir proto 1)")
+            {
+                return Err(bad(&c, "not protocol CIR (`(cir proto 1)` expected)"));
+            }
+        },
+        None    : return Err("an empty file"),
+    }
+    Generated gen = Generated {
+        .guard_notes = Vec::new(),
+        .fwd = String::new(),
+        .types = String::new(),
+        .strings = String::new(),
+        .protos = String::new(),
+        .thunks = String::new(),
+        .descs = String::new(),
+        .units = Vec::new(),
+        .tail = String::new(),
+        .header_text = String::new(),
+        .kept = None,
+        .decided = false,
+        .unsupported = None,
+    };
+    bool ended = false;
+    while (!ended)
+    {
+        StringView l = match (next_line(s, &mut c))
+        {
+            Some(x) : x,
+            None    : return Err(bad(&c, "the text ends before `(end)`")),
+        };
+        Vec<StringView> w = words_of(l);
+        if (l == "(end)")
+        {
+            ended = true;
+        }
+        else if (Vec::len(&w) == 2 && w[0] == "decided")
+        {
+            gen.decided = w[1] == "1";
+        }
+        else if (Vec::len(&w) == 2 && w[0] == "kept")
+        {
+            usize n = match (number(w[1]))
+            {
+                Some(v) : v,
+                None    : return Err(bad(&c, "`(kept N)`: N is not a number")),
+            };
+            match (take(s, &mut c, n))
+            {
+                Some(t) : gen.kept = Some(String::copy(t)),
+                None    : return Err(bad(&c, "`(kept N)`: N bytes and a line end do not follow")),
+            }
+        }
+        else if (Vec::len(&w) == 3 && w[0] == "text")
+        {
+            usize n = match (number(w[2]))
+            {
+                Some(v) : v,
+                None    : return Err(bad(&c, "`(text NAME N)`: N is not a number")),
+            };
+            String t = match (take(s, &mut c, n))
+            {
+                Some(x) : String::copy(x),
+                None    : return Err(bad(&c, "`(text NAME N)`: N bytes and a line end do not follow")),
+            };
+            if (w[1] == "fwd") { gen.fwd = t; }
+            else if (w[1] == "types") { gen.types = t; }
+            else if (w[1] == "strings") { gen.strings = t; }
+            else if (w[1] == "protos") { gen.protos = t; }
+            else if (w[1] == "thunks") { gen.thunks = t; }
+            else if (w[1] == "descs") { gen.descs = t; }
+            else if (w[1] == "tail") { gen.tail = t; }
+            else if (w[1] == "header") { gen.header_text = t; }
+            else
+            {
+                return Err(bad(&c, "`(text NAME N)`: no part has this name"));
+            }
+        }
+        else if (Vec::len(&w) == 3 && w[0] == "unit")
+        {
+            usize k = match (number(w[2]))
+            {
+                Some(v) : v,
+                None    : return Err(bad(&c, "`(unit P K)`: K is not a number")),
+            };
+            PBuf nodes = pbuf_new();
+            for (usize i = 0; i < k; i += 1)
+            {
+                StringView nl = match (next_line(s, &mut c))
+                {
+                    Some(x) : x,
+                    None    : return Err(bad(&c, "a unit ends before its last node")),
+                };
+                Vec<StringView> nw = StringView::split(nl, " ");
+                if (Vec::len(&nw) != 3)
+                {
+                    return Err(bad(&c, "a node is `KIND IND N` and N bytes of text"));
+                }
+                usize ind = match (number(nw[1]))
+                {
+                    Some(v) : v,
+                    None    : return Err(bad(&c, "a node's indentation is not a number")),
+                };
+                usize n = match (number(nw[2]))
+                {
+                    Some(v) : v,
+                    None    : return Err(bad(&c, "a node's length is not a number")),
+                };
+                StringView t = match (take(s, &mut c, n))
+                {
+                    Some(x) : x,
+                    None    : return Err(bad(&c, "a node's text and a line end do not follow its head")),
+                };
+                pbuf_push(&mut nodes, ind, t);
+                // The kind is what the text reads as; a text that says
+                // another is not one this compiler wrote.
+                usize at = pbuf_count(&nodes) - 1;
+                if (nw[0] != pk_name(nodes.nodes[at].kind))
+                {
+                    return Err(bad(&c, "a node's kind is not what its text reads as"));
+                }
+            }
+            Vec::push(&mut gen.units, Unit { .nodes = nodes, .pure_std = w[1] == "1" });
+        }
+        else
+        {
+            return Err(bad(&c, "neither a part, a unit nor `(end)`"));
+        }
+    }
+    Ok(gen)
+}

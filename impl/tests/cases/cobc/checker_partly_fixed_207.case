@@ -1,0 +1,607 @@
+# The static pass on the partly fixed reports of Update 207 (108, 109,
+# 114, 183, 229) and report 311 of Update 208: programs that passed the
+# check and faulted, refused now; correct programs refused, accepted now;
+# the two build forms in agreement; divide-and-conquer threads decided.
+# 108: a resource field of a slice's element is reached through a
+# reference (the slice), so it is not moved out: refused as through a
+# `ref` or a `ref<Vec>`.
+file slice_field_move.cb
+import std;
+
+struct Person
+{
+    String name;
+    i32 age;
+}
+
+fn d(slice<Person, shared> ps) : String
+{
+    ps[0].name
+}
+
+fn main()
+{
+    Vec<Person> v = Vec::new();
+    Vec::push(&mut v, Person { .name = "Ada", .age = 36 });
+    String n = d(&v);
+    printf("%s\n", &n);
+}
+end
+run $COBC --check slice_field_move.cb
+status 1
+stderr-has diag.move-out-of-field
+stderr-has `ps[0].name` is reached through a reference
+# 108: a copy, an exchange and a plain field through a slice are taken.
+file slice_field_ok.cb
+import std;
+
+struct Person
+{
+    String name;
+    i32 age;
+}
+
+// Accepted: copies, references, exchanges and plain values.
+fn ok1(slice<Person, shared> ps) : String
+{
+    String::clone(&ps[0].name)
+}
+
+fn ok2(slice<Person, exclusive> ps) : String
+{
+    replace(&mut ps[0].name, String::copy("x"))
+}
+
+fn ok3(slice<Person, shared> ps) : i32
+{
+    ps[0].age
+}
+
+fn main()
+{
+    Vec<Person> v = Vec::new();
+    Vec::push(&mut v, Person { .name = "Ada", .age = 36 });
+    String a = ok1(&v);
+    String b = ok2(&mut v);
+    printf("%s %s %s %d\n", &a, &b, &v[0].name, ok3(&v));
+}
+end
+run $COBC --run slice_field_ok.cb
+status 0
+stdout-is Ada Ada x 36\n
+run $COBC --all-checks --run slice_field_ok.cb
+status 0
+stdout-is Ada Ada x 36\n
+# 109: a closure binding without `move` pushed into a `Vec` declared
+# outside the loop that declares its capture: refused as the literal is.
+file closure_binding_pushed.cb
+import std;
+fn main()
+{
+    Vec<fn() : usize> fs = Vec::new();
+    foreach (i in 0..3)
+    {
+        auto c = [i]() : usize { i * 10 };
+        Vec::push(&mut fs, c);
+    }
+    foreach (f in &fs)
+    {
+        printf("%d\n", (*f)());
+    }
+}
+end
+run $COBC --check closure_binding_pushed.cb
+status 1
+stderr-has diag.destroy-while-aliased
+stderr-has borrows `i`, which ends with its block
+# 109: such a closure stored into an element of the outer `Vec`.
+file closure_into_element.cb
+import std;
+fn main()
+{
+    Vec<fn() : usize> fs = Vec::new();
+    Vec::push(&mut fs, move []() : usize { 1 });
+    foreach (i in 0..3)
+    {
+        fs[0] = [i]() : usize { i * 10 };
+    }
+    foreach (f in &fs)
+    {
+        printf("%d\n", (*f)());
+    }
+}
+end
+run $COBC --check closure_into_element.cb
+status 1
+stderr-has diag.destroy-while-aliased
+stderr-has stored in `fs`
+# 109: a `move` closure binding, and one whose capture outlives the
+# container, are stored.
+file closure_binding_ok.cb
+import std;
+fn main()
+{
+    Vec<fn() : usize> fs = Vec::new();
+    foreach (i in 0..3)
+    {
+        auto c = move [i]() : usize { i * 10 };
+        Vec::push(&mut fs, c);
+    }
+    usize k = 4;
+    foreach (j in 0..2)
+    {
+        auto d = [k]() : usize { k * 10 };
+        Vec::push(&mut fs, d);
+        fs[0] = [k]() : usize { k + 1 };
+    }
+    foreach (f in &fs)
+    {
+        printf("%d\n", (*f)());
+    }
+}
+end
+run $COBC --run closure_binding_ok.cb
+status 0
+stdout-is 5\n10\n20\n40\n40\n
+run $COBC --all-checks --run closure_binding_ok.cb
+status 0
+stdout-is 5\n10\n20\n40\n40\n
+# 114: a reference used only in a `match`'s integer or `bool` scrutinee
+# ends once the scrutinee is read, as after an `if`'s condition: the arm's
+# write is taken in both forms.
+file match_scrutinee_ends.cb
+import std;
+
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[0: u32, 1]);
+    ref<u32, shared> it = &v[0];
+    match (*it)
+    {
+        0 : { v[0] = 5; },
+        _ : {},
+    }
+    printf("%v\n", v[0]);
+    ref<u32, shared> r = &v[1];
+    match (*r + 1)
+    {
+        2 : { v[1] = 7; },
+        n : { v[1] = n; },
+    }
+    printf("%v\n", v[1]);
+    bool flag = true;
+    ref<bool, shared> f = &flag;
+    match (*f)
+    {
+        true  : { flag = false; },
+        false : {},
+    }
+    printf("%v\n", flag);
+}
+end
+run $COBC --run match_scrutinee_ends.cb
+status 0
+stdout-is 5\n7\nfalse\n
+run $COBC --all-checks --run match_scrutinee_ends.cb
+status 0
+stdout-is 5\n7\nfalse\n
+# 114: named in the arm after the write, it is still live there.
+file match_arm_uses_ref.cb
+import std;
+
+// The reference is named in an arm after the write: still live there.
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[0: u32, 1]);
+    ref<u32, shared> it = &v[0];
+    match (*it)
+    {
+        0 : { v[0] = 5; printf("%v\n", *it); },
+        _ : {},
+    }
+    printf("%v\n", v[0]);
+}
+end
+run $COBC --check match_arm_uses_ref.cb
+status 1
+stderr-has diag.aliasing-conflict
+stderr-has `it` still borrows `v[0]`
+# 183: a pattern test on a probe-only parameter (`if (Some(rest) =
+# StringView::strip_prefix(path, "x."))`, and in a `match`) whose binder only
+# feeds comparisons is a probe.
+file from_pattern_probe.cb
+import std;
+
+struct Entry
+{
+    String key;
+    String value;
+}
+
+// The value for `path` ("x.key" or "key").
+fn lookup(ref<Vec<Entry>, shared> entries, StringView path) : Option<ref<String, shared>> from entries
+{
+    if (Some(rest) = StringView::strip_prefix(path, "x."))
+    {
+        foreach (e in entries)
+        {
+            if (e.key == rest)
+            {
+                return Some(&e.value);
+            }
+        }
+        return None;
+    }
+    foreach (e in entries)
+    {
+        if (e.key == path)
+        {
+            return Some(&e.value);
+        }
+    }
+    None
+}
+
+fn lookup2(ref<Vec<Entry>, shared> entries, StringView path) : Option<ref<String, shared>> from entries
+{
+    match (StringView::strip_prefix(path, "x."))
+    {
+        Some(rest) :
+        {
+            foreach (e in entries)
+            {
+                if (StringView::len(rest) > 0 && e.key == rest)
+                {
+                    return Some(&e.value);
+                }
+            }
+            None
+        },
+        None       : None,
+    }
+}
+
+fn main()
+{
+    Vec<Entry> es = Vec::new();
+    Vec::push(&mut es, Entry { .key = "port", .value = "8080" });
+    match (lookup(&es, "x.port"))
+    {
+        Some(v) : printf("%s\n", v),
+        None    : printf("none\n"),
+    }
+    match (lookup2(&es, "x.port"))
+    {
+        Some(v) : printf("%s\n", v),
+        None    : printf("none\n"),
+    }
+}
+end
+run $COBC --run from_pattern_probe.cb
+status 0
+stdout-is 8080\n8080\n
+run $COBC --all-checks --run from_pattern_probe.cb
+status 0
+stdout-is 8080\n8080\n
+# 183: a binder returned keeps the parameter.
+file from_pattern_kept.cb
+import std;
+
+// Must stay refused: the binder escapes into the result.
+fn bad(ref<String, shared> s, StringView path) : Option<StringView> from s
+{
+    if (Some(rest) = StringView::strip_prefix(path, "x."))
+    {
+        return Some(rest);
+    }
+    Some(&s[0..1])
+}
+
+fn bad2(ref<String, shared> s, StringView path) : StringView from s
+{
+    StringView r = &s[0..1];
+    match (StringView::strip_prefix(path, "x."))
+    {
+        Some(rest) :
+        {
+            r = rest;
+        },
+        None       : {},
+    }
+    r
+}
+
+fn main()
+{
+    String s = String::copy("ab");
+    printf("%v\n", Option::is_some(&bad(&s, "x.y")));
+    printf("%s\n", bad2(&s, "x.y"));
+}
+end
+run $COBC --check from_pattern_kept.cb
+status 1
+stderr-has diag.result-source-kept
+stderr-has keeps `path` here
+# 183: a binder assigned to a binding the result comes from keeps it.
+file from_pattern_assigned.cb
+import std;
+
+fn bad2(ref<String, shared> s, StringView path) : StringView from s
+{
+    StringView r = &s[0..1];
+    match (StringView::strip_prefix(path, "x."))
+    {
+        Some(rest) :
+        {
+            r = rest;
+        },
+        None       : {},
+    }
+    r
+}
+
+fn main()
+{
+    String s = String::copy("ab");
+    printf("%s\n", bad2(&s, "x.y"));
+}
+end
+run $COBC --check from_pattern_assigned.cb
+status 1
+stderr-has diag.result-source-kept
+stderr-has keeps `path` here
+# 229: a block's `String` value borrowed where a `StringView` is declared,
+# as `&String::copy(...)` is.
+file block_text_argument.cb
+import std;
+
+fn width(StringView s) : usize
+{
+    StringView::len(s)
+}
+
+fn main()
+{
+    printf("%v\n", StringView::len(&String::copy("abcd")));
+    printf("%v\n", StringView::len(&{ String::copy("abcd") }));
+    printf("%v\n", width(&unsafe { String::copy("abcde") }));
+    printf("%v\n", width(&{ String::copy("ab") }));
+}
+end
+run $COBC --run block_text_argument.cb
+status 0
+stdout-is 4\n4\n5\n2\n
+run $COBC --all-checks --run block_text_argument.cb
+status 0
+stdout-is 4\n4\n5\n2\n
+# 229: borrowed elsewhere, the message says where it is allowed.
+file block_borrow_elsewhere.cb
+import std;
+
+fn main()
+{
+    ref<Vec<i32>, shared> r = &{ Vec::from_slice(&[1, 2, 3]) };
+    printf("%v\n", Vec::len(r));
+}
+end
+run $COBC --check block_borrow_elsewhere.cb
+status 1
+stderr-has diag.borrow-of-non-place
+stderr-has allowed only as an argument
+# 311: two ranges of one slice that meet at a local no statement writes
+# (`[0 .. mid]`, `[mid .. n]`) are disjoint: lent to two threads, the
+# function is decided.
+file split_spawn.cb
+import std;
+
+// Splits `s` in halves, gives each half to a thread while `depth > 0`,
+// and at the leaves does plain work on the elements.
+fn work(slice<u64, exclusive> s, usize depth)
+{
+    usize n = slice_len(s);
+    if (depth > 0)
+    {
+        usize mid = n / 2;
+        auto a = spawn(work, &mut s[0..mid], depth - 1);
+        auto b = spawn(work, &mut s[mid..n], depth - 1);
+        join(a);
+        join(b);
+        return;
+    }
+    foreach (round in 0..20)
+    {
+        for (usize i = 0; i < n; i += 1)
+        {
+            s[i] = wrapping_add(wrapping_mul(s[i], 3), 1);
+        }
+    }
+}
+
+fn main()
+{
+    usize depth = 0;
+    if (arg_count() > 0)
+    {
+        depth = Result::unwrap(StringView::parse<usize>(&Result::unwrap(arg(0))));
+    }
+    Vec<u64> v = Vec::filled(400000, 1: u64);
+    u64 t0 = monotonic_ns();
+    work(&mut v, depth);
+    printf("depth %v: %v ms, v[7] = %v\n", depth, (monotonic_ns() - t0) / 1000000, v[7]);
+}
+end
+run $COBC --report-tracking split_spawn.cb
+status 0
+stdout-has no run-time tracking
+run $COBC -o split split_spawn.cb
+status 0
+run ./split 2
+status 0
+stdout-has v[7] = 5230176601
+# 311: `mid` written between the two borrows: the ranges overlap, and
+# the run finds it in both forms.
+file split_written.cb
+import std;
+
+fn work(slice<u64, exclusive> s, usize depth)
+{
+    foreach (i in 0..slice_len(s))
+    {
+        s[i] = s[i] + widen<u64>(depth);
+    }
+}
+
+// `mid` is written between the two borrows: the two ranges overlap.
+fn split(slice<u64, exclusive> s)
+{
+    usize n = slice_len(s);
+    usize mid = n / 2;
+    auto a = spawn(work, &mut s[0..mid], 1);
+    mid = mid - 1;
+    auto b = spawn(work, &mut s[mid..n], 2);
+    join(a);
+    join(b);
+}
+
+fn main()
+{
+    Vec<u64> v = Vec::filled(8, 1: u64);
+    split(&mut v);
+    printf("%v\n", v[3]);
+}
+end
+run $COBC --run split_written.cb
+status 1
+stderr-has diag.aliasing-conflict
+run $COBC --all-checks --run split_written.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 311: a second binding of the name, and one declared in a loop, give
+# no key.
+file split_shadowed.cb
+import std;
+
+fn work(slice<u64, exclusive> s, usize depth)
+{
+    foreach (i in 0..slice_len(s))
+    {
+        s[i] = s[i] + widen<u64>(depth);
+    }
+}
+
+// Two bindings named `mid`: the second range starts at the inner one.
+fn split(slice<u64, exclusive> s)
+{
+    usize n = slice_len(s);
+    usize mid = n / 2;
+    auto a = spawn(work, &mut s[0..mid], 1);
+    {
+        usize mid = 1;
+        auto b = spawn(work, &mut s[mid..n], 2);
+        join(b);
+    }
+    join(a);
+}
+
+// Declared in a loop: each pass has its own `m`, and a handle of one pass
+// outlives it.
+fn looped(slice<u64, exclusive> s)
+{
+    usize n = slice_len(s);
+    Vec<handle<void>> hs = Vec::new();
+    foreach (k in 0..2)
+    {
+        usize m = n / 2 - k;
+        if (k == 0)
+        {
+            Vec::push(&mut hs, spawn(work, &mut s[0..m], 1));
+        }
+        else
+        {
+            Vec::push(&mut hs, spawn(work, &mut s[m..n], 2));
+        }
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+}
+
+fn main()
+{
+    Vec<u64> v = Vec::filled(8, 1: u64);
+    split(&mut v);
+    printf("%v\n", v[3]);
+    looped(&mut v);
+    printf("%v\n", v[3]);
+}
+end
+run $COBC --run split_shadowed.cb
+status 1
+stderr-has diag.aliasing-conflict
+run $COBC --all-checks --run split_shadowed.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 311: declared in a loop.
+file split_looped.cb
+import std;
+
+fn work(slice<u64, exclusive> s, usize depth)
+{
+    foreach (i in 0..slice_len(s))
+    {
+        s[i] = s[i] + widen<u64>(depth);
+    }
+}
+
+// Two bindings named `mid`: the second range starts at the inner one.
+fn split(slice<u64, exclusive> s)
+{
+    usize n = slice_len(s);
+    usize mid = n / 2;
+    auto a = spawn(work, &mut s[0..mid], 1);
+    {
+        usize mid = 1;
+        auto b = spawn(work, &mut s[mid..n], 2);
+        join(b);
+    }
+    join(a);
+}
+
+// Declared in a loop: each pass has its own `m`, and a handle of one pass
+// outlives it.
+fn looped(slice<u64, exclusive> s)
+{
+    usize n = slice_len(s);
+    Vec<handle<void>> hs = Vec::new();
+    foreach (k in 0..2)
+    {
+        usize m = n / 2 - k;
+        if (k == 0)
+        {
+            Vec::push(&mut hs, spawn(work, &mut s[0..m], 1));
+        }
+        else
+        {
+            Vec::push(&mut hs, spawn(work, &mut s[m..n], 2));
+        }
+    }
+    foreach (h in hs)
+    {
+        join(h);
+    }
+}
+
+fn main()
+{
+    Vec<u64> v = Vec::filled(8, 1: u64);
+    looped(&mut v);
+    printf("%v\n", v[3]);
+}
+end
+run $COBC --run split_looped.cb
+status 1
+stderr-has diag.aliasing-conflict
+run $COBC --all-checks --run split_looped.cb
+status 1
+stderr-has diag.aliasing-conflict

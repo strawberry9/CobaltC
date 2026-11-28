@@ -1,0 +1,331 @@
+# D-0341: correct programs accepted, certain faults refused (the improvements
+# D-0340 left).
+# 418: a cursor reference reassigned after the element it read is written:
+# both builds run it.
+file f418.cb
+import std;
+
+struct Step
+{
+    usize next;
+    u32 cost;
+    bool visited;
+}
+
+fn walk(ref<Vec<Step>, exclusive> steps) : u32
+{
+    u32 total = 0;
+    usize i = 0;
+    ref<Step, shared> cur = &steps[0];
+    while (!cur.visited)
+    {
+        total += cur.cost;
+        usize nx = cur.next;
+        steps[i].visited = true;
+        i = nx;
+        cur = &steps[i];
+    }
+    total
+}
+
+fn main()
+{
+    Vec<Step> s = Vec::new();
+    Vec::push(&mut s, Step { .next = 2, .cost = 1, .visited = false });
+    Vec::push(&mut s, Step { .next = 0, .cost = 10, .visited = false });
+    Vec::push(&mut s, Step { .next = 1, .cost = 100, .visited = false });
+    printf("%v\n", walk(&mut s));
+}
+end
+run $COBC --run f418.cb
+status 0
+stdout-is 111\n
+run $COBC --all-checks --run f418.cb
+status 0
+stdout-is 111\n
+# 418: the straight-line form, literal indices, accepted by the check.
+file f418b.cb
+import std;
+
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[1, 2]);
+    ref<i32, shared> cur = &v[0];
+    i32 a = *cur;
+    v[0] = 5;
+    cur = &v[1];
+    printf("%v %v\n", a, *cur);
+}
+end
+run $COBC --run f418b.cb
+status 0
+stdout-is 1 2\n
+# 392: views of a text, the text written, then an element read: refused.
+file f392.cb
+import std;
+
+fn main()
+{
+    String text = "first line\nsecond line\n";
+    Vec<StringView> lines = StringView::lines(&text);
+    String::append(&mut text, "a much longer tail, so that the buffer grows\n");
+    printf("%s\n", lines[0]);
+}
+end
+run $COBC --check f392.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 392: a struct field holding the views.
+file f392s.cb
+import std;
+
+struct Holder
+{
+    Vec<StringView> lines;
+}
+
+fn main()
+{
+    String text = "first line\nsecond";
+    Holder h = Holder { .lines = StringView::lines(&text) };
+    String::append(&mut text, " and a much longer tail that makes the String grow");
+    printf("%s\n", h.lines[0]);
+}
+end
+run $COBC --check f392s.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 409: each branch fixes one type argument.
+file f409.cb
+import std;
+
+fn main()
+{
+    usize n = 3;
+    auto r = if (n > 1) { Ok(true) } else { Err("short") };
+    match (r)
+    {
+        Ok(b)  : printf("%v\n", b),
+        Err(e) : printf("%s\n", e),
+    }
+}
+end
+run $COBC --run f409.cb
+status 0
+stdout-is true\n
+# A branch its known condition never takes holds no fault.
+file fdead.cb
+import std;
+
+fn main()
+{
+    if (!(1: i32 <= 1: i32))
+    {
+        printf("%v\n", 1 / (1 - 1));
+    }
+    printf("ok\n");
+}
+end
+run $COBC --run fdead.cb
+status 0
+stdout-is ok\n
+# 370: a module file may start with a `#!` line too.
+file m2.cb
+#!/usr/bin/env -S cobc --run
+import std;
+export fn hi() : i32
+{
+    1
+}
+end
+file main2.cb
+import std;
+module m2 "./m2.cb";
+fn main()
+{
+    printf("%v\n", m2::hi());
+}
+end
+run $COBC --run main2.cb
+status 0
+stdout-is 1\n
+# 445: `foreach (d in &K)` over a constant array.
+file f445.cb
+import std;
+
+const array<u8, 3> DAYS = [31, 28, 31];
+
+fn main()
+{
+    u32 t = 0;
+    foreach (d in &DAYS)
+    {
+        t += widen<u32>(*d);
+    }
+    printf("%v\n", t);
+}
+end
+run $COBC --run f445.cb
+status 0
+stdout-is 90\n
+# 417: an arm binder used only in an `if` condition ends after it.
+file f417.cb
+import std;
+
+enum State
+{
+    Reading(String),
+    Done,
+}
+
+fn feed(ref<State, exclusive> st)
+{
+    match (st)
+    {
+        Reading(buf) :
+        {
+            if (StringView::len(buf) > 3)
+            {
+                overwrite(st, Done);
+            }
+        },
+        Done : {},
+    }
+}
+
+fn main()
+{
+    State st = Reading("hello");
+    feed(&mut st);
+    match (&st)
+    {
+        Done       : printf("done\n"),
+        Reading(_) : printf("reading\n"),
+    }
+}
+end
+run $COBC --run f417.cb
+status 0
+stdout-is done\n
+run $COBC --all-checks --run f417.cb
+status 0
+stdout-is done\n
+# 400: a literal `*` width is a `usize`.
+file f400.cb
+import std;
+
+fn main()
+{
+    printf("[%*d]\n", 5, 42);
+}
+end
+run $COBC --run f400.cb
+status 0
+stdout-is [   42]\n
+# 396: views of a trimmed line's parts kept, with an early `continue`.
+file f396.cb
+import std;
+
+fn keys(StringView text) : Vec<StringView> from text
+{
+    Vec<StringView> out = Vec::new();
+    foreach (raw in StringView::lines(text))
+    {
+        StringView line = StringView::trim(raw);
+        match (StringView::find(line, "="))
+        {
+            Some(i) : Vec::push(&mut out, StringView::trim(&line[0..i])),
+            None    : continue,
+        }
+    }
+    out
+}
+
+fn main()
+{
+    String t = "a = 1\nb= 2\n";
+    Vec<StringView> ks = keys(&t);
+    foreach (k in &ks)
+    {
+        printf("[%s]\n", *k);
+    }
+}
+end
+run $COBC --run f396.cb
+status 0
+stdout-is [a]\n[b]\n
+# 396, soundness: such a view of a text the program then writes is still refused.
+file f396s.cb
+import std;
+
+fn main()
+{
+    String s = "  ab  ";
+    Vec<StringView> out = Vec::new();
+    {
+        StringView v = &s;
+        Vec::push(&mut out, StringView::trim(&v[0..4]));
+    }
+    String::append(&mut s, "a longer tail so that the buffer grows");
+    printf("%s\n", out[0]);
+}
+end
+run $COBC --check f396s.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 415: copying views out of a field through an exclusive reference holds the
+# views, shared, not the whole struct.
+file f415.cb
+import std;
+
+struct Cur
+{
+    Option<StringView> peeked;
+    usize pos;
+}
+
+fn bump(ref<Cur, exclusive> c) : usize
+{
+    Option<StringView> t = c.peeked;
+    c.pos += 1;
+    match (t)
+    {
+        Some(s) : StringView::len(s),
+        None    : 0,
+    }
+}
+
+fn main()
+{
+    String src = "hello";
+    Cur c = Cur { .peeked = Some(&src), .pos = 0 };
+    usize n = bump(&mut c);
+    printf("%v %v\n", n, c.pos);
+}
+end
+run $COBC --run f415.cb
+status 0
+stdout-is 5 1\n
+# 437: a literal beside a generic body's `foreach` index takes the index's type.
+file f437.cb
+import std;
+
+fn numbered<T>(ref<Vec<T>, shared> items) : usize
+{
+    usize last = 0;
+    foreach (i, x in items)
+    {
+        last = i + 1;
+    }
+    last
+}
+
+fn main()
+{
+    Vec<u8> v = Vec::from_slice(&[1: u8, 2]);
+    printf("%v\n", numbered(&v));
+}
+end
+run $COBC --run f437.cb
+status 0
+stdout-is 2\n

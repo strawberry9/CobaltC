@@ -1,0 +1,108 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.fs [Copy-File] [Remove-Dir] [Path-Kind] [Read-Link] [List-Dir], rule.stdlib.file [Write-File] (reports 076, 095, 096, 103, 168, 222); conf.fs-failures-named
+// kind: positive
+// expect: ok
+// platform: unix
+// args: $TMP
+//
+// The failures a program meets in the file system each say what they are,
+// and none loses data: `write_bytes` to a full device is `NoSpace` (it
+// returned `Ok` for fewer than 8 KiB); closing a file on `/dev/null` is
+// `Ok` (its `fsync` says EINVAL, which means nothing to make durable); a
+// copy onto its own source, by another spelling or through a link, is
+// `SameFile` and leaves it whole; a directory that is not empty is
+// `NotEmpty`, a copy of a directory `IsDirectory`, a link loop `LinkLoop`, a
+// missing working directory for a command `NotFound`. `read_link` tells a
+// link from what it names, and `list_dir_bytes` lists a name that is not
+// UTF-8, which `list_dir` refuses.
+
+import std;
+
+fn say(str what, Result<void, FileError> r)
+{
+    match (r)
+    {
+        Ok(_)  : printf("%s: ok\n", what),
+        Err(e) : printf("%s: %s\n", what, FileError::text(&e)),
+    }
+}
+
+fn sh(StringView script)
+{
+    Command c = Command::new("/bin/sh");
+    Command::arg(&mut c, "-c");
+    Command::arg(&mut c, script);
+    _ = Result::unwrap(Command::status(&c));
+}
+
+fn main()
+{
+    String dir = Result::unwrap(arg(0));
+    say("write_bytes to /dev/full", write_bytes("/dev/full", b"abc"));
+    File null = Result::unwrap(File::create("/dev/null"));
+    _ = File::write_text(&mut null, "discarded\n");
+    say("close on /dev/null", File::close(null));
+
+    String data = path_join(&dir, "data.txt");
+    _ = Result::unwrap(write_file(&data, "precious"));
+    String again = path_join(&dir, "./data.txt");
+    match (copy_file(&data, &again))
+    {
+        Ok(n)  : printf("copy onto itself: copied %v\n", n),
+        Err(e) : printf("copy onto itself: %s\n", FileError::text(&e)),
+    }
+    String link = path_join(&dir, "link.txt");
+    sh(&sprintf("ln -s data.txt '%s'", &link));
+    match (copy_file(&data, &link))
+    {
+        Ok(n)  : printf("copy onto a link to it: copied %v\n", n),
+        Err(e) : printf("copy onto a link to it: %s\n", FileError::text(&e)),
+    }
+    printf("still: %s\n", &Result::unwrap(read_file(&data)));
+    match (Result::unwrap(read_link(&link)))
+    {
+        Some(t) : printf("read_link of the link: %s\n", &t),
+        None    : printf("read_link of the link: not a link\n"),
+    }
+    printf("read_link of the file: %v\n", Option::is_none(&Result::unwrap(read_link(&data))));
+
+    String full = path_join(&dir, "full");
+    _ = Result::unwrap(make_dir(&full));
+    _ = Result::unwrap(write_file(&path_join(&full, "f"), "x"));
+    say("remove_dir of a full directory", remove_dir(&full));
+    match (copy_file(&full, &path_join(&dir, "copy")))
+    {
+        Ok(_)  : printf("copy of a directory: ok\n"),
+        Err(e) : printf("copy of a directory: %s\n", FileError::text(&e)),
+    }
+    String looped = path_join(&dir, "loop");
+    sh(&sprintf("ln -s loop '%s'", &looped));
+    match (path_kind(&looped))
+    {
+        Ok(_)  : printf("a link to itself: ok\n"),
+        Err(e) : printf("a link to itself: %s\n", FileError::text(&e)),
+    }
+    Command c = Command::new("pwd");
+    Command::current_dir(&mut c, &path_join(&dir, "no-such-dir"));
+    match (Command::output(&c))
+    {
+        Ok(_)  : printf("missing working directory: ran\n"),
+        Err(e) : printf("missing working directory: %s\n", FileError::text(&e)),
+    }
+
+    String names = path_join(&dir, "names");
+    _ = Result::unwrap(make_dir(&names));
+    _ = Result::unwrap(write_file(&path_join(&names, "good.txt"), ""));
+    sh(&sprintf("printf '' > '%s'/\"$(printf 'caf\\351.txt')\"", &names));
+    printf("list_dir refuses: %v\n", Result::is_err(&list_dir(&names)));
+    Vec<Vec<u8>> listed = Result::unwrap(list_dir_bytes(&names));
+    foreach (n in &listed)
+    {
+        match (StringView::from_utf8(n))
+        {
+            Ok(v)  : printf("  %s\n", &String::copy(v)),
+            Err(e) : printf("  not UTF-8 from byte %v: %s\n", e.offset, &to_hex(n)),
+        }
+    }
+}

@@ -1,0 +1,4779 @@
+// The static half of the model, written from the specification:
+//
+// - typing for the fragment (`spec/12`), including the mode rules:
+//   `[Write-Not-Exclusive]`, `[Borrow-Exceeds-Source]` and D-0218's
+//   `[T-Read-Through-Shared]`;
+// - `rule.control.flow-analysis` (`spec/14` §6): the facts `valid`,
+//   `deriv` and `escaped`, the transfer table and the discharge table, as
+//   written, for the constructs of the fragment;
+// - `rule.temporal.ref-escape` (`spec/10`);
+// - `[Ref-Binding-Last-Use]` (`spec/14` §1, D-0111, D-0133): which
+//   statement each local holding a reference ends after;
+// - `rule.control.frame-references` (`spec/14` §6, D-0282): inherited
+//   facts, the call-site rule with the access summaries of `frames.cb`,
+//   element accesses, evaluation order and moving out through a reference,
+//   over the same state, after the flow analysis; it only refutes.
+//
+// Where two static diagnostics apply, the first in source order is the one
+// reported (D-0110). The analysis is intraprocedural; each function body
+// is analysed on its own, helpers included.
+
+import std;
+import ast;
+import maps;
+import frames;
+
+export struct StaticErr
+{
+    export usize line;
+    export str diag;
+    export String why;
+}
+
+// Where a binding ends early: (function, block number in pre-order, the
+// statement index) -> the bindings that end after that statement.
+export struct EndKey
+{
+    export String f;
+    export usize block;
+    export usize stmt;
+}
+
+// D-0241: (function, line, binding) -> whether every `¬clash` the
+// discharge table resolves there for an access rooted at the binding
+// is *proven* (no run-time check licensed).
+export struct ProvenKey
+{
+    export String f;
+    export usize line;
+    export String x;
+}
+
+export struct Statics
+{
+    export Vec<StaticErr> errors;
+    export HashMap<EndKey, Vec<String>> ends;
+    // Every binding's type, per function.
+    export HashMap<String, HashMap<String, Ty>> types;
+    export HashMap<ProvenKey, bool> proven;
+}
+
+// `cobmodel check --pre-d0236`: the table as it stood before D-0236, a
+// forgotten fact leaving its root unescaped (evidence for the finding).
+export static Atomic<i32> PRE_D0236 = 0;
+// `--pre-d0243`: the closure row as it stood before D-0243, a captured
+// reference binding left unescaped.
+export static Atomic<i32> PRE_D0243 = 0;
+// `--pre-d0282`: without `rule.control.frame-references`.
+export static Atomic<i32> PRE_D0282 = 0;
+
+// The first finding in source order: of those on the least line, the
+// first found.
+export fn Statics::first(ref<Statics, shared> s) : Option<usize>
+{
+    Option<usize> best = None;
+    for (usize i = 0; i < Vec::len(&s.errors); i += 1)
+    {
+        match (best)
+        {
+            Some(b) :
+            {
+                if (s.errors[i].line < s.errors[b].line)
+                {
+                    best = Some(i);
+                }
+            },
+            None    : best = Some(i),
+        }
+    }
+    best
+}
+
+export enum Tri
+{
+    F,
+    T,
+    Q, // `?`: the join of T and F
+}
+
+fn join_tri(Tri a, Tri b) : Tri
+{
+    if (a == b)
+    {
+        return a;
+    }
+    Tri::Q
+}
+
+// A syntactic place's root (`spec/14` §6: a binding x, or the referent
+// `*q` of a tracked binding q of reference type, D-0071).
+export enum Root
+{
+    Var(String),
+    Deref(String),
+}
+
+// A place: its root and its steps, encoded (`frames::steps_enc`).
+export struct SPlace
+{
+    export Root root;
+    export String steps;
+}
+
+fn sp_var(StringView n) : SPlace
+{
+    SPlace { .root = Root::Var(String::copy(n)), .steps = "" }
+}
+
+fn sp_deref(StringView n) : SPlace
+{
+    SPlace { .root = Root::Deref(String::copy(n)), .steps = "" }
+}
+
+// The key of a `deriv` (or inherited) fact: (holder, place, mode).
+export struct DKey
+{
+    export String h;
+    export SPlace p;
+    export Mode m;
+}
+
+struct Fact
+{
+    SPlace p;
+    Mode m;
+    Tri v;
+}
+
+struct PMode
+{
+    SPlace p;
+    Mode m;
+}
+
+// π1, π2 overlap iff one is a prefix of the other, literal indices
+// compared by value; a range meets a literal index inside it or a literal
+// range it intersects (an empty range meets neither).
+fn overlap(StringView ae, StringView be) : bool
+{
+    Vec<StepK> a = steps_dec(ae);
+    Vec<StepK> b = steps_dec(be);
+    usize n = Vec::len(&a);
+    if (Vec::len(&b) < n)
+    {
+        n = Vec::len(&b);
+    }
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (!step_meet(&a[i], &b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+struct Flow
+{
+    SMap<String, Tri> valid;
+    SMap<Root, Tri> escaped;
+    SMap<DKey, Tri> deriv;
+    // D-0282: the facts a frame-held reference inherits where the rows
+    // above form none. They join and end as `deriv` facts do; no discharge
+    // of the flow analysis reads them.
+    SMap<DKey, Tri> inh;
+    // No path reaches this point: it follows a `break` or `continue` in its
+    // block, and a join ignores it.
+    bool dead;
+}
+
+fn Flow::new() : Flow
+{
+    Flow { .valid = SMap::new(), .escaped = SMap::new(), .deriv = SMap::new(), .inh = SMap::new(), .dead = false }
+}
+
+fn Flow::dead() : Flow
+{
+    Flow { .valid = SMap::new(), .escaped = SMap::new(), .deriv = SMap::new(), .inh = SMap::new(), .dead = true }
+}
+
+fn Flow::eq(ref<Flow, shared> a, ref<Flow, shared> b) : bool
+{
+    a.dead == b.dead && Vec::eq(&a.valid.keys, &b.valid.keys) && Vec::eq(&a.valid.vals, &b.valid.vals) && Vec::eq(&a.escaped.keys, &b.escaped.keys) && Vec::eq(&a.escaped.vals, &b.escaped.vals)
+        && Vec::eq(&a.deriv.keys, &b.deriv.keys) && Vec::eq(&a.deriv.vals, &b.deriv.vals) && Vec::eq(&a.inh.keys, &b.inh.keys) && Vec::eq(&a.inh.vals, &b.inh.vals)
+}
+
+// Every key of either map, each with the join of its two values (F where
+// a map has none).
+fn join_map<K: ordered>(ref<SMap<K, Tri>, shared> a, ref<SMap<K, Tri>, shared> b) : SMap<K, Tri>
+{
+    SMap<K, Tri> r = SMap::new();
+    usize i = 0;
+    usize j = 0;
+    usize na = Vec::len(&a.keys);
+    usize nb = Vec::len(&b.keys);
+    while (i < na || j < nb)
+    {
+        if (j >= nb || (i < na && a.keys[i] < b.keys[j]))
+        {
+            Vec::push(&mut r.keys, clone(&a.keys[i]));
+            Vec::push(&mut r.vals, join_tri(a.vals[i], Tri::F));
+            i += 1;
+        }
+        else if (i >= na || b.keys[j] < a.keys[i])
+        {
+            Vec::push(&mut r.keys, clone(&b.keys[j]));
+            Vec::push(&mut r.vals, join_tri(Tri::F, b.vals[j]));
+            j += 1;
+        }
+        else
+        {
+            Vec::push(&mut r.keys, clone(&a.keys[i]));
+            Vec::push(&mut r.vals, join_tri(a.vals[i], b.vals[j]));
+            i += 1;
+            j += 1;
+        }
+    }
+    r
+}
+
+fn Flow::join(ref<Flow, shared> a, ref<Flow, shared> o) : Flow
+{
+    if (a.dead)
+    {
+        return clone(o);
+    }
+    if (o.dead)
+    {
+        return clone(a);
+    }
+    Flow { .valid = join_map(&a.valid, &o.valid), .escaped = join_map(&a.escaped, &o.escaped), .deriv = join_map(&a.deriv, &o.deriv), .inh = join_map(&a.inh, &o.inh), .dead = false }
+}
+
+fn get_tri<K: ordered>(ref<SMap<K, Tri>, shared> m, ref<K, shared> k) : Tri
+{
+    match (SMap::find(m, k))
+    {
+        Some(i) : m.vals[i],
+        None    : Tri::F,
+    }
+}
+
+// D-0236 "Forgetting": a holder's facts cleared because it ends, is
+// reassigned or is moved leave their roots escaped -- the reference it
+// held may live on in a copy the analysis does not follow.
+fn Flow::forget_holder(ref<Flow, exclusive> fl, StringView h)
+{
+    if (Atomic::load(&PRE_D0236) != 0)
+    {
+        Flow::clear_holder(fl, h);
+        return;
+    }
+    Vec<String> roots = Vec::new();
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].h == h && fl.deriv.vals[i] != Tri::F)
+        {
+            match (&fl.deriv.keys[i].p.root)
+            {
+                Root::Var(x)   : Vec::push(&mut roots, clone(x)),
+                Root::Deref(_) : {},
+            }
+        }
+    }
+    foreach (x in &roots)
+    {
+        _ = SMap::insert(&mut fl.escaped, Root::Var(clone(x)), Tri::T);
+    }
+    Flow::clear_holder(fl, h);
+}
+
+fn Flow::clear_holder(ref<Flow, exclusive> fl, StringView h)
+{
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].h == h)
+        {
+            fl.deriv.vals[i] = Tri::F;
+        }
+    }
+    for (usize i = 0; i < Vec::len(&fl.inh.keys); i += 1)
+    {
+        if (fl.inh.keys[i].h == h)
+        {
+            fl.inh.vals[i] = Tri::F;
+        }
+    }
+}
+
+fn root_is_deref(ref<Root, shared> r, StringView q) : bool
+{
+    match (r)
+    {
+        Root::Deref(x) : *x == q,
+        Root::Var(_)   : false,
+    }
+}
+
+fn root_is_var(ref<Root, shared> r, StringView q) : bool
+{
+    match (r)
+    {
+        Root::Var(x)   : *x == q,
+        Root::Deref(_) : false,
+    }
+}
+
+fn Flow::clear_referent(ref<Flow, exclusive> fl, StringView q)
+{
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (root_is_deref(&fl.deriv.keys[i].p.root, q))
+        {
+            fl.deriv.vals[i] = Tri::F;
+        }
+    }
+    for (usize i = 0; i < Vec::len(&fl.inh.keys); i += 1)
+    {
+        if (root_is_deref(&fl.inh.keys[i].p.root, q))
+        {
+            fl.inh.vals[i] = Tri::F;
+        }
+    }
+}
+
+// A holder's `deriv` facts, each with its value where not F (D-0288).
+fn Flow::deriv_facts(ref<Flow, shared> fl, StringView h) : Vec<Fact>
+{
+    Vec<Fact> out = Vec::new();
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].h == h && fl.deriv.vals[i] != Tri::F)
+        {
+            Vec::push(&mut out, Fact { .p = clone(&fl.deriv.keys[i].p), .m = fl.deriv.keys[i].m, .v = fl.deriv.vals[i] });
+        }
+    }
+    out
+}
+
+// A holder's facts for D-0282: its `deriv` facts and those it inherited,
+// each with its value where not F.
+fn Flow::holder_facts(ref<Flow, shared> fl, StringView h) : Vec<Fact>
+{
+    Vec<Fact> out = Flow::deriv_facts(fl, h);
+    for (usize i = 0; i < Vec::len(&fl.inh.keys); i += 1)
+    {
+        if (fl.inh.keys[i].h == h && fl.inh.vals[i] != Tri::F)
+        {
+            Vec::push(&mut out, Fact { .p = clone(&fl.inh.keys[i].p), .m = fl.inh.keys[i].m, .v = fl.inh.vals[i] });
+        }
+    }
+    out
+}
+
+fn set_deriv(ref<Flow, exclusive> fl, StringView h, SPlace p, Mode m, Tri v)
+{
+    _ = SMap::insert(&mut fl.deriv, DKey { .h = String::copy(h), .p = p, .m = m }, v);
+}
+
+fn set_valid(ref<Flow, exclusive> fl, StringView n, Tri v)
+{
+    _ = SMap::insert(&mut fl.valid, String::copy(n), v);
+}
+
+struct Binding
+{
+    Ty ty;
+    usize block; // the declaring block's number
+    usize id;    // its number in `Positions` (NONE: none)
+}
+
+struct CloInfo
+{
+    bool mv;
+    bool ws;
+}
+
+struct LoopCx
+{
+    usize depth;
+    Flow brk;
+    Flow cont;
+}
+
+struct TyMode
+{
+    Ty t;
+    Mode m;
+}
+
+// How an expression is used: read for its value, or as a place to write
+// or borrow.
+enum Use
+{
+    Read,
+    Write,
+    Borrow(Mode),
+}
+
+struct Cx
+{
+    Program prog;
+    String fname;
+    Vec<StaticErr> errors;
+    HashMap<String, Vec<Binding>> binds; // innermost last: a nested block may shadow
+    Vec<SSet<String>> regions;           // the names each open block declared
+    // block number -> its parent's number (None for the body)
+    Vec<Option<usize>> parents;
+    usize next_block;
+    // The referent block of each reference binding, where a visible borrow
+    // gave it one (`rule.temporal.ref-escape`).
+    HashMap<String, Option<usize>> referent;
+    HashMap<EndKey, Vec<String>> ends;
+    HashMap<String, Ty> all_types;
+    HashMap<ProvenKey, bool> proven;
+    // The body's result type (a function's, or a closure's).
+    Ty ret;
+    // In a closure body: the captures. A capture is not a binding of the
+    // body the analysis tracks: an access through it is never proven
+    // (its root is the closure's field, or `*a_i` for a borrow capture).
+    SSet<String> caps;
+    // A binding holding a closure literal: (move, writes-self).
+    HashMap<String, CloInfo> clo_info;
+    // D-0289, CHG-0384: a spawn pushed onto a `Vec` of handles adds its
+    // facts to the `Vec`'s (`Vec::push(&mut hs, spawn(…))`).
+    bool accumulate;
+    // A binding holding a `move` closure literal that captured a resource:
+    // resource-typed by derivation (`rule.type.is-resource`).
+    SSet<String> clo_owns;
+    // The closure bodies analysed inside this one: their binding types.
+    HashMap<String, HashMap<String, Ty>> sub_types;
+    // The open loops, innermost last: the number of regions open at the
+    // body's entry, and the facts at each `break` and `continue` joined
+    // (§5's edges to the loop's exit and its test).
+    Vec<LoopCx> loops;
+    // D-0282: the program's access summaries, this body's source positions,
+    // and each frame-held reference bound as a copy of another: the one it
+    // copies, followed back to the first (`a copy of a reference carries the
+    // same path`).
+    Summaries sums;
+    Positions pos;
+    HashMap<String, String> copies;
+}
+
+fn Cx::err(ref<Cx, exclusive> cx, usize line, str diag, String why)
+{
+    Vec::push(&mut cx.errors, StaticErr { .line = line, .diag = diag, .why = why });
+}
+
+fn Cx::ty_of(ref<Cx, shared> cx, StringView n) : Option<Ty>
+{
+    match (HashMap::get(&cx.binds, n))
+    {
+        Some(v) :
+        {
+            usize k = Vec::len(v);
+            if (k > 0)
+            {
+                return Some(clone(&v[k - 1].ty));
+            }
+        },
+        None    : {},
+    }
+    // D-0258: a static's name, where no binding shadows it.
+    if (Program::is_static(&cx.prog, n))
+    {
+        return Some(Ty::Atomic);
+    }
+    None
+}
+
+fn Cx::has_binding(ref<Cx, shared> cx, StringView n) : bool
+{
+    match (HashMap::get(&cx.binds, n))
+    {
+        Some(v) : Vec::len(v) > 0,
+        None    : false,
+    }
+}
+
+fn Cx::is_static_var(ref<Cx, shared> cx, ref<Expr, shared> e) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Var(n) : Program::is_static(&cx.prog, n) && !Cx::has_binding(cx, n),
+        _             : false,
+    }
+}
+
+fn Cx::block_of(ref<Cx, shared> cx, StringView n) : Option<usize>
+{
+    match (HashMap::get(&cx.binds, n))
+    {
+        Some(v) :
+        {
+            usize k = Vec::len(v);
+            if (k > 0)
+            {
+                return Some(v[k - 1].block);
+            }
+            None
+        },
+        None    : None,
+    }
+}
+
+fn ty_is_var_of(ref<Cx, shared> cx, StringView n, ref<Ty, shared> t) : bool
+{
+    opt_ty_is(&Cx::ty_of(cx, n), t)
+}
+
+fn opt_is_slice(ref<Option<Ty>, shared> t) : bool
+{
+    match (t)
+    {
+        Some(Ty::Slice(_)) : true,
+        _                  : false,
+    }
+}
+
+fn opt_is_ref(ref<Option<Ty>, shared> t) : bool
+{
+    match (t)
+    {
+        Some(Ty::Ref { .. }) : true,
+        _                    : false,
+    }
+}
+
+fn opt_is_handle(ref<Option<Ty>, shared> t) : bool
+{
+    match (t)
+    {
+        Some(Ty::Handle(_)) : true,
+        _                   : false,
+    }
+}
+
+// The static type of a place expression, and whether it is reached
+// through a shared path (`via-shared`, D-0218; a binding's own path is
+// exclusive, `[Binding-Form]`).
+fn Cx::place_ty(ref<Cx, shared> cx, ref<Expr, shared> e, Use u) : Option<TyMode>
+{
+    match (&e.k)
+    {
+        ExprK::Var(n) : match (Cx::ty_of(cx, n))
+        {
+            Some(t) : Some(TyMode { .t = t, .m = Mode::Excl }),
+            None    : None,
+        },
+        ExprK::Index { v, k } :
+        {
+            Option<Ty> vt = Cx::ty_of(cx, v);
+            // `a[k]` of an array: a projection of the binding's path (`[Index-Checked]`).
+            if (opt_ty_is(&vt, &Ty::Arr))
+            {
+                return Some(TyMode { .t = Ty::I32, .m = Mode::Excl });
+            }
+            // `s[k]` of a slice: an element, in the slice's mode (`[Slice-Index]`).
+            match (&vt)
+            {
+                Some(Ty::Slice(m)) : return Some(TyMode { .t = Ty::I32, .m = *m }),
+                _                  : {},
+            }
+            // `[Index-Vec]`: index_exclusive where the place is written or
+            // borrowed mut, index_shared elsewhere.
+            Ty et = match (&vt)
+            {
+                Some(Ty::Vec)  : Ty::I32,
+                Some(Ty::VecR) : Ty::refi(Mode::Excl),
+                _              : return None,
+            };
+            Mode m = match (u)
+            {
+                Use::Write              : Mode::Excl,
+                Use::Borrow(Mode::Excl) : Mode::Excl,
+                _                       : Mode::Shared,
+            };
+            Some(TyMode { .t = et, .m = m })
+        },
+        ExprK::Deref(a)       :
+        {
+            // `*v[k] = e`, `&mut *v[k]` with v a Vec of exclusive references:
+            // the element is reached by index_exclusive (`[Index-Vec]` "where
+            // the place is written", read so that it covers the place under
+            // `*`; the tools' reading, D-0219 finding 6).
+            bool writing = match (u)
+            {
+                Use::Write              : true,
+                Use::Borrow(Mode::Excl) : true,
+                _                       : false,
+            };
+            if (writing)
+            {
+                match (&Box::get(a).k)
+                {
+                    ExprK::Index { v, k } :
+                    {
+                        if (ty_is_var_of(cx, v, &Ty::VecR))
+                        {
+                            return Some(TyMode { .t = Ty::I32, .m = Mode::Excl });
+                        }
+                    },
+                    _                     : {},
+                }
+            }
+            match (Cx::value_ty(cx, Box::get(a)))
+            {
+                Some(Ty::Ref { t, m }) : Some(TyMode { .t = Box::into_inner(t), .m = m }),
+                // `[Guard-Deref]`: the lock path, exclusive.
+                Some(Ty::Guard)        : Some(TyMode { .t = Ty::I32, .m = Mode::Excl }),
+                _                      : None,
+            }
+        },
+        ExprK::Field(a)       :
+        {
+            // `e.r` of a Hold place, or of a reference to one
+            // (`[Field-Access-Auto-Deref]`).
+            match (Cx::place_ty(cx, Box::get(a), Use::Read))
+            {
+                Some(tm) :
+                {
+                    if (ty_eq(&tm.t, &Ty::Hold))
+                    {
+                        return Some(TyMode { .t = Ty::refi(Mode::Excl), .m = tm.m });
+                    }
+                },
+                None     : {},
+            }
+            match (Cx::value_ty(cx, Box::get(a)))
+            {
+                Some(Ty::Ref { t, m }) :
+                {
+                    if (ty_eq(Box::get(&t), &Ty::Hold))
+                    {
+                        return Some(TyMode { .t = Ty::refi(Mode::Excl), .m = m });
+                    }
+                    None
+                },
+                _                      : None,
+            }
+        },
+        _                     : None,
+    }
+}
+
+fn place_ty_t(ref<Option<TyMode>, shared> o) : Option<Ty>
+{
+    match (o)
+    {
+        Some(tm) : Some(clone(&tm.t)),
+        None     : None,
+    }
+}
+
+// The type of an expression read as a value. A reference read through
+// a shared path is a shared reference (`[T-Read-Through-Shared]`).
+fn Cx::value_ty(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<Ty>
+{
+    match (&e.k)
+    {
+        ExprK::Int(_)                 : Some(Ty::I32),
+        ExprK::Var(_)                 : Cx::read_place_ty(cx, e),
+        ExprK::Deref(_)               : Cx::read_place_ty(cx, e),
+        ExprK::Field(_)               : Cx::read_place_ty(cx, e),
+        ExprK::Index { .. }           : Cx::read_place_ty(cx, e),
+        ExprK::Borrow { m, e: a } : match (Cx::place_ty(cx, Box::get(a), Use::Borrow(*m)))
+        {
+            Some(TyMode { t, m: _ }) : Some(Ty::Ref { .t = Box::new(t), .m = *m }),
+            None                     : None,
+        },
+        ExprK::Add { .. }             : Some(Ty::I32),
+        ExprK::Gt { .. }              : Some(Ty::Bool),
+        ExprK::Call { f, xs }         :
+        {
+            if (*f == "Mutex::new")
+            {
+                return Some(Ty::Mutex);
+            }
+            if (*f == "lock")
+            {
+                return Some(Ty::Guard);
+            }
+            if (*f == "Atomic::new")
+            {
+                return Some(Ty::Atomic);
+            }
+            if (*f == "Atomic::load" || *f == "Atomic::fetch_add")
+            {
+                return Some(Ty::I32);
+            }
+            if (*f == "Atomic::store" || *f == "Atomic::wait" || *f == "Atomic::notify_all")
+            {
+                return Some(Ty::Unit);
+            }
+            if (*f == "Vec::new")
+            {
+                return None; // fixed by the declaration
+            }
+            if (*f == "Vec::push")
+            {
+                return Some(Ty::Unit);
+            }
+            if (*f == "Vec::pop")
+            {
+                return match (Cx::vec_elem(cx, e))
+                {
+                    Some(t) : Some(Ty::Opt(Box::new(t))),
+                    None    : None,
+                };
+            }
+            if (*f == "Vec::index_exclusive")
+            {
+                return match (Cx::vec_elem(cx, e))
+                {
+                    Some(t) : Some(Ty::Ref { .t = Box::new(t), .m = Mode::Excl }),
+                    None    : None,
+                };
+            }
+            if (*f == "Channel::new")
+            {
+                return None; // fixed by the declaration
+            }
+            if (*f == "Channel::send")
+            {
+                return match (Cx::chan_elem(cx, e))
+                {
+                    Some(t) : Some(Ty::Res(Box::new(t))),
+                    None    : None,
+                };
+            }
+            if (*f == "Channel::recv")
+            {
+                return match (Cx::chan_elem(cx, e))
+                {
+                    Some(t) : Some(Ty::Opt(Box::new(t))),
+                    None    : None,
+                };
+            }
+            if (*f == "Channel::close" || *f == "swap")
+            {
+                return Some(Ty::Unit);
+            }
+            if (*f == "replace")
+            {
+                return Some(Ty::I32);
+            }
+            match (Program::func(&cx.prog, f))
+            {
+                Some(func) : Some(clone(&func.ret)),
+                None       : None,
+            }
+        },
+        ExprK::Spawn { f, xs } : match (Program::func(&cx.prog, f))
+        {
+            Some(func) : Some(Ty::Handle(Box::new(clone(&func.ret)))),
+            None       : None,
+        },
+        ExprK::Slice { m, v, lo, hi } : Some(Ty::Slice(*m)),
+        ExprK::Closure(c)             : Some(Ty::Fn(Box::new(clone(&Box::get(c).ret)))),
+        ExprK::CallVal(a) : match (place_ty_t(&Cx::place_ty(cx, Box::get(a), Use::Read)))
+        {
+            Some(Ty::Fn(r)) : Some(Box::into_inner(r)),
+            _               : None,
+        },
+        ExprK::SpawnClo(a) : match (Cx::value_ty(cx, Box::get(a)))
+        {
+            Some(Ty::Fn(r)) : Some(Ty::Handle(r)),
+            _               : None,
+        },
+        ExprK::JobLit(_)              : Some(Ty::Job),
+        ExprK::ArrLit(_)              : Some(Ty::Arr),
+        ExprK::Join(t) : match (Cx::ty_of(cx, t))
+        {
+            Some(Ty::Handle(r)) : Some(Box::into_inner(r)),
+            _                   : None,
+        },
+        ExprK::HoldLit(_)             : Some(Ty::Hold),
+    }
+}
+
+fn Cx::read_place_ty(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<Ty>
+{
+    match (Cx::place_ty(cx, e, Use::Read))
+    {
+        Some(TyMode { t: pt, m: pm }) : match (pt)
+        {
+            Ty::Ref { t, m } :
+            {
+                if (m == Mode::Excl && pm == Mode::Shared)
+                {
+                    return Some(Ty::Ref { .t = t, .m = Mode::Shared });
+                }
+                Some(Ty::Ref { .t = t, .m = m })
+            },
+            other            : Some(other),
+        },
+        None : None,
+    }
+}
+
+fn first_arg(ref<Expr, shared> e) : Option<ref<Expr, shared>> from e
+{
+    match (&e.k)
+    {
+        ExprK::Call { f, xs } :
+        {
+            if (Vec::len(xs) > 0)
+            {
+                return Some(&xs[0]);
+            }
+            None
+        },
+        _                     : None,
+    }
+}
+
+// The element type of a `Vec::…(&_m v, …)` call's vector.
+fn Cx::vec_elem(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<Ty>
+{
+    ref<Expr, shared> a = match (first_arg(e))
+    {
+        Some(a) : a,
+        None    : return None,
+    };
+    match (Cx::value_ty(cx, a))
+    {
+        Some(Ty::Ref { t, m }) : match (Box::get(&t))
+        {
+            Ty::Vec  : Some(Ty::I32),
+            Ty::VecR : Some(Ty::refi(Mode::Excl)),
+            Ty::VecH : Some(Ty::handle_of(Ty::Unit)),
+            _        : None,
+        },
+        _ : None,
+    }
+}
+
+// T of a `Channel::…(&c, …)` call: c's type is Channel<T>.
+fn Cx::chan_elem(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<Ty>
+{
+    ref<Expr, shared> a = match (first_arg(e))
+    {
+        Some(a) : a,
+        None    : return None,
+    };
+    match (Cx::value_ty(cx, a))
+    {
+        Some(Ty::Ref { t, m }) : match (Box::into_inner(t))
+        {
+            Ty::Chan(x) : Some(Box::into_inner(x)),
+            _           : None,
+        },
+        _ : None,
+    }
+}
+
+// The flow analysis' place for a syntactic place, when it has one.
+fn Cx::splace(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<SPlace>
+{
+    Vec<String> names = Vec::new();
+    expr_names(e, &mut names);
+    foreach (n in &names)
+    {
+        if (sset_has(&cx.caps, n))
+        {
+            return None; // a capture's place: not tracked
+        }
+    }
+    match (&e.k)
+    {
+        ExprK::Var(n)         : Some(sp_var(n)),
+        ExprK::Index { v, k } :
+        {
+            // An array's element is a place, at its literal index.
+            if (ty_is_var_of(cx, v, &Ty::Arr))
+            {
+                return Some(SPlace { .root = Root::Var(clone(v)), .steps = idx_step(*k) });
+            }
+            // A `Vec` element is not a place of the analysis (D-0219 finding
+            // 10, the implementations' reading): its accesses are checked
+            // where they run; a borrow of one counts as a borrow of the vector
+            // (`deriv_place`).
+            None
+        },
+        ExprK::Field(a)       :
+        {
+            // h.r for a Hold binding; s.r = (*s).r for a tracked reference s.
+            match (&Box::get(a).k)
+            {
+                ExprK::Var(n)   :
+                {
+                    return match (Cx::ty_of(cx, n))
+                    {
+                        Some(Ty::Hold)       : Some(SPlace { .root = Root::Var(clone(n)), .steps = field_step() }),
+                        Some(Ty::Ref { .. }) : Some(SPlace { .root = Root::Deref(clone(n)), .steps = field_step() }),
+                        _                    : None,
+                    };
+                },
+                ExprK::Deref(b) :
+                {
+                    match (&Box::get(b).k)
+                    {
+                        ExprK::Var(q) : return Some(SPlace { .root = Root::Deref(clone(q)), .steps = field_step() }),
+                        _             : {},
+                    }
+                },
+                _               : {},
+            }
+            None
+        },
+        ExprK::Deref(a) : match (&Box::get(a).k)
+        {
+            ExprK::Var(q) : match (Cx::ty_of(cx, q))
+            {
+                Some(Ty::Ref { .. }) : Some(sp_deref(q)),
+                Some(Ty::Guard)      : Some(sp_deref(q)),
+                Some(Ty::Slice(_))   : Some(sp_deref(q)),
+                _                    : None,
+            },
+            _ : None, // `*r` for r not a tracked binding: neither T nor F
+        },
+        _                     : None,
+    }
+}
+
+// The place a borrow derives from: `v[k]` of a `Vec` counts as `v` itself.
+fn Cx::deriv_place(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<SPlace>
+{
+    match (&e.k)
+    {
+        ExprK::Index { v, k } :
+        {
+            if (sset_has(&cx.caps, v))
+            {
+                return None;
+            }
+            Option<Ty> vt = Cx::ty_of(cx, v);
+            if (opt_is_slice(&vt))
+            {
+                return Some(sp_deref(v));
+            }
+            if (opt_ty_is(&vt, &Ty::Arr))
+            {
+                return Cx::splace(cx, e);
+            }
+            Some(sp_var(v))
+        },
+        _                     : Cx::splace(cx, e),
+    }
+}
+
+// A slice's place: `v.[lo, hi)` of a `Vec` binding, `*s.[lo, hi)` of a
+// slice binding (its positions in that slice; such places are
+// compared only with other places rooted at `*s`).
+fn Cx::slice_place(ref<Cx, shared> cx, StringView v, i64 lo, i64 hi) : Option<SPlace>
+{
+    if (sset_has(&cx.caps, v))
+    {
+        return None;
+    }
+    Root root = match (Cx::ty_of(cx, v))
+    {
+        Some(Ty::Slice(_)) : Root::Deref(String::copy(v)),
+        Some(_)            : Root::Var(String::copy(v)),
+        None               : return None,
+    };
+    Some(SPlace { .root = root, .steps = range_step(lo, hi) })
+}
+
+// An access whose mode the analysis does not know (a call of a
+// closure it did not see formed: shared, or exclusive if the closure
+// writes itself, D-0239): refuted only as a shared access would be,
+// proven only as an exclusive one would be.
+fn Cx::check_access_unknown(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<SPlace, shared> p, usize line)
+{
+    usize before = Vec::len(&cx.errors);
+    Cx::check_access(cx, fl, p, Mode::Excl, line);
+    Vec::truncate(&mut cx.errors, before);
+    Cx::check_access_refute(cx, fl, p, Mode::Shared, line);
+}
+
+fn Cx::check_access_refute(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<SPlace, shared> p, Mode m, usize line)
+{
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        ref<DKey, shared> k = &fl.deriv.keys[i];
+        if (k.p.root != p.root || !overlap(&k.p.steps, &p.steps) || (m == Mode::Shared && k.m == Mode::Shared))
+        {
+            continue;
+        }
+        if (fl.deriv.vals[i] == Tri::T)
+        {
+            String why = sprintf("`%s` holds a %s borrow of this place", &k.h, Mode::word(k.m));
+            Cx::err(cx, line, "diag.aliasing-conflict", why);
+            return;
+        }
+        // Report 313 (`spec/14` §6, the `¬clash` row): `?` where the
+        // holder is a thread's handle or a `Vec` of them declared outside a
+        // loop the access is in, and neither path has a computed index or
+        // range (the fragment's indices and ranges are all literal): lent on
+        // an earlier round, the conflict would depend on whether that thread
+        // has ended, which is timing.
+        if (fl.deriv.vals[i] == Tri::Q && Cx::thread_holder(cx, &k.h) && Cx::held_across_rounds(cx, &k.h))
+        {
+            String why = sprintf("`%s` may still hold a thread lent this place on an earlier round of the loop", &k.h);
+            Cx::err(cx, line, "diag.aliasing-conflict", why);
+            return;
+        }
+    }
+}
+
+// Report 313: a binding of a thread's handle, or of a `Vec` of them.
+fn Cx::thread_holder(ref<Cx, shared> cx, StringView h) : bool
+{
+    match (Cx::ty_of(cx, h))
+    {
+        Some(Ty::Handle(_)) : true,
+        Some(Ty::VecH)      : true,
+        _                   : false,
+    }
+}
+
+// Report 313: whether `h` is declared outside the innermost open loop: in
+// a block opened before the loop's body (its region below the loop's
+// depth).
+fn Cx::held_across_rounds(ref<Cx, shared> cx, StringView h) : bool
+{
+    usize n = Vec::len(&cx.loops);
+    if (n == 0)
+    {
+        return false;
+    }
+    usize depth = cx.loops[n - 1].depth;
+    usize r = Vec::len(&cx.regions);
+    while (r > 0)
+    {
+        r -= 1;
+        if (SSet::contains(&cx.regions[r], &String::copy(h)))
+        {
+            return r < depth;
+        }
+    }
+    false
+}
+
+// The discharge table's `¬clash` row for an access at `p` in mode `m`:
+// refuted when some overlapping, non-permitted deriv fact is T.
+fn Cx::check_access(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<SPlace, shared> p, Mode m, usize line)
+{
+    // The *proven* outcome (D-0241): escaped(x) = F and every
+    // overlapping, non-permitted deriv fact F. Recorded per statement
+    // and binding, false if any access there is not proven.
+    match (&p.root)
+    {
+        Root::Var(x)   :
+        {
+            bool proven = get_tri(&fl.escaped, &p.root) == Tri::F;
+            if (proven)
+            {
+                for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+                {
+                    ref<DKey, shared> k = &fl.deriv.keys[i];
+                    if (!(fl.deriv.vals[i] == Tri::F || k.p.root != p.root || !overlap(&k.p.steps, &p.steps) || (m == Mode::Shared && k.m == Mode::Shared)))
+                    {
+                        proven = false;
+                        break;
+                    }
+                }
+            }
+            ProvenKey key = ProvenKey { .f = clone(&cx.fname), .line = line, .x = clone(x) };
+            ref<bool, exclusive> e = HashMap::entry(&mut cx.proven, &key, true);
+            *e = *e && proven;
+        },
+        Root::Deref(_) : {},
+    }
+    Cx::check_access_refute(cx, fl, p, m, line);
+}
+
+// A use of binding `n` (`[Binding-Lookup]`): refuted when valid(n) is F,
+// and (D-0087) when it is `?`.
+fn Cx::use_binding(ref<Cx, exclusive> cx, ref<Flow, shared> fl, StringView n, usize line)
+{
+    match (SMap::find(&fl.valid, &String::copy(n)))
+    {
+        Some(i) :
+        {
+            if (fl.valid.vals[i] == Tri::T)
+            {
+                return;
+            }
+        },
+        None    : {},
+    }
+    Cx::err(cx, line, "diag.stale-binding", sprintf("`%s` may have been moved or ended", n));
+}
+
+fn use_mode(Use u) : Mode
+{
+    match (u)
+    {
+        Use::Read      : Mode::Shared,
+        Use::Write     : Mode::Excl,
+        Use::Borrow(m) : m,
+    }
+}
+
+// Walks a place expression: binding uses, the reads of references it
+// goes through, and the access itself.
+fn Cx::place(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Expr, shared> e, Use u, usize line)
+{
+    match (&e.k)
+    {
+        ExprK::Var(n)         : Cx::use_binding(cx, fl, n, line),
+        ExprK::Index { v, k } :
+        {
+            Option<Ty> vt = Cx::ty_of(cx, v);
+            if (opt_is_slice(&vt))
+            {
+                // `s[k]` reads the slice binding `s`, then reaches the element
+                // through its borrow (`[Slice-Index]`).
+                Cx::place(cx, fl, &ex_var(v), Use::Read, line);
+            }
+            else if (opt_ty_is(&vt, &Ty::Arr))
+            {
+                // `a[k]` with a literal `k` outside the array: rejected
+                // (`[Index-Checked]`'s bound, static for a literal).
+                Cx::use_binding(cx, fl, v, line);
+                if (*k < 0 || *k >= 2)
+                {
+                    Cx::err(cx, line, "diag.index-out-of-bounds", "a literal index outside the array");
+                }
+            }
+            else
+            {
+                // `v[k]` is not a call (D-0238): an element access, which the
+                // flow analysis does not check (D-0221); the binding is used.
+                // D-0282 checks it against the frame-held references.
+                Cx::use_binding(cx, fl, v, line);
+                Cx::element_access(cx, fl, e, v, *k, u, line);
+            }
+        },
+        ExprK::Deref(a)       : Cx::rvalue(cx, fl, Box::get(a), line),
+        ExprK::Field(a)       :
+        {
+            bool hold_place = match (Cx::place_ty(cx, Box::get(a), Use::Read))
+            {
+                Some(tm) : ty_eq(&tm.t, &Ty::Hold),
+                None     : false,
+            };
+            match (&Box::get(a).k)
+            {
+                ExprK::Deref(b) :
+                {
+                    // auto-deref: the reference is read
+                    Cx::rvalue(cx, fl, Box::get(b), line);
+                },
+                _               :
+                {
+                    if (hold_place)
+                    {
+                        Cx::place(cx, fl, Box::get(a), Use::Read, line);
+                    }
+                    else
+                    {
+                        Cx::rvalue(cx, fl, Box::get(a), line);
+                    }
+                },
+            }
+        },
+        _                     : {},
+    }
+    match (Cx::splace(cx, e))
+    {
+        Some(p) : Cx::check_access(cx, fl, &p, use_mode(u), line),
+        None    : {},
+    }
+}
+
+// An expression evaluated for its value, in evaluation order; `holder`
+// is the binding a `let`/assignment stores it in (for the deriv lines).
+fn Cx::rvalue(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Expr, shared> e, usize line)
+{
+    Cx::rvalue_into(cx, fl, e, line, None);
+}
+
+fn is_borrow(ref<Expr, shared> e) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Borrow { .. } : true,
+        _                    : false,
+    }
+}
+
+fn is_closure(ref<Expr, shared> e) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Closure(_) : true,
+        _                 : false,
+    }
+}
+
+fn holder_set(ref<Flow, exclusive> fl, ref<Option<String>, shared> holder, Option<SPlace> p, Mode m)
+{
+    match (p)
+    {
+        Some(p) : match (holder)
+        {
+            Some(h) :
+            {
+                // `auto r = &_m x.π;` / `r = &_m x.π`
+                Flow::forget_holder(fl, h);
+                set_deriv(fl, h, p, m, Tri::T);
+            },
+            None    : { _ = SMap::insert(&mut fl.escaped, clone(&p.root), Tri::T); },
+        },
+        None : {},
+    }
+}
+
+fn Cx::call_params(ref<Cx, exclusive> cx, ref<Expr, shared> e, StringView f, usize line) : Option<Vec<Ty>>
+{
+    Vec<Ty> v = Vec::new();
+    if (f == "Mutex::new" || f == "Atomic::new" || f == "Channel::new")
+    {
+        // D-0249, D-0253: every operation takes the atomic by shared
+        // reference.
+        Vec::push(&mut v, Ty::I32);
+    }
+    else if (f == "lock")
+    {
+        Vec::push(&mut v, Ty::ref_of(Ty::Mutex, Mode::Shared));
+    }
+    else if (f == "Atomic::load" || f == "Atomic::notify_all")
+    {
+        Vec::push(&mut v, Ty::ref_of(Ty::Atomic, Mode::Shared));
+    }
+    else if (f == "Atomic::store" || f == "Atomic::fetch_add" || f == "Atomic::wait")
+    {
+        Vec::push(&mut v, Ty::ref_of(Ty::Atomic, Mode::Shared));
+        Vec::push(&mut v, Ty::I32);
+    }
+    else if (f == "Vec::new")
+    {
+    }
+    else if (f == "Vec::push" || f == "Vec::pop" || f == "Vec::index_exclusive")
+    {
+        Ty et = match (Cx::vec_elem(cx, e))
+        {
+            Some(t) : t,
+            None    : Ty::I32,
+        };
+        Ty vt = match (&et)
+        {
+            Ty::I32       : Ty::Vec,
+            Ty::Handle(_) : Ty::VecH,
+            _             : Ty::VecR,
+        };
+        Vec::push(&mut v, Ty::ref_of(vt, Mode::Excl));
+        if (f == "Vec::push")
+        {
+            Vec::push(&mut v, et);
+        }
+        else if (f == "Vec::index_exclusive")
+        {
+            Vec::push(&mut v, Ty::I32);
+        }
+    }
+    else if (f == "swap")
+    {
+        // `std::swap`, `std::replace` at T = i32 (D-0235)
+        Vec::push(&mut v, Ty::refi(Mode::Excl));
+        Vec::push(&mut v, Ty::refi(Mode::Excl));
+    }
+    else if (f == "replace")
+    {
+        Vec::push(&mut v, Ty::refi(Mode::Excl));
+        Vec::push(&mut v, Ty::I32);
+    }
+    else if (f == "Channel::send" || f == "Channel::recv" || f == "Channel::close")
+    {
+        Ty t = match (Cx::chan_elem(cx, e))
+        {
+            Some(t) : t,
+            None    : Ty::Unit,
+        };
+        Vec::push(&mut v, Ty::ref_of(Ty::Chan(Box::new(clone(&t))), Mode::Shared));
+        if (f == "Channel::send")
+        {
+            Vec::push(&mut v, t);
+        }
+    }
+    else
+    {
+        match (Program::func(&cx.prog, f))
+        {
+            Some(func) :
+            {
+                foreach (p in &func.params)
+                {
+                    Vec::push(&mut v, clone(&p.ty));
+                }
+            },
+            None       :
+            {
+                Cx::err(cx, line, "diag.unbound-name", sprintf("no function `%s`", f));
+                return None;
+            },
+        }
+    }
+    Some(v)
+}
+
+// The binding a `Vec::push(&mut v, …)`-like first argument names, when
+// it is a binding borrowed exclusively.
+fn excl_borrow_var(ref<Vec<Expr>, shared> args) : Option<String>
+{
+    if (Vec::len(args) == 0)
+    {
+        return None;
+    }
+    match (&args[0].k)
+    {
+        ExprK::Borrow { m, e } :
+        {
+            if (*m != Mode::Excl)
+            {
+                return None;
+            }
+            match (&Box::get(e).k)
+            {
+                ExprK::Var(n) : Some(clone(n)),
+                _             : None,
+            }
+        },
+        _                      : None,
+    }
+}
+
+fn Cx::rvalue_call(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Expr, shared> e, StringView f, ref<Vec<Expr>, shared> args, usize line, ref<Option<String>, shared> holder)
+{
+    Vec<Ty> params = match (Cx::call_params(cx, e, f, line))
+    {
+        Some(v) : v,
+        None    : return,
+    };
+    // The D-0011 elided call: `auto r = f(&_m x…)` with a
+    // reference result — as `auto r = &_m x`.
+    usize src = 0;
+    bool ref_ret = false;
+    match (Program::func(&cx.prog, f))
+    {
+        Some(x) :
+        {
+            src = x.src;
+            ref_ret = is_ref_ty(&x.ret);
+        },
+        None    : {},
+    }
+    bool has_holder = match (holder)
+    {
+        Some(_) : true,
+        None    : false,
+    };
+    bool elided = has_holder && ref_ret && src < Vec::len(args) && is_borrow(&args[src]);
+    // D-0289, CHG-0384: `Vec::push(&mut hs, spawn(…))` into a `Vec`
+    // of handles of this frame binds the spawn: `hs` holds its
+    // facts besides what it held.
+    Option<String> pool = None;
+    // And a handle binding holding facts pushed there gives them
+    // to the `Vec` as it moves in.
+    Option<String> pushed_to = None;
+    Vec<Fact> pushed_facts = Vec::new();
+    if (f == "Vec::push" && Vec::len(args) >= 2)
+    {
+        match (excl_borrow_var(args))
+        {
+            Some(hs) :
+            {
+                if (opt_ty_is(&Cx::ty_of(cx, &hs), &Ty::VecH))
+                {
+                    match (&args[1].k)
+                    {
+                        ExprK::Spawn { .. } : pool = Some(clone(&hs)),
+                        ExprK::SpawnClo(_)  : pool = Some(clone(&hs)),
+                        ExprK::Var(t)       :
+                        {
+                            if (opt_is_handle(&Cx::ty_of(cx, t)))
+                            {
+                                pushed_facts = Flow::holder_facts(fl, t);
+                                pushed_to = Some(clone(&hs));
+                            }
+                        },
+                        _                   : {},
+                    }
+                }
+            },
+            None     : {},
+        }
+    }
+    // D-0290: a `Vec<ref<…>>` of this frame is a holder: a push
+    // adds what the element holds; any other operation that
+    // takes it exclusively may remove some, which then hold on
+    // some paths only.
+    Option<String> vec_holder = None;
+    match (excl_borrow_var(args))
+    {
+        Some(n) :
+        {
+            if (opt_ty_is(&Cx::ty_of(cx, &n), &Ty::VecR) && !sset_has(&cx.caps, &n))
+            {
+                vec_holder = Some(n);
+            }
+        },
+        None    : {},
+    }
+    bool has_added = false;
+    Vec<Fact> vec_added = Vec::new();
+    match (&vec_holder)
+    {
+        Some(_) :
+        {
+            if (f == "Vec::push" && Vec::len(args) >= 2)
+            {
+                vec_added = Cx::inherit(cx, fl, &args[1]).facts;
+                has_added = true;
+            }
+        },
+        None    : {},
+    }
+    for (usize i = 0; i < Vec::len(args); i += 1)
+    {
+        ref<Expr, shared> a = &args[i];
+        bool in_pool = match (&pool)
+        {
+            Some(_) : i == 1,
+            None    : false,
+        };
+        if (i == src && elided)
+        {
+            Cx::rvalue_into(cx, fl, a, line, clone(holder));
+        }
+        else if (in_pool)
+        {
+            bool saved = cx.accumulate;
+            cx.accumulate = true;
+            Cx::rvalue_into(cx, fl, a, line, clone(&pool));
+            cx.accumulate = saved;
+        }
+        else
+        {
+            Cx::rvalue(cx, fl, a, line);
+        }
+        if (i < Vec::len(&params))
+        {
+            ref<Ty, shared> pt = &params[i];
+            Cx::check_arg(cx, pt, a, line);
+            Cx::consume_resource(cx, fl, pt, a, line);
+            if (Ty::is_resource(pt))
+            {
+                Cx::move_out(cx, a, line);
+            }
+        }
+    }
+    Cx::call_site(cx, fl, e, f, args, line, holder);
+    match (&vec_holder)
+    {
+        Some(v) :
+        {
+            if (has_added)
+            {
+                foreach (x in &vec_added)
+                {
+                    DKey k = DKey { .h = clone(v), .p = clone(&x.p), .m = x.m };
+                    Tri cur = get_tri(&fl.deriv, &k);
+                    Tri nv = Tri::Q;
+                    if (cur == Tri::T || x.v == Tri::T)
+                    {
+                        nv = Tri::T;
+                    }
+                    _ = SMap::insert(&mut fl.deriv, k, nv);
+                }
+            }
+            else
+            {
+                for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+                {
+                    if (fl.deriv.keys[i].h == *v && fl.deriv.vals[i] == Tri::T)
+                    {
+                        fl.deriv.vals[i] = Tri::Q;
+                    }
+                }
+            }
+        },
+        None    : {},
+    }
+    match (&pushed_to)
+    {
+        Some(hs) :
+        {
+            foreach (x in &pushed_facts)
+            {
+                set_deriv(fl, hs, clone(&x.p), x.m, x.v);
+            }
+        },
+        None     : {},
+    }
+}
+
+fn Cx::rvalue_spawn(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, StringView f, ref<Vec<Expr>, shared> args, usize line, ref<Option<String>, shared> holder)
+{
+    Vec<Ty> params = Vec::new();
+    match (Program::func(&cx.prog, f))
+    {
+        Some(func) :
+        {
+            foreach (p in &func.params)
+            {
+                Vec::push(&mut params, clone(&p.ty));
+            }
+        },
+        None       :
+        {
+            Cx::err(cx, line, "diag.unbound-name", sprintf("no function `%s`", f));
+            return;
+        },
+    }
+    bool has_holder = match (holder)
+    {
+        Some(_) : true,
+        None    : false,
+    };
+    // D-0340 §8: a guard stays on the thread that locked it.
+    foreach (a in args)
+    {
+        match (Cx::value_ty(cx, a))
+        {
+            Some(Ty::Guard) :
+            {
+                Cx::err(cx, line, "diag.thread-affine-moved", "a guard passed to spawn: it stays on the thread that locked it");
+                return;
+            },
+            _               : {},
+        }
+    }
+    Vec<PMode> facts = Vec::new();
+    for (usize i = 0; i < Vec::len(args); i += 1)
+    {
+        ref<Expr, shared> a = &args[i];
+        Option<Mode> pm = None;
+        if (i < Vec::len(&params))
+        {
+            match (&params[i])
+            {
+                Ty::Ref { t, m } : pm = Some(*m),
+                _                : {},
+            }
+        }
+        bool done = false;
+        match (&a.k)
+        {
+            ExprK::Borrow { m, e: p }     :
+            {
+                // `spawn(…, &_m x …)`: escaped(x) := T; and the
+                // handle derives the place (D-0071).
+                Cx::check_borrow_mode(cx, *m, Box::get(p), line);
+                Cx::place(cx, fl, Box::get(p), Use::Borrow(*m), line);
+                match (Cx::deriv_place(cx, Box::get(p)))
+                {
+                    Some(sp) :
+                    {
+                        // D-0289: a handle bound whole holds the
+                        // lend; only an unbound one escapes it.
+                        if (!has_holder)
+                        {
+                            _ = SMap::insert(&mut fl.escaped, clone(&sp.root), Tri::T);
+                        }
+                        Vec::push(&mut facts, PMode { .p = sp, .m = *m });
+                    },
+                    None     : {},
+                }
+                done = true;
+            },
+            ExprK::Slice { m, v, lo, hi } :
+            {
+                // A slice, as a visible borrow of its range.
+                Cx::rvalue(cx, fl, a, line);
+                match (Cx::slice_place(cx, v, *lo, *hi))
+                {
+                    Some(sp) : Vec::push(&mut facts, PMode { .p = sp, .m = *m }),
+                    None     : {},
+                }
+                done = true;
+            },
+            // A slice binding passed whole is lent as a value: the
+            // row names a binding of reference type (D-0247).
+            ExprK::Var(r)                 :
+            {
+                if (opt_is_ref(&Cx::ty_of(cx, r)))
+                {
+                    // D-0213: the lend is a borrow of *r in the
+                    // parameter's mode.
+                    Cx::use_binding(cx, fl, r, line);
+                    Mode m = match (pm)
+                    {
+                        Some(m) : m,
+                        None    : Mode::Shared,
+                    };
+                    SPlace sp = sp_deref(r);
+                    Cx::check_access(cx, fl, &sp, m, line);
+                    Vec::push(&mut facts, PMode { .p = sp, .m = m });
+                    done = true;
+                }
+            },
+            _                             : {},
+        }
+        if (!done)
+        {
+            Cx::rvalue(cx, fl, a, line);
+        }
+        if (i < Vec::len(&params))
+        {
+            ref<Ty, shared> pt = &params[i];
+            Cx::check_arg(cx, pt, a, line);
+            Cx::consume_resource(cx, fl, pt, a, line);
+            if (Ty::is_resource(pt))
+            {
+                Cx::move_out(cx, a, line);
+            }
+        }
+    }
+    match (holder)
+    {
+        Some(h) :
+        {
+            if (!cx.accumulate)
+            {
+                Flow::forget_holder(fl, h);
+            }
+            foreach (x in &facts)
+            {
+                set_deriv(fl, h, clone(&x.p), x.m, Tri::T);
+            }
+        },
+        None    : {},
+    }
+}
+
+fn Cx::rvalue_into(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Expr, shared> e, usize line, Option<String> holder)
+{
+    match (&e.k)
+    {
+        ExprK::Int(_)                 : {},
+        ExprK::Var(n)                 :
+        {
+            if (Cx::is_static_var(cx, e))
+            {
+                // D-0258 `[Static-Use]`: a static is never read whole.
+                Cx::err(cx, line, "diag.read-of-resource", sprintf("`%s` is a static: it is borrowed (`&%s`), never read or moved whole", n, n));
+            }
+            else
+            {
+                Cx::place(cx, fl, e, Use::Read, line);
+            }
+        },
+        ExprK::Deref(_)               : Cx::place(cx, fl, e, Use::Read, line),
+        ExprK::Field(_)               : Cx::place(cx, fl, e, Use::Read, line),
+        ExprK::Index { .. }           : Cx::place(cx, fl, e, Use::Read, line),
+        ExprK::Add { a, b }           :
+        {
+            Cx::rvalue(cx, fl, Box::get(a), line);
+            Cx::rvalue(cx, fl, Box::get(b), line);
+        },
+        ExprK::Gt { a, b }            :
+        {
+            Cx::rvalue(cx, fl, Box::get(a), line);
+            Cx::rvalue(cx, fl, Box::get(b), line);
+        },
+        ExprK::Borrow { m, e: a }     :
+        {
+            if (Cx::is_static_var(cx, Box::get(a)))
+            {
+                // D-0258 `[Ref-Form-Static]`: `&S` is a shared reference with
+                // program extent, nothing to track; `&mut S` is refused.
+                if (*m == Mode::Excl)
+                {
+                    String n = match (&Box::get(a).k)
+                    {
+                        ExprK::Var(n) : clone(n),
+                        _             : "",
+                    };
+                    Cx::err(cx, line, "diag.write-through-shared", sprintf("`%s` is a static, shared by every thread: borrow it `&%s`", &n, &n));
+                }
+                return;
+            }
+            Cx::check_borrow_mode(cx, *m, Box::get(a), line);
+            Cx::place(cx, fl, Box::get(a), Use::Borrow(*m), line);
+            Option<SPlace> p = Cx::deriv_place(cx, Box::get(a));
+            holder_set(fl, &holder, p, *m);
+        },
+        ExprK::Call { f, xs }         : Cx::rvalue_call(cx, fl, e, f, xs, line, &holder),
+        ExprK::Spawn { f, xs }        : Cx::rvalue_spawn(cx, fl, f, xs, line, &holder),
+        ExprK::Join(t)                :
+        {
+            // A resource binding consumed as an argument.
+            Cx::use_binding(cx, fl, t, line);
+            set_valid(fl, t, Tri::F);
+            Flow::clear_holder(fl, t);
+        },
+        ExprK::HoldLit(a)             :
+        {
+            Cx::rvalue(cx, fl, Box::get(a), line);
+            Cx::check_arg(cx, &Ty::refi(Mode::Excl), Box::get(a), line);
+            // A copied exclusive reference: an exclusive borrow of `*q`
+            // (`hold_facts`, CHG-0439).
+            match (&Box::get(a).k)
+            {
+                ExprK::Var(q) :
+                {
+                    if (opt_ty_is(&Cx::ty_of(cx, q), &Ty::refi(Mode::Excl)) || is_excl_ref_of(&Cx::ty_of(cx, q)))
+                    {
+                        if (!sset_has(&cx.caps, q) && Cx::d0282(cx))
+                        {
+                            Cx::check_access(cx, fl, &sp_deref(q), Mode::Excl, line);
+                        }
+                    }
+                },
+                _             : {},
+            }
+        },
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (x in xs)
+            {
+                Cx::rvalue(cx, fl, x, line);
+                Cx::check_arg(cx, &Ty::I32, x, line);
+            }
+        },
+        ExprK::JobLit(a)              :
+        {
+            // A resource-typed whole binding consumed as a field initializer.
+            Ty ht = Ty::handle_of(Ty::Unit);
+            Cx::rvalue(cx, fl, Box::get(a), line);
+            Cx::check_arg(cx, &ht, Box::get(a), line);
+            Cx::consume_resource(cx, fl, &ht, Box::get(a), line);
+            Cx::move_out(cx, Box::get(a), line);
+        },
+        ExprK::Slice { m, v, lo, hi } :
+        {
+            // `[Slice-Form]`: `&_m v[lo .. hi]` borrows v's range; through
+            // a slice binding, its range of the slice's source.
+            Option<Ty> vt = Cx::ty_of(cx, v);
+            match (&vt)
+            {
+                Some(Ty::Slice(sm)) :
+                {
+                    if (*m == Mode::Excl && *sm == Mode::Shared)
+                    {
+                        Cx::err(cx, line, "diag.borrow-exceeds-source", "an exclusive slice of a shared one");
+                    }
+                    Cx::place(cx, fl, &ex_var(v), Use::Read, line);
+                },
+                _                   : Cx::use_binding(cx, fl, v, line),
+            }
+            if (opt_ty_is(&Cx::ty_of(cx, v), &Ty::Arr) && !(0 <= *lo && *lo <= *hi && *hi <= 2))
+            {
+                Cx::err(cx, line, "diag.index-out-of-bounds", "a literal range outside the array");
+            }
+            Option<SPlace> p = Cx::slice_place(cx, v, *lo, *hi);
+            match (&p)
+            {
+                Some(sp) : Cx::check_access(cx, fl, sp, *m, line),
+                None     : {},
+            }
+            holder_set(fl, &holder, p, *m);
+        },
+        ExprK::Closure(c)             : Cx::closure_lit(cx, fl, Box::get(c), line, &holder),
+        ExprK::CallVal(a)             :
+        {
+            // `[Closure-Call]`: the closure's place is borrowed, shared,
+            // or exclusive for one that writes itself (D-0239).
+            match (Cx::place_ty(cx, Box::get(a), Use::Read))
+            {
+                Some(tm) :
+                {
+                    if (!is_fn_ty(&tm.t))
+                    {
+                        Cx::err(cx, line, "diag.type-mismatch", sprintf("a call of %s", &Ty::text(&tm.t)));
+                    }
+                },
+                None     : {},
+            }
+            match (&Box::get(a).k)
+            {
+                ExprK::Var(n) :
+                {
+                    Cx::use_binding(cx, fl, n, line);
+                    match (Cx::splace(cx, Box::get(a)))
+                    {
+                        Some(p) :
+                        {
+                            Option<CloInfo> ci = match (HashMap::get(&cx.clo_info, n))
+                            {
+                                Some(x) : Some(*x),
+                                None    : None,
+                            };
+                            match (ci)
+                            {
+                                Some(x) :
+                                {
+                                    Mode m = Mode::Shared;
+                                    if (x.ws)
+                                    {
+                                        m = Mode::Excl;
+                                    }
+                                    Cx::check_access(cx, fl, &p, m, line);
+                                },
+                                None    : Cx::check_access_unknown(cx, fl, &p, line),
+                            }
+                        },
+                        None    : {},
+                    }
+                },
+                _             : Cx::place(cx, fl, Box::get(a), Use::Read, line),
+            }
+        },
+        ExprK::SpawnClo(a)            :
+        {
+            ref<Expr, shared> ae = Box::get(a);
+            match (&ae.k)
+            {
+                ExprK::Closure(c) :
+                {
+                    if (!Box::get(c).mv)
+                    {
+                        Cx::err(cx, line, "diag.spawn-borrow-closure", "a closure passed to spawn must be a move closure");
+                    }
+                    // D-0340 §8: a captured guard goes to the thread.
+                    foreach (n in &Box::get(c).caps)
+                    {
+                        match (Cx::ty_of(cx, n))
+                        {
+                            Some(Ty::Guard) : Cx::err(cx, line, "diag.thread-affine-moved", "a guard captured by a spawned closure: it stays on the thread that locked it"),
+                            _               : {},
+                        }
+                    }
+                },
+                ExprK::Var(n)     :
+                {
+                    bool borrowing = match (HashMap::get(&cx.clo_info, n))
+                    {
+                        Some(x) : !x.mv,
+                        None    : false,
+                    };
+                    if (borrowing)
+                    {
+                        Cx::err(cx, line, "diag.spawn-borrow-closure", "a closure passed to spawn must be a move closure");
+                    }
+                },
+                _                 : {},
+            }
+            bool has_holder = match (&holder)
+            {
+                Some(_) : true,
+                None    : false,
+            };
+            // D-0289: the handle holds what the closure row gives the
+            // closure it runs: a literal's facts, a binding's copied.
+            Vec<Fact> copied = Vec::new();
+            match (&ae.k)
+            {
+                ExprK::Var(n) :
+                {
+                    if (has_holder)
+                    {
+                        copied = Flow::deriv_facts(fl, n);
+                    }
+                },
+                _             : {},
+            }
+            match (&ae.k)
+            {
+                ExprK::Closure(c) :
+                {
+                    if (has_holder)
+                    {
+                        Cx::closure_lit(cx, fl, Box::get(c), line, &holder);
+                    }
+                    else
+                    {
+                        Cx::rvalue(cx, fl, ae, line);
+                    }
+                },
+                _                 : Cx::rvalue(cx, fl, ae, line),
+            }
+            // A closure that owns a resource moves into the thread.
+            Cx::consume_resource(cx, fl, &Ty::Unit, ae, line);
+            match (&holder)
+            {
+                Some(h) :
+                {
+                    if (!is_closure(ae))
+                    {
+                        if (!cx.accumulate)
+                        {
+                            Flow::forget_holder(fl, h);
+                        }
+                        foreach (x in &copied)
+                        {
+                            set_deriv(fl, h, clone(&x.p), x.m, x.v);
+                        }
+                    }
+                },
+                None    : {},
+            }
+        },
+    }
+}
+
+fn is_excl_ref_of(ref<Option<Ty>, shared> t) : bool
+{
+    match (t)
+    {
+        Some(Ty::Ref { t: _, m }) : *m == Mode::Excl,
+        _                         : false,
+    }
+}
+
+// A closure literal (`rule.fn.closure`, `spec/14` §6's closure row).
+fn Cx::closure_lit(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Clo, shared> c, usize line, ref<Option<String>, shared> holder)
+{
+    SSet<String> free = free_names(c, &cx.prog);
+    SSet<String> listed = SSet::new();
+    foreach (x in &c.caps)
+    {
+        _ = SSet::insert(&mut listed, clone(x));
+    }
+    if (!SSet::eq(&free, &listed))
+    {
+        Cx::err(cx, line, "diag.capture-list-mismatch", "the capture list is not the body's free variables");
+    }
+    Vec<PMode> facts = Vec::new();
+    // D-0288: what the captures reach, for a closure with or without
+    // `move`: `*r` for a captured reference or slice, and the facts of
+    // another capture that may hold a reference.
+    Vec<Fact> reach = Vec::new();
+    foreach (x in &c.caps)
+    {
+        Ty t = match (Cx::ty_of(cx, x))
+        {
+            Some(t) : t,
+            None    :
+            {
+                Cx::err(cx, line, "diag.unbound-name", sprintf("no binding `%s`", x));
+                continue;
+            },
+        };
+        Mode m = Mode::Shared;
+        if (writes_root(&c.body, x))
+        {
+            m = Mode::Excl;
+        }
+        Expr xe = ex_var(x);
+        match (&t)
+        {
+            Ty::Ref { t: _, m: rm } : Vec::push(&mut reach, Fact { .p = sp_deref(x), .m = *rm, .v = Tri::T }),
+            Ty::Slice(rm)           : Vec::push(&mut reach, Fact { .p = sp_deref(x), .m = *rm, .v = Tri::T }),
+            _                       :
+            {
+                if (may_hold_ref(&t))
+                {
+                    Vec::append(&mut reach, Flow::deriv_facts(fl, x));
+                }
+            },
+        }
+        if (c.mv)
+        {
+            // `[Closure-Form-Move]`: the capture's value is stored (read).
+            Cx::rvalue(cx, fl, &xe, line);
+            if (Ty::is_resource(&t))
+            {
+                Cx::consume_resource(cx, fl, &t, &xe, line);
+            }
+        }
+        else
+        {
+            // `[Closure-Form-Borrow]`: `&_m x` stored in a field.
+            Cx::use_binding(cx, fl, x, line);
+            match (Cx::splace(cx, &xe))
+            {
+                Some(p) :
+                {
+                    Cx::check_access(cx, fl, &p, m, line);
+                    if (!is_ref_ty(&t))
+                    {
+                        Vec::push(&mut facts, PMode { .p = p, .m = m });
+                    }
+                    else if (Atomic::load(&PRE_D0243) == 0)
+                    {
+                        // D-0243: the closure holds a borrow of the reference
+                        // binding itself; since D-0288 a fact describes it.
+                        _ = SMap::insert(&mut fl.escaped, clone(&p.root), Tri::T);
+                        Vec::push(&mut reach, Fact { .p = p, .m = m, .v = Tri::T });
+                    }
+                },
+                None    : {},
+            }
+        }
+    }
+    match (holder)
+    {
+        Some(h) :
+        {
+            if (!cx.accumulate)
+            {
+                Flow::forget_holder(fl, h);
+            }
+            foreach (x in &facts)
+            {
+                set_deriv(fl, h, clone(&x.p), x.m, Tri::T);
+            }
+            foreach (x in &reach)
+            {
+                set_deriv(fl, h, clone(&x.p), x.m, x.v);
+            }
+        },
+        // `&x…` in any other position.
+        None    :
+        {
+            foreach (x in &facts)
+            {
+                _ = SMap::insert(&mut fl.escaped, clone(&x.p.root), Tri::T);
+            }
+        },
+    }
+    Cx::analyse_closure(cx, c);
+}
+
+// D-0288's `fn` value row: a copy of a binding holds its facts; a call's
+// result may hold what any argument that may hold a reference formed or
+// held, which the run decides (`?`).
+fn Cx::fn_value_facts(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> e) : Vec<Fact>
+{
+    match (&e.k)
+    {
+        ExprK::Var(x)         : Flow::deriv_facts(fl, x),
+        ExprK::Call { f, xs } :
+        {
+            Vec<Fact> out = Vec::new();
+            foreach (a in xs)
+            {
+                match (&a.k)
+                {
+                    ExprK::Borrow { m, e: p } :
+                    {
+                        match (Cx::deriv_place(cx, Box::get(p)))
+                        {
+                            Some(sp) : Vec::push(&mut out, Fact { .p = sp, .m = *m, .v = Tri::Q }),
+                            None     : {},
+                        }
+                    },
+                    ExprK::Var(y)             :
+                    {
+                        Option<Ty> yt = Cx::ty_of(cx, y);
+                        bool may = match (&yt)
+                        {
+                            Some(t) : may_hold_ref(t),
+                            None    : false,
+                        };
+                        if (may)
+                        {
+                            match (&yt)
+                            {
+                                Some(Ty::Ref { t: _, m: rm }) : Vec::push(&mut out, Fact { .p = sp_deref(y), .m = *rm, .v = Tri::Q }),
+                                Some(Ty::Slice(rm))           : Vec::push(&mut out, Fact { .p = sp_deref(y), .m = *rm, .v = Tri::Q }),
+                                _                             : {},
+                            }
+                            Vec<Fact> yf = Flow::deriv_facts(fl, y);
+                            foreach (x in &yf)
+                            {
+                                Vec::push(&mut out, Fact { .p = clone(&x.p), .m = x.m, .v = Tri::Q });
+                            }
+                        }
+                    },
+                    _                         : {},
+                }
+            }
+            out
+        },
+        _                     : Vec::new(),
+    }
+}
+
+// A closure's body, analysed as a body of its own: the captures bound
+// with their types, untracked.
+fn Cx::analyse_closure(ref<Cx, exclusive> cx, ref<Clo, shared> c)
+{
+    Vec<Option<usize>> parents = Vec::new();
+    usize next = 0;
+    number_blocks(&c.body, None, &mut next, &mut parents);
+    Positions pos = Positions::of(&cx.prog, &c.caps, &c.body);
+    Cx sub = Cx::new(clone(&cx.prog), clone(&cx.sums), pos, sprintf("$clo%d", c.id), parents, clone(&c.ret));
+    Flow fl = Flow::new();
+    foreach (x in &c.caps)
+    {
+        Ty t = match (Cx::ty_of(cx, x))
+        {
+            Some(t) : t,
+            None    : continue,
+        };
+        if (is_ref_ty(&t))
+        {
+            _ = HashMap::insert(&mut sub.referent, clone(x), None);
+        }
+        usize id = HashMap::len(&sub.binds);
+        Vec::push(HashMap::entry(&mut sub.binds, x, Vec::new()), Binding { .ty = t, .block = 0, .id = id });
+        _ = SSet::insert(&mut sub.regions[0], clone(x));
+        _ = SSet::insert(&mut sub.caps, clone(x));
+        set_valid(&mut fl, x, Tri::T);
+    }
+    Cx::block(&mut sub, &mut fl, &c.body, None);
+    Cx::absorb(cx, sub);
+    // (the closure's own binding types, under its name)
+}
+
+// What a nested body's analysis found, added to this one's.
+fn Cx::absorb(ref<Cx, exclusive> cx, Cx sub)
+{
+    Vec::append(&mut cx.errors, replace(&mut sub.errors, Vec::new()));
+    foreach (k, v in &sub.ends)
+    {
+        _ = HashMap::insert(&mut cx.ends, clone(k), clone(v));
+    }
+    foreach (k, v in &sub.proven)
+    {
+        _ = HashMap::insert(&mut cx.proven, clone(k), *v);
+    }
+    foreach (k, v in &sub.sub_types)
+    {
+        _ = HashMap::insert(&mut cx.sub_types, clone(k), clone(v));
+    }
+    _ = HashMap::insert(&mut cx.sub_types, clone(&sub.fname), replace(&mut sub.all_types, HashMap::new()));
+}
+
+// "resource-typed whole binding x consumed … as an argument": valid(x)
+// := F and every deriv(·, x, ·) := F; `solitary(a_x)` is refuted when
+// some deriv(·, x.·, ·) is T (`diag.move-while-aliased`).
+fn Cx::consume_resource(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Ty, shared> pt, ref<Expr, shared> a, usize line)
+{
+    String x = match (&a.k)
+    {
+        ExprK::Var(x) : clone(x),
+        _             : return,
+    };
+    if (!Ty::is_resource(pt) && !sset_has(&cx.clo_owns, &x))
+    {
+        return;
+    }
+    Root root = Root::Var(clone(&x));
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.vals[i] == Tri::T && fl.deriv.keys[i].p.root == root)
+        {
+            Cx::err(cx, line, "diag.move-while-aliased", sprintf("`%s` is moved while borrowed", &x));
+            break;
+        }
+    }
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].p.root == root)
+        {
+            fl.deriv.vals[i] = Tri::F;
+        }
+    }
+    for (usize i = 0; i < Vec::len(&fl.inh.keys); i += 1)
+    {
+        if (fl.inh.keys[i].p.root == root)
+        {
+            fl.inh.vals[i] = Tri::F;
+        }
+    }
+    // D-0244: a consumed binding that held borrows (a handle moved into
+    // a `Vec` or a struct) moves them on with it: its own facts are
+    // forgotten, as for a moved reference.
+    Flow::forget_holder(fl, &x);
+    set_valid(fl, &x, Tri::F);
+}
+
+fn Cx::check_borrow_mode(ref<Cx, exclusive> cx, Mode m, ref<Expr, shared> place, usize line)
+{
+    if (m == Mode::Excl)
+    {
+        match (Cx::place_ty(cx, place, Use::Borrow(m)))
+        {
+            Some(tm) :
+            {
+                if (tm.m == Mode::Shared)
+                {
+                    Cx::err(cx, line, "diag.borrow-exceeds-source", "an exclusive borrow through a shared path");
+                }
+            },
+            None     : {},
+        }
+    }
+}
+
+// An argument against its parameter type (`[Call]`, `rule.fn.bind-param`).
+fn Cx::check_arg(ref<Cx, exclusive> cx, ref<Ty, shared> pt, ref<Expr, shared> a, usize line)
+{
+    Ty at = match (Cx::value_ty(cx, a))
+    {
+        Some(t) : t,
+        None    : return,
+    };
+    match (pt)
+    {
+        Ty::Ref { t: t1, m: pm } :
+        {
+            match (&at)
+            {
+                Ty::Ref { t: t2, m: am } :
+                {
+                    if (ty_eq(Box::get(t1), Box::get(t2)))
+                    {
+                        if (*pm == Mode::Excl && *am == Mode::Shared)
+                        {
+                            // A reference read through a shared path where an exclusive
+                            // one is expected is `diag.borrow-exceeds-source` (D-0218);
+                            // a shared one otherwise is a type mismatch.
+                            bool through = match (&a.k)
+                            {
+                                ExprK::Var(_)   : true,
+                                ExprK::Deref(_) : true,
+                                ExprK::Field(_) : true,
+                                _               : false,
+                            };
+                            if (through)
+                            {
+                                through = match (Cx::place_ty(cx, a, Use::Read))
+                                {
+                                    Some(tm) : ty_eq(&tm.t, &Ty::refi(Mode::Excl)),
+                                    None     : false,
+                                };
+                            }
+                            if (through)
+                            {
+                                Cx::err(cx, line, "diag.borrow-exceeds-source", "an exclusive reference read through a shared one");
+                            }
+                            else
+                            {
+                                Cx::err(cx, line, "diag.type-mismatch", sprintf("%s where %s is expected", &Ty::text(&at), &Ty::text(pt)));
+                            }
+                            return;
+                        }
+                        if (*pm == Mode::Shared)
+                        {
+                            return;
+                        }
+                    }
+                },
+                _                        : {},
+            }
+        },
+        _                        : {},
+    }
+    if (ty_eq(pt, &at))
+    {
+        return;
+    }
+    Cx::err(cx, line, "diag.type-mismatch", sprintf("%s where %s is expected", &Ty::text(&at), &Ty::text(pt)));
+}
+
+// Whether a declared or assigned type accepts a value's (the same, a
+// shared reference given any reference to the same type, a shared slice
+// given any slice).
+fn accepts(ref<Ty, shared> t, ref<Ty, shared> it) : bool
+{
+    if (ty_eq(t, it))
+    {
+        return true;
+    }
+    match (t)
+    {
+        Ty::Ref { t: a, m } :
+        {
+            if (*m == Mode::Shared)
+            {
+                return match (it)
+                {
+                    Ty::Ref { t: b, m: _ } : ty_eq(Box::get(a), Box::get(b)),
+                    _                      : false,
+                };
+            }
+            false
+        },
+        Ty::Slice(m)        : *m == Mode::Shared && is_slice_ty(it),
+        _                   : false,
+    }
+}
+
+fn stmt_line_ok() : bool
+{
+    true
+}
+
+fn Cx::stmt(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Stmt, shared> s, usize block)
+{
+    usize line = s.line;
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              : Cx::stmt_let(cx, fl, s, name, ty, init, block),
+        StmtK::Assign { place, value }             : Cx::stmt_assign(cx, fl, s, place, value),
+        StmtK::Expr(e)                             : Cx::rvalue(cx, fl, e, line),
+        StmtK::Print(e)                            :
+        {
+            match (Cx::value_ty(cx, e))
+            {
+                Some(t) :
+                {
+                    if (!ty_eq(&t, &Ty::I32))
+                    {
+                        Cx::err(cx, line, "diag.type-mismatch", sprintf("printf of %s", &Ty::text(&t)));
+                    }
+                },
+                None    : {},
+            }
+            Cx::rvalue(cx, fl, e, line);
+        },
+        StmtK::Block(b)                            : Cx::block(cx, fl, b, None),
+        StmtK::Discard(e)                          : Cx::rvalue(cx, fl, e, line),
+        StmtK::Match { scrut, binder, some, none } : Cx::stmt_match(cx, fl, s, scrut, binder, some, none),
+        StmtK::While { cond, body }                :
+        {
+            // `rule.control.flow-analysis`: the loop's head joins its
+            // entry with each back edge, iterated to the least fixed
+            // point; the diagnostics, proofs and ends are those of a
+            // last pass at the fixed point.
+            usize start = cx.next_block;
+            usize saved_err = Vec::len(&cx.errors);
+            HashMap<ProvenKey, bool> saved_proven = clone(&cx.proven);
+            HashMap<EndKey, Vec<String>> saved_ends = clone(&cx.ends);
+            // A `continue` joins the head as the back edge does; a
+            // `break` joins the loop's exit.
+            usize depth = Vec::len(&cx.regions);
+            Flow head = clone(fl);
+            for (usize round = 0; round < 64; round += 1)
+            {
+                cx.next_block = start;
+                Flow b = clone(&head);
+                Cx::rvalue(cx, &mut b, cond, line);
+                Vec::push(&mut cx.loops, LoopCx { .depth = depth, .brk = Flow::dead(), .cont = Flow::dead() });
+                Cx::block(cx, &mut b, body, None);
+                LoopCx l = Option::unwrap(Vec::pop(&mut cx.loops));
+                Flow j = Flow::join(&Flow::join(&head, &b), &l.cont);
+                if (Flow::eq(&j, &head))
+                {
+                    break;
+                }
+                head = j;
+            }
+            Vec::truncate(&mut cx.errors, saved_err);
+            cx.proven = saved_proven;
+            cx.ends = saved_ends;
+            cx.next_block = start;
+            Cx::rvalue(cx, &mut head, cond, line);
+            Flow b = clone(&head);
+            Vec::push(&mut cx.loops, LoopCx { .depth = depth, .brk = Flow::dead(), .cont = Flow::dead() });
+            Cx::block(cx, &mut b, body, None);
+            LoopCx l = Option::unwrap(Vec::pop(&mut cx.loops));
+            *fl = Flow::join(&head, &l.brk);
+        },
+        StmtK::Break                               : Cx::stmt_leave(cx, fl, true, line),
+        StmtK::Continue                            : Cx::stmt_leave(cx, fl, false, line),
+        StmtK::If { cond, thn, els }               :
+        {
+            Cx::rvalue(cx, fl, cond, line);
+            Flow a = clone(fl);
+            Cx::block(cx, &mut a, thn, None);
+            Flow b = clone(fl);
+            match (els)
+            {
+                Some(e) : Cx::block(cx, &mut b, e, None),
+                None    : {},
+            }
+            *fl = Flow::join(&a, &b);
+        },
+    }
+}
+
+fn Cx::stmt_leave(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, bool brk, usize line)
+{
+    if (Vec::len(&cx.loops) == 0)
+    {
+        Cx::err(cx, line, "diag.break-outside-loop", "break or continue outside a loop");
+        return;
+    }
+    // `[Break]`: every block up to and including the loop's body
+    // is exited, its bindings ended.
+    usize top = Vec::len(&cx.loops) - 1;
+    usize depth = cx.loops[top].depth;
+    Flow f = clone(fl);
+    Vec<String> names = Vec::new();
+    for (usize r = depth; r < Vec::len(&cx.regions); r += 1)
+    {
+        foreach (n in &cx.regions[r].keys)
+        {
+            Vec::push(&mut names, clone(n));
+        }
+    }
+    foreach (n in &names)
+    {
+        end_binding(&mut f, n);
+    }
+    if (brk)
+    {
+        cx.loops[top].brk = Flow::join(&cx.loops[top].brk, &f);
+    }
+    else
+    {
+        cx.loops[top].cont = Flow::join(&cx.loops[top].cont, &f);
+    }
+    fl.dead = true;
+}
+
+fn Cx::stmt_let(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Stmt, shared> s, ref<String, shared> name, ref<Option<Ty>, shared> ty, ref<Expr, shared> init, usize block)
+{
+    usize line = s.line;
+    usize nreg = Vec::len(&cx.regions);
+    if (nreg > 0 && sset_has(&cx.regions[nreg - 1], name))
+    {
+        Cx::err(cx, line, "diag.duplicate-local", sprintf("`%s` is declared twice in one block", name));
+    }
+    Cx::rvalue_into(cx, fl, init, line, Some(clone(name)));
+    Cx::move_out(cx, init, line);
+    Option<Ty> it = Cx::value_ty(cx, init);
+    Ty t = match (ty)
+    {
+        Some(t) : match (&it)
+        {
+            Some(it) :
+            {
+                if (!accepts(t, it))
+                {
+                    Cx::err(cx, line, "diag.type-mismatch", sprintf("`%s` is declared %s but its initializer is %s", name, &Ty::text(t), &Ty::text(it)));
+                }
+                clone(t)
+            },
+            None     : clone(t),
+        },
+        None : match (it)
+        {
+            Some(it) : it,
+            None     : Ty::Unit,
+        },
+    };
+    if (is_ref_ty(&t) || is_slice_ty(&t))
+    {
+        Option<usize> r = Cx::referent_of_value(cx, init);
+        _ = HashMap::insert(&mut cx.referent, clone(name), r);
+    }
+    // "as a local-declaration initializer (`auto y = x`)": a
+    // resource-typed whole binding is consumed.
+    match (&init.k)
+    {
+        ExprK::Var(x) :
+        {
+            Ty xt = match (Cx::ty_of(cx, x))
+            {
+                Some(t) : t,
+                None    : Ty::Unit,
+            };
+            Cx::consume_resource(cx, fl, &xt, init, line);
+        },
+        _             : {},
+    }
+    _ = SSet::remove(&mut cx.clo_owns, name);
+    match (&init.k)
+    {
+        ExprK::Closure(cb) :
+        {
+            ref<Clo, shared> c = Box::get(cb);
+            bool ws = false;
+            if (c.mv)
+            {
+                foreach (x in &c.caps)
+                {
+                    if (writes_root(&c.body, x))
+                    {
+                        ws = true;
+                    }
+                }
+            }
+            _ = HashMap::insert(&mut cx.clo_info, clone(name), CloInfo { .mv = c.mv, .ws = ws });
+            if (c.mv)
+            {
+                bool owns = false;
+                foreach (x in &c.caps)
+                {
+                    bool res = match (Cx::ty_of(cx, x))
+                    {
+                        Some(t) : Ty::is_resource(&t),
+                        None    : false,
+                    };
+                    if (res || sset_has(&cx.clo_owns, x))
+                    {
+                        owns = true;
+                    }
+                }
+                if (owns)
+                {
+                    _ = SSet::insert(&mut cx.clo_owns, clone(name));
+                }
+            }
+        },
+        _                  : { _ = HashMap::remove(&mut cx.clo_info, name); },
+    }
+    // A reference copied from anything but a visible borrow: the
+    // referents the analysis cannot exclude escape.
+    bool visible = match (&init.k)
+    {
+        ExprK::Borrow { .. } : true,
+        ExprK::Slice { .. }  : true,
+        _                    : false,
+    };
+    if ((is_ref_ty(&t) || is_slice_ty(&t)) && !visible && !Cx::is_elided(cx, init))
+    {
+        Cx::escape_copied(cx, fl, init);
+    }
+    usize id = cx.pos.decl[s.id];
+    if (Cx::d0282(cx))
+    {
+        Inh inh = Cx::inherit(cx, fl, init);
+        usize end = cx.pos.stmt_end[s.id];
+        if (end == NONE)
+        {
+            end = 0;
+        }
+        Cx::bind_frame_held(cx, fl, name, &t, init, inh, id, end, line);
+    }
+    if (is_fn_ty(&t) && !is_closure(init))
+    {
+        Vec<Fact> vf = Cx::fn_value_facts(cx, fl, init);
+        foreach (x in &vf)
+        {
+            set_deriv(fl, name, clone(&x.p), x.m, x.v);
+        }
+    }
+    // D-0290: a `Hold` of this frame is a holder of what its field
+    // was made from; a copy of one holds what it holds.
+    if (ty_eq(&t, &Ty::Hold) && Cx::d0282(cx))
+    {
+        Vec<Fact> hf = Cx::hold_facts(cx, fl, init);
+        foreach (x in &hf)
+        {
+            set_deriv(fl, name, clone(&x.p), x.m, x.v);
+        }
+    }
+    Vec::push(HashMap::entry(&mut cx.binds, name, Vec::new()), Binding { .ty = t, .block = block, .id = id });
+    if (nreg > 0)
+    {
+        _ = SSet::insert(&mut cx.regions[nreg - 1], clone(name));
+    }
+    set_valid(fl, name, Tri::T);
+}
+
+fn Cx::stmt_assign(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Stmt, shared> s, ref<Expr, shared> place, ref<Expr, shared> value)
+{
+    usize line = s.line;
+    // target place first, then value (`spec/13` §1)
+    Option<TyMode> pty = Cx::place_ty(cx, place, Use::Write);
+    match (&pty)
+    {
+        Some(tm) :
+        {
+            if (tm.m == Mode::Shared)
+            {
+                Cx::err(cx, line, "diag.write-through-shared", "a write through a shared path");
+            }
+        },
+        None     : {},
+    }
+    Option<String> whole = match (&place.k)
+    {
+        ExprK::Var(n) : Some(clone(n)),
+        _             : None,
+    };
+    bool is_whole = match (&whole)
+    {
+        Some(_) : true,
+        None    : false,
+    };
+    if (!is_whole)
+    {
+        Cx::place(cx, fl, place, Use::Write, line);
+    }
+    Cx::rvalue_into(cx, fl, value, line, clone(&whole));
+    Cx::move_out(cx, value, line);
+    bool has_inh = Cx::d0282(cx) && is_whole;
+    Inh inh = Inh { .facts = Vec::new(), .temp = false };
+    if (has_inh)
+    {
+        inh = Cx::inherit(cx, fl, value);
+    }
+    match (&pty)
+    {
+        Some(tm) : match (Cx::value_ty(cx, value))
+        {
+            Some(vt) :
+            {
+                if (!accepts(&tm.t, &vt))
+                {
+                    Cx::err(cx, line, "diag.type-mismatch", sprintf("%s assigned to a place of type %s", &Ty::text(&vt), &Ty::text(&tm.t)));
+                }
+            },
+            None     : {},
+        },
+        None : {},
+    }
+    match (&whole)
+    {
+        Some(n) :
+        {
+            // `x = e`: a whole-object write (`spec/11`).
+            match (Cx::splace(cx, place))
+            {
+                Some(p) : Cx::check_access(cx, fl, &p, Mode::Excl, line),
+                None    : {},
+            }
+            Option<Ty> nt = Cx::ty_of(cx, n);
+            // D-0290: a `Hold` assigned whole holds what the new value
+            // does.
+            if (opt_ty_is(&nt, &Ty::Hold) && Cx::d0282(cx))
+            {
+                Vec<Fact> facts = Cx::hold_facts(cx, fl, value);
+                Flow::forget_holder(fl, n);
+                foreach (x in &facts)
+                {
+                    set_deriv(fl, n, clone(&x.p), x.m, x.v);
+                }
+            }
+            match (&nt)
+            {
+                Some(Ty::Fn(_)) :
+                {
+                    match (&value.k)
+                    {
+                        ExprK::Closure(cb) :
+                        {
+                            ref<Clo, shared> c = Box::get(cb);
+                            // `rule.temporal.ref-escape`: a closure without
+                            // `move` is an aggregate of borrows of its
+                            // captures (CHG-0113).
+                            if (!c.mv)
+                            {
+                                foreach (x in &c.caps)
+                                {
+                                    match (Cx::referent_block(cx, &ex_var(x)))
+                                    {
+                                        Some(rb) : match (Cx::block_of(cx, n))
+                                        {
+                                            Some(b) :
+                                            {
+                                                if (rb != b && Cx::encloses(cx, b, rb))
+                                                {
+                                                    Cx::err(cx, line, "diag.reference-escapes-scope", sprintf("`%s` outlives `%s`, which it borrows", n, x));
+                                                }
+                                            },
+                                            None    : {},
+                                        },
+                                        None : {},
+                                    }
+                                }
+                            }
+                            bool ws = false;
+                            if (c.mv)
+                            {
+                                foreach (x in &c.caps)
+                                {
+                                    if (writes_root(&c.body, x))
+                                    {
+                                        ws = true;
+                                    }
+                                }
+                            }
+                            _ = HashMap::insert(&mut cx.clo_info, clone(n), CloInfo { .mv = c.mv, .ws = ws });
+                        },
+                        _                  :
+                        {
+                            _ = HashMap::remove(&mut cx.clo_info, n);
+                            Vec<Fact> facts = Cx::fn_value_facts(cx, fl, value);
+                            Flow::forget_holder(fl, n);
+                            foreach (x in &facts)
+                            {
+                                set_deriv(fl, n, clone(&x.p), x.m, x.v);
+                            }
+                        },
+                    }
+                },
+                _               : {},
+            }
+            if (opt_is_ref(&nt) || opt_is_slice(&nt))
+            {
+                // `r = e`: a reference reassigned; what derived from *r
+                // before is gone.
+                Flow::clear_referent(fl, n);
+                bool visible = match (&value.k)
+                {
+                    ExprK::Borrow { .. } : true,
+                    ExprK::Slice { .. }  : true,
+                    _                    : false,
+                };
+                if (visible)
+                {
+                    match (Cx::referent_of_value(cx, value))
+                    {
+                        Some(rb) : match (Cx::block_of(cx, n))
+                        {
+                            Some(b) :
+                            {
+                                if (rb != b && Cx::encloses(cx, b, rb))
+                                {
+                                    Cx::err(cx, line, "diag.reference-escapes-scope", sprintf("`%s` outlives what it would refer to", n));
+                                }
+                            },
+                            None    : {},
+                        },
+                        None : {},
+                    }
+                }
+                else if (!Cx::is_elided(cx, value))
+                {
+                    Flow::forget_holder(fl, n);
+                    Cx::escape_copied(cx, fl, value);
+                }
+            }
+            if (has_inh)
+            {
+                match (Cx::ty_of(cx, n))
+                {
+                    Some(t) :
+                    {
+                        usize id = NONE;
+                        match (HashMap::get(&cx.binds, n))
+                        {
+                            Some(v) :
+                            {
+                                if (Vec::len(v) > 0)
+                                {
+                                    id = v[Vec::len(v) - 1].id;
+                                }
+                            },
+                            None    : {},
+                        }
+                        usize end = cx.pos.stmt_end[s.id];
+                        if (end == NONE)
+                        {
+                            end = 0;
+                        }
+                        Cx::bind_frame_held(cx, fl, n, &t, value, inh, id, end, line);
+                    },
+                    None    : {},
+                }
+            }
+            set_valid(fl, n, Tri::T);
+        },
+        None    : {},
+    }
+    if (Cx::d0282(cx))
+    {
+        Cx::eval_order(cx, fl, place, value, line);
+    }
+}
+
+fn Cx::stmt_match(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Stmt, shared> s, ref<Expr, shared> scrut, ref<String, shared> binder, ref<Block, shared> some, ref<Block, shared> none)
+{
+    usize line = s.line;
+    Cx::rvalue(cx, fl, scrut, line);
+    Ty bt = match (Cx::value_ty(cx, scrut))
+    {
+        Some(Ty::Opt(t)) : Box::into_inner(t),
+        _                :
+        {
+            Cx::err(cx, line, "diag.type-mismatch", "match on a non-Option");
+            Ty::Unit
+        },
+    };
+    // The arm's binder, when the scrutinee is a call whose result
+    // holds a reference without being one: deriv(b, x.π, m) for the
+    // first reference parameter's argument, when it is a visible
+    // borrow (D-0088, D-0071).
+    Flow a = clone(fl);
+    Vec<PMode> facts = Vec::new();
+    if (Ty::holds_ref(&bt))
+    {
+        match (&scrut.k)
+        {
+            ExprK::Call { f, xs } :
+            {
+                if (Vec::len(xs) > 0)
+                {
+                    match (&xs[0].k)
+                    {
+                        ExprK::Borrow { m, e: p } :
+                        {
+                            match (Cx::splace(cx, Box::get(p)))
+                            {
+                                Some(sp) : Vec::push(&mut facts, PMode { .p = sp, .m = *m }),
+                                None     : {},
+                            }
+                        },
+                        _                         : {},
+                    }
+                }
+            },
+            _                     : {},
+        }
+    }
+    // D-0282: a frame-held binder the row forms no fact for
+    // inherits the scrutinee's ("a `match` arm's binder stands for
+    // the scrutinee").
+    Vec<Fact> inh = Vec::new();
+    _ = HashMap::remove(&mut cx.copies, binder);
+    if (Cx::d0282(cx) && Vec::len(&facts) == 0 && frame_held(&bt))
+    {
+        inh = Cx::inherit(cx, fl, scrut).facts;
+        match (&scrut.k)
+        {
+            ExprK::Var(o) :
+            {
+                String root = Cx::copy_root(cx, o);
+                _ = HashMap::insert(&mut cx.copies, clone(binder), root);
+            },
+            _             : {},
+        }
+    }
+    // D-0289, CHG-0384: a handle taken out of a `Vec` of them holds
+    // what the `Vec` holds.
+    if (is_handle_ty(&bt))
+    {
+        match (&scrut.k)
+        {
+            ExprK::Call { f, xs } :
+            {
+                if (*f == "Vec::pop" && Vec::len(xs) > 0)
+                {
+                    match (&xs[0].k)
+                    {
+                        ExprK::Borrow { m, e: v } :
+                        {
+                            match (&Box::get(v).k)
+                            {
+                                ExprK::Var(hs) : inh = Flow::holder_facts(fl, hs),
+                                _              : {},
+                            }
+                        },
+                        _                         : {},
+                    }
+                }
+            },
+            _                     : {},
+        }
+    }
+    usize id = cx.pos.decl[s.id];
+    Cx::block(cx, &mut a, some, Some(Pre { .name = clone(binder), .ty = bt, .facts = facts, .inh = inh, .id = id }));
+    Flow b = clone(fl);
+    Cx::block(cx, &mut b, none, None);
+    *fl = Flow::join(&a, &b);
+}
+
+fn Cx::is_elided(ref<Cx, shared> cx, ref<Expr, shared> e) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Call { f, xs } : match (Program::func(&cx.prog, f))
+        {
+            Some(x) : is_ref_ty(&x.ret) && x.src < Vec::len(xs) && is_borrow(&xs[x.src]),
+            None    : false,
+        },
+        _ : false,
+    }
+}
+
+// `r = e` from anything but a visible borrow: `escaped(x) := T for the x
+// the analysis cannot exclude` — read here as every place some
+// reference binding mentioned in `e` is known to derive from.
+fn Cx::escape_copied(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Expr, shared> e)
+{
+    Vec<String> names = Vec::new();
+    expr_names(e, &mut names);
+    Vec<Root> keys = Vec::new();
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.vals[i] != Tri::F && contains_str(&names, &fl.deriv.keys[i].h))
+        {
+            Vec::push(&mut keys, clone(&fl.deriv.keys[i].p.root));
+        }
+    }
+    foreach (r in &keys)
+    {
+        _ = SMap::insert(&mut fl.escaped, clone(r), Tri::T);
+    }
+}
+
+// The referent block of a reference or slice value: a visible borrow's,
+// a slice's source's.
+fn Cx::referent_of_value(ref<Cx, shared> cx, ref<Expr, shared> e) : Option<usize>
+{
+    match (&e.k)
+    {
+        ExprK::Borrow { m, e: p }     : Cx::referent_block(cx, Box::get(p)),
+        ExprK::Slice { m, v, lo, hi } : Cx::referent_block(cx, &ex_var(v)),
+        _                             : None,
+    }
+}
+
+fn Cx::referent_of(ref<Cx, shared> cx, StringView n) : Option<usize>
+{
+    match (HashMap::get(&cx.referent, n))
+    {
+        Some(r) : *r,
+        None    : None,
+    }
+}
+
+fn Cx::referent_block(ref<Cx, shared> cx, ref<Expr, shared> p) : Option<usize>
+{
+    String n = match (&p.k)
+    {
+        ExprK::Var(n)         : clone(n),
+        ExprK::Index { v, k } : clone(v),
+        ExprK::Deref(a)       :
+        {
+            return match (&Box::get(a).k)
+            {
+                ExprK::Var(q) : Cx::referent_of(cx, q),
+                _             : None,
+            };
+        },
+        _                     : return None,
+    };
+    match (Cx::ty_of(cx, &n))
+    {
+        Some(Ty::Ref { .. }) : None,
+        Some(Ty::Slice(_))   : Cx::referent_of(cx, &n),
+        Some(_)              : Cx::block_of(cx, &n),
+        None                 : None,
+    }
+}
+
+// Does block `outer` strictly enclose block `inner`?
+fn Cx::encloses(ref<Cx, shared> cx, usize outer, usize inner) : bool
+{
+    Option<usize> b = parent_of(&cx.parents, inner);
+    while (true)
+    {
+        match (b)
+        {
+            Some(x) :
+            {
+                if (x == outer)
+                {
+                    return true;
+                }
+                b = parent_of(&cx.parents, x);
+            },
+            None    : return false,
+        }
+    }
+    false
+}
+
+fn parent_of(ref<Vec<Option<usize>>, shared> parents, usize b) : Option<usize>
+{
+    if (b < Vec::len(parents))
+    {
+        return parents[b];
+    }
+    None
+}
+
+// A block; `pre` is a pattern binder the block's region declares (a
+// `match` arm's), with the deriv facts it starts with.
+fn Cx::block(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Block, shared> b, Option<Pre> pre)
+{
+    usize me = cx.next_block;
+    cx.next_block += 1;
+    Cx::block_in(cx, fl, b, me, pre);
+}
+
+struct Planned
+{
+    String x;
+    usize d;
+}
+
+fn Cx::block_in(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, ref<Block, shared> b, usize me, Option<Pre> pre)
+{
+    Vec::push(&mut cx.regions, SSet::new());
+    usize top = Vec::len(&cx.regions) - 1;
+    Vec<String> declared = Vec::new();
+    match (pre)
+    {
+        Some(p) :
+        {
+            Pre { name: n, ty: t, facts, inh, id } = p;
+            Vec::push(HashMap::entry(&mut cx.binds, &n, Vec::new()), Binding { .ty = t, .block = me, .id = id });
+            _ = SSet::insert(&mut cx.regions[top], clone(&n));
+            set_valid(fl, &n, Tri::T);
+            foreach (x in &facts)
+            {
+                set_deriv(fl, &n, clone(&x.p), x.m, Tri::T);
+            }
+            foreach (x in &inh)
+            {
+                _ = SMap::insert(&mut fl.inh, DKey { .h = clone(&n), .p = clone(&x.p), .m = x.m }, x.v);
+            }
+            Vec::push(&mut declared, n);
+        },
+        None    : {},
+    }
+    // `[Ref-Binding-Last-Use]` (D-0221): each candidate waits from its
+    // last mention until no binding that may hold a reference and shares
+    // a statement with it is mentioned later; it then ends, unless the
+    // flow facts root another binding's borrow in it.
+    EndPlan ep = end_plan(cx, b);
+    for (usize i = 0; i < Vec::len(&ep.plan); i += 1)
+    {
+        Vec::sort(&mut ep.plan[i]);
+    }
+    Vec<Planned> waiting = Vec::new();
+    for (usize i = 0; i < Vec::len(&b.stmts); i += 1)
+    {
+        ref<Stmt, shared> s = &b.stmts[i];
+        Cx::stmt(cx, fl, s, me);
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init } : Vec::push(&mut declared, clone(name)),
+            _                             : {},
+        }
+        Vec<String> now = Vec::new();
+        foreach (p in &ep.plan[i])
+        {
+            Vec::push(&mut waiting, clone(p));
+        }
+        Vec<Planned> still = Vec::new();
+        Vec<Planned> free = Vec::new();
+        foreach (p in &waiting)
+        {
+            if (Cx::end_blocked(cx, b, &p.x, p.d, i, &ep.mentions, &ep.tail))
+            {
+                Vec::push(&mut still, clone(p));
+            }
+            else
+            {
+                Vec::push(&mut free, clone(p));
+            }
+        }
+        waiting = still;
+        // One at a time, in order: a binding ended frees what was
+        // rooted in it for the next, and one passed over is judged again
+        // once a later one has ended, until none more ends (CHG-0439:
+        // `q1 = &h1`, both last mentioned here, end together).
+        // One whose facts still root another binding's reference waits
+        // for a later statement (D-0288).
+        while (true)
+        {
+            Vec<Planned> passed = Vec::new();
+            bool progress = false;
+            foreach (p in &free)
+            {
+                bool rooted = false;
+                for (usize k = 0; k < Vec::len(&fl.deriv.keys); k += 1)
+                {
+                    ref<DKey, shared> dk = &fl.deriv.keys[k];
+                    if (fl.deriv.vals[k] != Tri::F && dk.h != p.x && (root_is_var(&dk.p.root, &p.x) || root_is_deref(&dk.p.root, &p.x)))
+                    {
+                        rooted = true;
+                        break;
+                    }
+                }
+                if (!rooted)
+                {
+                    end_binding(fl, &p.x);
+                    Vec::push(&mut now, clone(&p.x));
+                    progress = true;
+                }
+                else
+                {
+                    Vec::push(&mut passed, clone(p));
+                }
+            }
+            if (!progress || Vec::len(&passed) == 0)
+            {
+                Vec::append(&mut waiting, passed);
+                break;
+            }
+            free = passed;
+        }
+        if (Vec::len(&now) > 0)
+        {
+            foreach (n in &now)
+            {
+                // `[Ref-Binding-Last-Use]`: the binding ends here as at
+                // its block's exit (the flow table's row, D-0219).
+                end_binding(fl, n);
+            }
+            _ = HashMap::insert(&mut cx.ends, EndKey { .f = clone(&cx.fname), .block = me, .stmt = i }, now);
+        }
+        // D-0341 `[Ref-Reassign-Releases]` (report 418): a reference binding
+        // this statement mentions, whose next mention in the block assigns
+        // it whole from a value that does not read it, with nothing between
+        // that may leave the block and no other binding's facts rooted in
+        // it, holds no loan from here: the machine lets it go (`ReleaseRef`,
+        // planned under the name with a leading `\u{1}`).
+        Vec<String> released = Vec::new();
+        foreach (x in &ep.mentions[i])
+        {
+            bool is_ref = match (Cx::ty_of(cx, x))
+            {
+                Some(Ty::Ref { .. }) : true,
+                _                    : false,
+            };
+            if (!is_ref || contains_str(&released, x))
+            {
+                continue;
+            }
+            Option<usize> next = None;
+            for (usize k = i + 1; k < Vec::len(&b.stmts); k += 1)
+            {
+                if (contains_str(&ep.mentions[k], x))
+                {
+                    next = Some(k);
+                    break;
+                }
+            }
+            usize j = match (next)
+            {
+                Some(j) : j,
+                None    : continue,
+            };
+            if (!stmt_overwrites(&b.stmts[j], x))
+            {
+                continue;
+            }
+            bool leaves = false;
+            for (usize k = i + 1; k <= j; k += 1)
+            {
+                if (stmt_may_leave(&b.stmts[k]))
+                {
+                    leaves = true;
+                }
+            }
+            if (leaves)
+            {
+                continue;
+            }
+            bool rooted = false;
+            for (usize k = 0; k < Vec::len(&fl.deriv.keys); k += 1)
+            {
+                ref<DKey, shared> dk = &fl.deriv.keys[k];
+                if (fl.deriv.vals[k] != Tri::F && dk.h != *x && (root_is_var(&dk.p.root, x) || root_is_deref(&dk.p.root, x)))
+                {
+                    rooted = true;
+                    break;
+                }
+            }
+            if (rooted)
+            {
+                continue;
+            }
+            Vec::push(&mut released, clone(x));
+        }
+        if (Vec::len(&released) > 0)
+        {
+            EndKey key = EndKey { .f = clone(&cx.fname), .block = me, .stmt = i };
+            ref<Vec<String>, exclusive> e = HashMap::entry(&mut cx.ends, &key, Vec::new());
+            foreach (x in &released)
+            {
+                Vec::push(e, sprintf("\u{1}%s", x));
+            }
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) :
+        {
+            Cx::rvalue(cx, fl, t, b.tail_line);
+            if (me == 0)
+            {
+                // a function's (or closure's) result
+                Cx::move_out(cx, t, b.tail_line);
+            }
+            match (Cx::value_ty(cx, t))
+            {
+                Some(tt) :
+                {
+                    bool ok = ty_eq(&tt, &cx.ret);
+                    match (&cx.ret)
+                    {
+                        Ty::Ref { t: a, m } :
+                        {
+                            if (*m == Mode::Shared)
+                            {
+                                match (&tt)
+                                {
+                                    Ty::Ref { t: x, m: _ } :
+                                    {
+                                        if (ty_eq(Box::get(a), Box::get(x)))
+                                        {
+                                            ok = true;
+                                        }
+                                    },
+                                    _                      : {},
+                                }
+                            }
+                        },
+                        _                   : {},
+                    }
+                    if (me == 0 && !ok)
+                    {
+                        String msg = sprintf("the body's value is %s, the result type %s", &Ty::text(&tt), &Ty::text(&cx.ret));
+                        Cx::err(cx, b.tail_line, "diag.type-mismatch", msg);
+                    }
+                },
+                None     : {},
+            }
+        },
+        None    : {},
+    }
+    // block exit
+    foreach (n in &declared)
+    {
+        end_binding(fl, n);
+        Option<Binding> bd = match (HashMap::get_mut(&mut cx.binds, n))
+        {
+            Some(v) : Vec::pop(v),
+            None    : None,
+        };
+        match (bd)
+        {
+            Some(Binding { ty, .. }) : { _ = HashMap::insert(&mut cx.all_types, clone(n), ty); },
+            None                     : {},
+        }
+    }
+    _ = Vec::pop(&mut cx.regions);
+}
+
+// The type `m` has where it is mentioned: bound, or declared later in `b`.
+fn Cx::mention_ty(ref<Cx, shared> cx, ref<Block, shared> b, StringView m) : Option<Ty>
+{
+    match (Cx::ty_of(cx, m))
+    {
+        Some(t) : Some(t),
+        None    : decl_ty_in(cx, b, m),
+    }
+}
+
+// D-0288: `m` stops counting at a later statement that assigns it
+// whole from a value that does not read it, with no `break` or
+// `continue` on the way: what `m` got in statement `j` ends there.
+fn later(ref<Block, shared> b, StringView m, usize j, usize i, ref<Vec<Vec<String>>, shared> mentions, ref<Vec<String>, shared> tail) : bool
+{
+    usize n = Vec::len(&b.stmts);
+    for (usize k = j + 1; k < n; k += 1)
+    {
+        if (stmt_may_leave(&b.stmts[k - 1]))
+        {
+            break;
+        }
+        if (stmt_overwrites(&b.stmts[k], m))
+        {
+            usize hi = k;
+            if (hi < i + 1)
+            {
+                hi = i + 1;
+            }
+            for (usize q = i + 1; q < hi; q += 1)
+            {
+                if (contains_str(&mentions[q], m))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    if (contains_str(tail, m))
+    {
+        return true;
+    }
+    for (usize q = i + 1; q < Vec::len(mentions); q += 1)
+    {
+        if (contains_str(&mentions[q], m))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether `x` (declared by statement `d`) must outlive statement `i`: a
+// binding that may hold a reference shares a statement with it since its
+// declaration and is mentioned after `i`.
+fn Cx::end_blocked(ref<Cx, shared> cx, ref<Block, shared> b, StringView x, usize d, usize i, ref<Vec<Vec<String>>, shared> mentions, ref<Vec<String>, shared> tail) : bool
+{
+    for (usize j = d; j <= i; j += 1)
+    {
+        if (!(j == d || contains_str(&mentions[j], x)))
+        {
+            continue;
+        }
+        Option<String> declared = match (&b.stmts[j].k)
+        {
+            StmtK::Let { name, ty, init } : Some(clone(name)),
+            _                             : None,
+        };
+        Vec<String> ms = clone(&mentions[j]);
+        match (&declared)
+        {
+            Some(n) : Vec::push(&mut ms, clone(n)),
+            None    : {},
+        }
+        foreach (m in &ms)
+        {
+            if (*m == x)
+            {
+                continue;
+            }
+            bool counts = match (Cx::mention_ty(cx, b, m))
+            {
+                Some(t) :
+                {
+                    bool is_decl = match (&declared)
+                    {
+                        Some(n) : *n == *m,
+                        None    : false,
+                    };
+                    may_hold_ref(&t) && (is_decl || !inert_ref(&t) || stmt_rebinds(&b.stmts[j], m))
+                },
+                None    : false,
+            };
+            if (counts && later(b, m, j, i, mentions, tail))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn end_binding(ref<Flow, exclusive> fl, StringView n)
+{
+    Flow::forget_holder(fl, n);
+    Flow::clear_referent(fl, n);
+    set_valid(fl, n, Tri::F);
+}
+
+// D-0275: a reference or slice whose referent holds no reference: it can
+// take another binding's path only by being rebound.
+fn inert_ref(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Ref { t: inner, m } : !may_hold_ref(Box::get(inner)),
+        Ty::Slice(_)            : true,
+        _                       : false,
+    }
+}
+
+export fn may_hold_ref(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Ref { .. } : true,
+        Ty::Hold       : true,
+        Ty::VecR       : true,
+        Ty::Slice(_)   : true,
+        Ty::Fn(_)      : true,
+        Ty::Opt(x)     : may_hold_ref(Box::get(x)),
+        Ty::Res(x)     : may_hold_ref(Box::get(x)),
+        Ty::Chan(x)    : may_hold_ref(Box::get(x)),
+        Ty::Handle(x)  : may_hold_ref(Box::get(x)),
+        _              : false,
+    }
+}
+
+struct EndPlan
+{
+    Vec<Vec<Planned>> plan;
+    Vec<Vec<String>> mentions;
+    Vec<String> tail;
+}
+
+// Each candidate (a `let` of a type that holds a reference and no resource)
+// at the statement of its last mention; each statement's mentions; the
+// trailing expression's.
+fn end_plan(ref<Cx, shared> cx, ref<Block, shared> b) : EndPlan
+{
+    usize n = Vec::len(&b.stmts);
+    Vec<Vec<Planned>> plan = Vec::new();
+    Vec<Vec<String>> mentions = Vec::new();
+    foreach (s in &b.stmts)
+    {
+        Vec::push(&mut plan, Vec::new());
+        Vec<String> v = Vec::new();
+        stmt_names(s, &mut v);
+        Vec::push(&mut mentions, v);
+    }
+    Vec<String> tail = Vec::new();
+    match (&b.tail)
+    {
+        Some(t) : expr_names(t, &mut tail),
+        None    : {},
+    }
+    // "no closure in the block captures x"
+    Vec<Clo> clos = Vec::new();
+    block_closures(b, &mut clos);
+    // D-0288: but a `move` closure bound whole (its binding holds the facts)
+    Vec<usize> whole = Vec::new();
+    bound_whole_move(b, &mut whole);
+    SSet<String> captured = SSet::new();
+    foreach (c in &clos)
+    {
+        if (!Vec::contains(&whole, c.id))
+        {
+            foreach (x in &c.caps)
+            {
+                _ = SSet::insert(&mut captured, clone(x));
+            }
+        }
+    }
+    for (usize d = 0; d < n; d += 1)
+    {
+        match (&b.stmts[d].k)
+        {
+            StmtK::Let { name, ty, init } :
+            {
+                Option<Ty> t = match (ty)
+                {
+                    Some(t) : Some(clone(t)),
+                    None    : guess_ty(cx, init),
+                };
+                match (&t)
+                {
+                    Some(t) :
+                    {
+                        if (Ty::holds_ref(t) && !Ty::is_resource(t) && !contains_str(&tail, name) && !sset_has(&captured, name))
+                        {
+                            usize last = d;
+                            for (usize j = d + 1; j < n; j += 1)
+                            {
+                                if (contains_str(&mentions[j], name))
+                                {
+                                    last = j;
+                                }
+                            }
+                            bool has_tail = match (&b.tail)
+                            {
+                                Some(_) : true,
+                                None    : false,
+                            };
+                            if (last + 1 < n || has_tail)
+                            {
+                                Vec::push(&mut plan[last], Planned { .x = clone(name), .d = d });
+                            }
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            _                             : {},
+        }
+    }
+    EndPlan { .plan = plan, .mentions = mentions, .tail = tail }
+}
+
+fn decl_ty_in(ref<Cx, shared> cx, ref<Block, shared> b, StringView y) : Option<Ty>
+{
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init } :
+            {
+                if (*name == y)
+                {
+                    return match (ty)
+                    {
+                        Some(t) : Some(clone(t)),
+                        None    : guess_ty(cx, init),
+                    };
+                }
+            },
+            _                             : {},
+        }
+    }
+    None
+}
+
+fn guess_ty(ref<Cx, shared> cx, ref<Expr, shared> init) : Option<Ty>
+{
+    match (&init.k)
+    {
+        // Any borrow is a reference, whatever its referent's type.
+        ExprK::Borrow { m, e }        : Some(Ty::refi(*m)),
+        ExprK::HoldLit(_)             : Some(Ty::Hold),
+        ExprK::Call { f, xs }         :
+        {
+            if (*f == "Vec::new")
+            {
+                return Some(Ty::Vec);
+            }
+            if (*f == "Mutex::new")
+            {
+                return Some(Ty::Mutex);
+            }
+            if (*f == "lock")
+            {
+                return Some(Ty::Guard);
+            }
+            if (*f == "Atomic::new")
+            {
+                return Some(Ty::Atomic);
+            }
+            if (*f == "Atomic::load" || *f == "Atomic::fetch_add")
+            {
+                return Some(Ty::I32);
+            }
+            match (Program::func(&cx.prog, f))
+            {
+                Some(func) : Some(clone(&func.ret)),
+                None       : None,
+            }
+        },
+        ExprK::Spawn { .. }           : Some(Ty::handle_of(Ty::Unit)),
+        ExprK::SpawnClo(_)            : Some(Ty::handle_of(Ty::Unit)),
+        ExprK::Slice { m, v, lo, hi } : Some(Ty::Slice(*m)),
+        ExprK::Closure(c)             : Some(Ty::Fn(Box::new(clone(&Box::get(c).ret)))),
+        ExprK::JobLit(_)              : Some(Ty::Job),
+        ExprK::ArrLit(_)              : Some(Ty::Arr),
+        ExprK::Int(_)                 : Some(Ty::I32),
+        ExprK::Var(n)                 : decl_or_bound(cx, n),
+        _                             : None,
+    }
+}
+
+fn decl_or_bound(ref<Cx, shared> cx, StringView n) : Option<Ty>
+{
+    Cx::ty_of(cx, n)
+}
+
+fn set_parent(ref<Vec<Option<usize>>, exclusive> parents, usize me, Option<usize> parent)
+{
+    while (Vec::len(parents) <= me)
+    {
+        Vec::push(parents, None);
+    }
+    parents[me] = parent;
+}
+
+// Numbers every block of a body in pre-order and records its parent.
+fn number_blocks(ref<Block, shared> b, Option<usize> parent, ref<usize, exclusive> next, ref<Vec<Option<usize>>, exclusive> parents)
+{
+    usize me = *next;
+    *next += 1;
+    set_parent(parents, me, parent);
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Block(c)                            : number_blocks(c, Some(me), next, parents),
+            StmtK::Match { scrut, binder, some, none } :
+            {
+                number_blocks(some, Some(me), next, parents);
+                number_blocks(none, Some(me), next, parents);
+            },
+            StmtK::If { cond, thn, els }               :
+            {
+                number_blocks(thn, Some(me), next, parents);
+                match (els)
+                {
+                    Some(e) : number_blocks(e, Some(me), next, parents),
+                    None    : {},
+                }
+            },
+            StmtK::While { cond, body }                : number_blocks(body, Some(me), next, parents),
+            _                                          : {},
+        }
+    }
+}
+
+fn Cx::new(Program prog, Summaries sums, Positions pos, String fname, Vec<Option<usize>> parents, Ty ret) : Cx
+{
+    Vec<SSet<String>> regions = Vec::new();
+    Vec::push(&mut regions, SSet::new());
+    Cx
+    {
+        .prog = prog,
+        .fname = fname,
+        .errors = Vec::new(),
+        .binds = HashMap::new(),
+        .regions = regions,
+        .parents = parents,
+        .next_block = 0,
+        .referent = HashMap::new(),
+        .ends = HashMap::new(),
+        .all_types = HashMap::new(),
+        .proven = HashMap::new(),
+        .ret = ret,
+        .caps = SSet::new(),
+        .clo_info = HashMap::new(),
+        .accumulate = false,
+        .clo_owns = SSet::new(),
+        .sub_types = HashMap::new(),
+        .loops = Vec::new(),
+        .sums = sums,
+        .pos = pos,
+        .copies = HashMap::new(),
+    }
+}
+
+fn declared_in(ref<Block, shared> b, ref<SSet<String>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init }              : { _ = SSet::insert(out, clone(name)); },
+            StmtK::Match { scrut, binder, some, none } :
+            {
+                _ = SSet::insert(out, clone(binder));
+                declared_in(some, out);
+                declared_in(none, out);
+            },
+            StmtK::Block(x)                            : declared_in(x, out),
+            StmtK::If { cond, thn, els }               :
+            {
+                declared_in(thn, out);
+                match (els)
+                {
+                    Some(e) : declared_in(e, out),
+                    None    : {},
+                }
+            },
+            StmtK::While { cond, body }                : declared_in(body, out),
+            _                                          : {},
+        }
+    }
+}
+
+// A closure body's free variables: the names it mentions that it does not
+// declare and that name no function.
+fn free_names(ref<Clo, shared> c, ref<Program, shared> prog) : SSet<String>
+{
+    Vec<String> names = Vec::new();
+    block_names(&c.body, &mut names);
+    SSet<String> decl = SSet::new();
+    declared_in(&c.body, &mut decl);
+    SSet<String> out = SSet::new();
+    foreach (n in &names)
+    {
+        // A static is every thread's by name: no capture (D-0258).
+        if (!sset_has(&decl, n) && !Program::has_func(prog, n) && !Program::is_static(prog, n))
+        {
+            _ = SSet::insert(&mut out, clone(n));
+        }
+    }
+    out
+}
+
+export fn check(ref<Program, shared> prog) : Statics
+{
+    Statics all = Statics { .errors = Vec::new(), .ends = HashMap::new(), .types = HashMap::new(), .proven = HashMap::new() };
+    Summaries sums = summaries(prog);
+    foreach (f in &prog.funcs)
+    {
+        Vec<Option<usize>> parents = Vec::new();
+        usize next = 0;
+        number_blocks(&f.body, None, &mut next, &mut parents);
+        Vec<String> names = Vec::new();
+        foreach (p in &f.params)
+        {
+            Vec::push(&mut names, clone(&p.name));
+        }
+        Positions pos = Positions::of(prog, &names, &f.body);
+        Cx cx = Cx::new(clone(prog), clone(&sums), pos, clone(&f.name), parents, clone(&f.ret));
+        Flow fl = Flow::new();
+        foreach (p in &f.params)
+        {
+            usize id = HashMap::len(&cx.binds);
+            Vec::push(HashMap::entry(&mut cx.binds, &p.name, Vec::new()), Binding { .ty = clone(&p.ty), .block = 0, .id = id });
+            _ = SSet::insert(&mut cx.regions[0], clone(&p.name));
+            set_valid(&mut fl, &p.name, Tri::T);
+            if (is_ref_ty(&p.ty))
+            {
+                _ = HashMap::insert(&mut cx.referent, clone(&p.name), None);
+            }
+        }
+        Cx::block(&mut cx, &mut fl, &f.body, None);
+        Vec::append(&mut all.errors, replace(&mut cx.errors, Vec::new()));
+        foreach (k, v in &cx.ends)
+        {
+            _ = HashMap::insert(&mut all.ends, clone(k), clone(v));
+        }
+        _ = HashMap::insert(&mut all.types, clone(&f.name), replace(&mut cx.all_types, HashMap::new()));
+        foreach (k, v in &cx.sub_types)
+        {
+            _ = HashMap::insert(&mut all.types, clone(k), clone(v));
+        }
+        foreach (k, v in &cx.proven)
+        {
+            _ = HashMap::insert(&mut all.proven, clone(k), *v);
+        }
+    }
+    all
+}
+
+// A pattern binder a block's region declares (a `match` arm's), with the
+// deriv facts it starts with, those it inherits (D-0282), and its number in
+// `Positions`.
+struct Pre
+{
+    String name;
+    Ty ty;
+    Vec<PMode> facts;
+    Vec<Fact> inh;
+    usize id;
+}
+
+// D-0282 "Holders": a binding of a reference, slice or `StringView` type, of
+// `Option`/`Result` of one, or of a closure or `fn` type. (The other bindings
+// §6 gives `deriv` facts, a spawn's handle among them, are holders with those
+// facts: `Cx::is_holder`.) Any other binding that holds a reference (a `Hold`,
+// a `Vec<ref<…>>`, a `Job`) keeps it in data.
+fn frame_held(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Ref { .. } : true,
+        Ty::Slice(_)   : true,
+        Ty::Fn(_)      : true,
+        Ty::Opt(x)     : is_ref_ty(Box::get(x)) || is_slice_ty(Box::get(x)),
+        Ty::Res(x)     : is_ref_ty(Box::get(x)) || is_slice_ty(Box::get(x)),
+        _              : false,
+    }
+}
+
+fn opt_frame_held(ref<Option<Ty>, shared> t) : bool
+{
+    match (t)
+    {
+        Some(t) : frame_held(t),
+        None    : false,
+    }
+}
+
+fn permitted(Mode a, Mode b) : bool
+{
+    a == Mode::Shared && b == Mode::Shared
+}
+
+fn extend(ref<SPlace, shared> p, StringView steps) : SPlace
+{
+    SPlace { .root = clone(&p.root), .steps = sprintf("%s%s", &p.steps, steps) }
+}
+
+// Inherited facts: the facts themselves, and whether they name the
+// statement's temporary.
+struct Inh
+{
+    Vec<Fact> facts;
+    bool temp;
+}
+
+fn no_inh() : Inh
+{
+    Inh { .facts = Vec::new(), .temp = false }
+}
+
+struct PlaceT
+{
+    SPlace p;
+    Tri v;
+}
+
+struct Base
+{
+    Vec<PlaceT> facts;
+    bool cut;
+    bool temp;
+}
+
+fn base_of(Inh i) : Base
+{
+    Vec<PlaceT> fs = Vec::new();
+    foreach (x in &i.facts)
+    {
+        Vec::push(&mut fs, PlaceT { .p = clone(&x.p), .v = x.v });
+    }
+    Base { .facts = fs, .cut = false, .temp = i.temp }
+}
+
+// `rule.control.frame-references` (`spec/14` §6, D-0282).
+fn Cx::d0282(ref<Cx, shared> cx) : bool
+{
+    Atomic::load(&PRE_D0282) == 0
+}
+
+// A holder: a frame-held reference, or another binding §6 gives `deriv`
+// facts (a spawn's handle).
+fn Cx::is_holder(ref<Cx, shared> cx, ref<Flow, shared> fl, StringView n, ref<Ty, shared> t) : bool
+{
+    if (frame_held(t))
+    {
+        return true;
+    }
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].h == n && fl.deriv.vals[i] != Tri::F)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn Cx::copy_root(ref<Cx, shared> cx, StringView n) : String
+{
+    match (HashMap::get(&cx.copies, n))
+    {
+        Some(r) : clone(r),
+        None    : String::copy(n),
+    }
+}
+
+// "Inherited facts": the facts of `e`, by the rule's table.
+fn Cx::inherit(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> e) : Inh
+{
+    match (&e.k)
+    {
+        ExprK::Var(q)                 :
+        {
+            // A capture's place is the closure's field, a static's is static
+            // data: neither is a place of this frame.
+            if (sset_has(&cx.caps, q) || Cx::is_static_var(cx, e))
+            {
+                return no_inh();
+            }
+            match (Cx::ty_of(cx, q))
+            {
+                // "a frame-held reference q: q's facts; for a reference or slice
+                // q with none, *q whole, in q's mode"
+                Some(t) :
+                {
+                    if (frame_held(&t))
+                    {
+                        Vec<Fact> f = Flow::holder_facts(fl, q);
+                        if (Vec::len(&f) == 0)
+                        {
+                            match (&t)
+                            {
+                                Ty::Ref { t: _, m } :
+                                {
+                                    Vec::push(&mut f, Fact { .p = sp_deref(q), .m = *m, .v = Tri::T });
+                                },
+                                Ty::Slice(m)        :
+                                {
+                                    Vec::push(&mut f, Fact { .p = sp_deref(q), .m = *m, .v = Tri::T });
+                                },
+                                _                   : {},
+                            }
+                        }
+                        return Inh { .facts = f, .temp = false };
+                    }
+                    // "an owner x of this frame: x whole, shared"
+                    Vec<Fact> f = Vec::new();
+                    Vec::push(&mut f, Fact { .p = sp_var(q), .m = Mode::Shared, .v = Tri::T });
+                    Inh { .facts = f, .temp = false }
+                },
+                None    : no_inh(),
+            }
+        },
+        // "an element of a container, or a reference read out of a field of
+        // an aggregate that holds references: tier D". The fragment's one
+        // field is `Hold.r`, a reference in an aggregate that holds
+        // references, so a value read out of it is tier D; "`b.f` for a
+        // frame-held b" counts as a place's projection (under `&_m`, in
+        // `place_base`).
+        ExprK::Field(_)               : no_inh(),
+        ExprK::Index { .. }           : no_inh(),
+        // "`*b`: the facts of b"
+        ExprK::Deref(b)               : Cx::inherit(cx, fl, Box::get(b)),
+        // "`&_m p` or a slice of p: the facts of p's root, extended by p's
+        // fields up to its first index, in mode m"
+        // where it forms one; otherwise …": the fact §6 forms for it (`p`'s
+        // place, literal indices and ranges included) comes first.
+        ExprK::Borrow { m, e: p }     :
+        {
+            match (Cx::deriv_place(cx, Box::get(p)))
+            {
+                Some(sp) :
+                {
+                    Vec<Fact> f = Vec::new();
+                    Vec::push(&mut f, Fact { .p = sp, .m = *m, .v = Tri::T });
+                    return Inh { .facts = f, .temp = false };
+                },
+                None     : {},
+            }
+            Base b = Cx::place_base_cut(cx, fl, Box::get(p));
+            Vec<Fact> f = Vec::new();
+            foreach (x in &b.facts)
+            {
+                Vec::push(&mut f, Fact { .p = clone(&x.p), .m = *m, .v = x.v });
+            }
+            Inh { .facts = f, .temp = b.temp }
+        },
+        ExprK::Slice { m, v, lo, hi } :
+        {
+            match (Cx::slice_place(cx, v, *lo, *hi))
+            {
+                Some(sp) :
+                {
+                    Vec<Fact> f = Vec::new();
+                    Vec::push(&mut f, Fact { .p = sp, .m = *m, .v = Tri::T });
+                    return Inh { .facts = f, .temp = false };
+                },
+                None     : {},
+            }
+            Base b = Cx::place_base_cut(cx, fl, &ex_var(v));
+            Vec<Fact> f = Vec::new();
+            foreach (x in &b.facts)
+            {
+                Vec::push(&mut f, Fact { .p = clone(&x.p), .m = *m, .v = x.v });
+            }
+            Inh { .facts = f, .temp = b.temp }
+        },
+        ExprK::Call { f, xs }         :
+        {
+            // "a call f(a1, …, an) whose result is or holds a reference:
+            // the facts of the first argument whose parameter is or holds a
+            // reference; none when no parameter is; tier D when the result
+            // holds a reference only through a type argument, or when that
+            // argument reaches storage that keeps references"
+            if (!opt_frame_held(&Cx::value_ty(cx, e)))
+            {
+                return no_inh();
+            }
+            if (*f == "Vec::pop" || *f == "Channel::recv" || *f == "Channel::send")
+            {
+                return no_inh();
+            }
+            Vec<PK> pks = Cx::param_kinds(cx, f);
+            Option<usize> found = None;
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                if (i < Vec::len(&pks))
+                {
+                    bool takes = match (pks[i])
+                    {
+                        PK::Ref(_)  : true,
+                        PK::Holds   : true,
+                        PK::TyParam : true,
+                        PK::Plain   : false,
+                    };
+                    if (takes)
+                    {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            usize i = match (found)
+            {
+                Some(i) : i,
+                None    : return no_inh(),
+            };
+            match (Cx::value_ty(cx, &xs[i]))
+            {
+                Some(Ty::Ref { t: inner, m }) :
+                {
+                    if (may_hold_ref(Box::get(&inner)))
+                    {
+                        return no_inh();
+                    }
+                },
+                _                             : {},
+            }
+            Cx::inherit(cx, fl, &xs[i])
+        },
+        // a literal, an arithmetic result, and what holds no reference
+        _                             : no_inh(),
+    }
+}
+
+// A place's root facts, extended by its fields up to its first index;
+// and whether the root is a temporary ("the result of a call that is not
+// a reference, holds none and is not a constant").
+fn Cx::place_base_cut(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> p) : Base
+{
+    match (&p.k)
+    {
+        ExprK::Var(x)         :
+        {
+            if (sset_has(&cx.caps, x) || Cx::is_static_var(cx, p))
+            {
+                return Base { .facts = Vec::new(), .cut = false, .temp = false };
+            }
+            match (Cx::ty_of(cx, x))
+            {
+                Some(_) :
+                {
+                    Vec<PlaceT> f = Vec::new();
+                    Vec::push(&mut f, PlaceT { .p = sp_var(x), .v = Tri::T });
+                    Base { .facts = f, .cut = false, .temp = false }
+                },
+                None    : Base { .facts = Vec::new(), .cut = false, .temp = false },
+            }
+        },
+        ExprK::Field(a)       :
+        {
+            // `h.r` of a Hold binding, or of a reference to one
+            // (auto-deref: the facts of the reference).
+            ref<Expr, shared> ae = Box::get(a);
+            bool through_ref = match (&ae.k)
+            {
+                ExprK::Var(q) : opt_is_ref(&Cx::ty_of(cx, q)),
+                _             : false,
+            };
+            Base b = Base { .facts = Vec::new(), .cut = false, .temp = false };
+            if (through_ref)
+            {
+                b = base_of(Cx::inherit(cx, fl, ae));
+            }
+            else
+            {
+                b = Cx::place_base_cut(cx, fl, ae);
+            }
+            if (b.cut)
+            {
+                return b;
+            }
+            Vec<PlaceT> fs = Vec::new();
+            foreach (x in &b.facts)
+            {
+                Vec::push(&mut fs, PlaceT { .p = extend(&x.p, &field_step()), .v = x.v });
+            }
+            Base { .facts = fs, .cut = false, .temp = b.temp }
+        },
+        // An index cuts the path: the facts of the indexed binding's root
+        // (a slice's: the slice's facts).
+        ExprK::Index { v, k } :
+        {
+            Expr ve = ex_var(v);
+            Base b = Base { .facts = Vec::new(), .cut = false, .temp = false };
+            if (opt_is_slice(&Cx::ty_of(cx, v)))
+            {
+                b = base_of(Cx::inherit(cx, fl, &ve));
+            }
+            else
+            {
+                b = Cx::place_base_cut(cx, fl, &ve);
+            }
+            Base { facts, cut: _, temp } = b;
+            Base { .facts = facts, .cut = true, .temp = temp }
+        },
+        ExprK::Deref(b)       : base_of(Cx::inherit(cx, fl, Box::get(b))),
+        ExprK::Call { .. }    :
+        {
+            Option<Ty> r = Cx::value_ty(cx, p);
+            bool temp = !opt_is_ref(&r) && !opt_is_slice(&r);
+            match (&r)
+            {
+                Some(t) :
+                {
+                    if (Ty::holds_ref(t))
+                    {
+                        temp = false;
+                    }
+                },
+                None    : {},
+            }
+            Base { .facts = Vec::new(), .cut = false, .temp = temp }
+        },
+        _                     : Base { .facts = Vec::new(), .cut = false, .temp = false },
+    }
+}
+
+// A frame-held binding `n` bound (declared or assigned) from `e`: where
+// the flow analysis' rows formed no fact, it inherits `e`'s. A binding
+// whose inherited facts name a temporary and which is live after its
+// statement is refuted.
+fn Cx::bind_frame_held(ref<Cx, exclusive> cx, ref<Flow, exclusive> fl, StringView n, ref<Ty, shared> t, ref<Expr, shared> e, Inh inh, usize id, usize end, usize line)
+{
+    _ = HashMap::remove(&mut cx.copies, n);
+    if (!frame_held(t))
+    {
+        return;
+    }
+    for (usize i = 0; i < Vec::len(&fl.inh.keys); i += 1)
+    {
+        if (fl.inh.keys[i].h == n)
+        {
+            fl.inh.vals[i] = Tri::F;
+        }
+    }
+    for (usize i = 0; i < Vec::len(&fl.deriv.keys); i += 1)
+    {
+        if (fl.deriv.keys[i].h == n && fl.deriv.vals[i] != Tri::F)
+        {
+            return;
+        }
+    }
+    foreach (x in &inh.facts)
+    {
+        _ = SMap::insert(&mut fl.inh, DKey { .h = String::copy(n), .p = clone(&x.p), .m = x.m }, x.v);
+    }
+    match (&e.k)
+    {
+        ExprK::Var(q) :
+        {
+            if (opt_frame_held(&Cx::ty_of(cx, q)))
+            {
+                String root = Cx::copy_root(cx, q);
+                _ = HashMap::insert(&mut cx.copies, String::copy(n), root);
+            }
+        },
+        _             : {},
+    }
+    if (inh.temp && Positions::live_after(&cx.pos, id, end))
+    {
+        Cx::err(cx, line, "diag.destroy-while-aliased", sprintf("`%s` borrows a temporary that ends with its statement", n));
+    }
+}
+
+// D-0290: what a `Hold` made from `e` holds: a literal what its field's
+// value holds; a copy of a `Hold` binding what that one holds.
+// An exclusive reference copied into the literal is an exclusive borrow
+// of its referent, as for an argument (D-0213, CHG-0439): `*r` may not
+// be used while the `Hold` is.
+fn Cx::hold_facts(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> e) : Vec<Fact>
+{
+    match (&e.k)
+    {
+        ExprK::HoldLit(a) :
+        {
+            match (&Box::get(a).k)
+            {
+                ExprK::Var(q) :
+                {
+                    if (is_excl_ref_of(&Cx::ty_of(cx, q)) && !sset_has(&cx.caps, q))
+                    {
+                        Vec<Fact> f = Vec::new();
+                        Vec::push(&mut f, Fact { .p = sp_deref(q), .m = Mode::Excl, .v = Tri::T });
+                        Vec::append(&mut f, Flow::holder_facts(fl, q));
+                        return f;
+                    }
+                },
+                _             : {},
+            }
+            Cx::inherit(cx, fl, Box::get(a)).facts
+        },
+        ExprK::Var(q)     :
+        {
+            if (ty_is_var_of(cx, q, &Ty::Hold) && !sset_has(&cx.caps, q))
+            {
+                return Flow::deriv_facts(fl, q);
+            }
+            Vec::new()
+        },
+        _                 : Vec::new(),
+    }
+}
+
+fn Cx::param_kinds(ref<Cx, shared> cx, StringView f) : Vec<PK>
+{
+    param_pks(&cx.prog, f)
+}
+
+struct Held
+{
+    String n;
+    usize id;
+}
+
+// The frame-held bindings in scope that are live at position `p`, other
+// than those in `skip`: by mention, and "while another live binding
+// holds a fact rooted at *h".
+fn Cx::live_holders(ref<Cx, shared> cx, ref<Flow, shared> fl, usize p, ref<SSet<String>, shared> skip) : SSet<String>
+{
+    Vec<Held> held = Vec::new();
+    foreach (n, v in &cx.binds)
+    {
+        usize k = Vec::len(v);
+        if (k == 0)
+        {
+            continue;
+        }
+        ref<Binding, shared> b = &v[k - 1];
+        if (Cx::is_holder(cx, fl, n, &b.ty) && !sset_has(skip, n) && !sset_has(&cx.caps, n))
+        {
+            Vec::push(&mut held, Held { .n = clone(n), .id = b.id });
+        }
+    }
+    // A handle or a `Vec` of handles is not ended at its last mention:
+    // its end waits for its threads (CHG-0384), so it holds its facts to
+    // its scope's end.
+    SSet<String> live = SSet::new();
+    foreach (h in &held)
+    {
+        Option<Ty> t = Cx::ty_of(cx, &h.n);
+        bool waits = opt_is_handle(&t) || opt_ty_is(&t, &Ty::VecH) || opt_ty_is(&t, &Ty::VecR);
+        if (Positions::live_after(&cx.pos, h.id, p) || waits)
+        {
+            _ = SSet::insert(&mut live, clone(&h.n));
+        }
+    }
+    while (true)
+    {
+        Vec<String> more = Vec::new();
+        foreach (h in &held)
+        {
+            if (sset_has(&live, &h.n))
+            {
+                continue;
+            }
+            bool reached = false;
+            foreach (g in &live.keys)
+            {
+                Vec<Fact> gf = Flow::holder_facts(fl, g);
+                foreach (x in &gf)
+                {
+                    if (root_is_deref(&x.p.root, &h.n))
+                    {
+                        reached = true;
+                    }
+                }
+            }
+            if (reached)
+            {
+                Vec::push(&mut more, clone(&h.n));
+            }
+        }
+        if (Vec::len(&more) == 0)
+        {
+            break;
+        }
+        foreach (m in &more)
+        {
+            _ = SSet::insert(&mut live, clone(m));
+        }
+    }
+    live
+}
+
+// The bindings an argument is formed through: "the root of its place,
+// through fields, dereferences, indexes and the reference arguments of a
+// call on it".
+fn Cx::formed_through(ref<Cx, shared> cx, ref<Expr, shared> a, ref<SSet<String>, exclusive> out)
+{
+    match (&a.k)
+    {
+        ExprK::Var(n)                 : { _ = SSet::insert(out, clone(n)); },
+        ExprK::Index { v, k }         : { _ = SSet::insert(out, clone(v)); },
+        ExprK::Slice { m, v, lo, hi } : { _ = SSet::insert(out, clone(v)); },
+        ExprK::Deref(b)               : Cx::formed_through(cx, Box::get(b), out),
+        ExprK::Field(b)               : Cx::formed_through(cx, Box::get(b), out),
+        ExprK::Borrow { m, e: b }     : Cx::formed_through(cx, Box::get(b), out),
+        ExprK::Call { f, xs }         :
+        {
+            Vec<PK> pks = Cx::param_kinds(cx, f);
+            for (usize i = 0; i < Vec::len(xs); i += 1)
+            {
+                if (i < Vec::len(&pks) && pk_is_ref(&pks[i]))
+                {
+                    Cx::formed_through(cx, &xs[i], out);
+                }
+            }
+        },
+        _                             : {},
+    }
+}
+
+struct Reach
+{
+    usize i;
+    Vec<PMode> w;
+    Vec<PMode> ef;
+}
+
+fn reads_or_writes(Mode m) : str
+{
+    if (m == Mode::Excl)
+    {
+        return "writes";
+    }
+    "reads"
+}
+
+// "The call-site rule": at a call of a named function, each argument
+// whose parameter is or holds a reference has a reach W and an effect E;
+// the call is refuted when a key of some E certainly overlaps a fact T
+// of a live binding other than the arguments' own (1), or a key of
+// another argument's W (2), in modes not permitted together.
+fn Cx::call_site(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<Expr, shared> e, StringView f, ref<Vec<Expr>, shared> args, usize line, ref<Option<String>, shared> holder)
+{
+    if (!Cx::d0282(cx))
+    {
+        return;
+    }
+    if (e.id >= Vec::len(&cx.pos.at) || cx.pos.at[e.id] == NONE)
+    {
+        return;
+    }
+    usize p = cx.pos.at[e.id];
+    Vec<PK> pks = Cx::param_kinds(cx, f);
+    bool body = Program::has_func(&cx.prog, f);
+    // (argument index, W, E)
+    Vec<Reach> reach = Vec::new();
+    for (usize i = 0; i < Vec::len(args); i += 1)
+    {
+        ref<Expr, shared> a = &args[i];
+        if (i >= Vec::len(&pks))
+        {
+            continue;
+        }
+        PK pk = pks[i];
+        Mode m = Mode::Shared;
+        match (pk)
+        {
+            PK::Ref(x)  : m = x,
+            PK::Holds   : m = Mode::Shared,
+            // "an argument of a type parameter's type counts, shared, when
+            // its value is or holds a reference"
+            PK::TyParam :
+            {
+                bool counts = match (Cx::value_ty(cx, a))
+                {
+                    Some(t) : Ty::holds_ref(&t) || frame_held(&t),
+                    None    : false,
+                };
+                if (!counts)
+                {
+                    continue;
+                }
+                m = Mode::Shared;
+            },
+            PK::Plain   : continue,
+        }
+        Vec<PMode> w = Vec::new();
+        bool done = false;
+        match (&a.k)
+        {
+            // "for a frame-held reference binding, its referent and its facts"
+            ExprK::Var(r) :
+            {
+                Option<Ty> rt = Cx::ty_of(cx, r);
+                if (opt_frame_held(&rt) && !sset_has(&cx.caps, r))
+                {
+                    if (opt_is_ref(&rt) || opt_is_slice(&rt))
+                    {
+                        Vec::push(&mut w, PMode { .p = sp_deref(r), .m = m });
+                    }
+                    Vec<Fact> rf = Flow::holder_facts(fl, r);
+                    foreach (x in &rf)
+                    {
+                        if (x.v == Tri::T)
+                        {
+                            Vec::push(&mut w, PMode { .p = clone(&x.p), .m = m });
+                        }
+                    }
+                    done = true;
+                }
+            },
+            _             : {},
+        }
+        if (!done)
+        {
+            // "otherwise the facts ai inherits"
+            Inh ai = Cx::inherit(cx, fl, a);
+            foreach (x in &ai.facts)
+            {
+                if (x.v == Tri::T)
+                {
+                    Vec::push(&mut w, PMode { .p = clone(&x.p), .m = m });
+                }
+            }
+        }
+        // "when F has a body and the parameter is a reference or slice,
+        // W(ai) extended by each projection of reads(F, pi) (shared) and
+        // of writes(F, pi) (exclusive for an exclusive parameter, shared
+        // for a shared one); otherwise W(ai)". A function of `std` is not
+        // in the program: its summary {ε} gives back W.
+        Vec<PMode> ef = Vec::new();
+        bool extended = false;
+        if (body && pk_is_ref(&pk))
+        {
+            match (Summaries::get(&cx.sums, f, i))
+            {
+                Some(s) :
+                {
+                    foreach (k in &w)
+                    {
+                        foreach (pi in &s.reads.keys)
+                        {
+                            Vec::push(&mut ef, PMode { .p = extend(&k.p, pi), .m = Mode::Shared });
+                        }
+                        foreach (pi in &s.writes.keys)
+                        {
+                            Vec::push(&mut ef, PMode { .p = extend(&k.p, pi), .m = m });
+                        }
+                    }
+                    extended = true;
+                },
+                None    : {},
+            }
+        }
+        if (!extended)
+        {
+            ef = clone(&w);
+        }
+        Vec::push(&mut reach, Reach { .i = i, .w = w, .ef = ef });
+    }
+    if (Vec::len(&reach) == 0)
+    {
+        return;
+    }
+    // 1. Against the live holders other than the arguments' own and the
+    // copies of a reference argument.
+    SSet<String> own = SSet::new();
+    foreach (r in &reach)
+    {
+        Cx::formed_through(cx, &args[r.i], &mut own);
+    }
+    match (holder)
+    {
+        Some(h) :
+        {
+            if (Cx::is_elided(cx, e))
+            {
+                // Not a rule of the text but the model's order: §6's row for
+                // `r = f(&_m x…)` (D-0011) is applied as the first argument is
+                // evaluated, so at the call the facts under `r`'s name are the
+                // result's, not those of the value `r` still holds (which §6
+                // checked the borrow against). Without this, `r = touch(&mut x)`
+                // would clash with itself. A `let`'s binding is not in scope at
+                // the call and needs nothing.
+                _ = SSet::insert(&mut own, clone(h));
+            }
+        },
+        None    : {},
+    }
+    SSet<String> roots = SSet::new();
+    foreach (n in &own.keys)
+    {
+        _ = SSet::insert(&mut roots, Cx::copy_root(cx, n));
+    }
+    Vec<String> copies = Vec::new();
+    foreach (n, v in &cx.binds)
+    {
+        if (sset_has(&roots, &Cx::copy_root(cx, n)))
+        {
+            Vec::push(&mut copies, clone(n));
+        }
+    }
+    foreach (n in &copies)
+    {
+        _ = SSet::insert(&mut own, clone(n));
+    }
+    SSet<String> live = Cx::live_holders(cx, fl, p, &own);
+    foreach (h in &live.keys)
+    {
+        Vec<Fact> hf = Flow::holder_facts(fl, h);
+        foreach (q in &hf)
+        {
+            if (q.v != Tri::T)
+            {
+                continue;
+            }
+            foreach (r in &reach)
+            {
+                foreach (k in &r.ef)
+                {
+                    if (k.p.root == q.p.root && certain(&k.p.steps, &q.p.steps) && !permitted(k.m, q.m))
+                    {
+                        String why = sprintf("`%s` %s through argument %d while `%s` still holds a %s borrow of it", f, reads_or_writes(k.m), r.i + 1, h, Mode::word(q.m));
+                        Cx::err(cx, line, "diag.aliasing-conflict", why);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // 2. Between two arguments.
+    foreach (ri in &reach)
+    {
+        foreach (rj in &reach)
+        {
+            if (ri.i == rj.i || Cx::one_path(cx, f, &args[ri.i], &args[rj.i]))
+            {
+                continue;
+            }
+            foreach (k in &ri.ef)
+            {
+                foreach (k2 in &rj.w)
+                {
+                    if (k2.p.root == k.p.root && certain(&k.p.steps, &k2.p.steps) && !permitted(k.m, k2.m))
+                    {
+                        String why = sprintf("`%s` %s through argument %d what argument %d also reaches", f, reads_or_writes(k.m), ri.i + 1, rj.i + 1);
+                        Cx::err(cx, line, "diag.aliasing-conflict", why);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "`swap` and `swap_places` of one place written the same way twice are
+// not refuted, nor is one reference binding passed twice, or beside a
+// copy of itself: one path."
+fn Cx::one_path(ref<Cx, shared> cx, StringView f, ref<Expr, shared> a, ref<Expr, shared> b) : bool
+{
+    if ((f == "swap" || f == "swap_places") && expr_eq(a, b))
+    {
+        return true;
+    }
+    match (&a.k)
+    {
+        ExprK::Var(x) : match (&b.k)
+        {
+            ExprK::Var(y) : Cx::copy_root(cx, x) == Cx::copy_root(cx, y),
+            _             : false,
+        },
+        _ : false,
+    }
+}
+
+// "Element accesses": a read or borrow of a `Vec`'s element `v[k]` is an
+// access to `v` at element `k`, refuted when a live frame-held reference
+// holds a fact T on `v` that certainly overlaps it in a mode not
+// permitted. (No frame-held reference reaches an element in the
+// fragment: `v` is always a binding.)
+fn Cx::element_access(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<Expr, shared> e, StringView v, i64 k, Use u, usize line)
+{
+    if (!Cx::d0282(cx) || sset_has(&cx.caps, v))
+    {
+        return;
+    }
+    Option<Ty> vt = Cx::ty_of(cx, v);
+    if (!(opt_ty_is(&vt, &Ty::Vec) || opt_ty_is(&vt, &Ty::VecR)))
+    {
+        return;
+    }
+    Mode m = match (u)
+    {
+        Use::Read      : Mode::Shared,
+        Use::Borrow(m) : m,
+        // The text names a read or a borrow; a write `v[k] = e` is
+        // neither (finding, see the report).
+        Use::Write     : return,
+    };
+    if (e.id >= Vec::len(&cx.pos.at) || cx.pos.at[e.id] == NONE)
+    {
+        return;
+    }
+    usize p = cx.pos.at[e.id];
+    String key = idx_step(k);
+    SSet<String> skip = SSet::new();
+    SSet<String> live = Cx::live_holders(cx, fl, p, &skip);
+    foreach (h in &live.keys)
+    {
+        Vec<Fact> hf = Flow::holder_facts(fl, h);
+        foreach (q in &hf)
+        {
+            if (q.v == Tri::T && root_is_var(&q.p.root, v) && certain(&key, &q.p.steps) && !permitted(m, q.m))
+            {
+                str what = "reads";
+                if (m == Mode::Excl)
+                {
+                    what = "borrows exclusively";
+                }
+                Cx::err(cx, line, "diag.aliasing-conflict", sprintf("`%s` still holds a %s borrow of `%s`, whose element this %s", h, Mode::word(q.m), v, what));
+                return;
+            }
+        }
+    }
+}
+
+// The container's keys: `v` for `v[k]`; for `*Vec::index_exclusive(a, k)`
+// the facts of `a` (and `*r` itself for a reference binding `r`).
+fn container(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> e) : Vec<SPlace>
+{
+    Vec<SPlace> keys = Vec::new();
+    match (&e.k)
+    {
+        ExprK::Index { v, k } :
+        {
+            Option<Ty> vt = Cx::ty_of(cx, v);
+            if (opt_ty_is(&vt, &Ty::Vec) || opt_ty_is(&vt, &Ty::VecR))
+            {
+                Vec::push(&mut keys, sp_var(v));
+            }
+        },
+        ExprK::Deref(a)       : keys = container(cx, fl, Box::get(a)),
+        ExprK::Field(a)       : keys = container(cx, fl, Box::get(a)),
+        ExprK::Call { f, xs } :
+        {
+            if (*f == "Vec::index_exclusive" && Vec::len(xs) > 0)
+            {
+                ref<Expr, shared> a = &xs[0];
+                Inh ai = Cx::inherit(cx, fl, a);
+                foreach (x in &ai.facts)
+                {
+                    if (x.v == Tri::T)
+                    {
+                        Vec::push(&mut keys, clone(&x.p));
+                    }
+                }
+                match (&a.k)
+                {
+                    ExprK::Var(r) : Vec::push(&mut keys, sp_deref(r)),
+                    _             : {},
+                }
+            }
+        },
+        _                     : {},
+    }
+    keys
+}
+
+fn push_true_facts(ref<Vec<SPlace>, exclusive> out, Inh i)
+{
+    foreach (x in &i.facts)
+    {
+        if (x.v == Tri::T)
+        {
+            Vec::push(out, clone(&x.p));
+        }
+    }
+}
+
+// The facts of every exclusive borrow (or exclusive slice) in `e`.
+fn borrows(ref<Cx, shared> cx, ref<Flow, shared> fl, ref<Expr, shared> e, ref<Vec<SPlace>, exclusive> out)
+{
+    match (&e.k)
+    {
+        ExprK::Borrow { m, e: b }     :
+        {
+            if (*m == Mode::Excl)
+            {
+                push_true_facts(out, Cx::inherit(cx, fl, e));
+            }
+            borrows(cx, fl, Box::get(b), out);
+        },
+        ExprK::Slice { m, v, lo, hi } :
+        {
+            if (*m == Mode::Excl)
+            {
+                push_true_facts(out, Cx::inherit(cx, fl, e));
+            }
+        },
+        ExprK::Call { f, xs }         :
+        {
+            foreach (a in xs)
+            {
+                borrows(cx, fl, a, out);
+            }
+        },
+        ExprK::Spawn { f, xs }        :
+        {
+            foreach (a in xs)
+            {
+                borrows(cx, fl, a, out);
+            }
+        },
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (a in xs)
+            {
+                borrows(cx, fl, a, out);
+            }
+        },
+        ExprK::Deref(a)               : borrows(cx, fl, Box::get(a), out),
+        ExprK::Field(a)               : borrows(cx, fl, Box::get(a), out),
+        ExprK::HoldLit(a)             : borrows(cx, fl, Box::get(a), out),
+        ExprK::JobLit(a)              : borrows(cx, fl, Box::get(a), out),
+        ExprK::CallVal(a)             : borrows(cx, fl, Box::get(a), out),
+        ExprK::SpawnClo(a)            : borrows(cx, fl, Box::get(a), out),
+        ExprK::Add { a, b }           :
+        {
+            borrows(cx, fl, Box::get(a), out);
+            borrows(cx, fl, Box::get(b), out);
+        },
+        ExprK::Gt { a, b }            :
+        {
+            borrows(cx, fl, Box::get(a), out);
+            borrows(cx, fl, Box::get(b), out);
+        },
+        _                             : {},
+    }
+}
+
+// "Evaluation order": an assignment whose place is reached through a
+// container's element, and whose value "contains an exclusive borrow
+// whose facts reach that container", may move the place before it is
+// written.
+fn Cx::eval_order(ref<Cx, exclusive> cx, ref<Flow, shared> fl, ref<Expr, shared> place, ref<Expr, shared> value, usize line)
+{
+    Vec<SPlace> keys = container(cx, fl, place);
+    if (Vec::len(&keys) == 0)
+    {
+        return;
+    }
+    Vec<SPlace> facts = Vec::new();
+    borrows(cx, fl, value, &mut facts);
+    foreach (f in &facts)
+    {
+        foreach (k in &keys)
+        {
+            if (k.root == f.root && certain(&k.steps, &f.steps))
+            {
+                Cx::err(cx, line, "diag.stale-binding", "the element this assigns to is found before the value, which borrows its container exclusively and may move it");
+                return;
+            }
+        }
+    }
+}
+
+// "Moving out through a reference": `*r`, for a reference binding `r`,
+// used where its value is moved (a resource: an argument, an
+// initializer, an assigned value, a function's result) is refuted, at
+// the `*r` (its statement's line in the fragment).
+fn Cx::move_out(ref<Cx, exclusive> cx, ref<Expr, shared> e, usize line)
+{
+    if (!Cx::d0282(cx))
+    {
+        return;
+    }
+    match (&e.k)
+    {
+        ExprK::Deref(a) : match (&Box::get(a).k)
+        {
+            ExprK::Var(r) : match (Cx::ty_of(cx, r))
+            {
+                Some(Ty::Ref { t, m }) :
+                {
+                    if (Ty::is_resource(Box::get(&t)))
+                    {
+                        Cx::err(cx, line, "diag.move-while-aliased", sprintf("`*%s` would move the value out of the place `%s` still refers to", r, r));
+                    }
+                },
+                _                      : {},
+            },
+            _ : {},
+        },
+        _ : {},
+    }
+}

@@ -1,0 +1,623 @@
+// Protocol CIR (step T4, stage C): the constructors. One for each kind of
+// statement the lowering writes: the place that emits a statement says what
+// it is and gives its operands apart, and the constructor writes the
+// statement's C text into the buffer's pool, operand by operand, and makes
+// the node with its kind, runtime entry and parts set from the operands'
+// places: nothing is read off the text (`classify` reads the lines of the
+// places not converted yet). A node built here has the kind `classify` reads
+// off its text: `cobc --from-cir` (`pdump.cb`) reads the text back through
+// `classify` and refuses a node whose kind is another.
+//
+// An operand is C text: a type, a name, an lvalue, a condition, a call's
+// argument, a value's expression. A value whose place does not know its
+// shape (`ask`: a `V`'s `c`, built somewhere else) is asked one thing, as
+// `classify` asks it of an initialiser: whether it is one call
+// (`proto::call_open`); the node is then a call's, with the callee looked up
+// in the runtime-entry table. Where the place knows the callee, it says so.
+
+import std;
+import proto;
+import rt;
+
+// Where the next node's text starts.
+fn here(ref<PBuf, shared> b) : usize
+{
+    StringView::len(&b.pool)
+}
+
+fn put(ref<PBuf, exclusive> b, StringView s)
+{
+    String::append(&mut b.pool, s);
+}
+
+// A call's arguments, the first `n` of them, with `, ` between.
+fn put_args(
+    ref<PBuf, exclusive> b,
+    usize n,
+    StringView a0,
+    StringView a1,
+    StringView a2,
+    StringView a3,
+    StringView a4,
+    StringView a5,
+)
+{
+    if (n > 0)
+    {
+        put(b, a0);
+    }
+    if (n > 1)
+    {
+        put(b, ", ");
+        put(b, a1);
+    }
+    if (n > 2)
+    {
+        put(b, ", ");
+        put(b, a2);
+    }
+    if (n > 3)
+    {
+        put(b, ", ");
+        put(b, a3);
+    }
+    if (n > 4)
+    {
+        put(b, ", ");
+        put(b, a4);
+    }
+    if (n > 5)
+    {
+        put(b, ", ");
+        put(b, a5);
+    }
+}
+
+// A declarator's start, `TYPE NAME` (`gap`: a space between them; without
+// it the type ends in `*`): where the name starts, from the node's start.
+fn put_declarator(ref<PBuf, exclusive> b, StringView ty, bool gap, StringView name) : usize
+{
+    put(b, ty);
+    if (gap)
+    {
+        put(b, " ");
+    }
+    put(b, name);
+    StringView::len(ty) + if (gap) { 1 } else { 0 }
+}
+
+// `TYPE NAME;`
+export fn pe_decl(ref<PBuf, exclusive> b, usize ind, StringView ty, bool gap, StringView name)
+{
+    usize off = here(b);
+    usize at = put_declarator(b, ty, gap, name);
+    put(b, ";");
+    pbuf_push_built(b, ind, off, PK_DECL, 0, RT_NONE, at, at, StringView::len(name), 0, 0, 0, 0);
+}
+
+// What follows ` = ` in a declaration or an assignment whose value is
+// `value`, written, and the node pushed: a value that is one call (asked
+// when `ask`) makes the call's node (`call`: `PK_DECL_CALL` or
+// `PK_SET_CALL`), any other the plain one (`plain`).
+fn finish_value(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    usize off,
+    u8 plain,
+    u8 call,
+    usize ty_len,
+    usize a_at,
+    usize a_len,
+    StringView value,
+    bool ask,
+)
+{
+    usize r = here(b) - off;
+    put(b, value);
+    put(b, ";");
+    u8 how = if (ask) { PF_ASKED } else { 0 };
+    if (ask)
+    {
+        match (call_open(value))
+        {
+            Some(open) :
+            {
+                u16 entry = rt_lookup(&value[0..open]);
+                usize args = StringView::len(value) - open - 2;
+                pbuf_push_built(b, ind, off, call, how, entry, ty_len, a_at, a_len, r, open, r + open + 1, args);
+                return;
+            },
+            None       : {},
+        }
+    }
+    pbuf_push_built(b, ind, off, plain, how, RT_NONE, ty_len, a_at, a_len, 0, 0, r, StringView::len(value));
+}
+
+// `TYPE NAME = VALUE;`
+export fn pe_decl_init(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView ty,
+    bool gap,
+    StringView name,
+    StringView value,
+    bool ask,
+)
+{
+    usize off = here(b);
+    usize at = put_declarator(b, ty, gap, name);
+    put(b, " = ");
+    finish_value(b, ind, off, PK_DECL_INIT, PK_DECL_CALL, at, at, StringView::len(name), value, ask);
+}
+
+// `LVALUE = VALUE;`
+export fn pe_set(ref<PBuf, exclusive> b, usize ind, StringView lv, StringView value, bool ask)
+{
+    usize off = here(b);
+    put(b, lv);
+    put(b, " = ");
+    finish_value(b, ind, off, PK_SET, PK_SET_CALL, 0, 0, StringView::len(lv), value, ask);
+}
+
+// `CALLEE(` written; then the arguments and `);` follow (`finish_call`).
+// Where the callee starts, from the node's start.
+fn put_callee(ref<PBuf, exclusive> b, usize off, StringView callee) : usize
+{
+    usize at = here(b) - off;
+    put(b, callee);
+    put(b, "(");
+    at
+}
+
+// `TYPE NAME = CALLEE(ARGS);`: the callee `callee` (the runtime entry
+// `entry`, or none), the arguments' text `args`.
+export fn pe_decl_call(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView ty,
+    bool gap,
+    StringView name,
+    StringView callee,
+    u16 entry,
+    StringView args,
+)
+{
+    usize off = here(b);
+    usize at = put_declarator(b, ty, gap, name);
+    put(b, " = ");
+    usize c = put_callee(b, off, callee);
+    put(b, args);
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(
+        b,
+        ind,
+        off,
+        PK_DECL_CALL,
+        0,
+        entry,
+        at,
+        at,
+        StringView::len(name),
+        c,
+        cl,
+        c + cl + 1,
+        StringView::len(args),
+    );
+}
+
+// A call's text `call`, `CALLEE(ARGS)`, whose place knows that it is a call
+// and how long its callee's name is (`callee`): written at the node's
+// `r`-th byte, and the node pushed with the callee and the arguments as its
+// parts and the callee's runtime entry, if it is one.
+fn finish_called(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    usize off,
+    u8 kind,
+    usize ty_len,
+    usize a_at,
+    usize a_len,
+    StringView call,
+    usize callee,
+)
+{
+    usize r = here(b) - off;
+    put(b, call);
+    put(b, ";");
+    u16 entry = rt_lookup(&call[0..callee]);
+    usize args = StringView::len(call) - callee - 2;
+    pbuf_push_built(b, ind, off, kind, 0, entry, ty_len, a_at, a_len, r, callee, r + callee + 1, args);
+}
+
+// `TYPE NAME = CALL;` where `CALL` is a call's whole text and its first
+// `callee` bytes the callee's name.
+export fn pe_decl_called(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView ty,
+    bool gap,
+    StringView name,
+    StringView call,
+    usize callee,
+)
+{
+    usize off = here(b);
+    usize at = put_declarator(b, ty, gap, name);
+    put(b, " = ");
+    finish_called(b, ind, off, PK_DECL_CALL, at, at, StringView::len(name), call, callee);
+}
+
+// `CALL;` where `CALL` is a call's whole text and its first `callee` bytes
+// the callee's name.
+export fn pe_called(ref<PBuf, exclusive> b, usize ind, StringView call, usize callee)
+{
+    usize off = here(b);
+    finish_called(b, ind, off, PK_CALL, 0, 0, 0, call, callee);
+}
+
+// `TYPE NAME = cb_…(A0, A1, …);`: the runtime entry `entry` with its first
+// `n` arguments.
+export fn pe_decl_rt(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView ty,
+    bool gap,
+    StringView name,
+    u16 entry,
+    usize n,
+    StringView a0,
+    StringView a1,
+    StringView a2,
+    StringView a3,
+    StringView a4,
+    StringView a5,
+)
+{
+    usize off = here(b);
+    usize at = put_declarator(b, ty, gap, name);
+    put(b, " = ");
+    StringView callee = rt_name(entry);
+    usize c = put_callee(b, off, callee);
+    usize args = here(b);
+    put_args(b, n, a0, a1, a2, a3, a4, a5);
+    usize al = here(b) - args;
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(b, ind, off, PK_DECL_CALL, 0, entry, at, at, StringView::len(name), c, cl, c + cl + 1, al);
+}
+
+// `LVALUE = CALLEE(ARGS);`
+export fn pe_set_call(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView lv,
+    StringView callee,
+    u16 entry,
+    StringView args,
+)
+{
+    usize off = here(b);
+    put(b, lv);
+    put(b, " = ");
+    usize c = put_callee(b, off, callee);
+    put(b, args);
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(
+        b,
+        ind,
+        off,
+        PK_SET_CALL,
+        0,
+        entry,
+        0,
+        0,
+        StringView::len(lv),
+        c,
+        cl,
+        c + cl + 1,
+        StringView::len(args),
+    );
+}
+
+// `LVALUE = cb_…(A0, A1, …);`
+export fn pe_set_rt(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    StringView lv,
+    u16 entry,
+    usize n,
+    StringView a0,
+    StringView a1,
+    StringView a2,
+    StringView a3,
+    StringView a4,
+    StringView a5,
+)
+{
+    usize off = here(b);
+    put(b, lv);
+    put(b, " = ");
+    StringView callee = rt_name(entry);
+    usize c = put_callee(b, off, callee);
+    usize args = here(b);
+    put_args(b, n, a0, a1, a2, a3, a4, a5);
+    usize al = here(b) - args;
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(b, ind, off, PK_SET_CALL, 0, entry, 0, 0, StringView::len(lv), c, cl, c + cl + 1, al);
+}
+
+// `CALLEE(ARGS);`
+export fn pe_call(ref<PBuf, exclusive> b, usize ind, StringView callee, u16 entry, StringView args)
+{
+    usize off = here(b);
+    usize c = put_callee(b, off, callee);
+    put(b, args);
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(b, ind, off, PK_CALL, 0, entry, 0, 0, 0, c, cl, c + cl + 1, StringView::len(args));
+}
+
+// `cb_…(A0, A1, …);`: the runtime entry `entry` with its first `n`
+// arguments, a statement.
+export fn pe_rt(
+    ref<PBuf, exclusive> b,
+    usize ind,
+    u16 entry,
+    usize n,
+    StringView a0,
+    StringView a1,
+    StringView a2,
+    StringView a3,
+    StringView a4,
+    StringView a5,
+)
+{
+    usize off = here(b);
+    StringView callee = rt_name(entry);
+    usize c = put_callee(b, off, callee);
+    usize args = here(b);
+    put_args(b, n, a0, a1, a2, a3, a4, a5);
+    usize al = here(b) - args;
+    put(b, ");");
+    usize cl = StringView::len(callee);
+    pbuf_push_built(b, ind, off, PK_CALL, 0, entry, 0, 0, 0, c, cl, c + cl + 1, al);
+}
+
+// `(void)(VALUE);`: a value evaluated and not kept. One call under it is a
+// call node (`PF_VOID`); any other value is a statement with no parts.
+export fn pe_void(ref<PBuf, exclusive> b, usize ind, StringView value)
+{
+    usize off = here(b);
+    put(b, "(void)(");
+    put(b, value);
+    put(b, ");");
+    match (call_open(value))
+    {
+        Some(open) :
+        {
+            u16 entry = rt_lookup(&value[0..open]);
+            usize args = StringView::len(value) - open - 2;
+            pbuf_push_built(b, ind, off, PK_CALL, PF_VOID | PF_ASKED, entry, 0, 0, 0, 7, open, 7 + open + 1, args);
+        },
+        None       : pbuf_push_built(b, ind, off, PK_RAW, PF_ASKED, RT_NONE, 0, 0, 0, 0, 0, 0, 0),
+    }
+}
+
+// `VALUE;`: an expression's text as a statement, where the place does not
+// know its shape. One call is a call node; any other text is read as a line
+// is (`classify`).
+export fn pe_eval(ref<PBuf, exclusive> b, usize ind, StringView value)
+{
+    match (call_open(value))
+    {
+        Some(open) :
+        {
+            usize off = here(b);
+            put(b, value);
+            put(b, ";");
+            u16 entry = rt_lookup(&value[0..open]);
+            usize args = StringView::len(value) - open - 2;
+            pbuf_push_built(b, ind, off, PK_CALL, PF_ASKED, entry, 0, 0, 0, 0, open, open + 1, args);
+        },
+        None       : pbuf_emit(b, ind, &sprintf("%v;", value)),
+    }
+}
+
+// A statement of a kind with no parts, its text `text`.
+fn pe_plain(ref<PBuf, exclusive> b, usize ind, u8 kind, StringView text)
+{
+    usize off = here(b);
+    put(b, text);
+    pbuf_push_built(b, ind, off, kind, 0, RT_NONE, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// A scope marker (`state::scope_marker`): byte 1, the marker's kind, the
+// scope's id; when `located`, byte 2 and the location `loc` after it.
+export fn pe_mark(ref<PBuf, exclusive> b, usize ind, u8 kind, u32 id, bool located, StringView loc)
+{
+    usize off = here(b);
+    String::push_ascii(&mut b.pool, 1);
+    String::push_ascii(&mut b.pool, kind);
+    String::appendf(&mut b.pool, "%v", id);
+    if (located)
+    {
+        String::push_ascii(&mut b.pool, 2);
+        put(b, loc);
+    }
+    pbuf_push_built(b, ind, off, PK_MARK, 0, RT_NONE, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// `{`
+export fn pe_block(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_BLOCK, "{");
+}
+
+// `}`
+export fn pe_close(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_CLOSE, "}");
+}
+
+// `} else {`
+export fn pe_else(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_ELSE, "} else {");
+}
+
+// `for (;;) {`
+export fn pe_loop(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_LOOP, "for (;;) {");
+}
+
+// Another line that opens a block (a `for` with a header, a `while`, a
+// `switch`, a `do`): `head` is the whole line, which ends in `{`.
+export fn pe_open(ref<PBuf, exclusive> b, usize ind, StringView head)
+{
+    pe_plain(b, ind, PK_OPEN, head);
+}
+
+// `if (COND) {`
+export fn pe_if(ref<PBuf, exclusive> b, usize ind, StringView cond)
+{
+    usize off = here(b);
+    put(b, "if (");
+    put(b, cond);
+    put(b, ") {");
+    pbuf_push_built(b, ind, off, PK_IF, 0, RT_NONE, 0, 0, 0, 0, 0, 4, StringView::len(cond));
+}
+
+// `} else if (COND) {`
+export fn pe_else_if(ref<PBuf, exclusive> b, usize ind, StringView cond)
+{
+    usize off = here(b);
+    put(b, "} else if (");
+    put(b, cond);
+    put(b, ") {");
+    pbuf_push_built(b, ind, off, PK_ELSE_IF, 0, RT_NONE, 0, 0, 0, 0, 0, 11, StringView::len(cond));
+}
+
+// `break;`
+export fn pe_break(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_BREAK, "break;");
+}
+
+// `continue;`
+export fn pe_continue(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_CONTINUE, "continue;");
+}
+
+// `return;`
+export fn pe_return(ref<PBuf, exclusive> b, usize ind)
+{
+    pe_plain(b, ind, PK_RETURN, "return;");
+}
+
+// `return VALUE;`
+export fn pe_return_value(ref<PBuf, exclusive> b, usize ind, StringView value)
+{
+    usize off = here(b);
+    put(b, "return ");
+    put(b, value);
+    put(b, ";");
+    pbuf_push_built(b, ind, off, PK_RETURN, 0, RT_NONE, 0, 0, 0, 0, 0, 7, StringView::len(value));
+}
+
+// `goto LABEL;`
+export fn pe_goto(ref<PBuf, exclusive> b, usize ind, StringView label)
+{
+    usize off = here(b);
+    put(b, "goto ");
+    put(b, label);
+    put(b, ";");
+    pbuf_push_built(b, ind, off, PK_GOTO, 0, RT_NONE, 0, 5, StringView::len(label), 0, 0, 0, 0);
+}
+
+// `LABEL:;`, or with `spaced` `LABEL: ;`
+export fn pe_label(ref<PBuf, exclusive> b, usize ind, StringView label, bool spaced)
+{
+    usize off = here(b);
+    put(b, label);
+    put(b, if (spaced) { ": ;" } else { ":;" });
+    pbuf_push_built(b, ind, off, PK_LABEL, 0, RT_NONE, 0, 0, StringView::len(label), 0, 0, 0, 0);
+}
+
+// `if (COND) break;`
+export fn pe_if_break(ref<PBuf, exclusive> b, usize ind, StringView cond)
+{
+    usize off = here(b);
+    put(b, "if (");
+    put(b, cond);
+    put(b, ") break;");
+    pbuf_push_built(b, ind, off, PK_IF_JUMP, PF_BREAK, RT_NONE, 0, 0, 0, 0, 0, 4, StringView::len(cond));
+}
+
+// `if (COND) continue;`
+export fn pe_if_continue(ref<PBuf, exclusive> b, usize ind, StringView cond)
+{
+    usize off = here(b);
+    put(b, "if (");
+    put(b, cond);
+    put(b, ") continue;");
+    pbuf_push_built(b, ind, off, PK_IF_JUMP, PF_CONTINUE, RT_NONE, 0, 0, 0, 0, 0, 4, StringView::len(cond));
+}
+
+// `if (COND) goto LABEL;`
+export fn pe_if_goto(ref<PBuf, exclusive> b, usize ind, StringView cond, StringView label)
+{
+    usize off = here(b);
+    put(b, "if (");
+    put(b, cond);
+    put(b, ") goto ");
+    usize at = here(b) - off;
+    put(b, label);
+    put(b, ";");
+    pbuf_push_built(
+        b,
+        ind,
+        off,
+        PK_IF_JUMP,
+        0,
+        RT_NONE,
+        0,
+        at,
+        StringView::len(label),
+        0,
+        0,
+        4,
+        StringView::len(cond),
+    );
+}
+
+// `if (COND) STATEMENT`: a guard, or any statement under a condition on one
+// line; `stmt` is the whole statement with its `;`, and is no jump.
+export fn pe_if_stmt(ref<PBuf, exclusive> b, usize ind, StringView cond, StringView stmt)
+{
+    usize off = here(b);
+    put(b, "if (");
+    put(b, cond);
+    put(b, ") ");
+    usize at = here(b) - off;
+    put(b, stmt);
+    pbuf_push_built(
+        b,
+        ind,
+        off,
+        PK_IF_STMT,
+        0,
+        RT_NONE,
+        0,
+        at,
+        StringView::len(stmt),
+        0,
+        0,
+        4,
+        StringView::len(cond),
+    );
+}

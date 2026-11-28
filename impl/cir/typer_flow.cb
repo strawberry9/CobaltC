@@ -1,0 +1,1956 @@
+// The typer (`typer.cb`): control flow, blocks and statements.
+//
+// Each function mirrors the typing half of the lowering function named in
+// its comment: what decides the type of the value the lowering returns, and
+// the expected type it hands each operand. Nothing here emits, names a
+// temporary, requests a function or asks for a type descriptor.
+//
+// Asked or lowered: where the lowering asks a type before it lowers
+// (`probe_type`, `probe_type_arm`, `probe_block_type`, `lower_block`'s value
+// type) the query is made under `Gen::typer_probing`; what the lowering then
+// lowers (each branch, arm, body and block) is walked again outside it.
+
+import std;
+import ast;
+import items;
+import state;
+import cnames;
+import typeops;
+import layout;
+import direct;
+import strings4;
+import gen;
+import typer;
+import typer_place;
+import typer_call;
+
+// Whether a walk of code the lowering lowers for real, whose answer decides
+// no type (a loop's body, the arms after the one that gives a `match` its
+// type), stops the query when the walk has no answer. False only to test
+// this file while the other files of the typer are stubs: the types are the
+// same either way.
+const bool WALK_STRICT = true;
+
+fn walked(ref<Option<Type>, shared> t) : bool
+{
+    !WALK_STRICT || Option::is_some(t)
+}
+
+// No answer of another type than `typer_gap`'s: `reason` names what is left.
+fn why(ref<Gen, exclusive> g, str reason)
+{
+    _ = typer_gap(g, reason);
+}
+
+fn as_exp(ref<Option<Type>, shared> o) : Option<ref<Type, shared>>
+{
+    match (o)
+    {
+        Some(t) : Some(t),
+        None    : None,
+    }
+}
+
+fn bind(ref<Fx, exclusive> x, ref<String, shared> name, Type ty)
+{
+    bind_in_scope(x, name, Binding { .c = String::new(), .ty = ty, .root = String::new(), .kind = BindKind::Local });
+}
+
+// A binding of the typer's own for a confined vector's holder
+// (`bind_holder`) is known by this root; the lowering's own holder by its
+// entry in `Fx::confined_params` and its C name in `Fx::direct_refs`.
+const str HOLDER_ROOT = "$confined";
+
+// A hidden holder of a confined vector of `elem`: a shared reference to the
+// vector, as `lower_stmt` binds it.
+fn bind_holder(ref<Fx, exclusive> x, ref<String, shared> name, Type elem)
+{
+    Vec<Type> va = Vec::new();
+    Vec::push(&mut va, elem);
+    Type vty = Type::TNamed(Box::new(NamedTy { .name = "std::Vec", .args = va }));
+    bind_in_scope(
+        x,
+        name,
+        Binding { .c = String::new(), .ty = ref_ty(vty, Mode::Shared), .root = HOLDER_ROOT, .kind = BindKind::Local },
+    );
+}
+
+// `confined_holder`: the element type of the confined vector the
+// initialiser `e` names (`p`, or `$each_drain(p, n)`): a confined parameter
+// (no binding, an entry in `Fx::confined_params`) or a holder of one.
+fn holder_elem(ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    Option<String> n = match (&e.kind)
+    {
+        ExprKind::ECall(c) :
+        {
+            if (plain_name_is(&Box::get(c).callee, "$each_drain") && Vec::len(&Box::get(c).args) > 0)
+            {
+                plain_name(&Box::get(c).args[0])
+            }
+            else
+            {
+                None
+            }
+        },
+        _                  : plain_name(e),
+    };
+    String name = n?;
+    match (lookup(x, &name))
+    {
+        Some(b) :
+        {
+            if (b.root == HOLDER_ROOT)
+            {
+                return match (&b.ty)
+                {
+                    Type::TRef(m) : vec_elem(&Box::get(m).inner),
+                    _             : None,
+                };
+            }
+            if (!HashSet::contains(&x.direct_refs, &b.c))
+            {
+                return None;
+            }
+        },
+        None    : {},
+    }
+    match (confined_param(x, &name))
+    {
+        Some(c) : Some(clone(&c.elem)),
+        None    : None,
+    }
+}
+
+// `probe_type`: the type the checker settled where nothing is expected, with
+// no probe; else the probe's.
+fn probe_ty(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    if (Option::is_none(&expected))
+    {
+        match (HashMap::get(&g.prog.facts.settled, e.id))
+        {
+            Some(t) : return Some(clone(t)),
+            None    : {},
+        }
+    }
+    type_probe(g, x, e, expected)
+}
+
+// `probe_place_type`.
+fn probe_place(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<Type>
+{
+    g.typer_probing += 1;
+    Option<Type> t = type_place(g, x, e);
+    g.typer_probing -= 1;
+    t
+}
+
+// `closure_fn_ty`: the `fn` type of a closure type's signature, `Some(None)`
+// for a type that is no closure's. The record is the lowering's or the
+// typer's own (`state::closure_info`).
+fn closure_fn(ref<Gen, exclusive> g, ref<Type, shared> t) : Option<Option<Type>>
+{
+    u64 id = match (t)
+    {
+        Type::TClosure(i) : *i,
+        _                 : return Some(None),
+    };
+    Option<Type> ft = match (closure_info(g, id))
+    {
+        Some(info) : Some(Type::TFn(Box::new(FnTy { .params = clone(&info.params), .ret = clone(&info.ret) }))),
+        None       : None,
+    };
+    if (Option::is_none(&ft))
+    {
+        why(g, "closure:signature");
+        return None;
+    }
+    Some(ft)
+}
+
+// ---- statements ----
+
+// The element type of a `Vec<T>`.
+fn vec_elem(ref<Type, shared> t) : Option<Type>
+{
+    match (t)
+    {
+        Type::TNamed(n) :
+        {
+            if (Box::get(n).name == "std::Vec" && Vec::len(&Box::get(n).args) == 1)
+            {
+                return Some(clone(&Box::get(n).args[0]));
+            }
+            None
+        },
+        _               : None,
+    }
+}
+
+// `foreach_alias`: the element type when the `let` at `si` of `b` is a
+// `foreach` element the lowering keeps as no binding (`x` stands for
+// `(*$c)[$i]`); `None` when it is a `let` like any other.
+fn alias_elem(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    usize si,
+    ref<LetStmt, shared> l,
+) : Option<Type>
+{
+    if (boot(g, 4) || Option::is_some(&l.ty))
+    {
+        return None;
+    }
+    ref<Expr, shared> init = match (&l.init)
+    {
+        Some(i) : i,
+        None    : return None,
+    };
+    ref<CallExpr, shared> call = match (&init.kind)
+    {
+        ExprKind::ECall(c) : Box::get(c),
+        _                  : return None,
+    };
+    bool mutable0 = callee_is_name(&call.callee, "$each_at_mut");
+    bool take = callee_is_name(&call.callee, "$each_take");
+    if (!(mutable0 || take || callee_is_name(&call.callee, "$each_at")) || Vec::len(&call.args) != 3)
+    {
+        return None;
+    }
+    String hname = match (&call.args[0].kind)
+    {
+        ExprKind::EPath(hp) :
+        {
+            if (Vec::len(&Box::get(hp).segs) != 1)
+            {
+                return None;
+            }
+            String::clone(&Box::get(hp).segs[0])
+        },
+        _                   : return None,
+    };
+    Option<Binding> hb = lookup(x, &hname);
+    Type hty = match (&hb)
+    {
+        Some(bd) : clone(&bd.ty),
+        None     : return None,
+    };
+    bool excl_holder = match (&hty)
+    {
+        Type::TRef(m) : Box::get(m).mode == Mode::Exclusive,
+        _             : false,
+    };
+    bool mutable = mutable0 || (take && excl_holder);
+    if (si + 1 >= Vec::len(&b.stmts))
+    {
+        return None;
+    }
+    ref<Block, shared> body = match (&b.stmts[si + 1])
+    {
+        Stmt::SBlockLike(bx) :
+        {
+            match (&Box::get(bx).kind)
+            {
+                ExprKind::EBlock(bb) : bb,
+                _                    : return None,
+            }
+        },
+        _                    : return None,
+    };
+    Type elem = Type::TVoid;
+    bool is_slice = false;
+    match (&hty)
+    {
+        Type::TRef(m)   :
+        {
+            ref<ModedTy, shared> mt = Box::get(m);
+            if (mt.mode == Mode::Exclusive && mutable)
+            {
+                elem = match (vec_elem(&mt.inner))
+                {
+                    Some(t) : t,
+                    None    : return None,
+                };
+            }
+            else if (mt.mode == Mode::Shared && !mutable)
+            {
+                elem = match (&mt.inner)
+                {
+                    Type::TArray(a) : clone(&Box::get(a).inner),
+                    _ : match (vec_elem(&mt.inner))
+                    {
+                        Some(t) : t,
+                        None    : return None,
+                    },
+                };
+            }
+            else
+            {
+                return None;
+            }
+        },
+        Type::TSlice(m) :
+        {
+            if (Box::get(m).mode != Mode::Shared)
+            {
+                return None;
+            }
+            elem = clone(&Box::get(m).inner);
+            is_slice = true;
+        },
+        _               : return None,
+    }
+    u64 size = size_align(g, &elem).size;
+    bool owning = !is_slice && size > 0 && !plain_data(g, &elem) && !has_refs(g, &elem) && !holds_fn(g, &elem);
+    bool reader = owning && foreach_reader(g, body, &l.name);
+    if (size == 0 || !(reader || (plain_data(g, &elem) && block_only_derefs(body, &l.name, mutable))))
+    {
+        return None;
+    }
+    Some(elem)
+}
+
+// A `let` (`lower_stmt`, and the forms `lower_block_body` takes first): its
+// binding is made in the scope on top; whether its initialiser diverges.
+fn type_let(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    usize si,
+    ref<LetStmt, shared> l,
+) : Option<bool>
+{
+    // `foreach (x in p)` over a confined parameter or holder `p`
+    // (`lower_stmt`, `confined_holder`): the hidden holders `$e = p` and
+    // `$d = $each_drain($e, n)` are `p` under other names, shared references
+    // to the vector, their initialisers never lowered.
+    if (Option::is_none(&l.ty) && StringView::starts_with(&l.name, "$"))
+    {
+        match (&l.init)
+        {
+            Some(he) :
+            {
+                match (holder_elem(x, he))
+                {
+                    Some(elem) :
+                    {
+                        bind_holder(x, &l.name, elem);
+                        return Some(false);
+                    },
+                    None       : {},
+                }
+            },
+            None     : {},
+        }
+    }
+    // `lower_bare_guard`: `auto g = lock(m);` used only through `*g` is bound
+    // as an exclusive reference to the mutex's interior, where that is plain.
+    if (!boot(g, 2))
+    {
+        match (bare_guard_let(&b.stmts[si], b, si + 1))
+        {
+            Some(bg) :
+            {
+                Type mt = probe_ty(g, x, &bg.marg, None)?;
+                Option<Type> inner = match (&mt)
+                {
+                    Type::TRef(m) : match (&Box::get(m).inner)
+                    {
+                        Type::TMutex(i) : Some(clone(Box::get(i))),
+                        _               : None,
+                    },
+                    _ : None,
+                };
+                match (inner)
+                {
+                    Some(it) :
+                    {
+                        if (!is_resource(g, &it) && !has_refs(g, &it))
+                        {
+                            _ = type_of(g, x, &bg.marg, None)?;
+                            bind(x, &l.name, ref_ty(it, Mode::Exclusive));
+                            return Some(false);
+                        }
+                    },
+                    None     : {},
+                }
+            },
+            None     : {},
+        }
+    }
+    // `foreach_alias`: the lowering makes no binding and never lowers the
+    // initialiser; `x` whole is a shared reference to the element and `*x`
+    // the element, which a binding of that reference type gives as well.
+    match (alias_elem(g, x, b, si, l))
+    {
+        Some(elem) :
+        {
+            bind(x, &l.name, ref_ty(elem, Mode::Shared));
+            return Some(false);
+        },
+        None       : {},
+    }
+    // `lower_stmt`: the declared type under the substitution, else the
+    // initialiser's.
+    Option<Type> declared = match (&l.ty)
+    {
+        Some(t) : Some(apply(t, &x.subst)),
+        None    : None,
+    };
+    match (&l.init)
+    {
+        Some(e) :
+        {
+            Type v0 = type_of(g, x, e, as_exp(&declared))?;
+            // A closure-typed local the body pins or assigns is kept as a
+            // `fn` value.
+            bool kept = HashSet::contains(&x.pinned, &l.name) || HashSet::contains(&x.assigned, &l.name);
+            bool pin_box = Option::is_none(&declared) && is_closure(&v0) && kept;
+            Type v = if (pin_box)
+            {
+                match (closure_fn(g, &v0)?)
+                {
+                    Some(ft) : ft,
+                    None     : v0,
+                }
+            }
+            else
+            {
+                v0
+            };
+            if (is_never(&v))
+            {
+                return Some(true);
+            }
+            Type ty = match (declared)
+            {
+                Some(t) : t,
+                None    : v,
+            };
+            // The walk (`reach.cb`) keeps a binding's type too.
+            typer_saw(g, &ty);
+            bind(x, &l.name, ty);
+            Some(false)
+        },
+        None    :
+        {
+            match (declared)
+            {
+                Some(t) :
+                {
+                    bind(x, &l.name, t);
+                    Some(false)
+                },
+                None    :
+                {
+                    why(g, "error:let-without-type");
+                    None
+                },
+            }
+        },
+    }
+}
+
+// `lower_destructure`: each named field becomes a binding of the field's
+// type under the struct's type arguments (the fields `..` passes over are
+// bound to hidden names nothing reads).
+fn type_destructure(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<DestructureStmt, shared> d) : Option<bool>
+{
+    Type v = type_of(g, x, &d.init, None)?;
+    if (is_never(&v))
+    {
+        return Some(true);
+    }
+    NamedTy nt = match (&v)
+    {
+        Type::TNamed(n) : clone(Box::get(n)),
+        _               :
+        {
+            why(g, "error:destructure-non-struct");
+            return None;
+        },
+    };
+    StructDecl sd = match (struct_decl(g, &nt.name))
+    {
+        Some(s) : s,
+        None    :
+        {
+            why(g, "error:destructure-non-struct");
+            return None;
+        },
+    };
+    HashMap<String, Type> sub = subst_of(&sd.type_params, &nt.args);
+    for (usize i = 0; i < Vec::len(&d.names) && i < Vec::len(&d.fields); i += 1)
+    {
+        usize k = 0;
+        while (k < Vec::len(&sd.fields) && sd.fields[k].name != d.names[i])
+        {
+            k += 1;
+        }
+        if (k == Vec::len(&sd.fields))
+        {
+            why(g, "error:destructure-field");
+            return None;
+        }
+        bind(x, &d.fields[i], apply(&sd.fields[k].ty, &sub));
+    }
+    Some(false)
+}
+
+// One statement of a block (`lower_block_body`'s loop, `lower_stmt`,
+// `lower_expr_stmt`): its bindings are made in the scope on top; whether it
+// diverges.
+fn type_stmt(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared> b, usize si) : Option<bool>
+{
+    match (&b.stmts[si])
+    {
+        Stmt::SLet(lb)        : type_let(g, x, b, si, Box::get(lb)),
+        Stmt::SDestructure(d) : type_destructure(g, x, Box::get(d)),
+        Stmt::SExpr(e)        :
+        {
+            Type t = type_of(g, x, Box::get(e), None)?;
+            Some(is_never(&t))
+        },
+        Stmt::SBlockLike(e)   :
+        {
+            Type t = type_of(g, x, Box::get(e), None)?;
+            Some(is_never(&t))
+        },
+    }
+}
+
+// ---- blocks ----
+
+// `lower_block_body` in the scope it opens: the statements in order, a
+// diverging one ending the block as `never`, then the tail with the
+// expected type.
+fn walk_body(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    for (usize si = 0; si < Vec::len(&b.stmts); si += 1)
+    {
+        if (type_stmt(g, x, b, si)?)
+        {
+            return Some(Type::TNever);
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : type_of(g, x, Box::get(t), expected),
+        None    : Some(Type::TVoid),
+    }
+}
+
+// `lower_block_body`: one pass over the block `b`.
+export fn walk_block(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    Vec::push(&mut x.scopes, HashMap::new());
+    Option<Type> t = walk_body(g, x, b, expected);
+    Vec::pop(&mut x.scopes);
+    t
+}
+
+// `lower_block`: the tail's type is asked first; a closure with no type
+// expected becomes a `fn` value; then the body is lowered.
+fn block_value(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    g.typer_probing += 1;
+    Option<Type> probed = walk_block(g, x, b, expected);
+    g.typer_probing -= 1;
+    Type value_ty = probed?;
+    Option<Type> fn_exp = None;
+    if (Option::is_none(&expected))
+    {
+        fn_exp = closure_fn(g, &value_ty)?;
+    }
+    Option<Type> second = match (&fn_exp)
+    {
+        Some(ft) : walk_block(g, x, b, Some(ft)),
+        None     : walk_block(g, x, b, expected),
+    };
+    Type real = second?;
+    // A block with no value by the first walk has no sink: the lowering
+    // returns what the body gave.
+    if (is_never(&value_ty) || is_void(&value_ty))
+    {
+        return Some(real);
+    }
+    Some(match (fn_exp)
+    {
+        Some(ft) : ft,
+        None     : value_ty,
+    })
+}
+
+// `probe_block_type`.
+fn probe_block(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    g.typer_probing += 1;
+    Option<Type> t = block_value(g, x, b, expected);
+    g.typer_probing -= 1;
+    t
+}
+
+// `lower_fused_text_loop`: the text held for the loop, then the body under
+// the piece's binding, a bare view; the loop is a statement.
+fn type_fused(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    ref<FusionPlan, shared> plan,
+) : Option<Type>
+{
+    Type svt = Type::TNamed(Box::new(NamedTy { .name = "std::StringView", .args = Vec::new() }));
+    Type a0 = type_of(g, x, fusion_source(b), Some(&svt))?;
+    if (is_never(&a0))
+    {
+        return Some(Type::TNever);
+    }
+    Vec::push(&mut x.scopes, HashMap::new());
+    bind(x, &plan.cname, svt);
+    Option<Type> v = type_of(g, x, fusion_be(b), None);
+    Vec::pop(&mut x.scopes);
+    if (!walked(&v))
+    {
+        return None;
+    }
+    Some(Type::TVoid)
+}
+
+// `lower_block_expr`: the type of the block `b` as a value.
+export fn type_block(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Block, shared> b,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    bool local = match (fusion_name(b))
+    {
+        Some(n) : is_bound(x, &n),
+        None    : false,
+    };
+    match (fusion_plan(g, b, local))
+    {
+        Some(plan) :
+        {
+            bool blk = match (&fusion_be(b).kind)
+            {
+                ExprKind::EBlock(_) : true,
+                _                   : false,
+            };
+            if (blk)
+            {
+                return type_fused(g, x, b, &plan);
+            }
+        },
+        None       : {},
+    }
+    block_value(g, x, b, expected)
+}
+
+// `lower_branch`: a branch or an arm's body lowered for real; a block into
+// a sink is one pass of its body.
+fn type_branch(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+    bool sink,
+) : Option<Type>
+{
+    if (sink)
+    {
+        match (&e.kind)
+        {
+            ExprKind::EBlock(b)  : return walk_block(g, x, b, expected),
+            ExprKind::EUnsafe(b) : return walk_block(g, x, b, expected),
+            _                    : {},
+        }
+    }
+    type_of(g, x, e, expected)
+}
+
+// ---- if ----
+
+// `lower_if`.
+export fn type_if(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<IfExpr, shared> i = match (&e.kind)
+    {
+        ExprKind::EIf(ie) : Box::get(ie),
+        _                 : return typer_gap(g, "error:if"),
+    };
+    Type tbool = Type::TBool;
+    Type cv = type_of(g, x, &i.cond, Some(&tbool))?;
+    if (is_never(&cv))
+    {
+        return Some(Type::TNever);
+    }
+    // D-0049: a literal then-branch takes the else branch's type.
+    Option<Type> else_hint = None;
+    match (&i.else_)
+    {
+        Some(ee) :
+        {
+            bool literal_then = is_literal_block(&i.then_) || is_untyped_variant_block(g, x, &i.then_);
+            if (Option::is_none(&expected) && literal_then && !is_literal_branch(ee))
+            {
+                Type t = probe_ty(g, x, ee, None)?;
+                if (!is_never(&t) && !is_void(&t))
+                {
+                    else_hint = Some(t);
+                }
+            }
+        },
+        None     : {},
+    }
+    Option<Type> exp_own = match (expected)
+    {
+        Some(t) : Some(clone(t)),
+        None    : else_hint,
+    };
+    Type then_ty = probe_block(g, x, &i.then_, as_exp(&exp_own))?;
+    Type result_ty = match (&i.else_)
+    {
+        None     : Type::TVoid,
+        Some(ee) :
+        {
+            if (is_never(&then_ty))
+            {
+                probe_ty(g, x, ee, as_exp(&exp_own))?
+            }
+            else
+            {
+                clone(&then_ty)
+            }
+        },
+    };
+    // Bug 012: branches that are closures, with no type expected, give a
+    // `fn` value.
+    if (Option::is_none(&expected))
+    {
+        Option<Type> ft = match (&exp_own)
+        {
+            Some(t) : closure_fn(g, t)?,
+            None    : if (is_fn_type(&result_ty)) { Some(clone(&result_ty)) } else { closure_fn(g, &result_ty)? },
+        };
+        match (ft)
+        {
+            Some(t) :
+            {
+                exp_own = Some(clone(&t));
+                result_ty = t;
+            },
+            None    : {},
+        }
+    }
+    // The branches for real: into the result's sink where there is one.
+    bool valued = !is_void(&result_ty) && !is_never(&result_ty);
+    Option<Type> tv = None;
+    if (valued)
+    {
+        tv = walk_block(g, x, &i.then_, as_exp(&exp_own));
+    }
+    else
+    {
+        tv = block_value(g, x, &i.then_, as_exp(&exp_own));
+    }
+    if (!walked(&tv))
+    {
+        return None;
+    }
+    match (&i.else_)
+    {
+        Some(ee) :
+        {
+            Option<Type> exp2 = match (&exp_own)
+            {
+                Some(t) : Some(clone(t)),
+                None    : if (is_never(&then_ty)) { None } else { Some(clone(&then_ty)) },
+            };
+            Option<Type> ev = type_branch(g, x, ee, as_exp(&exp2), valued);
+            if (!walked(&ev))
+            {
+                return None;
+            }
+        },
+        None     : {},
+    }
+    Some(result_ty)
+}
+
+// ---- while ----
+
+// Whether `e` holds a `break` of the loop around it: one not inside a loop
+// or a closure within `e`.
+fn has_break(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EBreak          : true,
+        ExprKind::EParen(i)       : has_break(Box::get(i)),
+        ExprKind::EPropagate(i)   : has_break(Box::get(i)),
+        ExprKind::EDeref(i)       : has_break(Box::get(i)),
+        ExprKind::EUnary(u)       : has_break(&Box::get(u).e),
+        ExprKind::EBorrow(bw)     : has_break(&Box::get(bw).e),
+        ExprKind::EField(f)       : has_break(&Box::get(f).e),
+        ExprKind::EArrayRepeat(r) : has_break(&Box::get(r).value),
+        ExprKind::EBinary(bn)     : has_break(&Box::get(bn).a) || has_break(&Box::get(bn).b),
+        ExprKind::EIndex(p)       : has_break(&Box::get(p).a) || has_break(&Box::get(p).b),
+        ExprKind::EAssign(p)      : has_break(&Box::get(p).a) || has_break(&Box::get(p).b),
+        ExprKind::ESliceOf(sl)    :
+        {
+            ref<SliceExpr, shared> s = Box::get(sl);
+            has_break(&s.base) || has_break(&s.lo) || has_break(&s.hi)
+        },
+        ExprKind::ECall(c)        :
+        {
+            if (has_break(&Box::get(c).callee))
+            {
+                return true;
+            }
+            foreach (a in &Box::get(c).args)
+            {
+                if (has_break(a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                if (has_break(a))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EStructLit(sl)  :
+        {
+            foreach (f in &Box::get(sl).fields)
+            {
+                if (has_break(&f.value))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        ExprKind::EReturn(r) : match (r)
+        {
+            Some(i) : has_break(Box::get(i)),
+            None    : false,
+        },
+        ExprKind::EBlock(b)       : block_has_break(b),
+        ExprKind::EUnsafe(b)      : block_has_break(b),
+        ExprKind::EIf(ie)         :
+        {
+            ref<IfExpr, shared> i = Box::get(ie);
+            has_break(&i.cond) || block_has_break(&i.then_) || match (&i.else_)
+            {
+                Some(ee) : has_break(ee),
+                None     : false,
+            }
+        },
+        ExprKind::EMatch(m)       :
+        {
+            if (has_break(&Box::get(m).scrut))
+            {
+                return true;
+            }
+            foreach (a in &Box::get(m).arms)
+            {
+                if (has_break(Box::get(&a.body)))
+                {
+                    return true;
+                }
+            }
+            false
+        },
+        _                         : false,
+    }
+}
+
+// The expression a statement evaluates, if any.
+fn stmt_expr(ref<Stmt, shared> st) : Option<ref<Expr, shared>>
+{
+    match (st)
+    {
+        Stmt::SLet(l) : match (&Box::get(l).init)
+        {
+            Some(e) : Some(e),
+            None    : None,
+        },
+        Stmt::SDestructure(d) : Some(&Box::get(d).init),
+        Stmt::SExpr(e)        : Some(Box::get(e)),
+        Stmt::SBlockLike(e)   : Some(Box::get(e)),
+    }
+}
+
+fn stmt_has_break(ref<Stmt, shared> st) : bool
+{
+    match (stmt_expr(st))
+    {
+        Some(e) : has_break(e),
+        None    : false,
+    }
+}
+
+fn block_has_break(ref<Block, shared> b) : bool
+{
+    foreach (st in &b.stmts)
+    {
+        if (stmt_has_break(st))
+        {
+            return true;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : has_break(Box::get(t)),
+        None    : false,
+    }
+}
+
+// Whether `e` can be `never` at all, by its form: a name, a literal, or
+// operators, borrows and projections of them cannot.
+fn may_diverge(ref<Expr, shared> e) : bool
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(_)     : false,
+        ExprKind::EFloat(_)   : false,
+        ExprKind::EStr(_)     : false,
+        ExprKind::EBool(_)    : false,
+        ExprKind::EUnit       : false,
+        ExprKind::EPath(_)    : false,
+        ExprKind::EDollar     : false,
+        ExprKind::EClosure(_) : false,
+        ExprKind::EParen(i)   : may_diverge(Box::get(i)),
+        ExprKind::EDeref(i)   : may_diverge(Box::get(i)),
+        ExprKind::EUnary(u)   : may_diverge(&Box::get(u).e),
+        ExprKind::EBorrow(bw) : may_diverge(&Box::get(bw).e),
+        ExprKind::EField(f)   : may_diverge(&Box::get(f).e),
+        ExprKind::EBinary(bn) : may_diverge(&Box::get(bn).a) || may_diverge(&Box::get(bn).b),
+        ExprKind::EIndex(p)   : may_diverge(&Box::get(p).a) || may_diverge(&Box::get(p).b),
+        _                     : true,
+    }
+}
+
+// The operands of an expression of a kind another file types, for
+// `reach`: `found` when a `break` in one is lowered, `beside` when another
+// operand is `never` (the lowering stops at the first such operand in its
+// own order, which this file does not know).
+struct Operands
+{
+    bool found;
+    bool beside;
+}
+
+fn reach_operand(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> c,
+    ref<Operands, exclusive> ops,
+) : Option<bool>
+{
+    if (has_break(c) && reach(g, x, c)?)
+    {
+        ops.found = true;
+        return Some(true);
+    }
+    if (may_diverge(c))
+    {
+        Type t = type_of(g, x, c, None)?;
+        if (is_never(&t))
+        {
+            ops.beside = true;
+        }
+    }
+    Some(true)
+}
+
+fn reach_operands_done(ref<Gen, exclusive> g, ref<Operands, shared> ops) : Option<bool>
+{
+    if (ops.found && ops.beside)
+    {
+        why(g, "while:break-beside-never");
+        return None;
+    }
+    Some(ops.found)
+}
+
+// Whether the lowering of `e` lowers a `break` of the loop around it
+// (`lower_jump` sets `x.loop_broken`'s top, in a probe as well): a `break`
+// after a statement, a condition, a scrutinee or an operand that diverges
+// is never lowered.
+fn reach(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> e) : Option<bool>
+{
+    if (!has_break(e))
+    {
+        return Some(false);
+    }
+    Operands ops = Operands { .found = false, .beside = false };
+    match (&e.kind)
+    {
+        ExprKind::EBreak          : Some(true),
+        ExprKind::EParen(i)       : reach(g, x, Box::get(i)),
+        ExprKind::EPropagate(i)   : reach(g, x, Box::get(i)),
+        ExprKind::EDeref(i)       : reach(g, x, Box::get(i)),
+        ExprKind::EUnary(u)       : reach(g, x, &Box::get(u).e),
+        ExprKind::EBorrow(bw)     : reach(g, x, &Box::get(bw).e),
+        ExprKind::EField(f)       : reach(g, x, &Box::get(f).e),
+        ExprKind::EArrayRepeat(r) : reach(g, x, &Box::get(r).value),
+        ExprKind::EReturn(r) : match (r)
+        {
+            Some(i) : reach(g, x, Box::get(i)),
+            None    : Some(false),
+        },
+        ExprKind::EBlock(b)       : reach_block(g, x, b),
+        ExprKind::EUnsafe(b)      : reach_block(g, x, b),
+        ExprKind::EIf(ie)         : reach_if(g, x, Box::get(ie)),
+        ExprKind::EMatch(m)       : reach_match(g, x, Box::get(m)),
+        ExprKind::EBinary(bn)     :
+        {
+            _ = reach_operand(g, x, &Box::get(bn).a, &mut ops)?;
+            _ = reach_operand(g, x, &Box::get(bn).b, &mut ops)?;
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::EIndex(p)       :
+        {
+            _ = reach_operand(g, x, &Box::get(p).a, &mut ops)?;
+            _ = reach_operand(g, x, &Box::get(p).b, &mut ops)?;
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::EAssign(p)      :
+        {
+            _ = reach_operand(g, x, &Box::get(p).a, &mut ops)?;
+            _ = reach_operand(g, x, &Box::get(p).b, &mut ops)?;
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::ESliceOf(s)     :
+        {
+            _ = reach_operand(g, x, &Box::get(s).base, &mut ops)?;
+            _ = reach_operand(g, x, &Box::get(s).lo, &mut ops)?;
+            _ = reach_operand(g, x, &Box::get(s).hi, &mut ops)?;
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::ECall(c)        :
+        {
+            _ = reach_operand(g, x, &Box::get(c).callee, &mut ops)?;
+            foreach (a in &Box::get(c).args)
+            {
+                _ = reach_operand(g, x, a, &mut ops)?;
+            }
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::EArrayLit(es)   :
+        {
+            foreach (a in es)
+            {
+                _ = reach_operand(g, x, a, &mut ops)?;
+            }
+            reach_operands_done(g, &ops)
+        },
+        ExprKind::EStructLit(sl)  :
+        {
+            foreach (f in &Box::get(sl).fields)
+            {
+                _ = reach_operand(g, x, &f.value, &mut ops)?;
+            }
+            reach_operands_done(g, &ops)
+        },
+        _                         : Some(false),
+    }
+}
+
+// `reach` for a block: its statements in order under their bindings, up to
+// the last one that holds a `break`.
+fn reach_body(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared> b) : Option<bool>
+{
+    usize n = Vec::len(&b.stmts);
+    bool tail_break = match (&b.tail)
+    {
+        Some(t) : has_break(Box::get(t)),
+        None    : false,
+    };
+    usize upto = if (tail_break) { n } else { 0 };
+    for (usize si = upto; si < n; si += 1)
+    {
+        if (stmt_has_break(&b.stmts[si]))
+        {
+            upto = si + 1;
+        }
+    }
+    for (usize si = 0; si < upto; si += 1)
+    {
+        match (stmt_expr(&b.stmts[si]))
+        {
+            Some(e) :
+            {
+                if (reach(g, x, e)?)
+                {
+                    return Some(true);
+                }
+            },
+            None    : {},
+        }
+        if (si + 1 < upto || tail_break)
+        {
+            if (type_stmt(g, x, b, si)?)
+            {
+                return Some(false);
+            }
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : reach(g, x, Box::get(t)),
+        None    : Some(false),
+    }
+}
+
+fn reach_block(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Block, shared> b) : Option<bool>
+{
+    Vec::push(&mut x.scopes, HashMap::new());
+    Option<bool> r = reach_body(g, x, b);
+    Vec::pop(&mut x.scopes);
+    r
+}
+
+// `reach` for an `if`: both branches are lowered (the then-branch at least
+// in its probe) unless the condition diverges.
+fn reach_if(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<IfExpr, shared> i) : Option<bool>
+{
+    if (reach(g, x, &i.cond)?)
+    {
+        return Some(true);
+    }
+    bool else_break = match (&i.else_)
+    {
+        Some(ee) : has_break(ee),
+        None     : false,
+    };
+    if (!block_has_break(&i.then_) && !else_break)
+    {
+        return Some(false);
+    }
+    if (may_diverge(&i.cond))
+    {
+        Type tbool = Type::TBool;
+        Type cv = type_of(g, x, &i.cond, Some(&tbool))?;
+        if (is_never(&cv))
+        {
+            return Some(false);
+        }
+    }
+    if (reach_block(g, x, &i.then_)?)
+    {
+        return Some(true);
+    }
+    match (&i.else_)
+    {
+        Some(ee) : reach(g, x, ee),
+        None     : Some(false),
+    }
+}
+
+// `reach` for a `match`: every arm the lowering lowers, under its binder.
+fn reach_match(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<MatchExpr, shared> m) : Option<bool>
+{
+    if (reach(g, x, &m.scrut)?)
+    {
+        return Some(true);
+    }
+    bool any = false;
+    foreach (a in &m.arms)
+    {
+        any = any || has_break(Box::get(&a.body));
+    }
+    if (!any)
+    {
+        return Some(false);
+    }
+    MatchPlan plan = match_plan(g, x, &m.scrut, &m.arms)?;
+    if (plan.diverges)
+    {
+        return Some(false);
+    }
+    for (usize k = 0; k < Vec::len(&m.arms); k += 1)
+    {
+        if (plan.first_only && k > 0)
+        {
+            break;
+        }
+        ref<Arm, shared> arm = &m.arms[k];
+        if (!has_break(Box::get(&arm.body)))
+        {
+            continue;
+        }
+        _ = push_arm(g, x, &plan, arm)?;
+        Option<bool> r = reach(g, x, Box::get(&arm.body));
+        Vec::pop(&mut x.scopes);
+        if (r?)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+// `lower_while`: the condition, the body and the step for real; `never`
+// for a `while (true)` no lowered `break` leaves (D-0175).
+export fn type_while(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<WhileExpr, shared> w = match (&e.kind)
+    {
+        ExprKind::EWhile(we) : Box::get(we),
+        _                    : return typer_gap(g, "error:while"),
+    };
+    Type tbool = Type::TBool;
+    Option<Type> cv = type_of(g, x, &w.cond, Some(&tbool));
+    if (!walked(&cv))
+    {
+        return None;
+    }
+    Option<Type> bv = block_value(g, x, &w.body, None);
+    if (!walked(&bv))
+    {
+        return None;
+    }
+    match (&w.step)
+    {
+        Some(st) :
+        {
+            Option<Type> sv = type_of(g, x, st, None);
+            if (!walked(&sv))
+            {
+                return None;
+            }
+        },
+        None     : {},
+    }
+    bool forever = match (&w.cond.kind)
+    {
+        ExprKind::EBool(t) : *t,
+        _                  : false,
+    };
+    if (!forever)
+    {
+        return Some(Type::TVoid);
+    }
+    // The walk that finds the `break`s the lowering reaches makes its
+    // queries as probes: the body is already walked for real above.
+    g.typer_probing += 1;
+    Option<bool> broken = reach_block(g, x, &w.body);
+    match (&w.step)
+    {
+        Some(st) :
+        {
+            match (broken)
+            {
+                Some(false) : broken = reach(g, x, st),
+                _           : {},
+            }
+        },
+        None     : {},
+    }
+    g.typer_probing -= 1;
+    Some(if (broken?) { Type::TVoid } else { Type::TNever })
+}
+
+// ---- match ----
+
+// How `lower_match` takes its scrutinee.
+struct MatchPlan
+{
+    // `never` before any arm: a scrutinee that diverges, or one that is no
+    // enum, integer, `bool` or text (the dynamic verdict).
+    bool diverges;
+    // `lower_match_scalar`: an arm's binder is the whole value.
+    bool scalar;
+    // D-0058: only the first arm, which matches everything, is lowered.
+    bool first_only;
+    // The type matched: the scalar's, or the enum's (the referent's, by
+    // reference).
+    Type s_ty;
+    // `[Match-By-Ref]`: the mode a binder borrows in.
+    Option<Mode> by_ref;
+    // The enum matched and its type arguments' substitution.
+    Option<EnumDecl> ed;
+    HashMap<String, Type> sub;
+}
+
+// A plan with no enum: whether it diverges (`d`), is a scalar's (`s`), keeps
+// the first arm only (`f`), and the type matched (`t`).
+fn plan_of(bool d, bool s, bool f, Type t) : MatchPlan
+{
+    HashMap<String, Type> sub = HashMap::new();
+    MatchPlan { .diverges = d, .scalar = s, .first_only = f, .s_ty = t, .by_ref = None, .ed = None, .sub = sub }
+}
+
+fn plan_diverges() : MatchPlan
+{
+    plan_of(true, false, false, Type::TNever)
+}
+
+fn plan_scalar(Type s_ty, bool first_only) : MatchPlan
+{
+    plan_of(false, true, first_only, s_ty)
+}
+
+// `lower_match` up to its arms: the scrutinee's probes and its lowering.
+fn match_plan(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> scrut,
+    ref<Vec<Arm>, shared> arms,
+) : Option<MatchPlan>
+{
+    usize n = Vec::len(arms);
+    bool place = is_place_kind(scrut);
+    // D-0340 section 11: an integer or `bool` scrutinee that is no place.
+    if (!place && n > 0)
+    {
+        Type st = probe_ty(g, x, scrut, None)?;
+        bool scalar_scrut = match (&st)
+        {
+            Type::TInt(_) : true,
+            Type::TBool   : true,
+            _             : false,
+        };
+        if (scalar_scrut)
+        {
+            Type sv = type_of(g, x, scrut, None)?;
+            if (is_never(&sv))
+            {
+                return Some(plan_diverges());
+            }
+            return Some(plan_scalar(sv, false));
+        }
+    }
+    // D-0058: a first arm that matches everything, on a scrutinee that is
+    // not an enum (nor an integer or `bool`).
+    if (n > 0 && Option::is_none(&arms[0].variant) && Option::is_none(&arms[0].lit))
+    {
+        Type st = if (place) { probe_place(g, x, scrut)? } else { probe_ty(g, x, scrut, None)? };
+        bool flat = match (&st)
+        {
+            Type::TNamed(_) : !is_enum_ty(g, &st),
+            Type::TRef(m)   : !is_enum_ty(g, &Box::get(m).inner),
+            Type::TInt(_)   : false,
+            Type::TBool     : false,
+            _               : true,
+        };
+        if (flat)
+        {
+            if (Option::is_none(&arms[0].binder) && place)
+            {
+                return Some(plan_scalar(Type::TVoid, true));
+            }
+            Type sv = type_of(g, x, scrut, None)?;
+            if (is_never(&sv))
+            {
+                return Some(plan_diverges());
+            }
+            return Some(plan_scalar(sv, true));
+        }
+    }
+    // D-0049: a place scrutinee of a resource enum (or text) type is
+    // matched in place.
+    ref<Expr, shared> bare = strip_parens(scrut);
+    bool res_place = match (&bare.kind)
+    {
+        ExprKind::EPath(p)  :
+        {
+            if (Vec::len(&Box::get(p).segs) == 1)
+            {
+                match (lookup(x, &Box::get(p).segs[0]))
+                {
+                    Some(bd) :
+                    {
+                        Type t = binding_place_ty(&bd);
+                        (is_enum_ty(g, &t) || is_text_ty(&t)) && is_resource(g, &t)
+                    },
+                    None     : false,
+                }
+            }
+            else
+            {
+                false
+            }
+        },
+        ExprKind::EField(_) : place_res_enum(g, x, scrut)?,
+        ExprKind::EIndex(_) : place_res_enum(g, x, scrut)?,
+        ExprKind::EDeref(_) : place_res_enum(g, x, scrut)?,
+        _                   : false,
+    };
+    // `match (&mut p)` / `match (&p)` on an enum place: matched through the
+    // place, a binder borrowing in the borrow's mode.
+    Option<Mode> by_ref = None;
+    Option<Type> fused = None;
+    if (!boot(g, 9))
+    {
+        match (&bare.kind)
+        {
+            ExprKind::EBorrow(bb) :
+            {
+                Type pt = probe_place(g, x, &Box::get(bb).e)?;
+                if (is_enum_ty(g, &pt))
+                {
+                    Type fp = type_place(g, x, &Box::get(bb).e)?;
+                    if (is_never(&fp))
+                    {
+                        return Some(plan_diverges());
+                    }
+                    by_ref = Some(Box::get(bb).mode);
+                    fused = Some(fp);
+                }
+            },
+            _                     : {},
+        }
+    }
+    Type sv = match (fused)
+    {
+        Some(t) : t,
+        None    :
+        {
+            if (res_place)
+            {
+                type_place(g, x, scrut)?
+            }
+            else
+            {
+                // A call's type is probed first (`scrut_own_scope`,
+                // `noted_payloads_taken`).
+                bool is_call = match (&bare.kind)
+                {
+                    ExprKind::ECall(_) : true,
+                    _                  : false,
+                };
+                if (is_call)
+                {
+                    _ = probe_ty(g, x, scrut, None)?;
+                }
+                type_of(g, x, scrut, None)?
+            }
+        },
+    };
+    if (is_never(&sv))
+    {
+        return Some(plan_diverges());
+    }
+    // `[Match-By-Ref]` (D-0046): a reference scrutinee is matched on its
+    // referent.
+    Type sv2 = match (clone(&sv))
+    {
+        Type::TRef(m) :
+        {
+            if (is_enum_ty(g, &Box::get(&m).inner))
+            {
+                by_ref = Some(Box::get(&m).mode);
+                clone(&Box::get(&m).inner)
+            }
+            else
+            {
+                sv
+            }
+        },
+        _             : sv,
+    };
+    bool scalar = match (&sv2)
+    {
+        Type::TInt(_) : true,
+        Type::TBool   : true,
+        _             : is_text_ty(&sv2),
+    };
+    if (scalar)
+    {
+        return Some(plan_scalar(sv2, false));
+    }
+    // `[Match]` on a non-enum: the dynamic verdict.
+    NamedTy nt = match (&sv2)
+    {
+        Type::TNamed(nn) : clone(Box::get(nn)),
+        _                : return Some(plan_diverges()),
+    };
+    EnumDecl ed = match (enum_decl(g, &nt.name))
+    {
+        Some(d) : d,
+        None    : return Some(plan_diverges()),
+    };
+    HashMap<String, Type> sub = subst_of(&ed.type_params, &nt.args);
+    MatchPlan plan = plan_of(false, false, false, sv2);
+    plan.by_ref = by_ref;
+    plan.ed = Some(ed);
+    plan.sub = sub;
+    Some(plan)
+}
+
+// `place_res_enum`.
+fn place_res_enum(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<Expr, shared> scrut) : Option<bool>
+{
+    Type t = probe_place(g, x, scrut)?;
+    Some((is_enum_ty(g, &t) || is_text_ty(&t)) && is_resource(g, &t))
+}
+
+// A pattern's levels (`arm_levels_crossing`): how many variants it names,
+// the innermost payload's type, and the mode of the references it looks
+// through (`crossing_mode`).
+struct ArmLevels
+{
+    usize nvis;
+    Option<Type> payload;
+    Option<Mode> cross;
+}
+
+fn arm_levels(ref<Gen, exclusive> g, ref<MatchPlan, shared> plan, ref<Arm, shared> arm) : Option<ArmLevels>
+{
+    EnumDecl decl = match (&plan.ed)
+    {
+        Some(d) : clone(d),
+        None    :
+        {
+            why(g, "error:match-pattern");
+            return None;
+        },
+    };
+    HashMap<String, Type> dsub = clone(&plan.sub);
+    Option<Type> payload = None;
+    bool crossed = false;
+    bool shared = false;
+    Vec<String> chain = arm_chain(arm);
+    for (usize k = 0; k < Vec::len(&chain); k += 1)
+    {
+        if (k > 0)
+        {
+            match (clone(&payload))
+            {
+                Some(Type::TRef(m)) :
+                {
+                    if (is_enum_ty(g, &Box::get(&m).inner))
+                    {
+                        crossed = true;
+                        shared = shared || Box::get(&m).mode == Mode::Shared;
+                        payload = Some(clone(&Box::get(&m).inner));
+                    }
+                },
+                _                   : {},
+            }
+            Option<EnumDecl> next = match (clone(&payload))
+            {
+                Some(Type::TNamed(nn)) :
+                {
+                    match (enum_decl(g, &Box::get(&nn).name))
+                    {
+                        Some(d) :
+                        {
+                            dsub = subst_of(&d.type_params, &Box::get(&nn).args);
+                            Some(d)
+                        },
+                        None    : None,
+                    }
+                },
+                _                      : None,
+            };
+            match (next)
+            {
+                Some(d) : decl = d,
+                None    :
+                {
+                    why(g, "error:match-pattern");
+                    return None;
+                },
+            }
+        }
+        usize vi = 0;
+        while (vi < Vec::len(&decl.variants) && decl.variants[vi].name != chain[k])
+        {
+            vi += 1;
+        }
+        if (vi == Vec::len(&decl.variants))
+        {
+            why(g, "error:match-pattern");
+            return None;
+        }
+        payload = match (&decl.variants[vi].payload)
+        {
+            Some(p) : Some(apply(p, &dsub)),
+            None    : None,
+        };
+    }
+    if (Option::is_some(&arm.lit) && Vec::len(&chain) > 0)
+    {
+        match (clone(&payload))
+        {
+            Some(Type::TRef(m)) :
+            {
+                // D-0127: a literal through a reference, text too.
+                ref<Type, shared> inner = &Box::get(&m).inner;
+                bool scalar = match (inner)
+                {
+                    Type::TInt(_) : true,
+                    Type::TBool   : true,
+                    _             : false,
+                };
+                if (scalar || is_text_ty(inner))
+                {
+                    crossed = true;
+                    shared = shared || Box::get(&m).mode == Mode::Shared;
+                    payload = Some(clone(inner));
+                }
+            },
+            _                   : {},
+        }
+    }
+    Option<Mode> cross = if (!crossed) { None } else if (shared) { Some(Mode::Shared) } else { Some(Mode::Exclusive) };
+    Some(ArmLevels { .nvis = Vec::len(&chain), .payload = payload, .cross = cross })
+}
+
+// The type of an arm's binder (`probe_type_arm`, `bind_match_arm`, and
+// `lower_match_scalar`'s own): `Some(None)` for an arm that binds nothing.
+fn arm_binder_ty(ref<Gen, exclusive> g, ref<MatchPlan, shared> plan, ref<Arm, shared> arm) : Option<Option<Type>>
+{
+    if (Option::is_none(&arm.binder))
+    {
+        return Some(None);
+    }
+    if (plan.scalar)
+    {
+        // D-0058: the whole value.
+        if (Option::is_none(&arm.lit))
+        {
+            return Some(Some(clone(&plan.s_ty)));
+        }
+        return Some(None);
+    }
+    if (Option::is_none(&arm.variant) && Option::is_none(&arm.lit))
+    {
+        Type whole = match (plan.by_ref)
+        {
+            Some(m) : ref_ty(clone(&plan.s_ty), m),
+            None    : clone(&plan.s_ty),
+        };
+        return Some(Some(whole));
+    }
+    ArmLevels lv = arm_levels(g, plan, arm)?;
+    Type p = match (clone(&lv.payload))
+    {
+        Some(t) : t,
+        None    : return Some(None),
+    };
+    // D-0046, D-0109: by reference through a matched or crossed reference,
+    // in the weaker mode.
+    Type pty = match (plan.by_ref)
+    {
+        Some(a) :
+        {
+            match (lv.cross)
+            {
+                Some(c) : ref_ty(p, if (a == Mode::Shared) { Mode::Shared } else { c }),
+                None    : ref_ty(p, a),
+            }
+        },
+        None    :
+        {
+            match (lv.cross)
+            {
+                Some(c) : ref_ty(p, c),
+                None    : p,
+            }
+        },
+    };
+    Some(Some(pty))
+}
+
+// The scope of an arm with its binder in it; the caller pops it. No scope
+// is left behind where there is no answer.
+fn push_arm(ref<Gen, exclusive> g, ref<Fx, exclusive> x, ref<MatchPlan, shared> plan, ref<Arm, shared> a) : Option<bool>
+{
+    Option<Type> bty = arm_binder_ty(g, plan, a)?;
+    Vec::push(&mut x.scopes, HashMap::new());
+    match (&a.binder)
+    {
+        Some(name) :
+        {
+            match (bty)
+            {
+                Some(t) : bind(x, name, t),
+                None    : {},
+            }
+        },
+        None       : {},
+    }
+    Some(true)
+}
+
+// An arm's literal pattern, lowered for real with the type it must equal.
+fn arm_literal(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<MatchPlan, shared> plan,
+    ref<Arm, shared> arm,
+    usize n,
+) : Option<bool>
+{
+    ref<Expr, shared> l = match (&arm.lit)
+    {
+        Some(le) : Box::get(le),
+        None     : return Some(true),
+    };
+    Option<Type> lt = None;
+    if (plan.scalar)
+    {
+        // Report 073: over 64 text arms are found in a table of the
+        // literals, none lowered.
+        if (!(n > 64 && is_text_ty(&plan.s_ty)))
+        {
+            lt = Some(clone(&plan.s_ty));
+        }
+    }
+    else
+    {
+        ArmLevels lv = arm_levels(g, plan, arm)?;
+        lt = clone(&lv.payload);
+    }
+    match (lt)
+    {
+        Some(t) :
+        {
+            Type ts = Type::TStr;
+            Option<Type> v = if (is_text_ty(&t)) { type_of(g, x, l, Some(&ts)) } else { type_of(g, x, l, Some(&t)) };
+            if (!walked(&v))
+            {
+                return None;
+            }
+        },
+        None    : {},
+    }
+    Some(true)
+}
+
+// The arms of a `match` (`lower_match`, `lower_match_scalar`): probed in
+// `probe_order` until one gives a type, which the others are then expected
+// to have; then every arm for real.
+fn match_arms(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<MatchPlan, shared> plan,
+    ref<Vec<Arm>, shared> arms,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    Option<Type> arm_expected = match (expected)
+    {
+        Some(t) : Some(clone(t)),
+        None    : None,
+    };
+    Type result_ty = Type::TNever;
+    Vec<usize> order = probe_order(arms, Option::is_some(&expected));
+    for (usize j = 0; j < Vec::len(&order); j += 1)
+    {
+        if (!is_never(&result_ty))
+        {
+            break;
+        }
+        ref<Arm, shared> arm = &arms[order[j]];
+        _ = push_arm(g, x, plan, arm)?;
+        Option<Type> probed = probe_ty(g, x, Box::get(&arm.body), as_exp(&arm_expected));
+        Vec::pop(&mut x.scopes);
+        Type t = probed?;
+        if (!is_never(&t) && !is_void(&t) && Option::is_none(&arm_expected))
+        {
+            arm_expected = Some(clone(&t));
+        }
+        if (!is_never(&t))
+        {
+            result_ty = t;
+        }
+    }
+    // Bug 012: arms that are closures, with no type expected, give a `fn`
+    // value.
+    if (Option::is_none(&expected))
+    {
+        match (closure_fn(g, &result_ty)?)
+        {
+            Some(ft) :
+            {
+                arm_expected = Some(clone(&ft));
+                result_ty = ft;
+            },
+            None     : {},
+        }
+    }
+    bool valued = !is_void(&result_ty) && !is_never(&result_ty);
+    for (usize k = 0; k < Vec::len(arms); k += 1)
+    {
+        ref<Arm, shared> arm = &arms[k];
+        _ = arm_literal(g, x, plan, arm, Vec::len(arms))?;
+        _ = push_arm(g, x, plan, arm)?;
+        Option<Type> v = type_branch(g, x, Box::get(&arm.body), as_exp(&arm_expected), valued);
+        Vec::pop(&mut x.scopes);
+        if (!walked(&v))
+        {
+            return None;
+        }
+    }
+    Some(result_ty)
+}
+
+// `lower_match` on the scrutinee `scrut` and the arms `arms`.
+fn match_value(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> scrut,
+    ref<Vec<Arm>, shared> arms,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    MatchPlan plan = match_plan(g, x, scrut, arms)?;
+    if (plan.diverges)
+    {
+        return Some(Type::TNever);
+    }
+    if (plan.first_only)
+    {
+        Vec<Arm> first = Vec::new();
+        Vec::push(&mut first, clone(&arms[0]));
+        return match_arms(g, x, &plan, &first, expected);
+    }
+    match_arms(g, x, &plan, arms, expected)
+}
+
+// `lower_match`.
+export fn type_match(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<MatchExpr, shared> m = match (&e.kind)
+    {
+        ExprKind::EMatch(mx) : Box::get(mx),
+        _                    : return typer_gap(g, "error:match"),
+    };
+    match_value(g, x, &m.scrut, &m.arms, expected)
+}
+
+// ---- `?` ----
+
+// An arm of the `match` `lower_propagate` synthesises; its body stands for
+// a node the lowering builds anew each time and is never typed here.
+fn propagate_arm(str variant, Option<String> binder, usize line, usize col) : Arm
+{
+    Option<String> v = Some(String::copy(variant));
+    Box<Expr> body = Box::new(mk(ExprKind::EUnit, line, col));
+    Arm { .variant = v, .nested = Vec::new(), .binder = binder, .lit = None, .body = body, .quals = Vec::new() }
+}
+
+// `lower_propagate`: `match (e) { Ok(__pv) : __pv, Err(__pe) : return
+// Err(__pe) }`, or on an `Option` `match (e) { Some(__pv) : __pv, None :
+// return None }`. The second arm is `never`, so the first gives the type:
+// its binder read whole, which is the binder's type (a closure where a `fn`
+// value is expected boxed, as `lower_expr` boxes it).
+export fn type_propagate(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    ref<Expr, shared> inner = match (&e.kind)
+    {
+        ExprKind::EPropagate(i) : Box::get(i),
+        _                       : return typer_gap(g, "error:propagate"),
+    };
+    Type it = probe_ty(g, x, inner, None)?;
+    bool is_option = is_named(&it, "std::Option");
+    Vec<Arm> arms = Vec::new();
+    if (is_option)
+    {
+        Vec::push(&mut arms, propagate_arm("Some", Some("__pv"), e.line, e.col));
+        Vec::push(&mut arms, propagate_arm("None", None, e.line, e.col));
+    }
+    else
+    {
+        Vec::push(&mut arms, propagate_arm("Ok", Some("__pv"), e.line, e.col));
+        Vec::push(&mut arms, propagate_arm("Err", Some("__pe"), e.line, e.col));
+    }
+    MatchPlan plan = match_plan(g, x, inner, &arms)?;
+    if (plan.diverges)
+    {
+        return Some(Type::TNever);
+    }
+    if (plan.scalar)
+    {
+        return typer_gap(g, "error:propagate-non-enum");
+    }
+    Type pv = match (arm_binder_ty(g, &plan, &arms[0])?)
+    {
+        Some(t) : t,
+        None    : return typer_gap(g, "error:propagate-no-payload"),
+    };
+    // The second arm's binder, for a pattern the enum does not have.
+    _ = arm_binder_ty(g, &plan, &arms[1])?;
+    match (expected)
+    {
+        Some(et) :
+        {
+            if (is_closure(&pv) && is_fn_type(et))
+            {
+                return Some(clone(et));
+            }
+        },
+        None     :
+        {
+            match (closure_fn(g, &pv)?)
+            {
+                Some(ft) : return Some(ft),
+                None     : {},
+            }
+        },
+    }
+    Some(pv)
+}

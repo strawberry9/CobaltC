@@ -1,0 +1,480 @@
+// `cobc --doc [NAME]` (CHG-0446): an item of `std`, a type with its
+// functions, or a module; `--doc --find WORD…` and the language's own
+// functions (CHG-0451). Over the records `cobc --prelude-summary` writes into
+// PRELUDE_DOCS (`summary.cb`): cobc has no `std` source of its own to read.
+
+import std;
+import prelude;
+import hints;
+
+// The module an intrinsic's record names (CHG-0451).
+const str LANGUAGE = "the language";
+
+// One exported item, as `--doc` shows it.
+struct Record
+{
+    String module_;
+    String item;
+    String kind;
+    String signature;
+    String summary;
+    String retired;
+    String text;
+}
+
+fn records() : Vec<Record>
+{
+    Vec<Record> out = Vec::new();
+    foreach (rec in StringView::split(PRELUDE_DOCS, "\u{1e}"))
+    {
+        if (StringView::len(rec) == 0)
+        {
+            continue;
+        }
+        Vec<String> f = Vec::new();
+        foreach (part in StringView::split(rec, "\u{1f}"))
+        {
+            Vec::push(&mut f, String::copy(part));
+        }
+        if (Vec::len(&f) < 7)
+        {
+            continue;
+        }
+        Vec::push(
+            &mut out,
+            Record {
+                .module_ = String::clone(&f[0]),
+                .item = String::clone(&f[1]),
+                .kind = String::clone(&f[2]),
+                .signature = String::clone(&f[3]),
+                .summary = String::clone(&f[4]),
+                .retired = String::clone(&f[5]),
+                .text = String::clone(&f[6]),
+            },
+        );
+    }
+    out
+}
+
+// An item's line in a listing: its signature, and its summary under it.
+fn line_of(ref<Record, shared> r) : String
+{
+    String s = sprintf("  %s\n", &r.signature);
+    if (r.retired == "deprecated")
+    {
+        String::append(&mut s, "      (deprecated)\n");
+    }
+    if (StringView::len(&r.summary) > 0)
+    {
+        String::appendf(&mut s, "      %s\n", &r.summary);
+    }
+    s
+}
+
+fn module_of(StringView name) : String
+{
+    if (name == "std" || StringView::starts_with(name, "std::"))
+    {
+        return String::copy(name);
+    }
+    sprintf("std::%v", name)
+}
+
+fn is_type_kind(ref<String, shared> k) : bool
+{
+    *k == "struct" || *k == "enum" || *k == "bitstruct"
+}
+
+// A module of the listing with no name: its name and how many items it
+// exports.
+struct ModCount
+{
+    String name;
+    usize count;
+}
+
+fn mod_less(ref<ModCount, shared> a, ref<ModCount, shared> b) : bool
+{
+    a.name < b.name
+}
+
+// A record with a part of a name that names nothing, and how much it has.
+struct Near
+{
+    usize score;
+    usize index;
+}
+
+fn near_before(ref<Near, shared> a, ref<Near, shared> b) : bool
+{
+    a.score > b.score
+}
+
+// What `--doc NAME` prints (`Ok`), or what it says when nothing has that
+// name (`Err`, exit status 1). With no name: the modules.
+export fn lookup(Option<String> wanted) : Result<String, String>
+{
+    Vec<Record> rs = records();
+    String name = match (wanted)
+    {
+        Some(n) : n,
+        None    :
+        {
+            Vec<ModCount> mods = Vec::new();
+            usize builtin = 0;
+            foreach (r in &rs)
+            {
+                if (r.module_ == LANGUAGE)
+                {
+                    builtin += 1;
+                    continue;
+                }
+                bool found = false;
+                for (usize i = 0; i < Vec::len(&mods); i += 1)
+                {
+                    if (mods[i].name == r.module_)
+                    {
+                        mods[i].count += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    Vec::push(&mut mods, ModCount { .name = String::clone(&r.module_), .count = 1 });
+                }
+            }
+            Vec::sort_by(&mut mods, mod_less);
+            String s = "The modules of `std`, and how many items each exports (`--doc MODULE` lists them):\n";
+            foreach (m in &mods)
+            {
+                String::appendf(&mut s, "  %s (%v)\n", &m.name, m.count);
+            }
+            if (builtin > 0)
+            {
+                String::appendf(
+                    &mut s,
+                    "and the language's own functions, in scope without an `import` (%v; `--doc language` lists them)\n",
+                    builtin,
+                );
+            }
+            String::append(
+                &mut s,
+                "`--doc NAME` shows an item (`Vec::push`, `printf`, `widen`), a type and its functions (`Vec`), or a module (`std::text`); `--doc --find WORD…` lists the items whose name, signature or summary has every word.\n",
+            );
+            return Ok(s);
+        },
+    };
+    // CHG-0451: the language's built-in functions.
+    if (name == "language" || name == LANGUAGE)
+    {
+        usize n = 0;
+        String body = String::new();
+        foreach (r in &rs)
+        {
+            if (r.module_ == LANGUAGE)
+            {
+                n += 1;
+                String::append(&mut body, &line_of(r));
+            }
+        }
+        String s = sprintf("the language's own functions, in scope without an `import`: %v\n", n);
+        String::append(&mut s, &body);
+        return Ok(s);
+    }
+    StringView bare = Option::unwrap_or(StringView::strip_prefix(&name, "std::"), &name);
+    // A module.
+    String m = module_of(&name);
+    Vec<usize> in_module = Vec::new();
+    for (usize i = 0; i < Vec::len(&rs); i += 1)
+    {
+        if (rs[i].module_ == m && rs[i].retired != "removed")
+        {
+            Vec::push(&mut in_module, i);
+        }
+    }
+    if (Vec::len(&in_module) > 0)
+    {
+        String s = sprintf("module `%s`: %v items\n", &m, Vec::len(&in_module));
+        foreach (i in &in_module)
+        {
+            String::append(&mut s, &line_of(&rs[*i]));
+        }
+        return Ok(s);
+    }
+    // An item: `Vec::push`, `std::collections::Vec::push`, `printf`.
+    String qualified = module_of(bare);
+    String s = String::new();
+    usize hits = 0;
+    for (usize i = 0; i < Vec::len(&rs); i += 1)
+    {
+        ref<Record, shared> r = &rs[i];
+        if (!(r.item == bare || sprintf("%s::%s", &r.module_, &r.item) == qualified))
+        {
+            continue;
+        }
+        if (hits > 0)
+        {
+            String::append(&mut s, "\n");
+        }
+        hits += 1;
+        String::append(&mut s, &r.text);
+        if (is_type_kind(&r.kind))
+        {
+            String prefix = sprintf("%s::", &r.item);
+            String fns = String::new();
+            foreach (f in &rs)
+            {
+                if (f.module_ == r.module_ && StringView::starts_with(&f.item, &prefix) && f.retired != "removed")
+                {
+                    String::append(&mut fns, &line_of(f));
+                }
+            }
+            if (StringView::len(&fns) > 0)
+            {
+                String::appendf(&mut s, "\nThe functions of `%s`:\n", &r.item);
+                String::append(&mut s, &fns);
+            }
+        }
+    }
+    if (hits > 0)
+    {
+        return Ok(s);
+    }
+    // Bug 306: `T::clone` of a `std` type is derived (D-0116), so it has
+    // no record of its own.
+    match (StringView::strip_suffix(bare, "::clone"))
+    {
+        Some(tn) :
+        {
+            foreach (r in &rs)
+            {
+                if (r.item == tn && is_type_kind(&r.kind) && (r.kind == "struct" || r.kind == "enum"))
+                {
+                    return Ok(sprintf(
+                        "fn %s::clone(ref<%s, shared> x) : %s    (derived; in `%s`)\n    A copy of `x`, field by field (D-0116, spec/16 `rule.agg.derived-clone`): a struct or enum that declares no `clone`, is not a `resource`, and has a field that may own memory (a `String`, a `Vec`, …) gets one. A type with no such field has none: it is copied by assignment. `clone(&x)` calls it too.\n",
+                        tn,
+                        tn,
+                        tn,
+                        &r.module_,
+                    ));
+                }
+            }
+        },
+        None     : {},
+    }
+    Vec<String> names = Vec::new();
+    foreach (r in &rs)
+    {
+        if (r.retired != "removed")
+        {
+            Vec::push(&mut names, String::clone(&r.item));
+        }
+    }
+    Vec::sort(&mut names);
+    Vec::dedup(&mut names);
+    String msg = match (hints::nearest(bare, &names))
+    {
+        Some(n) : sprintf("nothing named `%s` in `std`; did you mean `%s`?", &name, &n),
+        None    : sprintf("nothing named `%s` in `std`; `--doc` alone lists its modules", &name),
+    };
+    // CHG-0451: the items that have a part of the name in theirs, so that
+    // `read_to_string` shows `read_all`.
+    Vec<String> parts = Vec::new();
+    String words = StringView::replace(bare, ":", "_");
+    foreach (p in StringView::split(&words, "_"))
+    {
+        if (StringView::len(p) >= 3)
+        {
+            Vec::push(&mut parts, StringView::to_ascii_lower(p));
+        }
+    }
+    // Ranked by the parts each has, an earlier part of the name weighing more
+    // (`read` before `string` for `read_to_string`).
+    Vec<Near> ranked = Vec::new();
+    for (usize i = 0; i < Vec::len(&rs); i += 1)
+    {
+        ref<Record, shared> r = &rs[i];
+        if (r.retired == "removed")
+        {
+            continue;
+        }
+        String item = StringView::to_ascii_lower(&StringView::replace(&r.item, ":", "_"));
+        Vec<StringView> ws = StringView::split(&item, "_");
+        usize score = 0;
+        for (usize k = 0; k < Vec::len(&parts); k += 1)
+        {
+            bool has = false;
+            foreach (w in &ws)
+            {
+                if (*w == parts[k])
+                {
+                    has = true;
+                }
+            }
+            if (has)
+            {
+                score += Vec::len(&parts) - k;
+            }
+        }
+        bool seen = false;
+        foreach (x in &ranked)
+        {
+            if (rs[x.index].item == r.item)
+            {
+                seen = true;
+            }
+        }
+        if (score > 0 && !seen)
+        {
+            Vec::push(&mut ranked, Near { .score = score, .index = i });
+        }
+    }
+    Vec::sort_by(&mut ranked, near_before);
+    Vec<usize> near = Vec::new();
+    foreach (x in &ranked)
+    {
+        Vec::push(&mut near, x.index);
+    }
+    if (Vec::len(&near) > 0)
+    {
+        String::append(&mut msg, "\nitems with a part of that name:\n");
+        for (usize k = 0; k < Vec::len(&near) && k < 8; k += 1)
+        {
+            String::append(&mut msg, &line_of(&rs[near[k]]));
+        }
+        if (Vec::len(&near) > 8)
+        {
+            // Bug 276: `--find` wants every word, so each part that an item
+            // here has is a query of its own (`vec`, not `vec firts`).
+            Vec<String> queries = Vec::new();
+            foreach (part in &parts)
+            {
+                bool found = false;
+                foreach (ix in &near)
+                {
+                    String item = StringView::to_ascii_lower(&StringView::replace(&rs[*ix].item, ":", "_"));
+                    foreach (w in StringView::split(&item, "_"))
+                    {
+                        if (w == *part)
+                        {
+                            found = true;
+                        }
+                    }
+                }
+                if (found)
+                {
+                    Vec::push(&mut queries, sprintf("`--doc --find %s`", part));
+                }
+            }
+            String::appendf(&mut msg, "  … and %v more: %s\n", Vec::len(&near) - 8, &String::join(&queries, ", "));
+        }
+        String::truncate(&mut msg, StringView::len(&msg) - 1);
+    }
+    Err(msg)
+}
+
+// CHG-0451: `--doc --find WORD…`: the items whose name, signature or summary
+// holds every word (case ignored), those whose name holds one first, each as
+// a listing shows it; `Err` when there are none.
+export fn find(ref<Vec<String>, shared> words0) : Result<String, String>
+{
+    Vec<Record> rs = records();
+    Vec<String> words = Vec::new();
+    foreach (w in words0)
+    {
+        Vec::push(&mut words, StringView::to_ascii_lower(w));
+    }
+    String by_name = String::new();
+    String by_text = String::new();
+    usize n = 0;
+    foreach (r in &rs)
+    {
+        if (r.retired == "removed")
+        {
+            continue;
+        }
+        String item = StringView::to_ascii_lower(&r.item);
+        String all = sprintf("%s %s %s", &item, &StringView::to_ascii_lower(&r.signature), &StringView::to_ascii_lower(&r.summary));
+        bool every = true;
+        bool in_name = false;
+        foreach (w in &words)
+        {
+            if (!StringView::contains(&all, w))
+            {
+                every = false;
+            }
+            if (StringView::contains(&item, w))
+            {
+                in_name = true;
+            }
+        }
+        if (!every)
+        {
+            continue;
+        }
+        n += 1;
+        if (in_name)
+        {
+            String::append(&mut by_name, &line_of(r));
+        }
+        else
+        {
+            String::append(&mut by_text, &line_of(r));
+        }
+    }
+    if (n == 0)
+    {
+        Vec<String> shown = Vec::new();
+        foreach (w in &words)
+        {
+            Vec::push(&mut shown, sprintf("`%s`", w));
+        }
+        return Err(sprintf("no item has %s in its name, signature or summary", &String::join(&shown, " and ")));
+    }
+    String::append(&mut by_name, &by_text);
+    String::appendf(&mut by_name, "%v item%s\n", n, if (n == 1) { "" } else { "s" });
+    Ok(by_name)
+}
+
+// `cobc --doc [NAME]`: the exit status.
+export fn run(ref<Vec<String>, shared> args, StringView tool) : u8
+{
+    Result<String, String> found = if (Vec::len(args) > 0 && args[0] == "--find")
+    {
+        if (Vec::len(args) < 2)
+        {
+            eprintf("usage: %v --doc --find WORD...\n", tool);
+            return 2;
+        }
+        Vec<String> words = Vec::new();
+        for (usize i = 1; i < Vec::len(args); i += 1)
+        {
+            Vec::push(&mut words, String::clone(&args[i]));
+        }
+        find(&words)
+    }
+    else
+    {
+        if (Vec::len(args) > 1)
+        {
+            eprintf("usage: %v --doc [NAME] | --doc --find WORD...\n", tool);
+            return 2;
+        }
+        Option<String> wanted = if (Vec::len(args) == 1) { Some(String::clone(&args[0])) } else { None };
+        lookup(wanted)
+    };
+    match (found)
+    {
+        Ok(s)  :
+        {
+            printf("%s", &s);
+            0
+        },
+        Err(e) :
+        {
+            eprintf("%v: %s\n", tool, &e);
+            1
+        },
+    }
+}

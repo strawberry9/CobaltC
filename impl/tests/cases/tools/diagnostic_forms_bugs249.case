@@ -1,0 +1,742 @@
+# The front end's messages for common slips (reports 241-349 of the push after
+# Update 207): each names the form to write, with the program's own text, and
+# none gives a repair line that does not fit. One program a slip.
+
+# 249: `?` on a plain value; on a `Result` in an `Option` function.
+file p249a.cb
+import std;
+fn read_count(ref<Vec<i32>, shared> v) : Result<usize, String>
+{
+    usize n = Vec::len(v)?;
+    Ok(n)
+}
+fn main()
+{
+    _ = read_count(&Vec::new<i32>());
+}
+end
+run $COBC --check p249a.cb
+status 1
+stderr-has `?` takes a `Result` or an `Option`, and this is a `usize`
+stderr-lacks rule.arith.convert
+file p249b.cb
+import std;
+fn port(StringView s) : Option<u16>
+{
+    u16 p = StringView::parse<u16>(s)?;
+    Some(p)
+}
+fn main()
+{
+    printf("%v\n", Option::unwrap(port("80")));
+}
+end
+run $COBC --check p249b.cb
+status 1
+stderr-has `Result::ok(r)?`
+
+# 250: `printf(&name)`, `{}`, `%s` of a number.
+file p250.cb
+import std;
+fn main()
+{
+    String name = "ann";
+    i32 age = 30;
+    printf(&name);
+    printf("{} is {}\n", &name, age);
+}
+end
+run $COBC --check p250.cb
+status 1
+stderr-has `printf("%s", &name)`
+stderr-has `{}` is not a conversion here
+file p250b.cb
+import std;
+fn main()
+{
+    i32 age = 30;
+    printf("age %s\n", age);
+}
+end
+run $COBC --check p250b.cb
+status 1
+stderr-has a number prints with `%d` (or `%v`)
+stderr-lacks rule.arith.convert
+
+# 251, 244: the body's last expression, and why it gives the wrong type.
+file p251.cb
+import std;
+fn sign(i32 x) : i32
+{
+    if (x > 0)
+    {
+        return 1;
+    }
+    else if (x < 0)
+    {
+        return -1;
+    }
+}
+fn add(i32 a, i32 b) : i32
+{
+    a + b;
+}
+fn save(StringView path) : Result<void, FileError>
+{
+    write_file(path, "data")?;
+    printf("saved\n");
+}
+fn main()
+{
+    printf("%d %d\n", sign(2), add(1, 2));
+    _ = save("x");
+}
+end
+run $COBC --check p251.cb
+status 1
+stderr-has p251.cb:4:5
+stderr-has this `if` has no `else`
+stderr-has p251.cb:15:5
+stderr-has a block's value is its last expression, written without `;`
+stderr-has end the body with `Ok(())`
+file p244.cb
+import std;
+fn main() : u8
+{
+    printf("hello\n");
+}
+end
+run $COBC --check p244.cb
+status 1
+stderr-has end the body with `0`
+stderr-lacks without `;`
+
+# 245: widen the operands, not the product.
+file p245.cb
+import std;
+fn area(u32 width, u32 height) : u64
+{
+    u64 n = width * height;
+    n
+}
+fn main()
+{
+    printf("%v\n", area(70000, 70000));
+}
+end
+run $COBC --check p245.cb
+status 1
+stderr-has `widen<u64>(width) * widen<u64>(height)`
+
+# 246: method calls on a `String`, with the receiver's own text.
+file p246.cb
+import std;
+fn main()
+{
+    String s = "abc";
+    usize n = s.len();
+    bool c = s.contains("b");
+    s.push_str("def");
+    bool e = s.equals("abc");
+}
+end
+run $COBC --check p246.cb
+status 1
+stderr-has `StringView::len(&s)`
+stderr-has `StringView::contains(&s, …)`
+stderr-has `String::append(&mut s, t)`
+stderr-has `s == t`
+
+# 248: a plain value where an `Option` is declared is wrapped.
+file p248.cb
+import std;
+fn find(ref<Vec<i32>, shared> v, i32 x) : Option<usize>
+{
+    foreach (i, y in v)
+    {
+        if (*y == x)
+        {
+            return i;
+        }
+    }
+    None
+}
+fn main()
+{
+    Option<i32> o = 5;
+    _ = find(&Vec::new<i32>(), 1);
+}
+end
+run $COBC --check p248.cb
+status 1
+stderr-has `Some(i)`
+stderr-has `Some(5)`
+stderr-lacks rule.arith.convert
+
+# 255: a closure that writes a capture borrows it while it exists.
+file p255.cb
+import std;
+fn main()
+{
+    i32 count = 0;
+    auto inc = [count]() { count += 1; };
+    inc();
+    printf("%d\n", count);
+}
+end
+run $COBC --check p255.cb
+status 1
+stderr-has `drop(inc);`
+
+# 256: a field set before the struct has a value.
+file p256.cb
+import std;
+struct Point
+{
+    i32 x;
+    i32 y;
+}
+fn main()
+{
+    Point p;
+    p.x = 1;
+    p.y = 2;
+    printf("%d %d\n", p.x, p.y);
+}
+end
+run $COBC --check p256.cb
+status 1
+stderr-has `p.x` is set here
+stderr-has `Point p = Point { .field = …, … };`
+
+# 257: the comma after the last arm may be left out (D-0337).
+file p257.cb
+import std;
+enum Color { Red, Green }
+fn main()
+{
+    Color c = Color::Green;
+    i32 n = match (c)
+    {
+        Red   : 1,
+        Green : 2
+    };
+    printf("%d\n", n);
+}
+end
+run $COBC --run p257.cb
+status 0
+stdout-is 2\n
+
+# 258: C's `break;` at the end of a `match` arm in a loop warns.
+file p258.cb
+import std;
+fn main()
+{
+    foreach (cmd in 0..4)
+    {
+        match (cmd)
+        {
+            1 : { printf("one\n"); break; },
+            2 : { printf("two\n"); break },
+            _ : { printf("cmd %d\n", cmd); },
+        }
+    }
+}
+end
+run $COBC --check p258.cb
+status 0
+stderr-has warning[diag.match-arm-break]
+stderr-has p258.cb:8:36
+
+# 259: a leading zero; 329: a `#!` first line.
+file p259.cb
+import std;
+fn main()
+{
+    printf("%v\n", 0755);
+}
+end
+run $COBC --check p259.cb
+status 1
+stderr-has written `755`, and C's octal reading, 493, is written `0o755`
+file p329.cb
+#!/usr/bin/env -S cobc --run
+import std;
+fn main()
+{
+    printf("%v\n", 0o755);
+}
+end
+run $COBC --run p329.cb
+status 0
+stdout-is 493\n
+
+# 260: `+` on text has its own diagnostic.
+file p260.cb
+import std;
+fn main()
+{
+    i32 n = 3;
+    String s = "n=" + n;
+}
+end
+run $COBC --check p260.cb
+status 1
+stderr-has error[diag.text-join]
+
+# 269, 270: no warning in a generic body's instantiation; `a - b >= 0`.
+file p269.cb
+import std;
+fn sign_of<T: integer>(T x) : i32
+{
+    if (x < 0) { -1 } else if (x == 0) { 0 } else { 1 }
+}
+fn main()
+{
+    u32 stock = 5;
+    u32 ordered = 3;
+    if (stock - ordered >= 0)
+    {
+        printf("%v %v\n", sign_of(-7: i64), sign_of(Vec::len(&Vec::from_slice(&[1, 2]))));
+    }
+}
+end
+run $COBC --check p269.cb
+status 0
+stderr-has `stock >= ordered`
+stderr-lacks `x` is a `usize`
+stderr-lacks the value
+
+# 271: the chained comparison with the operands' own text.
+file p271.cb
+import std;
+struct R { i32 lo; i32 hi; }
+fn main()
+{
+    R r = R { .lo = 1, .hi = 5 };
+    i32 x = 3;
+    if (r.lo <= x < r.hi)
+    {
+        printf("in\n");
+    }
+}
+end
+run $COBC --check p271.cb
+status 1
+stderr-has `r.lo <= x && x < r.hi`
+
+# 272: a missing `;` before a declaration gets no suffix hint.
+file p272.cb
+import std;
+fn main()
+{
+    u32 count = 0
+    u32 total = 0;
+    printf("%v %v\n", count, total);
+}
+end
+run $COBC --check p272.cb
+status 1
+stderr-has expected `;`, found `u32`
+stderr-lacks a literal's type follows a colon
+
+# 283: the missing `from` clause, at the function that lacks it.
+file p283.cb
+import std;
+struct Config { HashMap<String, String> values; }
+fn Config::get(ref<Config, shared> c, StringView key) : Option<StringView>
+{
+    match (HashMap::get(&c.values, key))
+    {
+        Some(v) : Some(StringView::trim(v)),
+        None    : None,
+    }
+}
+fn Config::get_or(ref<Config, shared> c, StringView key, StringView dflt) : StringView from c, dflt
+{
+    Option::unwrap_or(Config::get(c, key), dflt)
+}
+fn main()
+{
+    Config c = Config { .values = HashMap::new() };
+    printf("[%v]\n", Config::get_or(&c, "host", "localhost"));
+}
+end
+run $COBC --check p283.cb
+status 1
+stderr-has error[diag.lifetime-elision-ambiguous]
+stderr-has `from c, key`
+
+# 294: a variant pattern without its enum.
+file p294.cb
+import std;
+enum Kind
+{
+    Checking,
+    Savings { u32 rate_bp; },
+}
+fn rate(Kind k) : u32
+{
+    if (Savings { rate_bp } = k)
+    {
+        return rate_bp;
+    }
+    0
+}
+fn main()
+{
+    printf("%v\n", rate(Kind::Savings { .rate_bp = 450 }));
+}
+end
+run $COBC --check p294.cb
+status 1
+stderr-has `Kind::Savings { rate_bp }`
+
+# 295, 297: the argument's own text, the caret on the argument.
+file p297.cb
+import std;
+struct Entry { u32 hour; }
+fn area(f64 w, f64 h) : f64
+{
+    w * h
+}
+fn main()
+{
+    HashMap<u32, u64> per_hour = HashMap::new();
+    Entry e = Entry { .hour = 7 };
+    *HashMap::entry(&mut per_hour, &e.hour, 0) += 1;
+    printf("%v\n", area(7, 2.5));
+}
+end
+run $COBC --check p297.cb
+status 1
+stderr-has pass the value itself: `e.hour`, without `&`
+stderr-has p297.cb:11:36
+stderr-has write it with a point (`7.0`)
+stderr-has p297.cb:12:25
+
+# 308: an empty byte literal names what to write.
+file p308.cb
+import std;
+fn main()
+{
+    auto b = b"";
+}
+end
+run $COBC --check p308.cb
+status 1
+stderr-has `&Vec::new<u8>()`
+
+# 343, 347: `==` on a struct with text and a float; on an `Option` of a function.
+file p343.cb
+import std;
+struct Item { String name; f64 price; }
+fn main()
+{
+    Item a = Item { .name = "x", .price = 1.0 };
+    Item b = Item { .name = "x", .price = 1.0 };
+    printf("%v\n", a == b);
+}
+end
+run $COBC --check p343.cb
+status 1
+stderr-has its field `price` is `f64`
+stderr-lacks a `Vec`, a `Box`
+file p347.cb
+import std;
+struct Button { String label; Option<fn(i32)> on_click; }
+fn main()
+{
+    Button b = Button { .label = "ok", .on_click = None };
+    if (b.on_click == None)
+    {
+        printf("none\n");
+    }
+}
+end
+run $COBC --check p347.cb
+status 1
+stderr-has `Option::is_none(&b.on_click)`
+
+# 344: a moved closure is not advised `clone`.
+file p344.cb
+import std;
+fn apply(fn(i32) : String f, i32 x) : String
+{
+    f(x)
+}
+fn main()
+{
+    String unit = "kg";
+    auto fmt = move [unit](i32 x) : String { sprintf("%v %v", x, &unit) };
+    String a = apply(fmt, 1);
+    String b = apply(fmt, 2);
+    printf("%v / %v\n", &a, &b);
+}
+end
+run $COBC --check p344.cb
+status 1
+stderr-has a function value has no copy
+stderr-lacks clone(&fmt)
+
+# 345: a literal at an unbounded type parameter, where it is written.
+file p345.cb
+import std;
+fn total<T>(slice<T, shared> xs) : T
+{
+    T s = 0;
+    foreach (x in xs)
+    {
+        s = *x;
+    }
+    s
+}
+fn main()
+{
+    printf("%v\n", total(&[1, 2]));
+}
+end
+run $COBC --check p345.cb
+status 1
+stderr-has needs the bound `T: number`
+stderr-has p345.cb:4:11
+
+# 348: a closure captures a variable whole.
+file p348.cb
+import std;
+struct Store { Vec<u32> items; u32 min; }
+fn Store::prune(ref<Store, exclusive> s)
+{
+    Vec::retain(&mut s.items, [s](ref<u32, shared> x) : bool { *x >= s.min });
+}
+fn main()
+{
+    Store st = Store { .items = Vec::from_slice(&[1: u32, 5, 10]), .min = 4 };
+    Store::prune(&mut st);
+}
+end
+run $COBC --check p348.cb
+status 1
+stderr-has `auto min = s.min;`
+
+# 349, 261: a function called through a type parameter.
+file p349.cb
+import std;
+fn speak_all<T>(ref<T, shared> x)
+{
+    T::speak(x);
+}
+fn dup<T: clone>(ref<T, shared> x) : T
+{
+    T::clone(x)
+}
+fn main()
+{
+    speak_all(&1);
+    _ = dup(&2);
+}
+end
+run $COBC --check p349.cb
+status 1
+stderr-has pass the operation as a `fn` parameter
+stderr-has a copy of its value is `clone(x)`
+stderr-lacks import std;` for the standard library
+
+# 241: a key held by reference in generic code: the `_ref` lookup.
+file p241.cb
+import std;
+fn count_known<K>(ref<HashMap<K, i32>, shared> m, slice<K, shared> keys) : usize
+{
+    usize n = 0;
+    foreach (k in keys)
+    {
+        if (HashMap::contains(m, *k))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+fn main()
+{
+    HashMap<String, i32> b = HashMap::new();
+    Vec<String> ks = Vec::new();
+    Vec::push(&mut ks, "x");
+    printf("%v\n", count_known(&b, &ks));
+}
+end
+run $COBC --check p241.cb
+status 1
+stderr-has `HashMap::contains_ref(…, k)`
+stderr-lacks `&x`
+
+# 247: the `for` header's error first, naming `usize`.
+file p247.cb
+import std;
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[1, 2, 3]);
+    for (i32 i = 0; i < Vec::len(&v); i += 1)
+    {
+        bool big = v[i] > 1;
+        printf("%v\n", big);
+    }
+}
+end
+run $COBC --check p247.cb
+status 1
+stderr-has p247.cb:5:21
+stderr-has declare it `usize` from the start (`usize i = 0`)
+
+# 253: generic forms in a generic body's advice.
+file p253.cb
+import std;
+fn largest<T: ordered>(slice<T, shared> xs) : T
+{
+    T best = xs[0];
+    best
+}
+fn main()
+{
+    Vec<String> words = Vec::new();
+    Vec::push(&mut words, "pear");
+    String w = largest(&words);
+    printf("%s\n", &w);
+}
+end
+run $COBC --check p253.cb
+status 1
+stderr-has `clone(&xs[0])`
+stderr-lacks String::clone(&v[i])
+
+# 254: Rust's `Vec` accessors get the forms that exist.
+file p254.cb
+import std;
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[1, 2]);
+    bool e = Vec::is_empty(&v);
+    auto l = Vec::last(&v);
+}
+end
+run $COBC --check p254.cb
+status 1
+stderr-has write `Vec::len(&v) == 0`
+stderr-has `v[$ - 1]` after checking `Vec::len(&v) > 0`
+
+# 261: more day-one habits.
+file p261a.cb
+import std;
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[1, 2, 3]);
+    for (x in &v)
+    {
+        printf("%d\n", *x);
+    }
+}
+end
+run $COBC --check p261a.cb
+status 1
+stderr-has a loop over a collection is `foreach (x in &v) { … }`
+file p261b.cb
+import std;
+fn main()
+{
+    f32 ratio = 0.5f;
+}
+end
+run $COBC --check p261b.cb
+status 1
+stderr-has C's literal suffixes are not CobaltC's
+file p261c.cb
+import std;
+fn main()
+{
+    Option<i32> age = None;
+    i32 a = age ?? 0;
+}
+end
+run $COBC --check p261c.cb
+status 1
+stderr-has `Option::unwrap_or(o, d)`
+file p261d.cb
+import std;
+fn raw_copy<T: Copy>(T x) : T
+{
+    x
+}
+fn main()
+{
+    printf("%d\n", raw_copy(3));
+}
+end
+run $COBC --check p261d.cb
+status 1
+stderr-has p261d.cb:2:16
+stderr-has Rust's `Copy` is `plain`
+file p261e.cb
+import std;
+fn main()
+{
+    HashMap<String, i32> ages = HashMap::new();
+    i32 a = *HashMap::get(&ages, "ann");
+}
+end
+run $COBC --check p261e.cb
+status 1
+stderr-has which may be `None`
+file p261f.cb
+import std;
+fn main()
+{
+    Vec<i32> v = [1, 2, 3];
+}
+end
+run $COBC --check p261f.cb
+status 1
+stderr-has `Vec::from_slice(&[…])`
+stderr-lacks declare it `array<i32, 3>`
+
+# 276: the `--find` query suggested finds the items.
+run $COBC --doc Vec::firts
+status 1
+stderr-has `--doc --find vec`
+stderr-lacks --find vec firts
+
+# 306: a derived `clone` is documented.
+run $COBC --doc PgRow::clone
+status 0
+stdout-has (derived;
+file p261g.cb
+import std;
+fn main()
+{
+    Vec<String> names = Vec::new();
+    Vec::push(&mut names, "ann");
+    foreach (n in names)
+    {
+        printf("%s\n", &n);
+    }
+    printf("%v names\n", Vec::len(&names));
+}
+end
+run $COBC --check p261g.cb
+status 1
+stderr-has the `foreach (x in names)` moved it
+file p261h.cb
+import std;
+fn take(Vec<i32> v)
+{
+}
+fn main()
+{
+    Vec<i32> v = Vec::new();
+    take(v);
+    printf("%v\n", Vec::len(&v));
+}
+end
+run $COBC --check p261h.cb
+status 1
+stderr-lacks foreach

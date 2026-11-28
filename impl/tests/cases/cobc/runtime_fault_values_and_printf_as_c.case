@@ -1,0 +1,83 @@
+# Reports 065, 126, 235, 230, 232. A failed check names the values it
+# compared: the index and the length, the range and the text's length, the
+# operands and the type, the value and the type it does not fit. `%u` prints
+# a value's bits unsigned, as C; `#` adds no prefix to 0, and a NaN with its
+# sign bit set prints `-nan`, as C. A null pointer's fault names the
+# function. `allocate` with an alignment that is not a power of two is `Err`.
+# Under each C compiler.
+file f.cb
+import std;
+
+fn main()
+{
+    String what = Result::unwrap(arg(0));
+    usize n = arg_count();
+    Vec<i32> v = Vec::new();
+    Vec::push(&mut v, 1);
+    Vec::push(&mut v, 2);
+    Vec::push(&mut v, 3);
+    String s = "hello";
+    u8 x = narrow<u8>(arg_count() + 249);
+    if (what == "index") { printf("%v\n", v[n + 3]); }
+    if (what == "range") { printf("%s\n", &s[0..n + 6]); }
+    if (what == "sub") { usize last = n - 2; printf("%v\n", last); }
+    if (what == "add") { u8 y = x + 10; printf("%v\n", y); }
+    if (what == "narrow") { i64 big = 300 + to_int<i64>(to_float<f64>(n)); printf("%v\n", narrow<u8>(big)); }
+    if (what == "toint") { printf("%v\n", to_int<i32>(1e20 + to_float<f64>(n))); }
+    if (what == "null") { Vec<u8> b = unsafe { Vec::from_raw(null_rawptr<u8>(), 16) }; printf("%v\n", Vec::len(&b)); }
+}
+end
+file p.cb
+import std;
+
+fn main()
+{
+    i32 n = -1;
+    printf("%u %x\n", n, n);
+    i32 z = 0;
+    printf("[%#x] [%#o] [%#010x] [%#.0x] [%#.0o] [%#x]\n", z, z, z, z, z, 255);
+    f64 zero = to_float<f64>(arg_count());
+    f64 nan = zero / zero;
+    printf("[%f] [%+f] [%e]\n", nan, nan, nan);
+    foreach (al in [8: usize, 24, 48, 0])
+    {
+        match (allocate(40, al))
+        {
+            Ok(p)  :
+            {
+                printf("align %v: Ok\n", al);
+                unsafe { deallocate(p, 40, al); }
+            },
+            Err(_) : printf("align %v: Err\n", al),
+        }
+    }
+}
+end
+run $COBC --cc $CC -o f f.cb
+status 0
+run ./f index
+status 1
+stderr-has fault[diag.index-out-of-bounds]: index 4 is out of bounds for length 3
+run ./f range
+status 1
+stderr-has fault[diag.index-out-of-bounds]: range 0..7 is out of bounds for length 5
+run ./f sub
+status 1
+stderr-has fault[diag.arith-overflow]: 1 - 2 is outside `usize` (0 to 18446744073709551615)
+run ./f add
+status 1
+stderr-has fault[diag.arith-overflow]: 250 + 10 is outside `u8` (0 to 255)
+run ./f narrow
+status 1
+stderr-has fault[diag.narrowing-overflow]: the `i64` 301 does not fit `u8` (0 to 255)
+run ./f toint
+status 1
+stderr-has fault[diag.narrowing-overflow]: 100000000000000000000.0 does not fit `i32` (-2147483648 to 2147483647)
+run ./f null
+status 1
+stderr-has fault[diag.null-pointer]: `Vec::from_raw`: `p` is C's `NULL`, where 16 elements were to be copied from
+run $COBC --cc $CC -o p p.cb
+status 0
+run ./p
+status 0
+stdout-is 4294967295 ffffffff\n[0] [0] [0000000000] [] [0] [0xff]\n[-nan] [-nan] [-nan]\nalign 8: Ok\nalign 24: Err\nalign 48: Err\nalign 0: Err\n

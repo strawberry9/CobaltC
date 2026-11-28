@@ -1,0 +1,162 @@
+// CONFORMANCE-CASE
+// spec: 16-aggregates
+// facility: rule.resauth.destroy [Destroy-Composite]; rule.agg.derived-clone [Derived-Clone] (D-0116); conf.drop-deep-owning
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 636861696e20747275652074727565207472756520747275650a7472656520747275652074727565207472756520747275650a6c69737420747275652074727565207472756520747275650a
+//
+// A chain, a tree and an enum list two million levels deep whose values
+// own a `String` beside their links are built, walked through `Box::get`,
+// cloned and destroyed, the copies and the originals, without recursion:
+// a value's fields destroyed after its link free memory only, so the
+// linked value's destruction waits for them in the loop that destroys
+// the links, and the second link of a tree's value waits on a list of
+// its own rather than in a nested loop (report 022).
+
+import std;
+
+struct Link
+{
+    u64 value;
+    String text;
+    Option<Box<Link>> next;
+}
+
+struct Node
+{
+    String text;
+    Option<Box<Node>> left;
+    u64 value;
+    Option<Box<Node>> right;
+}
+
+enum List
+{
+    Nil,
+    Cons { String text; Box<List> next; u64 value; },
+}
+
+fn mix(u64 h, u64 v) : u64
+{
+    wrapping_add(wrapping_mul(h, 31), v)
+}
+
+fn link_sum(ref<Link, shared> l) : u64
+{
+    u64 s = 0;
+    ref<Link, shared> cur = l;
+    while (true)
+    {
+        s = mix(s, cur.value + widen<u64>(StringView::len(&cur.text)));
+        match (&cur.next)
+        {
+            Some(b) : cur = Box::get(b),
+            None    : break,
+        }
+    }
+    s
+}
+
+fn node_sum(ref<Node, shared> t) : u64
+{
+    u64 s = 0;
+    Vec<ref<Node, shared>> todo = Vec::new();
+    Vec::push(&mut todo, t);
+    while (true)
+    {
+        match (Vec::pop(&mut todo))
+        {
+            Some(n) :
+            {
+                s = mix(s, n.value + widen<u64>(StringView::len(&n.text)));
+                match (&n.right)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+                match (&n.left)
+                {
+                    Some(b) : Vec::push(&mut todo, Box::get(b)),
+                    None    : {},
+                }
+            },
+            None    : break,
+        }
+    }
+    s
+}
+
+fn list_sum(ref<List, shared> l) : u64
+{
+    u64 s = 0;
+    ref<List, shared> cur = l;
+    while (true)
+    {
+        match (cur)
+        {
+            List::Cons { text, next, value } :
+            {
+                s = mix(s, *value + widen<u64>(StringView::len(text)));
+                cur = Box::get(next);
+            },
+            Nil                              : break,
+        }
+    }
+    s
+}
+
+fn chain(u64 n) : u64
+{
+    Link l = Link { .value = 0, .text = "end", .next = None };
+    foreach (i in 1..n)
+    {
+        l = Link { .value = i, .text = "link", .next = Some(Box::new(l)) };
+    }
+    u64 h = link_sum(&l);
+    Link c = clone(&l);
+    u64 h2 = link_sum(&c);
+    printf("chain %v %v %v %v\n", h == h2, h != 0, c.value == n - 1, l.value == n - 1);
+    h
+}
+
+fn tree(u64 n) : u64
+{
+    // The deep side alternating: each value's other child a leaf.
+    Node t = Node { .text = "root", .left = None, .value = 0, .right = None };
+    foreach (i in 1..n)
+    {
+        Node leaf = Node { .text = "leaf", .left = None, .value = i + n, .right = None };
+        t = if (i % 2 == 0)
+        {
+            Node { .text = "node", .left = Some(Box::new(t)), .value = i, .right = Some(Box::new(leaf)) }
+        }
+        else { Node { .text = "node", .left = Some(Box::new(leaf)), .value = i, .right = Some(Box::new(t)) } };
+    }
+    u64 h = node_sum(&t);
+    Node c = clone(&t);
+    u64 h2 = node_sum(&c);
+    printf("tree %v %v %v %v\n", h == h2, h != 0, c.value == n - 1, t.value == n - 1);
+    h
+}
+
+fn list(u64 n) : u64
+{
+    List l = List::Nil;
+    foreach (i in 0..n)
+    {
+        l = List::Cons { .text = "cons", .next = Box::new(l), .value = i };
+    }
+    u64 h = list_sum(&l);
+    List c = clone(&l);
+    u64 h2 = list_sum(&c);
+    printf("list %v %v %v %v\n", h == h2, h != 0, list_sum(&List::Nil) == 0, n > 0);
+    h
+}
+
+fn main()
+{
+    u64 n = 2000000;
+    _ = chain(n);
+    _ = tree(n);
+    _ = list(n);
+}

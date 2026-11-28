@@ -1,0 +1,279 @@
+# The second round of the push after Update 206 (reports 109, 114, 136,
+# 183, and the view escaping a guard found with 136).
+#
+# A view a `match` (or `if (P = e)`) binder holds of the scrutinee's
+# temporary (here a lock's guard) may be used in the arm, but a copy of it
+# used after the `match` is refused (D-0135): the guard is gone.
+file escape.cb
+import std;
+
+fn leak(ref<mutex<HashMap<u64, String>>, shared> m, u64 k) : usize
+{
+    StringView kept = "";
+    match (HashMap::get(&*lock(m), k))
+    {
+        Some(n) : { kept = n; },
+        None    : {},
+    }
+    StringView::len(kept)
+}
+
+fn main()
+{
+    HashMap<u64, String> h = HashMap::new();
+    HashMap::insert(&mut h, 1, "abc");
+    mutex<HashMap<u64, String>> m = Mutex::new(h);
+    printf("%v\n", leak(&m, 1));
+}
+end
+run $COBC --check escape.cb
+status 1
+stderr-has `kept` holds a view of a temporary of the `match`
+file escape_if.cb
+import std;
+
+fn leak(ref<mutex<HashMap<u64, String>>, shared> m, u64 k) : usize
+{
+    StringView kept = "";
+    if (Some(n) = HashMap::get(&*lock(m), k))
+    {
+        kept = n;
+    }
+    StringView::len(kept)
+}
+
+fn main()
+{
+    mutex<HashMap<u64, String>> m = Mutex::new(HashMap::new());
+    printf("%v\n", leak(&m, 1));
+}
+end
+run $COBC --check escape_if.cb
+status 1
+stderr-has `kept` holds a view of a temporary of the `match`
+# 136: the `if (P = e)` form and the `match` form agree.
+file guarded.cb
+import std;
+
+fn with_match(ref<mutex<HashMap<u64, String>>, shared> m, u64 k) : usize
+{
+    match (HashMap::get(&*lock(m), k))
+    {
+        Some(n) : StringView::len(n),
+        None    : 0,
+    }
+}
+
+fn with_if(ref<mutex<HashMap<u64, String>>, shared> m, u64 k) : usize
+{
+    if (Some(n) = HashMap::get(&*lock(m), k))
+    {
+        StringView t = n;
+        return StringView::len(t);
+    }
+    0
+}
+
+fn main()
+{
+    HashMap<u64, String> h = HashMap::new();
+    HashMap::insert(&mut h, 1, "abc");
+    mutex<HashMap<u64, String>> m = Mutex::new(h);
+    printf("%v %v\n", with_match(&m, 1), with_if(&m, 1));
+}
+end
+run $COBC --run guarded.cb
+status 0
+stdout-is 3 3\n
+run $COBC --all-checks --run guarded.cb
+status 0
+stdout-is 3 3\n
+# 114: a reference whose last use is an `if`'s condition ends there, in
+# the checker and in the run, so the write in the branch is accepted by both
+# forms; one used in the branch too still conflicts.
+file condend.cb
+import std;
+
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[0: u32, 1]);
+    ref<u32, shared> it = &v[0];
+    if (*it == 0)
+    {
+        v[0] = 5;
+    }
+    printf("%v\n", v[0]);
+}
+end
+run $COBC --run condend.cb
+status 0
+stdout-is 5\n
+run $COBC --all-checks --run condend.cb
+status 0
+stdout-is 5\n
+file condend_used.cb
+import std;
+
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[0: u32, 1]);
+    ref<u32, shared> it = &v[0];
+    if (*it == 0)
+    {
+        v[0] = 5;
+        printf("%v\n", *it);
+    }
+}
+end
+run $COBC --check condend_used.cb
+status 1
+stderr-has `it` still borrows `v[0]`
+# 183: a `foreach` over a probe-only parameter's bytes.
+file probe_foreach.cb
+import std;
+
+struct Node
+{
+    u32 n;
+}
+
+fn walk(ref<Node, shared> root, StringView path) : Option<ref<Node, shared>> from root
+{
+    u32 dots = 0;
+    foreach (c in StringView::as_bytes(path))
+    {
+        if (*c == b'.')
+        {
+            dots += 1;
+        }
+    }
+    if (dots == root.n) { Some(root) } else { None }
+}
+
+fn main()
+{
+    Node r = Node { .n = 2 };
+    printf("%v\n", Option::is_some(&walk(&r, "a.b.c")));
+}
+end
+run $COBC --run probe_foreach.cb
+status 0
+stdout-is true\n
+# 109: a closure without `move` stored in a container that outlives one
+# of its captures is refused, naming both.
+file closures.cb
+import std;
+
+fn main()
+{
+    Vec<fn() : usize> fs = Vec::new();
+    foreach (i in 0..3)
+    {
+        Vec::push(&mut fs, [i]() : usize { i * 10 });
+    }
+    printf("%v\n", Vec::len(&fs));
+}
+end
+run $COBC --check closures.cb
+status 1
+stderr-has the closure `[i](…)` borrows `i`, which ends with its block, but it is stored in `fs`
+file closures_move.cb
+import std;
+
+fn main()
+{
+    Vec<fn() : usize> fs = Vec::new();
+    foreach (i in 0..3)
+    {
+        Vec::push(&mut fs, move [i]() : usize { i * 10 });
+    }
+    foreach (f in &fs)
+    {
+        printf("%v\n", (*f)());
+    }
+}
+end
+run $COBC --run closures_move.cb
+status 0
+stdout-is 0\n10\n20\n
+# 114: a reference whose last use is an assignment's value ends once the
+# value is made, before the place is written, in the run as in the checker;
+# the place's bounds still fault before the value's own fault.
+file assignend.cb
+import std;
+
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[7: u32, 1]);
+    ref<u32, shared> it = &v[0];
+    v[0] = *it + 1;
+    u32 x = 3;
+    ref<u32, shared> r = &x;
+    u32 y = 0;
+    y = *r * 2;
+    printf("%v %v\n", v[0], y);
+}
+end
+run $COBC --run assignend.cb
+status 0
+stdout-is 8 6\n
+run $COBC --all-checks --run assignend.cb
+status 0
+stdout-is 8 6\n
+file assignend_oob.cb
+import std;
+
+fn main()
+{
+    Vec<u32> v = Vec::from_slice(&[7: u32]);
+    Vec<u32> none = Vec::new();
+    u32 z = narrow<u32>(Vec::len(&none));
+    ref<u32, shared> it = &v[0];
+    v[5] = *it / z;
+}
+end
+run $COBC --all-checks --run assignend_oob.cb
+status 1
+stderr-has diag.index-out-of-bounds
+run $COBC --run assignend_oob.cb
+status 1
+stderr-has diag.index-out-of-bounds
+# 183: a value made from a probe-only parameter is followed through a
+# binding declared from it; reassigning an existing binding is refused,
+# naming the form that works.
+file probe_reassign.cb
+import std;
+
+struct Entry
+{
+    String key;
+}
+
+fn lookup(ref<Vec<Entry>, shared> entries, StringView path) : Option<ref<Entry, shared>> from entries
+{
+    StringView key = path;
+    match (StringView::find(path, "."))
+    {
+        Some(dot) :
+        {
+            key = &path[dot + 1..$];
+        },
+        None      : {},
+    }
+    match (Vec::position(entries, [key](ref<Entry, shared> e) : bool { e.key == key }))
+    {
+        Some(i) : Some(&entries[i]),
+        None    : None,
+    }
+}
+
+fn main()
+{
+    Vec<Entry> es = Vec::new();
+    printf("%v\n", Option::is_none(&lookup(&es, "a.b")));
+}
+end
+run $COBC --check probe_reassign.cb
+status 1
+stderr-has by assigning a value made from it to `key`
+stderr-has declare a new binding for it (`StringView rest = &path[…];`)

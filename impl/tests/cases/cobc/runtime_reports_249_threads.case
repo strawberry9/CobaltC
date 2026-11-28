@@ -1,0 +1,167 @@
+# Reports 317, 312, 332, 277, 331, 302 (group R, the push after Update
+# 207): what `main` printed is written when it returns, before the wait for
+# a thread still running; a supervisor cancelled while it joins cancels the
+# child it joins; a thread waiting in `read_line` can be cancelled; a
+# destructor that faults while a contained fault unwinds reports the
+# thread's own fault first; under `watch_interrupts` a second unseen
+# interrupt ends the program; `_ = spawn(…)` is warned. Under each C
+# compiler.
+platform unix
+file bg.cb
+import std;
+
+fn background(Arc<Channel<handle<void>>> inbox)
+{
+    drop(Option::unwrap(Channel::recv(Arc::get(&inbox))));
+    sleep_ms(1500);
+    eprintf("background done\n");
+}
+
+fn main()
+{
+    Arc<Channel<handle<void>>> inbox = Arc::new(Channel::new(1));
+    _ = Channel::send(Arc::get(&inbox), spawn(background, Arc::clone(&inbox)));
+    printf("main's result line\n");
+}
+end
+file sup.cb
+import std;
+
+fn sleeper() : u8
+{
+    sleep_ms(20000);
+    1
+}
+
+fn supervisor() : u8
+{
+    auto a = spawn(sleeper);
+    join(a)
+}
+
+fn main()
+{
+    auto h = spawn(supervisor);
+    sleep_ms(100);
+    cancel(&h);
+    match (try_join(h))
+    {
+        Ok(v) : printf("ok %v\n", v),
+        Err(f) : printf("supervisor failed: cancelled=%v\n", ThreadFailure::is_cancelled(&f)),
+    }
+}
+end
+file keys.cb
+import std;
+
+fn watch_keys(u32 unused) : u32
+{
+    u32 n = 0;
+    while (Some(l) = Result::unwrap(read_line()))
+    {
+        n += 1;
+    }
+    n
+}
+
+fn main() : u8
+{
+    handle<u32> h = spawn(watch_keys, 0);
+    sleep_ms(100);
+    cancel(&h);
+    printf("leaving main\n");
+    0
+}
+end
+file dtor.cb
+import std;
+
+resource struct Conn
+{
+    Vec<u32> pending;
+}
+
+fn Conn::drop(ref<Conn, exclusive> self)
+{
+    u32 last = self.pending[0];
+    eprintf("last %v\n", last);
+}
+
+fn worker(u32 n) : u32
+{
+    Conn c = Conn { .pending = Vec::new() };
+    Vec<u32> v = Vec::new();
+    v[widen<usize>(n)]
+}
+
+fn main() : u8
+{
+    handle<u32> h = spawn(worker, 3);
+    _ = try_join(h);
+    0
+}
+end
+file stop.cb
+import std;
+
+fn main() : u8
+{
+    watch_interrupts();
+    u64 n = 0;
+    while (!interrupt_requested())
+    {
+        match (read_line())
+        {
+            Ok(Some(_)) : n += 1,
+            _           : break,
+        }
+    }
+    0
+}
+end
+file discard.cb
+import std;
+
+fn work(u32 n)
+{
+    sleep_ms(10);
+}
+
+fn main()
+{
+    _ = spawn(work, 1);
+}
+end
+run $COBC --cc $CC -o bg bg.cb
+status 0
+run sh -c "./bg 2>/dev/null | { read l; date +%s > t1.txt; echo \"$l\"; cat; date +%s > t2.txt; }"
+stdout-is main's result line\n
+run sh -c "test $(cat t1.txt) -lt $(cat t2.txt) && echo first"
+stdout-is first\n
+run $COBC --cc $CC -o sup sup.cb
+status 0
+run timeout 10 ./sup
+status 0
+stdout-is supervisor failed: cancelled=true\n
+run $COBC --all-checks --cc $CC -o supx sup.cb
+status 0
+run timeout 10 ./supx
+status 0
+stdout-is supervisor failed: cancelled=true\n
+run $COBC --cc $CC -o keys keys.cb
+status 0
+run sh -c "mkfifo kf; (sleep 8 > kf 2>/dev/null &); timeout 5 ./keys < kf; echo $?"
+stdout-is leaving main\n0\n
+run $COBC --cc $CC -o dtor dtor.cb
+status 0
+run ./dtor
+status 1
+stderr-has fault[diag.index-out-of-bounds]: index 3 is out of bounds for length 0
+stderr-has fault[diag.index-out-of-bounds]: index 0 is out of bounds for length 0
+run $COBC --cc $CC -o stop stop.cb
+status 0
+run sh -c "mkfifo sf; (sleep 8 > sf 2>/dev/null &); ./stop < sf & p=$!; sleep 0.5; kill -INT $p; sleep 0.3; kill -INT $p; sleep 0.5; kill -0 $p 2>/dev/null && echo alive || echo ended; kill -9 $p 2>/dev/null; wait $p; echo $?"
+stdout-is ended\n130\n
+run $COBC --check discard.cb
+status 0
+stderr-has warning[diag.handle-discarded]

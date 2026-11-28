@@ -1,0 +1,955 @@
+// Every outcome the rules allow a program: the static pass first (its
+// first finding in source order is the program's outcome), then every
+// interleaving of the threads' steps (`[Thread-Step]`, `outcome:
+// unspecified`), explored depth-first with states deduplicated.
+//
+// Reduction: a step that touches nothing another thread can observe (the
+// operand stack, a fresh statement scope or frame, a binding's own lookup)
+// commutes with every step of every other thread, so it is taken without
+// branching.
+//
+// States are deduplicated by a 128-bit hash of their fields
+// (`hash_state`), so the count of states is exact as long as the hash
+// does not collide.
+
+import std;
+import ast;
+import maps;
+import statics;
+import machine;
+import parse;
+
+export enum End
+{
+    Okay, // no fault
+    Fault { String diag; str phase; usize line; },
+    TooBig,
+}
+
+// An outcome: the output and how the run ended. The output is kept
+// encoded (`out_key`) so that an outcome is a key type, ordered by the
+// output list first, then by the end.
+export struct Outcome
+{
+    export String out;
+    export End end;
+}
+
+fn push_hex64(ref<String, exclusive> s, i64 k)
+{
+    u64 u = reinterpret<u64>(k) ^ 0x8000000000000000;
+    String::appendf(s, "%016x", u);
+}
+
+// The output list as text whose order is the list's.
+export fn out_key(ref<Vec<i64>, shared> out) : String
+{
+    String s = String::new();
+    foreach (k in out)
+    {
+        push_hex64(&mut s, *k);
+    }
+    s
+}
+
+fn out_dec(StringView key) : Vec<i64>
+{
+    slice<u8, shared> b = StringView::as_bytes(key);
+    Vec<i64> v = Vec::new();
+    usize i = 0;
+    while (i + 16 <= slice_len(b))
+    {
+        u64 u = 0;
+        for (usize j = 0; j < 16; j += 1)
+        {
+            u8 c = b[i + j];
+            u64 d = 0;
+            if (c >= b'a')
+            {
+                d = widen<u64>(c - b'a') + 10;
+            }
+            else
+            {
+                d = widen<u64>(c - b'0');
+            }
+            u = (u << 4) | d;
+        }
+        Vec::push(&mut v, reinterpret<i64>(u ^ 0x8000000000000000));
+        i += 16;
+    }
+    v
+}
+
+export fn Outcome::text(ref<Outcome, shared> o) : String
+{
+    Vec<i64> out = out_dec(&o.out);
+    String end = match (&o.end)
+    {
+        End::Okay                        : "ok",
+        End::Fault { diag, phase, line } : sprintf("%s (%s) line %d", diag, *phase, *line),
+        End::TooBig                      : "too-big",
+    };
+    if (Vec::len(&out) == 0)
+    {
+        return end;
+    }
+    String s = "[";
+    for (usize i = 0; i < Vec::len(&out); i += 1)
+    {
+        if (i > 0)
+        {
+            String::push_ascii(&mut s, b' ');
+        }
+        String::appendf(&mut s, "%d", out[i]);
+    }
+    String::appendf(&mut s, "] %s", &end);
+    s
+}
+
+// One step of a schedule: (thread, function, instruction); the thread
+// `NO_THREAD` stands for every waiting thread faulting together.
+export struct Wit
+{
+    export u32 t;
+    export usize func;
+    export usize pc;
+}
+
+export const u32 NO_THREAD = 4294967295;
+
+export struct Report
+{
+    export SSet<Outcome> outcomes;
+    // One schedule reaching each outcome.
+    export SMap<Outcome, Vec<Wit>> witness;
+    export usize states;
+    export bool static_reject; // decided before any step ran
+}
+
+fn local(ref<Ins, shared> ins) : bool
+{
+    match (ins)
+    {
+        Ins::Int(_)         : true,
+        Ins::Add            : true,
+        Ins::Gt             : true,
+        Ins::Pop            : true,
+        Ins::Jump(_)        : true,
+        Ins::JumpIfFalse(_) : true,
+        Ins::StmtEnter      : true,
+        Ins::BlockEnter     : true,
+        Ins::HoldLit        : true,
+        Ins::Var(_)         : true,
+        Ins::Licensed(_)    : true,
+        _                   : false,
+    }
+}
+
+export const usize STATE_LIMIT = 3000000;
+
+export fn run(ref<Program, shared> prog, bool spare_result) : Report
+{
+    run_with(prog, spare_result, false)
+}
+
+fn static_report(ref<StaticErr, shared> e) : Report
+{
+    SSet<Outcome> outcomes = SSet::new();
+    _ = SSet::insert(&mut outcomes, Outcome { .out = "", .end = End::Fault { .diag = String::copy(e.diag), .phase = "static", .line = e.line } });
+    Report { .outcomes = outcomes, .witness = SMap::new(), .states = 0, .static_reject = true }
+}
+
+// D-0241: `as_licensed`, every access the discharge table proves is marked,
+// and one that `clash` refutes all the same ends in the outcome
+// `model.proven-but-false`.
+export fn run_with(ref<Program, shared> prog, bool spare_result, bool as_licensed) : Report
+{
+    Statics st = statics::check(prog);
+    match (Statics::first(&st))
+    {
+        Some(k) : return static_report(&st.errors[k]),
+        None    : {},
+    }
+    Code code = compile_with(prog, &st.ends, as_licensed, &st.proven);
+    explore(&code, spare_result)
+}
+
+// D-0299 (`cobmodel certify`): the program explored with the certificate's
+// verdicts applied (`machine::compile_certified`): an alias or temporal
+// fault at a step of a body the certificate calls decided is the outcome
+// `model.decided-but-false`.
+export fn run_certified(ref<Program, shared> prog, bool spare_result, ref<SSet<String>, shared> decided, bool all) : Report
+{
+    Statics st = statics::check(prog);
+    match (Statics::first(&st))
+    {
+        Some(k) : return static_report(&st.errors[k]),
+        None    : {},
+    }
+    Code code = compile_certified(prog, &st.ends, decided, all);
+    explore(&code, spare_result)
+}
+
+// The faults a program with no record of references cannot raise: a
+// conflict between references, or an access through one to an object that
+// has ended. A bound, a resource's state or an uninitialised object is a
+// check of a value, which such a program still makes.
+fn unrecorded_diag(str d) : bool
+{
+    d == "diag.aliasing-conflict" || d == "diag.stale-binding" || d == "diag.destroy-while-aliased" || d == "diag.move-while-aliased"
+}
+
+// ---- the state's hash ----
+
+export struct StateKey
+{
+    export u64 a;
+    export u64 b;
+}
+
+struct H
+{
+    u64 a;
+    u64 b;
+}
+
+fn H::word(ref<H, exclusive> h, u64 x)
+{
+    h.a = wrapping_mul(h.a ^ x, 0x100000001B3);
+    h.a = h.a ^ (h.a >> 29);
+    h.b = wrapping_mul(wrapping_add(h.b, x), 0x9E3779B97F4A7C15);
+    h.b = rotate_left(h.b, 27) ^ 0x632BE59BD9B4E019;
+}
+
+fn H::u32v(ref<H, exclusive> h, u32 x)
+{
+    H::word(h, widen<u64>(x));
+}
+
+fn H::usz(ref<H, exclusive> h, usize x)
+{
+    H::word(h, narrow_wrapping<u64>(x));
+}
+
+fn H::i64v(ref<H, exclusive> h, i64 x)
+{
+    H::word(h, reinterpret<u64>(x));
+}
+
+fn H::flag(ref<H, exclusive> h, bool x)
+{
+    if (x)
+    {
+        H::word(h, 1);
+    }
+    else
+    {
+        H::word(h, 0);
+    }
+}
+
+fn H::opt_u32(ref<H, exclusive> h, Option<u32> x)
+{
+    match (x)
+    {
+        Some(v) :
+        {
+            H::word(h, 1);
+            H::u32v(h, v);
+        },
+        None    : H::word(h, 0),
+    }
+}
+
+fn H::text(ref<H, exclusive> h, StringView s)
+{
+    H::usz(h, StringView::len(s));
+    foreach (c in StringView::as_bytes(s))
+    {
+        H::word(h, widen<u64>(*c));
+    }
+}
+
+fn H::mode(ref<H, exclusive> h, Mode m)
+{
+    match (m)
+    {
+        Mode::Shared : H::word(h, 0),
+        Mode::Excl   : H::word(h, 1),
+    }
+}
+
+fn H::val(ref<H, exclusive> h, ref<Val, shared> v)
+{
+    match (v)
+    {
+        Val::Unit                       : H::word(h, 100),
+        Val::Int(k)                     :
+        {
+            H::word(h, 101);
+            H::i64v(h, *k);
+        },
+        Val::Bool(b)                    :
+        {
+            H::word(h, 102);
+            H::flag(h, *b);
+        },
+        Val::Ref(t)                     :
+        {
+            H::word(h, 103);
+            H::u32v(h, *t);
+        },
+        Val::Hold(t)                    :
+        {
+            H::word(h, 104);
+            H::u32v(h, *t);
+        },
+        Val::Vec { buf, len, cap }      :
+        {
+            H::word(h, 105);
+            H::u32v(h, *buf);
+            H::u32v(h, *len);
+            H::u32v(h, *cap);
+        },
+        Val::Handle(t)                  :
+        {
+            H::word(h, 106);
+            H::u32v(h, *t);
+        },
+        Val::Opt(o)                     :
+        {
+            H::word(h, 107);
+            match (o)
+            {
+                Some(b) :
+                {
+                    H::word(h, 1);
+                    H::val(h, Box::get(b));
+                },
+                None    : H::word(h, 0),
+            }
+        },
+        Val::Mutex(k)                   :
+        {
+            H::word(h, 108);
+            H::i64v(h, *k);
+        },
+        Val::Guard(t)                   :
+        {
+            H::word(h, 109);
+            H::u32v(h, *t);
+        },
+        Val::Chan { q, closed, cap }    :
+        {
+            H::word(h, 110);
+            H::usz(h, Vec::len(q));
+            foreach (x in q)
+            {
+                H::val(h, x);
+            }
+            H::flag(h, *closed);
+            H::u32v(h, *cap);
+        },
+        Val::Res(o)                     :
+        {
+            H::word(h, 111);
+            match (o)
+            {
+                Some(b) :
+                {
+                    H::word(h, 1);
+                    H::val(h, Box::get(b));
+                },
+                None    : H::word(h, 0),
+            }
+        },
+        Val::Clo { func, caps, mv, ws } :
+        {
+            H::word(h, 112);
+            H::usz(h, *func);
+            H::usz(h, Vec::len(caps));
+            foreach (x in caps)
+            {
+                H::val(h, x);
+            }
+            H::flag(h, *mv);
+            H::flag(h, *ws);
+        },
+        Val::Slice { tok, start, len }  :
+        {
+            H::word(h, 113);
+            H::u32v(h, *tok);
+            H::u32v(h, *start);
+            H::u32v(h, *len);
+        },
+        Val::Job(t)                     :
+        {
+            H::word(h, 114);
+            H::u32v(h, *t);
+        },
+        Val::Arr(xs)                    :
+        {
+            H::word(h, 115);
+            H::usz(h, Vec::len(xs));
+            foreach (x in xs)
+            {
+                H::i64v(h, *x);
+            }
+        },
+        Val::Atomic { v: x, w }         :
+        {
+            H::word(h, 116);
+            H::i64v(h, *x);
+            H::word(h, *w);
+        },
+    }
+}
+
+fn H::fault(ref<H, exclusive> h, ref<Fault, shared> f)
+{
+    H::text(h, f.diag);
+    H::usz(h, f.line);
+    H::opt_u32(h, f.tok);
+    H::flag(h, f.value);
+}
+
+fn H::pstep(ref<H, exclusive> h, PStep st)
+{
+    match (st)
+    {
+        PStep::F(i)         :
+        {
+            H::word(h, 0);
+            H::word(h, widen<u64>(i));
+        },
+        PStep::R { lo, hi } :
+        {
+            H::word(h, 1);
+            H::u32v(h, lo);
+            H::u32v(h, hi);
+        },
+        PStep::I(i)         :
+        {
+            H::word(h, 2);
+            H::u32v(h, i);
+        },
+    }
+}
+
+fn H::act(ref<H, exclusive> h, ref<Act, shared> a)
+{
+    H::usz(h, a.func);
+    H::usz(h, a.pc);
+    H::usz(h, Vec::len(&a.stack));
+    foreach (x in &a.stack)
+    {
+        match (x)
+        {
+            SVal::V(v)     :
+            {
+                H::word(h, 0);
+                H::val(h, v);
+            },
+            SVal::Place(t) :
+            {
+                H::word(h, 1);
+                H::u32v(h, *t);
+            },
+        }
+    }
+    H::usz(h, Vec::len(&a.slots.keys));
+    for (usize i = 0; i < Vec::len(&a.slots.keys); i += 1)
+    {
+        H::text(h, &a.slots.keys[i]);
+        H::usz(h, Vec::len(&a.slots.vals[i]));
+        foreach (t in &a.slots.vals[i])
+        {
+            H::u32v(h, *t);
+        }
+    }
+    H::usz(h, Vec::len(&a.frames));
+    foreach (f in &a.frames)
+    {
+        H::u32v(h, *f);
+    }
+    H::u32v(h, a.param_frame);
+    match (&a.exiting)
+    {
+        Some(l) :
+        {
+            H::word(h, 1);
+            H::usz(h, Vec::len(l));
+            foreach (o in l)
+            {
+                H::u32v(h, *o);
+            }
+        },
+        None    : H::word(h, 0),
+    }
+}
+
+// A hash of every field of `State` that tells one state from another (the
+// trace itself left out: it is empty but under `trace`).
+export fn hash_state(ref<State, shared> s) : StateKey
+{
+    H h = H { .a = 0xCBF29CE484222325, .b = 0x84222325CBF29CE4 };
+    H::flag(&mut h, s.pend_next);
+    H::flag(&mut h, s.lend_next);
+    H::flag(&mut h, s.quiet_store);
+    H::u32v(&mut h, s.quiet_end);
+    H::flag(&mut h, s.emit_end);
+    match (&s.moving)
+    {
+        Some(mv) :
+        {
+            H::word(&mut h, 1);
+            H::u32v(&mut h, mv.o);
+            H::u32v(&mut h, mv.a);
+            H::u32v(&mut h, mv.t);
+            H::val(&mut h, &mv.v);
+        },
+        None     : H::word(&mut h, 0),
+    }
+    H::usz(&mut h, Vec::len(&s.handle_obj.keys));
+    for (usize i = 0; i < Vec::len(&s.handle_obj.keys); i += 1)
+    {
+        H::u32v(&mut h, s.handle_obj.keys[i]);
+        H::u32v(&mut h, s.handle_obj.vals[i]);
+    }
+    H::usz(&mut h, Vec::len(&s.guard_obj.keys));
+    for (usize i = 0; i < Vec::len(&s.guard_obj.keys); i += 1)
+    {
+        H::u32v(&mut h, s.guard_obj.keys[i]);
+        H::u32v(&mut h, s.guard_obj.vals[i]);
+    }
+    H::usz(&mut h, Vec::len(&s.objs.keys));
+    for (usize i = 0; i < Vec::len(&s.objs.keys); i += 1)
+    {
+        ref<Obj, shared> o = &s.objs.vals[i];
+        H::u32v(&mut h, s.objs.keys[i]);
+        H::flag(&mut h, o.is_res);
+        match (&o.val)
+        {
+            Some(v) :
+            {
+                H::word(&mut h, 1);
+                H::val(&mut h, v);
+            },
+            None    : H::word(&mut h, 0),
+        }
+        match (o.elem)
+        {
+            Some(e) :
+            {
+                H::word(&mut h, 1);
+                H::u32v(&mut h, e.buf);
+                H::u32v(&mut h, e.i);
+            },
+            None    : H::word(&mut h, 0),
+        }
+        H::opt_u32(&mut h, o.scope);
+        H::word(&mut h, o.origin);
+    }
+    H::usz(&mut h, Vec::len(&s.paths.keys));
+    for (usize i = 0; i < Vec::len(&s.paths.keys); i += 1)
+    {
+        ref<Path, shared> p = &s.paths.vals[i];
+        H::u32v(&mut h, s.paths.keys[i]);
+        H::u32v(&mut h, p.of);
+        H::usz(&mut h, Vec::len(&p.steps));
+        foreach (st in &p.steps)
+        {
+            H::pstep(&mut h, *st);
+        }
+        H::mode(&mut h, p.mode);
+        match (p.thread)
+        {
+            Owner::T(t)    :
+            {
+                H::word(&mut h, 0);
+                H::u32v(&mut h, t);
+            },
+            Owner::Transit : H::word(&mut h, 1),
+        }
+        H::flag(&mut h, p.valid);
+        H::u32v(&mut h, p.frame);
+        H::opt_u32(&mut h, p.scope);
+        H::opt_u32(&mut h, p.base);
+        H::flag(&mut h, p.pending);
+        H::flag(&mut h, p.lockp);
+        H::flag(&mut h, p.transient);
+    }
+    H::usz(&mut h, Vec::len(&s.holder.keys));
+    for (usize i = 0; i < Vec::len(&s.holder.keys); i += 1)
+    {
+        H::u32v(&mut h, s.holder.keys[i]);
+        H::u32v(&mut h, s.holder.vals[i]);
+    }
+    H::usz(&mut h, Vec::len(&s.bufs.keys));
+    for (usize i = 0; i < Vec::len(&s.bufs.keys); i += 1)
+    {
+        H::u32v(&mut h, s.bufs.keys[i]);
+        H::usz(&mut h, Vec::len(&s.bufs.vals[i]));
+        foreach (v in &s.bufs.vals[i])
+        {
+            H::val(&mut h, v);
+        }
+    }
+    H::usz(&mut h, Vec::len(&s.elems.keys));
+    for (usize i = 0; i < Vec::len(&s.elems.keys); i += 1)
+    {
+        H::u32v(&mut h, s.elems.keys[i].buf);
+        H::u32v(&mut h, s.elems.keys[i].i);
+        H::u32v(&mut h, s.elems.vals[i]);
+    }
+    H::usz(&mut h, Vec::len(&s.threads.keys));
+    for (usize i = 0; i < Vec::len(&s.threads.keys); i += 1)
+    {
+        ref<Thread, shared> th = &s.threads.vals[i];
+        H::u32v(&mut h, s.threads.keys[i]);
+        H::usz(&mut h, Vec::len(&th.acts));
+        foreach (a in &th.acts)
+        {
+            H::act(&mut h, a);
+        }
+        H::usz(&mut h, Vec::len(&th.scopes));
+        foreach (x in &th.scopes)
+        {
+            H::u32v(&mut h, x.sc);
+            H::u32v(&mut h, x.frame);
+        }
+        match (&th.status)
+        {
+            Status::Running   : H::word(&mut h, 0),
+            Status::Done(v)   :
+            {
+                H::word(&mut h, 1);
+                H::val(&mut h, v);
+            },
+            Status::Failed(f) :
+            {
+                H::word(&mut h, 2);
+                H::fault(&mut h, f);
+            },
+            Status::Taken     : H::word(&mut h, 3),
+        }
+        H::flag(&mut h, th.waiting);
+        H::flag(&mut h, th.lent);
+        H::usz(&mut h, Vec::len(&th.licensed.keys));
+        foreach (t in &th.licensed.keys)
+        {
+            H::u32v(&mut h, *t);
+        }
+    }
+    H::usz(&mut h, Vec::len(&s.out));
+    foreach (k in &s.out)
+    {
+        H::i64v(&mut h, *k);
+    }
+    H::u32v(&mut h, s.next);
+    H::word(&mut h, s.clock);
+    H::usz(&mut h, Vec::len(&s.sync.keys));
+    for (usize i = 0; i < Vec::len(&s.sync.keys); i += 1)
+    {
+        H::u32v(&mut h, s.sync.keys[i]);
+        match (s.sync.vals[i])
+        {
+            Sync::Unlocked    :
+            {
+                H::word(&mut h, 0);
+            },
+            Sync::LockedBy(t) :
+            {
+                H::word(&mut h, 1);
+                H::u32v(&mut h, t);
+            },
+            Sync::Poisoned(t) :
+            {
+                H::word(&mut h, 2);
+                H::u32v(&mut h, t);
+            },
+        }
+    }
+    H::usz(&mut h, Vec::len(&s.statics));
+    foreach (t in &s.statics)
+    {
+        H::u32v(&mut h, *t);
+    }
+    StateKey { .a = h.a, .b = h.b }
+}
+
+struct Frontier
+{
+    State s;
+    Vec<Wit> hist;
+}
+
+fn add_outcome(ref<SSet<Outcome>, exclusive> outcomes, ref<SMap<Outcome, Vec<Wit>>, exclusive> witness, Outcome o, ref<Vec<Wit>, shared> hist)
+{
+    if (!SMap::contains(witness, &o))
+    {
+        _ = SMap::insert(witness, clone(&o), clone(hist));
+    }
+    _ = SSet::insert(outcomes, o);
+}
+
+export fn explore(ref<Code, shared> code, bool spare_result) : Report
+{
+    Machine m = Machine { .code = code, .spare_result = spare_result };
+    SSet<Outcome> outcomes = SSet::new();
+    HashSet<StateKey> seen = HashSet::new();
+    SMap<Outcome, Vec<Wit>> witness = SMap::new();
+    Vec<Frontier> stack = Vec::new();
+    Vec::push(&mut stack, Frontier { .s = State::new(code), .hist = Vec::new() });
+    while (true)
+    {
+        Frontier fr = match (Vec::pop(&mut stack))
+        {
+            Some(f) : f,
+            None    : break,
+        };
+        Frontier { s, hist } = fr;
+        if (!HashSet::insert(&mut seen, hash_state(&s)))
+        {
+            continue;
+        }
+        if (HashSet::len(&seen) > STATE_LIMIT)
+        {
+            Outcome o = Outcome { .out = out_key(&s.out), .end = End::TooBig };
+            add_outcome(&mut outcomes, &mut witness, o, &hist);
+            break;
+        }
+        Vec<u32> en = Vec::new();
+        foreach (t in &s.threads.keys)
+        {
+            if (Machine::enabled(&m, &s, *t))
+            {
+                Vec::push(&mut en, *t);
+            }
+        }
+        if (Vec::len(&en) == 0)
+        {
+            // Every live thread waits and none can go on. The main thread
+            // waiting alone on a channel is `[Channel-Deadlock]`; otherwise
+            // `[Deadlock]` (b): each thread at the end of a chain of waits
+            // (one waiting on a channel or an atomic) faults.
+            bool running_spawned = false;
+            Vec<u32> ends = Vec::new();
+            for (usize i = 0; i < Vec::len(&s.threads.keys); i += 1)
+            {
+                u32 t = s.threads.keys[i];
+                bool running = Status::is_running(&s.threads.vals[i].status);
+                if (t != 0 && running)
+                {
+                    running_spawned = true;
+                }
+                if (running && Machine::waits_at_chain_end(&m, &s, t))
+                {
+                    Vec::push(&mut ends, t);
+                }
+            }
+            if (!running_spawned && Machine::waits_on_channel(&m, &s, 0))
+            {
+                Outcome o = Outcome { .out = out_key(&s.out), .end = End::Fault { .diag = "diag.channel-deadlock", .phase = "dynamic", .line = Machine::line(&m, &s, 0) } };
+                add_outcome(&mut outcomes, &mut witness, o, &hist);
+                continue;
+            }
+            if (Vec::len(&ends) == 0)
+            {
+                Outcome o = Outcome { .out = out_key(&s.out), .end = End::Fault { .diag = "diag.deadlock", .phase = "dynamic", .line = Machine::line(&m, &s, 0) } };
+                add_outcome(&mut outcomes, &mut witness, o, &hist);
+                continue;
+            }
+            // The ends fault together; one that is not contained (the main
+            // thread, or a lent one) ends the program, and which of them is
+            // reported depends on which faults first.
+            Vec<u32> uncontained = Vec::new();
+            foreach (t in &ends)
+            {
+                if (*t == 0 || State::thread(&s, *t).lent)
+                {
+                    Vec::push(&mut uncontained, *t);
+                }
+            }
+            if (Vec::len(&uncontained) > 0)
+            {
+                foreach (t in &uncontained)
+                {
+                    Outcome o = Outcome { .out = out_key(&s.out), .end = End::Fault { .diag = "diag.deadlock", .phase = "dynamic", .line = Machine::line(&m, &s, *t) } };
+                    add_outcome(&mut outcomes, &mut witness, o, &hist);
+                }
+                continue;
+            }
+            State s2 = s;
+            foreach (t in &ends)
+            {
+                usize line = Machine::line(&m, &s2, *t);
+                Machine::contain(&m, &mut s2, *t, Fault { .diag = "diag.deadlock", .line = line, .tok = None, .value = false });
+            }
+            Vec<Wit> h2 = hist;
+            Vec::push(&mut h2, Wit { .t = NO_THREAD, .func = 0, .pc = 0 });
+            Vec::push(&mut stack, Frontier { .s = s2, .hist = h2 });
+            continue;
+        }
+        // A thread whose next step is local goes alone.
+        Vec<u32> choice = Vec::new();
+        foreach (t in &en)
+        {
+            ref<Act, shared> a = State::act_of(&s, *t);
+            if (local(&code.funcs[a.func].code[a.pc].ins))
+            {
+                Vec::push(&mut choice, *t);
+                break;
+            }
+        }
+        if (Vec::len(&choice) == 0)
+        {
+            choice = en;
+        }
+        foreach (t in &choice)
+        {
+            ref<Act, shared> a = State::act_of(&s, *t);
+            usize afunc = a.func;
+            usize apc = a.pc;
+            bool decided_here = afunc < Vec::len(&code.decided) && code.decided[afunc];
+            Vec<Wit> h2 = clone(&hist);
+            Vec::push(&mut h2, Wit { .t = *t, .func = afunc, .pc = apc });
+            match (Machine::step(&m, clone(&s), *t))
+            {
+                Step::Next(s2)           : Vec::push(&mut stack, Frontier { .s = s2, .hist = h2 }),
+                Step::Blocked            : {},
+                Step::Fault { s: s2, f } :
+                {
+                    // D-0299: the step was a decided body's, the fault one of
+                    // a reference's record, not of a value's own state, and
+                    // the access through a frame-held path -- or the whole
+                    // program is decided, and keeps no record at all.
+                    bool held = match (f.tok)
+                    {
+                        Some(a) : State::frame_held(&s2, a, *t),
+                        None    : false,
+                    };
+                    bool unrecorded = decided_here && !f.value && unrecorded_diag(f.diag) && (code.all_decided || held);
+                    String diag = String::copy(f.diag);
+                    if (unrecorded)
+                    {
+                        diag = "model.decided-but-false";
+                    }
+                    Outcome o = Outcome { .out = out_key(&s2.out), .end = End::Fault { .diag = diag, .phase = "dynamic", .line = f.line } };
+                    add_outcome(&mut outcomes, &mut witness, o, &h2);
+                },
+                Step::Exit(s2)           :
+                {
+                    Outcome o = Outcome { .out = out_key(&s2.out), .end = End::Okay };
+                    add_outcome(&mut outcomes, &mut witness, o, &h2);
+                },
+            }
+        }
+    }
+    Report { .outcomes = outcomes, .witness = witness, .states = HashSet::len(&seen), .static_reject = false }
+}
+
+// ---- tests ----
+
+// D-0299: a certificate's claim checked against the run. The program is
+// `sample/hand-b01.cb`: `r` is redirected to `x` on one path of a loop,
+// so the write to `x` after it is a conflict the static pass leaves to
+// the run (`fn main: left`), and the run finds it. A certificate that
+// called `main` decided would be refuted: the same fault, as
+// `model.decided-but-false`.
+const str REDIRECTED = "import std;\n\nfn main()\n{\n    i32 x = 1;\n    i32 y = 2;\n    auto r = &mut y;\n    i32 i = 0;\n    while (2 > i)\n    {\n        if (i > 0)\n        {\n            r = &mut x;\n            break;\n        }\n        i = i + 1;\n    }\n    x = 5;\n    *r = *r + 1;\n    printf(\"%v\\n\", x);\n    printf(\"%v\\n\", y);\n}\n";
+
+// `sample/three-p001018.cb`: `bump_hold` is decided, but its access goes
+// through a reference kept in data (`h.r`, a parameter's field), which
+// the run records in every function: the fault is the rules' own.
+const str THROUGH_DATA = "import std;\n\nstruct Hold\n{\n    ref<i32, exclusive> r;\n}\n\nfn bump_hold(Hold h)\n{\n    *h.r = *h.r + 1;\n}\n\nfn main()\n{\n    i32 x = 1;\n    i32 y = 2;\n    Hold h1 = Hold { .r = &mut x };\n    auto t1 = spawn(bump_hold, h1);\n    bump_hold(h1);\n    printf(\"%v\\n\", x);\n    printf(\"%v\\n\", y);\n}\n";
+
+// `sample/hand-o02.cb`: a `fn` value called after its closure was moved
+// out (`[Fn-Value-Empty-Call]`) is a check of the value's own state,
+// which a program keeping no record of references still makes.
+const str EMPTY_CALL = "import std;\n\nfn call_twice(fn() : void f)\n{\n    auto g = f;\n    g();\n    f();\n}\n\nfn main()\n{\n    i32 x = 1;\n    Vec<i32> v1 = Vec::new();\n    auto mk = move [v1]() { Vec::push(&mut v1, 1); };\n    call_twice(mk);\n    printf(\"%v\\n\", x);\n}\n";
+
+fn outcomes_of(str src, ref<Vec<str>, shared> decided, bool all) : Vec<String>
+{
+    Program p = Result::unwrap(parse::parse(src));
+    SSet<String> set = SSet::new();
+    foreach (d in decided)
+    {
+        _ = SSet::insert(&mut set, String::copy(*d));
+    }
+    Report r = run_certified(&p, true, &set, all);
+    Vec<String> out = Vec::new();
+    foreach (o in &r.outcomes.keys)
+    {
+        Vec::push(&mut out, Outcome::text(o));
+    }
+    out
+}
+
+fn texts_are(ref<Vec<String>, shared> got, ref<Vec<str>, shared> want) : bool
+{
+    if (Vec::len(got) != Vec::len(want))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(got); i += 1)
+    {
+        if (got[i] != want[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+unittest "a body left to the run faults as the rules say"
+{
+    Vec<str> none = Vec::new();
+    Vec<str> want = Vec::new();
+    Vec::push(&mut want, "diag.aliasing-conflict (dynamic) line 18");
+    assert(texts_are(&outcomes_of(REDIRECTED, &none, false), &want));
+}
+
+unittest "a false decided claim is refuted"
+{
+    Vec<str> main_only = Vec::new();
+    Vec::push(&mut main_only, "main");
+    Vec<str> none = Vec::new();
+    Vec<str> want = Vec::new();
+    Vec::push(&mut want, "model.decided-but-false (dynamic) line 18");
+    assert(texts_are(&outcomes_of(REDIRECTED, &main_only, false), &want));
+    assert(texts_are(&outcomes_of(REDIRECTED, &none, true), &want));
+}
+
+unittest "an access through data in a decided body is the run's"
+{
+    Vec<str> bh = Vec::new();
+    Vec::push(&mut bh, "bump_hold");
+    Vec<str> want = Vec::new();
+    Vec::push(&mut want, "diag.aliasing-conflict (dynamic) line 10");
+    Vec::push(&mut want, "[3 2] ok");
+    assert(texts_are(&outcomes_of(THROUGH_DATA, &bh, false), &want));
+    // Were the whole program decided, nothing would be recorded.
+    Vec<str> none = Vec::new();
+    Vec<str> want2 = Vec::new();
+    Vec::push(&mut want2, "model.decided-but-false (dynamic) line 10");
+    Vec::push(&mut want2, "[3 2] ok");
+    assert(texts_are(&outcomes_of(THROUGH_DATA, &none, true), &want2));
+}
+
+unittest "a value state check is not a record"
+{
+    Vec<str> none = Vec::new();
+    Vec<str> want = Vec::new();
+    Vec::push(&mut want, "diag.stale-binding (dynamic) line 7");
+    assert(texts_are(&outcomes_of(EMPTY_CALL, &none, true), &want));
+}
+
+unittest "a decided claim about another body changes nothing"
+{
+    Vec<str> other = Vec::new();
+    Vec::push(&mut other, "other");
+    Vec<str> want = Vec::new();
+    Vec::push(&mut want, "diag.aliasing-conflict (dynamic) line 18");
+    assert(texts_are(&outcomes_of(REDIRECTED, &other, false), &want));
+}

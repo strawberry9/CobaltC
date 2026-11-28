@@ -1,0 +1,91 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.json [Json-Parse] [Json-Text], rule.stdlib.time [From-Iso] [To-Iso-Local], `ParseError::text`, `Utf8Error` (reports 051, 057, 157, 158, 217, 221); conf.parse-errors-placed
+// kind: positive
+// expect: ok
+//
+// Every text parser's error names the first byte that does not fit, the
+// length when the text stops short: a JSON literal cut off or misspelt, an
+// HTTP date's zone or a word after it. `ParseError::text` says "invalid
+// syntax" for any parser, and `ParseError::describe` places the error at a
+// line and a column. A UTF-8 error's offset is where the ill-formed sequence
+// starts, so the bytes before it are UTF-8. A year too large for `to_unix`
+// is `OutOfRange` when read, not a fault later. `Json::text` keeps a
+// negative zero's sign. `to_iso_local` names the same moment as `to_iso`.
+
+import std;
+
+fn at(Result<Json, ParseError> r) : String
+{
+    match (r)
+    {
+        Err(Invalid(i)) : sprintf("Invalid(%v)", i),
+        Err(e)          : String::copy(ParseError::text(&e)),
+        Ok(_)           : "ok",
+    }
+}
+
+fn date_at(Result<DateTime, ParseError> r) : String
+{
+    match (r)
+    {
+        Err(Invalid(i)) : sprintf("Invalid(%v)", i),
+        Err(e)          : String::copy(ParseError::text(&e)),
+        Ok(_)           : "ok",
+    }
+}
+
+fn main()
+{
+    printf("tru: %s\n", &at(Json::parse("tru")));
+    printf("{\"a\": nul}: %s\n", &at(Json::parse("{\"a\": nul}")));
+    printf("[1, fals]: %s\n", &at(Json::parse("[1, fals]")));
+    printf("nothing: %s\n", &at(Json::parse("[1, x]")));
+    printf("UTC: %s\n", &date_at(DateTime::from_http_date("Sun, 06 Nov 1994 08:49:37 UTC")));
+    printf("after GMT: %s\n", &date_at(DateTime::from_http_date("Sun, 06 Nov 1994 08:49:37 GMT x")));
+    printf("short: %s\n", &date_at(DateTime::from_http_date("Sun, 06 Nov 1994")));
+    printf("month: %s\n", &date_at(DateTime::from_http_date("Sun, 06 Xyz 1994 08:49:37 GMT")));
+
+    String cfg = "{\n  \"a\": 1,\n}";
+    match (Json::parse(&cfg))
+    {
+        Err(e) : printf("%s; %s\n", ParseError::text(&e), &ParseError::describe(&e, &cfg)),
+        Ok(_)  : printf("ok?\n"),
+    }
+    ParseError short = Invalid(3);
+    printf("%s\n", &ParseError::describe(&short, "tru"));
+    ParseError tab = Invalid(1);
+    printf("%s\n", &ParseError::describe(&tab, "a\tb"));
+    ParseError wide = Invalid(2);
+    printf("%s\n", &ParseError::describe(&wide, "é€x"));
+
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, 0x61);
+    Vec::push(&mut b, 0x62);
+    Vec::push(&mut b, 0xE2);
+    Vec::push(&mut b, 0x82);
+    Vec::push(&mut b, 0x63);
+    match (StringView::from_utf8(&b))
+    {
+        Err(e) : printf("utf-8 offset %v, prefix valid: %v\n", e.offset, Result::is_ok(&StringView::from_utf8(&b[0..e.offset]))),
+        Ok(_)  : printf("valid?\n"),
+    }
+
+    printf("huge year: %v\n", unix_ms_from_iso("+292277026597-01-01T00:00:00Z") == Err(OutOfRange));
+    printf("huge year read: %s\n", &date_at(DateTime::from_iso("+292277026597-01-01T00:00:00Z")));
+    printf("largest: %v\n", Result::is_ok(&unix_ms_from_iso("+292278994-08-17T07:12:55Z")));
+
+    Vec<Json> zs = Vec::new();
+    Vec::push(&mut zs, JsonNumber(-0.0));
+    Vec::push(&mut zs, JsonNumber(0.0));
+    String t = Json::text(&JsonArray(zs));
+    printf("%s\n", &t);
+    Json back = Result::unwrap(Json::parse(&t));
+    f64 z = Option::unwrap(Json::as_f64(Option::unwrap(Json::at(&back, 0))));
+    printf("sign kept: %v\n", (reinterpret<u64>(z) >> 63) == 1);
+
+    DateTime m = Option::unwrap(DateTime::new(2024, 3, 10, 7, 30, 0));
+    String local = DateTime::to_iso_local(&m);
+    i64 off = local_offset_seconds(DateTime::to_unix(&m));
+    printf("local text has its offset: %v\n", StringView::len(&local) == 25 && (off != 0 || StringView::ends_with(&local, "+00:00")));
+}

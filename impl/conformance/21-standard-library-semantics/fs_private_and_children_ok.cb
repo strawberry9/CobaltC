@@ -1,0 +1,86 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.fs [Private-Files], rule.stdlib.process [Command] [Kill] (reports 223, 224, 239); conf.fs-private-and-children
+// kind: positive
+// expect: ok
+// platform: linux
+// args: $TMP
+//
+// `File::create_private` makes a file only its owner may read (mode 0600,
+// whatever the umask), and only where nothing was; `make_temp_dir` a new
+// directory of mode 0700 under `temp_dir()`, a different one each time. A
+// child killed and dropped without `wait` is reaped, so it leaves no
+// zombie. An environment name that is empty or holds `=` is refused.
+
+import std;
+
+fn mode(StringView path) : String
+{
+    Command c = Command::new("stat");
+    Command::arg(&mut c, "-c");
+    Command::arg(&mut c, "%a");
+    Command::arg(&mut c, path);
+    Output { status, stdout, stderr } = Result::unwrap(Command::output(&c));
+    String t = Result::unwrap(String::from_utf8(stdout));
+    String::copy(StringView::trim(&t))
+}
+
+fn zombies() : usize
+{
+    Command c = Command::new("ps");
+    Command::arg(&mut c, "-o");
+    Command::arg(&mut c, "stat=");
+    Command::arg(&mut c, "--ppid");
+    Command::arg(&mut c, &sprintf("%v", process_id()));
+    Output { status, stdout, stderr } = Result::unwrap(Command::output(&c));
+    String t = Result::unwrap(String::from_utf8(stdout));
+    usize n = 0;
+    foreach (l in StringView::lines(&t))
+    {
+        if (StringView::starts_with(l, "Z"))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn main()
+{
+    String dir = Result::unwrap(arg(0));
+    String secret = path_join(&dir, "token");
+    File f = Option::unwrap(Result::unwrap(File::create_private(&secret)));
+    _ = File::write_text(&mut f, "s3cret\n");
+    _ = Result::unwrap(File::close(f));
+    printf("private file mode %s\n", &mode(&secret));
+    printf("again: %v\n", Option::is_none(&Result::unwrap(File::create_private(&secret))));
+
+    String a = Result::unwrap(make_temp_dir("cbtest-"));
+    String b = Result::unwrap(make_temp_dir("cbtest-"));
+    printf("temp dirs differ: %v, mode %s, under temp_dir: %v\n", a != b, &mode(&a), StringView::starts_with(&a, &temp_dir()));
+    _ = remove_dir(&a);
+    _ = remove_dir(&b);
+
+    for (u32 i = 0; i < 20; i += 1)
+    {
+        Command s = Command::new("sleep");
+        Command::arg(&mut s, "60");
+        Child ch = Result::unwrap(Command::spawn(&s));
+        _ = Child::kill(&mut ch);
+    }
+    printf("zombies after 20 killed and dropped: %v\n", zombies());
+
+    Command e = Command::new("env");
+    Command::clear_env(&mut e);
+    Command::env(&mut e, "A=B", "x");
+    printf("a name with '=': %v\n", Result::is_err(&Command::output(&e)));
+    Command z = Command::new("env");
+    Command::clear_env(&mut z);
+    Command::env(&mut z, "", "x");
+    printf("an empty name: %v\n", Result::is_err(&Command::output(&z)));
+    Command ok = Command::new("env");
+    Command::clear_env(&mut ok);
+    Command::env(&mut ok, "GREETING", "hello");
+    Output { status, stdout, stderr } = Result::unwrap(Command::output(&ok));
+    printf("%s", &Result::unwrap(String::from_utf8(stdout)));
+}

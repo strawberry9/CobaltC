@@ -1,0 +1,997 @@
+// Command cases (D-0326, phase D): a test that writes some files, runs the
+// compiler or a program and checks what came of it, written as a case
+// file, `NAME.case`, one directive a line, run in a fresh directory of its
+// own:
+//
+//   # a comment (also any blank line)
+//   file NAME                  the lines up to `end` are the file's text
+//   …
+//   end
+//   run WORD…                  runs a command; `$COBC` is the compiler,
+//                              `$CC` the C compiler under test, `$DIR` the
+//                              case's directory; a word may be "quoted"
+//                              (`\"`, `\\`, `\n` inside); `env NAME=VALUE`
+//                              words before the program set its environment,
+//                              and `in DIR` runs it in that directory of the
+//                              case's
+//   stdin TEXT                 the next run's standard input (`\n` escapes)
+//   status N                   the last run's exit status
+//   stdout-is TEXT             its standard output, exactly (`\n`, `\t`, `\r`
+//                              escapes; `\s` a space, for one that ends a text)
+//   stderr-is TEXT
+//   stdout-has TEXT            contains; `-lacks` does not; `-starts` begins with
+//   stderr-has TEXT
+//   stdout-lacks TEXT
+//   stderr-lacks TEXT
+//   stdout-starts TEXT
+//   stderr-starts TEXT
+//   stdout-empty
+//   stderr-empty
+//   same-stderr-as RUN         its standard error is that of run number RUN
+//                              (from 1, in the case's order)
+//   same-stdout-as RUN
+//   stderr-starts-as RUN       its standard error begins with that of run RUN
+//   stdout-starts-as RUN
+//   exists PATH                a file or directory in the case's directory
+//   absent PATH
+//   file-is PATH TEXT          a file's whole text (`\n` escapes); `file-has`
+//   file-has PATH TEXT         contains it, `file-starts` begins with it
+//   file-starts PATH TEXT
+//   file-lacks PATH TEXT
+//   same-files A B             two files of the case's directory hold the same bytes
+//   copy REPO-PATH NAME        a file of the repository (its path from the
+//                              root) copied into the case's directory as NAME
+//   platform unix|windows      the case runs only there (first, before any run);
+//                              elsewhere it is skipped, saying so
+//   lists-line FILE MARKER     the standard output names `FILE:N`, N the
+//                              line of FILE that contains MARKER
+//   omits-line FILE MARKER     … does not
+//
+// And, for the checks a test computes; in these the
+// arguments are words, as `run` reads them ("quoted" where a word holds a
+// space), and a PATTERN is a text in which `…` stands for any run of
+// characters within one line:
+//
+//   save-stdout NAME           writes the last run's standard output to the
+//                              file NAME of the case's directory
+//   stdout-ends TEXT           ends with it (the rest of the line, as `-has`)
+//   stderr-ends TEXT
+//   stdout-line N TEXT [PREFIX]
+//                              line N (from 1) of the standard output contains
+//                              TEXT (counting only the lines that begin with
+//                              PREFIX, when one is given)
+//   stderr-line N TEXT [PREFIX]
+//   stdout-lines N [PREFIX]    the number of its lines (those that begin with
+//   stderr-lines N [PREFIX]    PREFIX, when one is given); `N+` is at least N
+//   stderr-numbers-below PREFIX MAX…
+//                              the first line of the standard error that begins
+//                              with PREFIX holds, after it, numbers whose first
+//                              ones are each below the MAX given in order
+//   listed-has FILE MARKER TEXT
+//                              a line of the standard output that lists `FILE:N`
+//                              (as `lists-line`) contains TEXT
+//   listed-lacks FILE MARKER TEXT
+//                              none does (also when no line lists it)
+//   file-like PATH PATTERN     some part of the file matches PATTERN (the rest
+//   file-unlike PATH PATTERN   of the line, as `file-has`); `-unlike`: none
+//   file-count PATH N PATTERN  PATTERN matches N parts of the file, none
+//                              overlapping; `N+` is at least N
+//   same-count A B PATTERN…    files A and B hold the PATTERNs, all told, as
+//                              many times
+//   cut SRC DEST FROM TO       writes DEST: the text of SRC from the first part
+//                              that matches FROM up to the first match of TO
+//                              after it (not included; "" is SRC's end); it
+//                              fails when either is not found
+//   drop-lines SRC DEST PREFIX writes DEST: SRC without its lines that begin
+//                              with PREFIX
+//   c-line-resumes FILE NAME   the first `#line N "…NAME"` line of the C file
+//                              FILE gives N as the number of the line after it
+//   set NAME FILE TEXT         NAME's value is the rest of the first line of FILE
+//                              that holds TEXT, after TEXT; a `run` word `$NAME`
+//                              alone becomes the words of that value
+//
+// A `run` word may also name `$BIN`, the directory that holds `$COBC` (the
+// tools built beside it, `$BIN/cobfmt`).
+//
+// A case passes when every check holds; the first that does not is its
+// failure.
+
+import std;
+import host;
+import cases;
+
+fn unescape(StringView t) : String
+{
+    String out = String::new();
+    slice<u8, shared> b = StringView::as_bytes(t);
+    usize i = 0;
+    usize n = slice_len(b);
+    while (i < n)
+    {
+        if (b[i] == b'\\' && i + 1 < n)
+        {
+            u8 c = b[i + 1];
+            if (c == b'n')
+            {
+                String::push_ascii(&mut out, b'\n');
+            }
+            else if (c == b't')
+            {
+                String::push_ascii(&mut out, b'\t');
+            }
+            else if (c == b's')
+            {
+                String::push_ascii(&mut out, b' ');
+            }
+            else if (c == b'r')
+            {
+                String::push_ascii(&mut out, b'\r');
+            }
+            else
+            {
+                String::push_ascii(&mut out, c);
+            }
+            i += 2;
+        }
+        else
+        {
+            usize j = i + 1;
+            while (j < n && (b[j] & 0xC0) == 0x80)
+            {
+                j += 1;
+            }
+            String::append(&mut out, &t[i..j]);
+            i = j;
+        }
+    }
+    out
+}
+
+// A command line's words: separated by spaces, a word "quoted" with the
+// escapes `unescape` reads.
+fn words(StringView line) : Vec<String>
+{
+    Vec<String> out = Vec::new();
+    slice<u8, shared> b = StringView::as_bytes(line);
+    usize n = slice_len(b);
+    usize i = 0;
+    while (i < n)
+    {
+        while (i < n && b[i] == b' ')
+        {
+            i += 1;
+        }
+        if (i >= n)
+        {
+            break;
+        }
+        if (b[i] == b'"')
+        {
+            usize j = i + 1;
+            while (j < n && b[j] != b'"')
+            {
+                if (b[j] == b'\\')
+                {
+                    j += 1;
+                }
+                j += 1;
+            }
+            Vec::push(&mut out, unescape(&line[i + 1..if (j < n) { j } else { n }]));
+            i = j + 1;
+        }
+        else
+        {
+            usize j = i;
+            while (j < n && b[j] != b' ')
+            {
+                j += 1;
+            }
+            Vec::push(&mut out, String::copy(&line[i..j]));
+            i = j;
+        }
+    }
+    out
+}
+
+fn text_of(slice<u8, shared> b) : String
+{
+    match (StringView::from_utf8(b))
+    {
+        Ok(v)  : String::copy(v),
+        Err(_) : sprintf("(not UTF-8) %s", &hex(b)),
+    }
+}
+
+// What a case is run with.
+export struct Tools
+{
+    export String cobc;
+    export String cc;
+    export String tmp_base;
+    // The repository's root, for `copy`.
+    export String repo;
+    export i64 cpu_secs;
+    export i64 wall_secs;
+}
+
+// The line (from 1) of `text` that contains `marker`, or 0.
+fn line_of(StringView text, StringView marker) : usize
+{
+    Vec<StringView> lines = StringView::lines(text);
+    for (usize i = 0; i < Vec::len(&lines); i += 1)
+    {
+        if (StringView::contains(lines[i], marker))
+        {
+            return i + 1;
+        }
+    }
+    0
+}
+
+// Whether the report `out` lists `file:n` (as `--report-tracking` lists a
+// line: `file:N` followed by a space or the end).
+fn lists(StringView out, StringView file, usize n) : bool
+{
+    String want = sprintf("%s:%v", file, n);
+    Vec<StringView> lines = StringView::lines(out);
+    foreach (l in &lines)
+    {
+        StringView t = StringView::trim_start(*l);
+        match (StringView::strip_prefix(t, &want))
+        {
+            Some(rest) :
+            {
+                if (StringView::len(rest) == 0 || StringView::starts_with(rest, " "))
+                {
+                    return true;
+                }
+            },
+            None       : {},
+        }
+    }
+    false
+}
+
+// Whether a line of `out` that lists `file:n` (as `lists`) contains `text`.
+fn listed_holds(StringView out, StringView file, usize n, StringView text) : bool
+{
+    String want = sprintf("%s:%v", file, n);
+    Vec<StringView> lines = StringView::lines(out);
+    foreach (l in &lines)
+    {
+        StringView t = StringView::trim_start(*l);
+        match (StringView::strip_prefix(t, &want))
+        {
+            Some(rest) :
+            {
+                if ((StringView::len(rest) == 0 || StringView::starts_with(rest, " ")) && StringView::contains(*l, text))
+                {
+                    return true;
+                }
+            },
+            None       : {},
+        }
+    }
+    false
+}
+
+// Whether a count meets its want: `N` exactly, `N+` at least N.
+fn count_meets(usize n, StringView want) : bool
+{
+    match (StringView::strip_suffix(want, "+"))
+    {
+        Some(least) : match (StringView::parse<usize>(least))
+        {
+            Ok(k)  : n >= k,
+            Err(_) : false,
+        },
+        None : match (StringView::parse<usize>(want))
+        {
+            Ok(k)  : n == k,
+            Err(_) : false,
+        },
+    }
+}
+
+// Where a pattern matched: its first byte and the byte after its last.
+struct Span
+{
+    usize start;
+    usize end;
+}
+
+// Whether `piece` occurs in `b` at byte `at`.
+fn bytes_at(slice<u8, shared> b, usize at, slice<u8, shared> piece) : bool
+{
+    usize m = slice_len(piece);
+    if (at + m > slice_len(b))
+    {
+        return false;
+    }
+    for (usize k = 0; k < m; k += 1)
+    {
+        if (b[at + k] != piece[k])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+// The end of a match of the pieces from `k` on, the gap before piece `k`
+// starting at `from` and holding no line's end.
+fn match_rest(slice<u8, shared> b, ref<Vec<StringView>, shared> pieces, usize k, usize from) : Option<usize>
+{
+    if (k == Vec::len(pieces))
+    {
+        return Some(from);
+    }
+    slice<u8, shared> p = StringView::as_bytes(pieces[k]);
+    usize q = from;
+    while (q + slice_len(p) <= slice_len(b))
+    {
+        if (bytes_at(b, q, p))
+        {
+            match (match_rest(b, pieces, k + 1, q + slice_len(p)))
+            {
+                Some(e) : return Some(e),
+                None    : {},
+            }
+        }
+        if (q >= slice_len(b) || b[q] == b'\n')
+        {
+            break;
+        }
+        q += 1;
+    }
+    None
+}
+
+// The first part of `t`, from byte `from` on, that matches `pattern` (`…`
+// any run of characters within a line).
+fn find_like(StringView t, StringView pattern, usize from) : Option<Span>
+{
+    Vec<StringView> pieces = StringView::split(pattern, "…");
+    slice<u8, shared> b = StringView::as_bytes(t);
+    slice<u8, shared> first = StringView::as_bytes(pieces[0]);
+    usize p = from;
+    while (p + slice_len(first) <= slice_len(b))
+    {
+        if (bytes_at(b, p, first))
+        {
+            match (match_rest(b, &pieces, 1, p + slice_len(first)))
+            {
+                Some(e) : return Some(Span { .start = p, .end = e }),
+                None    : {},
+            }
+        }
+        p += 1;
+    }
+    None
+}
+
+// How many parts of `t`, none overlapping, match `pattern`.
+fn count_like(StringView t, StringView pattern) : usize
+{
+    usize n = 0;
+    usize from = 0;
+    while (true)
+    {
+        match (find_like(t, pattern, from))
+        {
+            Some(s) :
+            {
+                n += 1;
+                from = if (s.end > s.start) { s.end } else { s.start + 1 };
+            },
+            None    : break,
+        }
+    }
+    n
+}
+
+// The numbers (runs of digits) in `t`, in order.
+fn numbers_in(StringView t) : Vec<u64>
+{
+    Vec<u64> out = Vec::new();
+    slice<u8, shared> b = StringView::as_bytes(t);
+    usize i = 0;
+    while (i < slice_len(b))
+    {
+        if (b[i] >= b'0' && b[i] <= b'9')
+        {
+            usize j = i;
+            while (j < slice_len(b) && b[j] >= b'0' && b[j] <= b'9')
+            {
+                j += 1;
+            }
+            Vec::push(&mut out, Result::unwrap_or(StringView::parse<u64>(&t[i..j]), 0));
+            i = j;
+        }
+        else
+        {
+            i += 1;
+        }
+    }
+    out
+}
+
+// The file `name` of the case's directory as text ("" when it cannot be read).
+fn case_text(StringView dir, StringView name) : String
+{
+    Result::unwrap_or(read_file(&path_join(dir, name)), "")
+}
+
+// Whether the case's `platform` line names another platform than this.
+export fn skipped_here(StringView src, bool on_windows) : bool
+{
+    Vec<StringView> lines = StringView::lines(src);
+    foreach (l in &lines)
+    {
+        match (StringView::strip_prefix(StringView::trim(*l), "platform "))
+        {
+            Some(p) :
+            {
+                bool windows = StringView::trim(p) == "windows";
+                return windows != on_windows;
+            },
+            None    : {},
+        }
+    }
+    false
+}
+
+// Runs the case file `path`: `None` when it passes, else its failure.
+export fn run_case(ref<Tools, shared> t, StringView path, usize index) : Option<String>
+{
+    String src = match (read_file(path))
+    {
+        Ok(s)  : s,
+        Err(_) : return Some("cannot read the case"),
+    };
+    String dir = path_join(&t.tmp_base, &sprintf("cbtest-script-%v-%v", process_id(), index));
+    _ = remove_dir_all(&dir);
+    _ = make_dir_all(&dir);
+    Vec<StringView> lines = StringView::split(&src, "\n");
+    Vec<Run> runs = Vec::new();
+    Vec<u8> next_stdin = Vec::new();
+    Option<String> failure = None;
+    // `set`'s names and values.
+    Vec<String> var_names = Vec::new();
+    Vec<String> var_values = Vec::new();
+    String bin = Option::unwrap_or(path_parent(&t.cobc), ".");
+    usize i = 0;
+    while (i < Vec::len(&lines) && Option::is_none(&failure))
+    {
+        StringView line = lines[i];
+        usize at = i + 1;
+        i += 1;
+        StringView t0 = StringView::trim(line);
+        if (StringView::len(t0) == 0 || StringView::starts_with(t0, "#"))
+        {
+            continue;
+        }
+        usize sp = Option::unwrap_or(StringView::find(t0, " "), StringView::len(t0));
+        StringView op = &t0[0..sp];
+        StringView arg_text = StringView::trim(&t0[sp..$]);
+        if (op == "file")
+        {
+            Vec<StringView> body = Vec::new();
+            while (i < Vec::len(&lines) && lines[i] != "end")
+            {
+                Vec::push(&mut body, lines[i]);
+                i += 1;
+            }
+            i += 1;
+            String text = StringView::join(&body, "\n");
+            String::append(&mut text, "\n");
+            String target = path_join(&dir, arg_text);
+            match (path_parent(&target))
+            {
+                Some(p) :
+                {
+                    _ = make_dir_all(&p);
+                },
+                None    : {},
+            }
+            _ = write_file(&target, &text);
+            continue;
+        }
+        if (op == "platform")
+        {
+            continue;
+        }
+        if (op == "stdin")
+        {
+            String s = unescape(arg_text);
+            next_stdin = Vec::from_slice(StringView::as_bytes(&s));
+            continue;
+        }
+        if (op == "run")
+        {
+            Vec<String> w = words(arg_text);
+            Spec s = Spec::new();
+            usize k = 0;
+            String cwd = String::clone(&dir);
+            while (k + 1 < Vec::len(&w) && (w[k] == "env" || w[k] == "in"))
+            {
+                if (w[k] == "env")
+                {
+                    Vec::push(&mut s.env, String::clone(&w[k + 1]));
+                }
+                else
+                {
+                    cwd = path_join(&dir, &w[k + 1]);
+                }
+                k += 2;
+            }
+            while (k < Vec::len(&w))
+            {
+                bool expanded = false;
+                for (usize v = 0; v < Vec::len(&var_names); v += 1)
+                {
+                    if (w[k] == sprintf("$%s", &var_names[v]))
+                    {
+                        Vec<StringView> parts = StringView::split_whitespace(&var_values[v]);
+                        foreach (part in &parts)
+                        {
+                            Spec::arg(&mut s, *part);
+                        }
+                        expanded = true;
+                    }
+                }
+                if (!expanded)
+                {
+                    String a = StringView::replace(&w[k], "$COBC", &t.cobc);
+                    a = StringView::replace(&a, "$CC", &t.cc);
+                    a = StringView::replace(&a, "$DIR", &dir);
+                    a = StringView::replace(&a, "$BIN", &bin);
+                    Spec::arg(&mut s, &a);
+                }
+                k += 1;
+            }
+            s.cwd = cwd;
+            s.input = replace(&mut next_stdin, Vec::new());
+            s.cpu_secs = t.cpu_secs;
+            s.wall_secs = t.wall_secs;
+            Vec::push(&mut s.env, sprintf("COBALTC_CPU_LIMIT=%v", t.cpu_secs));
+            Vec::push(&mut runs, run(&s));
+            continue;
+        }
+        if (op == "copy")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 2)
+            {
+                failure = Some(sprintf("line %v: copy takes a repository path and a name", at));
+                break;
+            }
+            match (read_bytes(&path_join(&t.repo, &w[0])))
+            {
+                Ok(b)  :
+                {
+                    _ = write_bytes(&path_join(&dir, &w[1]), &b);
+                },
+                Err(_) : failure = Some(sprintf("line %v: no file %s in the repository", at, &w[0])),
+            }
+            continue;
+        }
+        if (op == "same-files")
+        {
+            Vec<String> w = words(arg_text);
+            bool same = Vec::len(&w) == 2;
+            if (same)
+            {
+                Vec<u8> x = Result::unwrap_or(read_bytes(&path_join(&dir, &w[0])), Vec::new());
+                Vec<u8> y = Result::unwrap_or(read_bytes(&path_join(&dir, &w[1])), Vec::new());
+                same = Vec::len(&x) == Vec::len(&y) && Vec::len(&x) > 0;
+                for (usize q = 0; same && q < Vec::len(&x); q += 1)
+                {
+                    same = x[q] == y[q];
+                }
+            }
+            if (!same)
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold", at, t0));
+            }
+            continue;
+        }
+        if (op == "file-is" || op == "file-has" || op == "file-starts" || op == "file-lacks")
+        {
+            usize sp3 = Option::unwrap_or(StringView::find(arg_text, " "), StringView::len(arg_text));
+            String ftext = Result::unwrap_or(read_file(&path_join(&dir, &arg_text[0..sp3])), "\u{0}(no such file)");
+            String fwant = unescape(StringView::trim_start(&arg_text[sp3..$]));
+            bool fok = if (op == "file-is")
+            {
+                ftext == fwant
+            }
+            else if (op == "file-has")
+            {
+                StringView::contains(&ftext, &fwant)
+            }
+            else if (op == "file-lacks")
+            {
+                !StringView::contains(&ftext, &fwant)
+            }
+            else
+            {
+                StringView::starts_with(&ftext, &fwant)
+            };
+            if (!fok)
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold; the file holds:\n%s", at, t0, &ftext));
+            }
+            continue;
+        }
+        if (op == "file-like" || op == "file-unlike")
+        {
+            usize sp4 = Option::unwrap_or(StringView::find(arg_text, " "), StringView::len(arg_text));
+            String ftext = case_text(&dir, &arg_text[0..sp4]);
+            String pat = unescape(StringView::trim_start(&arg_text[sp4..$]));
+            bool found = Option::is_some(&find_like(&ftext, &pat, 0));
+            if (found != (op == "file-like"))
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold; the file holds:\n%s", at, t0, &ftext));
+            }
+            continue;
+        }
+        if (op == "file-count")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 3)
+            {
+                failure = Some(sprintf("line %v: file-count takes a path, a count and a pattern", at));
+                break;
+            }
+            usize got = count_like(&case_text(&dir, &w[0]), &w[2]);
+            if (!count_meets(got, &w[1]))
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold: %v found", at, t0, got));
+            }
+            continue;
+        }
+        if (op == "same-count")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) < 3)
+            {
+                failure = Some(sprintf("line %v: same-count takes two paths and a pattern or more", at));
+                break;
+            }
+            String xa = case_text(&dir, &w[0]);
+            String xb = case_text(&dir, &w[1]);
+            usize na = 0;
+            usize nb = 0;
+            for (usize q = 2; q < Vec::len(&w); q += 1)
+            {
+                na += count_like(&xa, &w[q]);
+                nb += count_like(&xb, &w[q]);
+            }
+            if (na != nb)
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold: %v in %s, %v in %s", at, t0, na, &w[0], nb, &w[1]));
+            }
+            continue;
+        }
+        if (op == "cut")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 4)
+            {
+                failure = Some(sprintf("line %v: cut takes a source, a destination, FROM and TO", at));
+                break;
+            }
+            String src_text = case_text(&dir, &w[0]);
+            match (find_like(&src_text, &w[2], 0))
+            {
+                Some(f) :
+                {
+                    usize upto = StringView::len(&src_text);
+                    if (StringView::len(&w[3]) > 0)
+                    {
+                        match (find_like(&src_text, &w[3], f.end))
+                        {
+                            Some(e) : upto = e.start,
+                            None    : failure = Some(sprintf("line %v: nothing in %s after `%s` matches `%s`", at, &w[0], &w[2], &w[3])),
+                        }
+                    }
+                    StringView part = &src_text[f.start..upto];
+                    _ = write_file(&path_join(&dir, &w[1]), part);
+                },
+                None    : failure = Some(sprintf("line %v: nothing in %s matches `%s`", at, &w[0], &w[2])),
+            }
+            continue;
+        }
+        if (op == "drop-lines")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 3)
+            {
+                failure = Some(sprintf("line %v: drop-lines takes a source, a destination and a prefix", at));
+                break;
+            }
+            String src_text = case_text(&dir, &w[0]);
+            Vec<StringView> pieces = StringView::split(&src_text, "\n");
+            Vec<StringView> kept = Vec::new();
+            foreach (p in &pieces)
+            {
+                if (!StringView::starts_with(*p, &w[2]))
+                {
+                    Vec::push(&mut kept, *p);
+                }
+            }
+            _ = write_file(&path_join(&dir, &w[1]), &StringView::join(&kept, "\n"));
+            continue;
+        }
+        if (op == "c-line-resumes")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 2)
+            {
+                failure = Some(sprintf("line %v: c-line-resumes takes a C file and a name", at));
+                break;
+            }
+            String ctext = case_text(&dir, &w[0]);
+            Vec<StringView> clines = StringView::split(&ctext, "\n");
+            String tail = sprintf("%s\"", &w[1]);
+            bool resumes = false;
+            bool seen = false;
+            for (usize q = 0; q < Vec::len(&clines) && !seen; q += 1)
+            {
+                if (StringView::starts_with(clines[q], "#line ") && StringView::ends_with(clines[q], &tail))
+                {
+                    seen = true;
+                    Vec<StringView> parts = StringView::split(clines[q], " ");
+                    resumes = Vec::len(&parts) > 1 && Result::unwrap_or(StringView::parse<usize>(parts[1]), 0) == q + 2;
+                }
+            }
+            if (!resumes)
+            {
+                failure = Some(sprintf("line %v: `%s` does not hold (%s)", at, t0, if (seen) { "it names another line" } else { "no such directive" }));
+            }
+            continue;
+        }
+        if (op == "set")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 3 || w[0] == "COBC" || w[0] == "CC" || w[0] == "DIR" || w[0] == "BIN")
+            {
+                failure = Some(sprintf("line %v: set takes a new name, a file and a text", at));
+                break;
+            }
+            String vtext = case_text(&dir, &w[1]);
+            Vec<StringView> vlines = StringView::lines(&vtext);
+            Option<String> value = None;
+            foreach (l in &vlines)
+            {
+                if (Option::is_none(&value))
+                {
+                    match (StringView::find(*l, &w[2]))
+                    {
+                        Some(k) : value = Some(String::copy(StringView::trim(&(*l)[k + StringView::len(&w[2])..$]))),
+                        None    : {},
+                    }
+                }
+            }
+            match (value)
+            {
+                Some(v) :
+                {
+                    Vec::push(&mut var_names, String::clone(&w[0]));
+                    Vec::push(&mut var_values, v);
+                },
+                None    : failure = Some(sprintf("line %v: no line of %s holds `%s`", at, &w[1], &w[2])),
+            }
+            continue;
+        }
+        usize nr = Vec::len(&runs);
+        if (nr == 0)
+        {
+            failure = Some(sprintf("line %v: `%s` before any run", at, op));
+            break;
+        }
+        ref<Run, shared> r = &runs[nr - 1];
+        String out = text_of(&r.out);
+        String err = text_of(&r.err);
+        String want = unescape(arg_text);
+        bool ok = true;
+        if (op == "status")
+        {
+            ok = sprintf("%v", r.status) == arg_text;
+        }
+        else if (op == "stdout-is")
+        {
+            ok = out == want;
+        }
+        else if (op == "stderr-is")
+        {
+            ok = err == want;
+        }
+        else if (op == "stdout-has")
+        {
+            ok = StringView::contains(&out, &want);
+        }
+        else if (op == "stderr-has")
+        {
+            ok = StringView::contains(&err, &want);
+        }
+        else if (op == "stdout-lacks")
+        {
+            ok = !StringView::contains(&out, &want);
+        }
+        else if (op == "stderr-lacks")
+        {
+            ok = !StringView::contains(&err, &want);
+        }
+        else if (op == "stdout-starts")
+        {
+            ok = StringView::starts_with(&out, &want);
+        }
+        else if (op == "stderr-starts")
+        {
+            ok = StringView::starts_with(&err, &want);
+        }
+        else if (op == "stdout-empty")
+        {
+            ok = Vec::len(&r.out) == 0;
+        }
+        else if (op == "stderr-empty")
+        {
+            ok = Vec::len(&r.err) == 0;
+        }
+        else if (op == "stderr-starts-as" || op == "stdout-starts-as")
+        {
+            usize other = Result::unwrap_or(StringView::parse<usize>(arg_text), 0);
+            if (other < 1 || other > nr)
+            {
+                failure = Some(sprintf("line %v: no run %s", at, arg_text));
+                break;
+            }
+            ok = if (op == "stderr-starts-as")
+            {
+                StringView::starts_with(&err, &text_of(&runs[other - 1].err))
+            }
+            else
+            {
+                StringView::starts_with(&out, &text_of(&runs[other - 1].out))
+            };
+        }
+        else if (op == "same-stderr-as" || op == "same-stdout-as")
+        {
+            usize other = Result::unwrap_or(StringView::parse<usize>(arg_text), 0);
+            if (other < 1 || other > nr)
+            {
+                failure = Some(sprintf("line %v: no run %s", at, arg_text));
+                break;
+            }
+            ok = if (op == "same-stderr-as")
+            {
+                text_of(&runs[other - 1].err) == err
+            }
+            else
+            {
+                text_of(&runs[other - 1].out) == out
+            };
+        }
+        else if (op == "exists" || op == "absent")
+        {
+            bool there = Result::is_ok(&path_kind(&path_join(&dir, arg_text)));
+            ok = if (op == "exists") { there } else { !there };
+        }
+        else if (op == "lists-line" || op == "omits-line")
+        {
+            usize sp2 = Option::unwrap_or(StringView::find(arg_text, " "), StringView::len(arg_text));
+            StringView file = &arg_text[0..sp2];
+            StringView marker = StringView::trim(&arg_text[sp2..$]);
+            String ftext = Result::unwrap_or(read_file(&path_join(&dir, file)), "");
+            usize n = line_of(&ftext, marker);
+            if (n == 0)
+            {
+                failure = Some(sprintf("line %v: `%s` is not in %s", at, marker, file));
+                break;
+            }
+            bool listed = lists(&out, file, n);
+            ok = if (op == "lists-line") { listed } else { !listed };
+        }
+        else if (op == "save-stdout")
+        {
+            ok = Result::is_ok(&write_bytes(&path_join(&dir, arg_text), &r.out));
+        }
+        else if (op == "stdout-ends")
+        {
+            ok = StringView::ends_with(&out, &want);
+        }
+        else if (op == "stderr-ends")
+        {
+            ok = StringView::ends_with(&err, &want);
+        }
+        else if (op == "stdout-line" || op == "stderr-line" || op == "stdout-lines" || op == "stderr-lines")
+        {
+            Vec<String> w = words(arg_text);
+            bool of_out = StringView::starts_with(op, "stdout");
+            Vec<StringView> ls = StringView::lines(if (of_out) { &out } else { &err });
+            if (op == "stdout-line" || op == "stderr-line")
+            {
+                usize ln = if (Vec::len(&w) == 2 || Vec::len(&w) == 3) { Result::unwrap_or(StringView::parse<usize>(&w[0]), 0) } else { 0 };
+                Vec<StringView> counted = Vec::new();
+                foreach (l in &ls)
+                {
+                    if (Vec::len(&w) < 3 || StringView::starts_with(*l, &w[2]))
+                    {
+                        Vec::push(&mut counted, *l);
+                    }
+                }
+                ok = ln >= 1 && ln <= Vec::len(&counted) && StringView::contains(counted[ln - 1], &w[1]);
+            }
+            else
+            {
+                usize n = 0;
+                foreach (l in &ls)
+                {
+                    if (Vec::len(&w) < 2 || StringView::starts_with(*l, &w[1]))
+                    {
+                        n += 1;
+                    }
+                }
+                ok = Vec::len(&w) >= 1 && count_meets(n, &w[0]);
+            }
+        }
+        else if (op == "stderr-numbers-below")
+        {
+            Vec<String> w = words(arg_text);
+            Vec<StringView> ls = StringView::lines(&err);
+            ok = false;
+            bool seen = false;
+            foreach (l in &ls)
+            {
+                if (!seen && Vec::len(&w) >= 2)
+                {
+                    match (StringView::strip_prefix(*l, &w[0]))
+                    {
+                        Some(rest) :
+                        {
+                            seen = true;
+                            Vec<u64> nums = numbers_in(rest);
+                            ok = Vec::len(&nums) >= Vec::len(&w) - 1;
+                            for (usize q = 1; ok && q < Vec::len(&w); q += 1)
+                            {
+                                ok = nums[q - 1] < Result::unwrap_or(StringView::parse<u64>(&w[q]), 0);
+                            }
+                        },
+                        None       : {},
+                    }
+                }
+            }
+        }
+        else if (op == "listed-has" || op == "listed-lacks")
+        {
+            Vec<String> w = words(arg_text);
+            if (Vec::len(&w) != 3)
+            {
+                failure = Some(sprintf("line %v: %s takes a file, a marker and a text", at, op));
+                break;
+            }
+            String ftext = case_text(&dir, &w[0]);
+            usize n = line_of(&ftext, &w[1]);
+            if (n == 0)
+            {
+                failure = Some(sprintf("line %v: `%s` is not in %s", at, &w[1], &w[0]));
+                break;
+            }
+            bool any = listed_holds(&out, &w[0], n, &w[2]);
+            ok = if (op == "listed-has") { any } else { !any };
+        }
+        else
+        {
+            failure = Some(sprintf("line %v: unknown directive `%s`", at, op));
+            break;
+        }
+        if (!ok)
+        {
+            failure = Some(sprintf("line %v: `%s` does not hold (run %v: status %v)\n--- stdout\n%s--- stderr\n%s",
+                at, t0, nr, r.status, &out, &err));
+        }
+    }
+    _ = remove_dir_all(&dir);
+    failure
+}

@@ -1,0 +1,1397 @@
+// The fragment of CobaltC the model covers, as a syntax tree.
+//
+// Every program of the fragment is also a CobaltC program: `print.cb`
+// writes it out in the house style and `parse.cb` reads it back, so the
+// tools under test run exactly the text the model ran.
+//
+// A CobaltC variant carries one payload, so a variant with several parts
+// is a variant with named fields. Every expression and statement carries
+// a number (`id`), unique in its program, given after parsing
+// (`number_program`): a body's source positions are keyed by it.
+
+import std;
+
+export enum Mode
+{
+    Shared,
+    Excl,
+}
+
+export fn Mode::word(Mode m) : str
+{
+    match (m)
+    {
+        Mode::Shared : "shared",
+        Mode::Excl   : "exclusive",
+    }
+}
+
+// A mode's variant name, as `Ins::debug` writes it for `--witness`.
+export fn Mode::debug(Mode m) : str
+{
+    match (m)
+    {
+        Mode::Shared : "Shared",
+        Mode::Excl   : "Excl",
+    }
+}
+
+export enum Ty
+{
+    I32,
+    Bool,
+    Unit,
+    Ref { Box<Ty> t; Mode m; },
+    Hold, // struct Hold { ref<i32, exclusive> r; }
+    Vec,  // Vec<i32>
+    VecR, // Vec<ref<i32, exclusive>>
+    Handle(Box<Ty>),
+    Opt(Box<Ty>),  // Option<…>: Vec::pop's and Channel::recv's results
+    Chan(Box<Ty>), // Channel<…>
+    Res(Box<Ty>),  // Result<void, …>: Channel::send's result
+    Mutex,         // mutex<i32>
+    Guard,         // guard<i32>
+    VecH,          // Vec<handle<void>>
+    Job,           // struct Job { handle<void> h; }
+    Fn(Box<Ty>),   // fn() : τ -- a closure's type too
+    Slice(Mode),   // slice<i32, m>
+    Arr,           // array<i32, 2>
+    Atomic,        // Atomic<i32> (D-0249, D-0253)
+}
+
+export fn Ty::refi(Mode m) : Ty
+{
+    Ty::Ref { .t = Box::new(Ty::I32), .m = m }
+}
+
+export fn Ty::ref_of(Ty t, Mode m) : Ty
+{
+    Ty::Ref { .t = Box::new(t), .m = m }
+}
+
+export fn Ty::handle_of(Ty t) : Ty
+{
+    Ty::Handle(Box::new(t))
+}
+
+// Structural equality.
+export fn ty_eq(ref<Ty, shared> a, ref<Ty, shared> b) : bool
+{
+    match (a)
+    {
+        Ty::Ref { t, m } : match (b)
+        {
+            Ty::Ref { t: t2, m: m2 } : *m == *m2 && ty_eq(Box::get(t), Box::get(t2)),
+            _                        : false,
+        },
+        Ty::Handle(x) : match (b)
+        {
+            Ty::Handle(y) : ty_eq(Box::get(x), Box::get(y)),
+            _             : false,
+        },
+        Ty::Opt(x) : match (b)
+        {
+            Ty::Opt(y) : ty_eq(Box::get(x), Box::get(y)),
+            _          : false,
+        },
+        Ty::Chan(x) : match (b)
+        {
+            Ty::Chan(y) : ty_eq(Box::get(x), Box::get(y)),
+            _           : false,
+        },
+        Ty::Res(x) : match (b)
+        {
+            Ty::Res(y) : ty_eq(Box::get(x), Box::get(y)),
+            _          : false,
+        },
+        Ty::Fn(x) : match (b)
+        {
+            Ty::Fn(y) : ty_eq(Box::get(x), Box::get(y)),
+            _         : false,
+        },
+        Ty::Slice(m) : match (b)
+        {
+            Ty::Slice(m2) : *m == *m2,
+            _             : false,
+        },
+        _ : ty_tag(a) == ty_tag(b),
+    }
+}
+
+// The variant's position, for the variants without a payload.
+export fn ty_tag(ref<Ty, shared> t) : u32
+{
+    match (t)
+    {
+        Ty::I32        : 0,
+        Ty::Bool       : 1,
+        Ty::Unit       : 2,
+        Ty::Ref { .. } : 3,
+        Ty::Hold       : 4,
+        Ty::Vec        : 5,
+        Ty::VecR       : 6,
+        Ty::Handle(_)  : 7,
+        Ty::Opt(_)     : 8,
+        Ty::Chan(_)    : 9,
+        Ty::Res(_)     : 10,
+        Ty::Mutex      : 11,
+        Ty::Guard      : 12,
+        Ty::VecH       : 13,
+        Ty::Job        : 14,
+        Ty::Fn(_)      : 15,
+        Ty::Slice(_)   : 16,
+        Ty::Arr        : 17,
+        Ty::Atomic     : 18,
+    }
+}
+
+// Whether an `Option<Ty>` holds a type equal to `t`.
+export fn opt_ty_is(ref<Option<Ty>, shared> o, ref<Ty, shared> t) : bool
+{
+    match (o)
+    {
+        Some(x) : ty_eq(x, t),
+        None    : false,
+    }
+}
+
+export fn is_ref_ty(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Ref { .. } : true,
+        _              : false,
+    }
+}
+
+export fn is_slice_ty(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Slice(_) : true,
+        _            : false,
+    }
+}
+
+export fn is_handle_ty(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Handle(_) : true,
+        _             : false,
+    }
+}
+
+export fn is_fn_ty(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Fn(_) : true,
+        _         : false,
+    }
+}
+
+// A reference, or an aggregate holding one (D-0133).
+export fn Ty::holds_ref(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Ref { .. } : true,
+        Ty::Hold       : true,
+        Ty::Slice(_)   : true,
+        Ty::Opt(x)     : Ty::holds_ref(Box::get(x)),
+        Ty::Res(x)     : Ty::holds_ref(Box::get(x)),
+        _              : false,
+    }
+}
+
+export fn Ty::is_resource(ref<Ty, shared> t) : bool
+{
+    match (t)
+    {
+        Ty::Vec       : true,
+        Ty::VecR      : true,
+        Ty::VecH      : true,
+        Ty::Job       : true,
+        Ty::Handle(_) : true,
+        Ty::Mutex     : true,
+        Ty::Guard     : true,
+        Ty::Chan(_)   : true,
+        Ty::Atomic    : true,
+        _             : false,
+    }
+}
+
+export fn Ty::text(ref<Ty, shared> t) : String
+{
+    match (t)
+    {
+        Ty::I32          : "i32",
+        Ty::Bool         : "bool",
+        Ty::Unit         : "void",
+        Ty::Ref { t, m } : sprintf("ref<%s, %s>", &Ty::text(Box::get(t)), Mode::word(*m)),
+        Ty::Hold         : "Hold",
+        Ty::Vec          : "Vec<i32>",
+        Ty::VecR         : "Vec<ref<i32, exclusive>>",
+        Ty::Handle(x)    : sprintf("handle<%s>", &Ty::text(Box::get(x))),
+        Ty::Opt(x)       : sprintf("Option<%s>", &Ty::text(Box::get(x))),
+        Ty::Chan(x)      : sprintf("Channel<%s>", &Ty::text(Box::get(x))),
+        Ty::Res(x)       : sprintf("Result<void, %s>", &Ty::text(Box::get(x))),
+        Ty::Mutex        : "mutex<i32>",
+        Ty::Guard        : "guard<i32>",
+        Ty::VecH         : "Vec<handle<void>>",
+        Ty::Job          : "Job",
+        Ty::Fn(r)        : sprintf("fn() : %s", &Ty::text(Box::get(r))),
+        Ty::Slice(m)     : sprintf("slice<i32, %s>", Mode::word(*m)),
+        Ty::Arr          : "array<i32, 2>",
+        Ty::Atomic       : "Atomic<i32>",
+    }
+}
+
+export struct Expr
+{
+    export usize id;
+    export ExprK k;
+}
+
+export enum ExprK
+{
+    Int(i64),
+    Var(String),
+    Deref(Box<Expr>),
+    Field(Box<Expr>),         // e.r, the one field of Hold (through a reference too)
+    Index { String v; i64 k; }, // v[k] on a Vec<i32>
+    Borrow { Mode m; Box<Expr> e; },
+    Add { Box<Expr> a; Box<Expr> b; },
+    Gt { Box<Expr> a; Box<Expr> b; },
+    Call { String f; Vec<Expr> xs; }, // a helper, Vec::new, Vec::push, Vec::pop
+    Spawn { String f; Vec<Expr> xs; },
+    Join(String),
+    HoldLit(Box<Expr>),
+    // `Job { .h = e }`
+    JobLit(Box<Expr>),
+    // `&_m v[lo .. hi]`, v a `Vec<i32>` or a slice binding (`[Slice-Form]`)
+    Slice { Mode m; String v; i64 lo; i64 hi; },
+    // A closure literal (`rule.fn.closure`).
+    Closure(Box<Clo>),
+    // A call of a closure place: `c()`, `(*f)()` (`[Closure-Call]`).
+    CallVal(Box<Expr>),
+    // `spawn(c)` or `spawn(move [..]() { .. })`: a closure run by a thread.
+    SpawnClo(Box<Expr>),
+    // `[e1, e2]`, an `array<i32, 2>`
+    ArrLit(Vec<Expr>),
+}
+
+export fn mk(ExprK k) : Expr
+{
+    Expr { .id = 0, .k = k }
+}
+
+export fn ex_var(StringView n) : Expr
+{
+    mk(ExprK::Var(String::copy(n)))
+}
+
+export fn ex_int(i64 k) : Expr
+{
+    mk(ExprK::Int(k))
+}
+
+// `move? [caps]() (: τ)? { body }`, numbered in source order (`id`) so
+// that the static pass and the machine name the same body.
+export struct Clo
+{
+    export usize id;
+    export bool mv;
+    export Vec<String> caps;
+    export Ty ret; // i32 when written `: i32`, else void
+    export Block body;
+}
+
+export enum StmtK
+{
+    // `auto x = e;` (ty None) or `T x = e;`
+    Let { String name; Option<Ty> ty; Expr init; },
+    Assign { Expr place; Expr value; },
+    Expr(Expr),
+    Print(Expr),
+    Block(Block),
+    If { Expr cond; Block thn; Option<Block> els; },
+    // `_ = e;`
+    Discard(Expr),
+    // `while (e) { … }`
+    While { Expr cond; Block body; },
+    // `match (e) { Some(b) : { … }, None : { … }, }` on an Option
+    Match { Expr scrut; String binder; Block some; Block none; },
+    // `break;` and `continue;` (`[Break]`, `[Continue]`), inside a `while`
+    Break,
+    Continue,
+}
+
+export struct Stmt
+{
+    export usize id;
+    export StmtK k;
+    export usize line;
+}
+
+export struct Block
+{
+    export Vec<Stmt> stmts;
+    export Option<Expr> tail;
+    export usize tail_line;
+    export usize end_line;
+}
+
+export fn Block::empty() : Block
+{
+    Block { .stmts = Vec::new(), .tail = None, .tail_line = 0, .end_line = 0 }
+}
+
+export struct ParamDecl
+{
+    export Ty ty;
+    export String name;
+}
+
+export struct Func
+{
+    export String name;
+    export Vec<ParamDecl> params;
+    export Ty ret;
+    export Block body;
+    export usize line;
+    // D-0312: the position of the parameter a `from` clause names, else 0.
+    export usize src;
+}
+
+// D-0258: `static Atomic<i32> NAME = k;`, each one object with program
+// extent that every thread reaches by name (`spec/17` §1a′).
+export struct StaticDecl
+{
+    export String name;
+    export i64 k;
+}
+
+export struct Program
+{
+    export bool hold; // declares struct Hold
+    export bool job;  // declares struct Job
+    export Vec<Func> funcs;
+    export Vec<StaticDecl> statics;
+    // How many expressions and statements `number_program` numbered.
+    export usize nexprs;
+    export usize nstmts;
+}
+
+export fn Program::empty() : Program
+{
+    Program { .hold = false, .job = false, .funcs = Vec::new(), .statics = Vec::new(), .nexprs = 0, .nstmts = 0 }
+}
+
+// The position of the function named `name`.
+export fn Program::find(ref<Program, shared> p, StringView name) : Option<usize>
+{
+    for (usize i = 0; i < Vec::len(&p.funcs); i += 1)
+    {
+        if (p.funcs[i].name == name)
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+export fn Program::func(ref<Program, shared> p, StringView name) : Option<ref<Func, shared>> from p
+{
+    foreach (f in &p.funcs)
+    {
+        if (f.name == name)
+        {
+            return Some(f);
+        }
+    }
+    None
+}
+
+export fn Program::has_func(ref<Program, shared> p, StringView name) : bool
+{
+    match (Program::find(p, name))
+    {
+        Some(_) : true,
+        None    : false,
+    }
+}
+
+export fn Program::is_static(ref<Program, shared> p, StringView name) : bool
+{
+    foreach (s in &p.statics)
+    {
+        if (s.name == name)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- numbering ----
+
+struct Counter
+{
+    usize e;
+    usize s;
+}
+
+fn number_expr(ref<Expr, exclusive> e, ref<Counter, exclusive> c)
+{
+    e.id = c.e;
+    c.e += 1;
+    match (&mut e.k)
+    {
+        ExprK::Deref(a)           : number_expr(Box::get_mut(a), c),
+        ExprK::Field(a)           : number_expr(Box::get_mut(a), c),
+        ExprK::HoldLit(a)         : number_expr(Box::get_mut(a), c),
+        ExprK::JobLit(a)          : number_expr(Box::get_mut(a), c),
+        ExprK::CallVal(a)         : number_expr(Box::get_mut(a), c),
+        ExprK::SpawnClo(a)        : number_expr(Box::get_mut(a), c),
+        ExprK::Borrow { m, e: a } : number_expr(Box::get_mut(a), c),
+        ExprK::Add { a, b }       :
+        {
+            number_expr(Box::get_mut(a), c);
+            number_expr(Box::get_mut(b), c);
+        },
+        ExprK::Gt { a, b }        :
+        {
+            number_expr(Box::get_mut(a), c);
+            number_expr(Box::get_mut(b), c);
+        },
+        ExprK::Call { f, xs }     :
+        {
+            foreach (x in xs)
+            {
+                number_expr(x, c);
+            }
+        },
+        ExprK::Spawn { f, xs }    :
+        {
+            foreach (x in xs)
+            {
+                number_expr(x, c);
+            }
+        },
+        ExprK::ArrLit(xs)         :
+        {
+            foreach (x in xs)
+            {
+                number_expr(x, c);
+            }
+        },
+        ExprK::Closure(cl)        : number_block(&mut Box::get_mut(cl).body, c),
+        _                         : {},
+    }
+}
+
+fn number_block(ref<Block, exclusive> b, ref<Counter, exclusive> c)
+{
+    foreach (s in &mut b.stmts)
+    {
+        number_stmt(s, c);
+    }
+    match (&mut b.tail)
+    {
+        Some(t) : number_expr(t, c),
+        None    : {},
+    }
+}
+
+fn number_stmt(ref<Stmt, exclusive> s, ref<Counter, exclusive> c)
+{
+    s.id = c.s;
+    c.s += 1;
+    match (&mut s.k)
+    {
+        StmtK::Let { name, ty, init }              : number_expr(init, c),
+        StmtK::Assign { place, value }             :
+        {
+            number_expr(place, c);
+            number_expr(value, c);
+        },
+        StmtK::Expr(e)                             : number_expr(e, c),
+        StmtK::Print(e)                            : number_expr(e, c),
+        StmtK::Discard(e)                          : number_expr(e, c),
+        StmtK::Block(b)                            : number_block(b, c),
+        StmtK::If { cond, thn, els }               :
+        {
+            number_expr(cond, c);
+            number_block(thn, c);
+            match (els)
+            {
+                Some(b) : number_block(b, c),
+                None    : {},
+            }
+        },
+        StmtK::While { cond, body }                :
+        {
+            number_expr(cond, c);
+            number_block(body, c);
+        },
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            number_expr(scrut, c);
+            number_block(some, c);
+            number_block(none, c);
+        },
+        StmtK::Break                               : {},
+        StmtK::Continue                            : {},
+    }
+}
+
+// Numbers every expression and statement of the program, in source order.
+export fn number_program(ref<Program, exclusive> p)
+{
+    Counter c = Counter { .e = 0, .s = 0 };
+    foreach (f in &mut p.funcs)
+    {
+        number_block(&mut f.body, &mut c);
+    }
+    p.nexprs = c.e;
+    p.nstmts = c.s;
+}
+
+// ---- equality (structural, on expressions) ----
+
+fn exprs_eq(ref<Vec<Expr>, shared> a, ref<Vec<Expr>, shared> b) : bool
+{
+    if (Vec::len(a) != Vec::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(a); i += 1)
+    {
+        if (!expr_eq(&a[i], &b[i]))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn strings_eq(ref<Vec<String>, shared> a, ref<Vec<String>, shared> b) : bool
+{
+    if (Vec::len(a) != Vec::len(b))
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(a); i += 1)
+    {
+        if (a[i] != b[i])
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn opt_expr_eq(ref<Option<Expr>, shared> a, ref<Option<Expr>, shared> b) : bool
+{
+    match (a)
+    {
+        Some(x) : match (b)
+        {
+            Some(y) : expr_eq(x, y),
+            None    : false,
+        },
+        None : match (b)
+        {
+            Some(_) : false,
+            None    : true,
+        },
+    }
+}
+
+fn opt_ty_eq(ref<Option<Ty>, shared> a, ref<Option<Ty>, shared> b) : bool
+{
+    match (a)
+    {
+        Some(x) : opt_ty_is(b, x),
+        None : match (b)
+        {
+            Some(_) : false,
+            None    : true,
+        },
+    }
+}
+
+fn block_eq(ref<Block, shared> a, ref<Block, shared> b) : bool
+{
+    if (Vec::len(&a.stmts) != Vec::len(&b.stmts) || a.tail_line != b.tail_line || a.end_line != b.end_line)
+    {
+        return false;
+    }
+    for (usize i = 0; i < Vec::len(&a.stmts); i += 1)
+    {
+        if (!stmt_eq(&a.stmts[i], &b.stmts[i]))
+        {
+            return false;
+        }
+    }
+    opt_expr_eq(&a.tail, &b.tail)
+}
+
+fn opt_block_eq(ref<Option<Block>, shared> a, ref<Option<Block>, shared> b) : bool
+{
+    match (a)
+    {
+        Some(x) : match (b)
+        {
+            Some(y) : block_eq(x, y),
+            None    : false,
+        },
+        None : match (b)
+        {
+            Some(_) : false,
+            None    : true,
+        },
+    }
+}
+
+fn stmt_eq(ref<Stmt, shared> a, ref<Stmt, shared> b) : bool
+{
+    if (a.line != b.line)
+    {
+        return false;
+    }
+    match (&a.k)
+    {
+        StmtK::Let { name, ty, init } : match (&b.k)
+        {
+            StmtK::Let { name: n2, ty: t2, init: i2 } : *name == *n2 && opt_ty_eq(ty, t2) && expr_eq(init, i2),
+            _                                         : false,
+        },
+        StmtK::Assign { place, value } : match (&b.k)
+        {
+            StmtK::Assign { place: p2, value: v2 } : expr_eq(place, p2) && expr_eq(value, v2),
+            _                                      : false,
+        },
+        StmtK::Expr(e) : match (&b.k)
+        {
+            StmtK::Expr(e2) : expr_eq(e, e2),
+            _               : false,
+        },
+        StmtK::Print(e) : match (&b.k)
+        {
+            StmtK::Print(e2) : expr_eq(e, e2),
+            _                : false,
+        },
+        StmtK::Discard(e) : match (&b.k)
+        {
+            StmtK::Discard(e2) : expr_eq(e, e2),
+            _                  : false,
+        },
+        StmtK::Block(x) : match (&b.k)
+        {
+            StmtK::Block(y) : block_eq(x, y),
+            _               : false,
+        },
+        StmtK::If { cond, thn, els } : match (&b.k)
+        {
+            StmtK::If { cond: c2, thn: t2, els: e2 } : expr_eq(cond, c2) && block_eq(thn, t2) && opt_block_eq(els, e2),
+            _                                        : false,
+        },
+        StmtK::While { cond, body } : match (&b.k)
+        {
+            StmtK::While { cond: c2, body: b2 } : expr_eq(cond, c2) && block_eq(body, b2),
+            _                                   : false,
+        },
+        StmtK::Match { scrut, binder, some, none } : match (&b.k)
+        {
+            StmtK::Match { scrut: s2, binder: b2, some: so2, none: no2 } : expr_eq(scrut, s2) && *binder == *b2 && block_eq(some, so2) && block_eq(none, no2),
+            _                                                            : false,
+        },
+        StmtK::Break : match (&b.k)
+        {
+            StmtK::Break : true,
+            _            : false,
+        },
+        StmtK::Continue : match (&b.k)
+        {
+            StmtK::Continue : true,
+            _               : false,
+        },
+    }
+}
+
+fn clo_eq(ref<Clo, shared> a, ref<Clo, shared> b) : bool
+{
+    a.id == b.id && a.mv == b.mv && strings_eq(&a.caps, &b.caps) && ty_eq(&a.ret, &b.ret) && block_eq(&a.body, &b.body)
+}
+
+// Structural equality of two expressions, their numbers left out.
+export fn expr_eq(ref<Expr, shared> a, ref<Expr, shared> b) : bool
+{
+    match (&a.k)
+    {
+        ExprK::Int(x) : match (&b.k)
+        {
+            ExprK::Int(y) : *x == *y,
+            _             : false,
+        },
+        ExprK::Var(x) : match (&b.k)
+        {
+            ExprK::Var(y) : *x == *y,
+            _             : false,
+        },
+        ExprK::Join(x) : match (&b.k)
+        {
+            ExprK::Join(y) : *x == *y,
+            _              : false,
+        },
+        ExprK::Deref(x) : match (&b.k)
+        {
+            ExprK::Deref(y) : expr_eq(Box::get(x), Box::get(y)),
+            _               : false,
+        },
+        ExprK::Field(x) : match (&b.k)
+        {
+            ExprK::Field(y) : expr_eq(Box::get(x), Box::get(y)),
+            _               : false,
+        },
+        ExprK::HoldLit(x) : match (&b.k)
+        {
+            ExprK::HoldLit(y) : expr_eq(Box::get(x), Box::get(y)),
+            _                 : false,
+        },
+        ExprK::JobLit(x) : match (&b.k)
+        {
+            ExprK::JobLit(y) : expr_eq(Box::get(x), Box::get(y)),
+            _                : false,
+        },
+        ExprK::CallVal(x) : match (&b.k)
+        {
+            ExprK::CallVal(y) : expr_eq(Box::get(x), Box::get(y)),
+            _                 : false,
+        },
+        ExprK::SpawnClo(x) : match (&b.k)
+        {
+            ExprK::SpawnClo(y) : expr_eq(Box::get(x), Box::get(y)),
+            _                  : false,
+        },
+        ExprK::Index { v, k } : match (&b.k)
+        {
+            ExprK::Index { v: v2, k: k2 } : *v == *v2 && *k == *k2,
+            _                             : false,
+        },
+        ExprK::Borrow { m, e } : match (&b.k)
+        {
+            ExprK::Borrow { m: m2, e: e2 } : *m == *m2 && expr_eq(Box::get(e), Box::get(e2)),
+            _                              : false,
+        },
+        ExprK::Add { a: x, b: y } : match (&b.k)
+        {
+            ExprK::Add { a: x2, b: y2 } : expr_eq(Box::get(x), Box::get(x2)) && expr_eq(Box::get(y), Box::get(y2)),
+            _                           : false,
+        },
+        ExprK::Gt { a: x, b: y } : match (&b.k)
+        {
+            ExprK::Gt { a: x2, b: y2 } : expr_eq(Box::get(x), Box::get(x2)) && expr_eq(Box::get(y), Box::get(y2)),
+            _                          : false,
+        },
+        ExprK::Call { f, xs } : match (&b.k)
+        {
+            ExprK::Call { f: f2, xs: xs2 } : *f == *f2 && exprs_eq(xs, xs2),
+            _                              : false,
+        },
+        ExprK::Spawn { f, xs } : match (&b.k)
+        {
+            ExprK::Spawn { f: f2, xs: xs2 } : *f == *f2 && exprs_eq(xs, xs2),
+            _                               : false,
+        },
+        ExprK::ArrLit(xs) : match (&b.k)
+        {
+            ExprK::ArrLit(xs2) : exprs_eq(xs, xs2),
+            _                  : false,
+        },
+        ExprK::Slice { m, v, lo, hi } : match (&b.k)
+        {
+            ExprK::Slice { m: m2, v: v2, lo: l2, hi: h2 } : *m == *m2 && *v == *v2 && *lo == *l2 && *hi == *h2,
+            _                                             : false,
+        },
+        ExprK::Closure(c) : match (&b.k)
+        {
+            ExprK::Closure(c2) : clo_eq(Box::get(c), Box::get(c2)),
+            _                  : false,
+        },
+    }
+}
+
+// ---- small queries ----
+
+export fn is_var_named(ref<Expr, shared> e, StringView n) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Var(m) : *m == n,
+        _             : false,
+    }
+}
+
+export fn contains_str(ref<Vec<String>, shared> v, StringView n) : bool
+{
+    foreach (x in v)
+    {
+        if (*x == n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Every name an expression mentions (for last-use, D-0111).
+export fn expr_names(ref<Expr, shared> e, ref<Vec<String>, exclusive> out)
+{
+    match (&e.k)
+    {
+        ExprK::Int(_)                 : {},
+        ExprK::Var(n)                 : Vec::push(out, clone(n)),
+        ExprK::Index { v, k }         : Vec::push(out, clone(v)),
+        ExprK::Join(n)                : Vec::push(out, clone(n)),
+        ExprK::Slice { m, v, lo, hi } : Vec::push(out, clone(v)),
+        ExprK::Deref(a)               : expr_names(Box::get(a), out),
+        ExprK::Field(a)               : expr_names(Box::get(a), out),
+        ExprK::Borrow { m, e: a }     : expr_names(Box::get(a), out),
+        ExprK::HoldLit(a)             : expr_names(Box::get(a), out),
+        ExprK::JobLit(a)              : expr_names(Box::get(a), out),
+        ExprK::CallVal(a)             : expr_names(Box::get(a), out),
+        ExprK::SpawnClo(a)            : expr_names(Box::get(a), out),
+        // A closure mentions what it captures.
+        ExprK::Closure(c)             :
+        {
+            foreach (x in &Box::get(c).caps)
+            {
+                Vec::push(out, clone(x));
+            }
+        },
+        ExprK::Add { a, b }           :
+        {
+            expr_names(Box::get(a), out);
+            expr_names(Box::get(b), out);
+        },
+        ExprK::Gt { a, b }            :
+        {
+            expr_names(Box::get(a), out);
+            expr_names(Box::get(b), out);
+        },
+        ExprK::Call { f, xs }         :
+        {
+            foreach (x in xs)
+            {
+                expr_names(x, out);
+            }
+        },
+        ExprK::Spawn { f, xs }        :
+        {
+            foreach (x in xs)
+            {
+                expr_names(x, out);
+            }
+        },
+        ExprK::ArrLit(xs)             :
+        {
+            foreach (x in xs)
+            {
+                expr_names(x, out);
+            }
+        },
+    }
+}
+
+export fn stmt_names(ref<Stmt, shared> s, ref<Vec<String>, exclusive> out)
+{
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              :
+        {
+            Vec::push(out, clone(name));
+            expr_names(init, out);
+        },
+        StmtK::Assign { place, value }             :
+        {
+            expr_names(place, out);
+            expr_names(value, out);
+        },
+        StmtK::Expr(e)                             : expr_names(e, out),
+        StmtK::Print(e)                            : expr_names(e, out),
+        StmtK::Discard(e)                          : expr_names(e, out),
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            expr_names(scrut, out);
+            Vec::push(out, clone(binder));
+            block_names(some, out);
+            block_names(none, out);
+        },
+        StmtK::Block(b)                            : block_names(b, out),
+        StmtK::If { cond, thn, els }               :
+        {
+            expr_names(cond, out);
+            block_names(thn, out);
+            match (els)
+            {
+                Some(b) : block_names(b, out),
+                None    : {},
+            }
+        },
+        StmtK::While { cond, body }                :
+        {
+            expr_names(cond, out);
+            block_names(body, out);
+        },
+        StmtK::Break                               : {},
+        StmtK::Continue                            : {},
+    }
+}
+
+export fn block_names(ref<Block, shared> b, ref<Vec<String>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        stmt_names(s, out);
+    }
+    match (&b.tail)
+    {
+        Some(t) : expr_names(t, out),
+        None    : {},
+    }
+}
+
+// Every closure literal in a block, nested ones included, in source order
+// (as copies).
+export fn block_closures(ref<Block, shared> b, ref<Vec<Clo>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        stmt_closures(s, out);
+    }
+    match (&b.tail)
+    {
+        Some(t) : expr_closures(t, out),
+        None    : {},
+    }
+}
+
+export fn stmt_closures(ref<Stmt, shared> s, ref<Vec<Clo>, exclusive> out)
+{
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              : expr_closures(init, out),
+        StmtK::Assign { place, value }             :
+        {
+            expr_closures(place, out);
+            expr_closures(value, out);
+        },
+        StmtK::Expr(e)                             : expr_closures(e, out),
+        StmtK::Print(e)                            : expr_closures(e, out),
+        StmtK::Discard(e)                          : expr_closures(e, out),
+        StmtK::Block(b)                            : block_closures(b, out),
+        StmtK::If { cond, thn, els }               :
+        {
+            expr_closures(cond, out);
+            block_closures(thn, out);
+            match (els)
+            {
+                Some(b) : block_closures(b, out),
+                None    : {},
+            }
+        },
+        StmtK::While { cond, body }                :
+        {
+            expr_closures(cond, out);
+            block_closures(body, out);
+        },
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            expr_closures(scrut, out);
+            block_closures(some, out);
+            block_closures(none, out);
+        },
+        StmtK::Break                               : {},
+        StmtK::Continue                            : {},
+    }
+}
+
+export fn expr_closures(ref<Expr, shared> e, ref<Vec<Clo>, exclusive> out)
+{
+    match (&e.k)
+    {
+        ExprK::Closure(c)         :
+        {
+            Vec::push(out, clone(Box::get(c)));
+            block_closures(&Box::get(c).body, out);
+        },
+        ExprK::Deref(a)           : expr_closures(Box::get(a), out),
+        ExprK::Field(a)           : expr_closures(Box::get(a), out),
+        ExprK::Borrow { m, e: a } : expr_closures(Box::get(a), out),
+        ExprK::HoldLit(a)         : expr_closures(Box::get(a), out),
+        ExprK::JobLit(a)          : expr_closures(Box::get(a), out),
+        ExprK::CallVal(a)         : expr_closures(Box::get(a), out),
+        ExprK::SpawnClo(a)        : expr_closures(Box::get(a), out),
+        ExprK::Add { a, b }       :
+        {
+            expr_closures(Box::get(a), out);
+            expr_closures(Box::get(b), out);
+        },
+        ExprK::Gt { a, b }        :
+        {
+            expr_closures(Box::get(a), out);
+            expr_closures(Box::get(b), out);
+        },
+        ExprK::Call { f, xs }     :
+        {
+            foreach (x in xs)
+            {
+                expr_closures(x, out);
+            }
+        },
+        ExprK::Spawn { f, xs }    :
+        {
+            foreach (x in xs)
+            {
+                expr_closures(x, out);
+            }
+        },
+        ExprK::ArrLit(xs)         :
+        {
+            foreach (x in xs)
+            {
+                expr_closures(x, out);
+            }
+        },
+        _                         : {},
+    }
+}
+
+// The `move` closures a block binds whole, nested blocks included:
+// `auto c = move […]…` and `c = move […]…` (D-0288).
+export fn bound_whole_move(ref<Block, shared> b, ref<Vec<usize>, exclusive> out)
+{
+    foreach (s in &b.stmts)
+    {
+        match (&s.k)
+        {
+            StmtK::Let { name, ty, init }              :
+            {
+                match (&init.k)
+                {
+                    ExprK::Closure(c) :
+                    {
+                        if (Box::get(c).mv)
+                        {
+                            Vec::push(out, Box::get(c).id);
+                        }
+                    },
+                    _                 : {},
+                }
+            },
+            StmtK::Assign { place, value }             :
+            {
+                match (&place.k)
+                {
+                    ExprK::Var(_) :
+                    {
+                        match (&value.k)
+                        {
+                            ExprK::Closure(c) :
+                            {
+                                if (Box::get(c).mv)
+                                {
+                                    Vec::push(out, Box::get(c).id);
+                                }
+                            },
+                            _                 : {},
+                        }
+                    },
+                    _             : {},
+                }
+            },
+            StmtK::Block(c)                            : bound_whole_move(c, out),
+            StmtK::While { cond, body }                : bound_whole_move(body, out),
+            StmtK::If { cond, thn, els }               :
+            {
+                bound_whole_move(thn, out);
+                match (els)
+                {
+                    Some(e) : bound_whole_move(e, out),
+                    None    : {},
+                }
+            },
+            StmtK::Match { scrut, binder, some, none } :
+            {
+                bound_whole_move(some, out);
+                bound_whole_move(none, out);
+            },
+            _                                          : {},
+        }
+    }
+}
+
+// Whether `s` assigns `x` whole from a value that does not read it (D-0288).
+export fn stmt_overwrites(ref<Stmt, shared> s, StringView x) : bool
+{
+    match (&s.k)
+    {
+        StmtK::Assign { place, value } :
+        {
+            if (!is_var_named(place, x))
+            {
+                return false;
+            }
+            Vec<String> v = Vec::new();
+            expr_names(value, &mut v);
+            !contains_str(&v, x)
+        },
+        _                              : false,
+    }
+}
+
+fn block_may_leave(ref<Block, shared> b) : bool
+{
+    foreach (s in &b.stmts)
+    {
+        if (stmt_may_leave(s))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether `s` holds a `break` or `continue` (D-0288), outside closures.
+export fn stmt_may_leave(ref<Stmt, shared> s) : bool
+{
+    match (&s.k)
+    {
+        StmtK::Break                               : true,
+        StmtK::Continue                            : true,
+        StmtK::Block(b)                            : block_may_leave(b),
+        StmtK::While { cond, body }                : block_may_leave(body),
+        StmtK::If { cond, thn, els }               :
+        {
+            if (block_may_leave(thn))
+            {
+                return true;
+            }
+            match (els)
+            {
+                Some(b) : block_may_leave(b),
+                None    : false,
+            }
+        },
+        StmtK::Match { scrut, binder, some, none } : block_may_leave(some) || block_may_leave(none),
+        _                                          : false,
+    }
+}
+
+fn rebinds_expr(ref<Expr, shared> e, StringView x) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Borrow { m, e: a } :
+        {
+            if (*m == Mode::Excl && is_var_named(Box::get(a), x))
+            {
+                return true;
+            }
+            rebinds_expr(Box::get(a), x)
+        },
+        ExprK::Closure(c)         : contains_str(&Box::get(c).caps, x) || rebinds_block(&Box::get(c).body, x),
+        ExprK::Deref(a)           : rebinds_expr(Box::get(a), x),
+        ExprK::Field(a)           : rebinds_expr(Box::get(a), x),
+        ExprK::HoldLit(a)         : rebinds_expr(Box::get(a), x),
+        ExprK::JobLit(a)          : rebinds_expr(Box::get(a), x),
+        ExprK::CallVal(a)         : rebinds_expr(Box::get(a), x),
+        ExprK::SpawnClo(a)        : rebinds_expr(Box::get(a), x),
+        ExprK::Add { a, b }       : rebinds_expr(Box::get(a), x) || rebinds_expr(Box::get(b), x),
+        ExprK::Gt { a, b }        : rebinds_expr(Box::get(a), x) || rebinds_expr(Box::get(b), x),
+        ExprK::Call { f, xs }     : rebinds_exprs(xs, x),
+        ExprK::Spawn { f, xs }    : rebinds_exprs(xs, x),
+        ExprK::ArrLit(xs)         : rebinds_exprs(xs, x),
+        _                         : false,
+    }
+}
+
+fn rebinds_exprs(ref<Vec<Expr>, shared> xs, StringView x) : bool
+{
+    foreach (a in xs)
+    {
+        if (rebinds_expr(a, x))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn rebinds_stmt(ref<Stmt, shared> s, StringView x) : bool
+{
+    match (&s.k)
+    {
+        StmtK::Assign { place, value }             : is_var_named(place, x) || rebinds_expr(place, x) || rebinds_expr(value, x),
+        StmtK::Let { name, ty, init }              : rebinds_expr(init, x),
+        StmtK::Expr(e)                             : rebinds_expr(e, x),
+        StmtK::Print(e)                            : rebinds_expr(e, x),
+        StmtK::Discard(e)                          : rebinds_expr(e, x),
+        StmtK::Block(b)                            : rebinds_block(b, x),
+        StmtK::If { cond, thn, els }               :
+        {
+            if (rebinds_expr(cond, x) || rebinds_block(thn, x))
+            {
+                return true;
+            }
+            match (els)
+            {
+                Some(b) : rebinds_block(b, x),
+                None    : false,
+            }
+        },
+        StmtK::While { cond, body }                : rebinds_expr(cond, x) || rebinds_block(body, x),
+        StmtK::Match { scrut, binder, some, none } : rebinds_expr(scrut, x) || rebinds_block(some, x) || rebinds_block(none, x),
+        StmtK::Break                               : false,
+        StmtK::Continue                            : false,
+    }
+}
+
+fn rebinds_block(ref<Block, shared> b, StringView x) : bool
+{
+    foreach (s in &b.stmts)
+    {
+        if (rebinds_stmt(s, x))
+        {
+            return true;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : rebinds_expr(t, x),
+        None    : false,
+    }
+}
+
+// Whether statement `s` may rebind `x` (D-0275): it assigns `x` whole,
+// borrows it whole exclusively, or a closure in it captures it.
+export fn stmt_rebinds(ref<Stmt, shared> s, StringView x) : bool
+{
+    rebinds_stmt(s, x)
+}
+
+// The root binding of a place: `x`, `x.r`, `*x`, `x[k]` and the like.
+fn root_name(ref<Expr, shared> e) : Option<String>
+{
+    match (&e.k)
+    {
+        ExprK::Var(n)                 : Some(clone(n)),
+        ExprK::Index { v, k }         : Some(clone(v)),
+        ExprK::Slice { m, v, lo, hi } : Some(clone(v)),
+        ExprK::Deref(a)               : root_name(Box::get(a)),
+        ExprK::Field(a)               : root_name(Box::get(a)),
+        _                             : None,
+    }
+}
+
+fn root_is(ref<Expr, shared> e, StringView x) : bool
+{
+    match (root_name(e))
+    {
+        Some(n) : n == x,
+        None    : false,
+    }
+}
+
+fn writes_expr(ref<Expr, shared> e, StringView x) : bool
+{
+    match (&e.k)
+    {
+        ExprK::Borrow { m, e: a }     :
+        {
+            if (*m == Mode::Excl)
+            {
+                return root_is(Box::get(a), x) || writes_expr(Box::get(a), x);
+            }
+            writes_expr(Box::get(a), x)
+        },
+        ExprK::Slice { m, v, lo, hi } : *m == Mode::Excl && *v == x,
+        ExprK::Deref(a)               : writes_expr(Box::get(a), x),
+        ExprK::Field(a)               : writes_expr(Box::get(a), x),
+        ExprK::HoldLit(a)             : writes_expr(Box::get(a), x),
+        ExprK::JobLit(a)              : writes_expr(Box::get(a), x),
+        ExprK::CallVal(a)             : writes_expr(Box::get(a), x),
+        ExprK::SpawnClo(a)            : writes_expr(Box::get(a), x),
+        ExprK::Add { a, b }           : writes_expr(Box::get(a), x) || writes_expr(Box::get(b), x),
+        ExprK::Gt { a, b }            : writes_expr(Box::get(a), x) || writes_expr(Box::get(b), x),
+        ExprK::Call { f, xs }         : writes_exprs(xs, x),
+        ExprK::Spawn { f, xs }        : writes_exprs(xs, x),
+        ExprK::ArrLit(xs)             : writes_exprs(xs, x),
+        ExprK::Closure(c)             : writes_root(&Box::get(c).body, x) && contains_str(&Box::get(c).caps, x),
+        _                             : false,
+    }
+}
+
+fn writes_exprs(ref<Vec<Expr>, shared> xs, StringView x) : bool
+{
+    foreach (a in xs)
+    {
+        if (writes_expr(a, x))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn writes_stmt(ref<Stmt, shared> s, StringView x) : bool
+{
+    match (&s.k)
+    {
+        StmtK::Assign { place, value }             : root_is(place, x) || writes_expr(place, x) || writes_expr(value, x),
+        StmtK::Let { name, ty, init }              : writes_expr(init, x),
+        StmtK::Expr(e)                             : writes_expr(e, x),
+        StmtK::Print(e)                            : writes_expr(e, x),
+        StmtK::Discard(e)                          : writes_expr(e, x),
+        StmtK::Block(b)                            : writes_root(b, x),
+        StmtK::If { cond, thn, els }               :
+        {
+            if (writes_expr(cond, x) || writes_root(thn, x))
+            {
+                return true;
+            }
+            match (els)
+            {
+                Some(b) : writes_root(b, x),
+                None    : false,
+            }
+        },
+        StmtK::While { cond, body }                : writes_expr(cond, x) || writes_root(body, x),
+        StmtK::Match { scrut, binder, some, none } : writes_expr(scrut, x) || writes_root(some, x) || writes_root(none, x),
+        StmtK::Break                               : false,
+        StmtK::Continue                            : false,
+    }
+}
+
+// The capture mode of `x` in a closure body (`rule.fn.closure`): exclusive
+// iff the body writes, borrows exclusively or moves a place whose root is
+// `x` -- `x`, `x.r`, `*x`, `x[k]` and the like (D-0017's syntactic scan).
+export fn writes_root(ref<Block, shared> b, StringView x) : bool
+{
+    foreach (s in &b.stmts)
+    {
+        if (writes_stmt(s, x))
+        {
+            return true;
+        }
+    }
+    match (&b.tail)
+    {
+        Some(t) : writes_expr(t, x),
+        None    : false,
+    }
+}

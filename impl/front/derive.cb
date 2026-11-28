@@ -1,0 +1,1802 @@
+// D-0116 and D-0118: a derived `T::clone` for every struct or enum that
+// declares none, is not marked `resource` and has a field that may own a
+// resource, and a `bitstruct`'s `Name::bits` and `Name::from_bits`;
+// ordinary functions added to the program before its names are resolved.
+
+import std;
+import ast;
+
+export fn add_derived(ref<Program, exclusive> p)
+{
+    add_in(&mut p.items);
+}
+
+fn add_in(ref<Vec<Item>, exclusive> items)
+{
+    HashSet<String> declared = HashSet::new();
+    // CHG-0475 (022): the names a chain's derived helpers would take in C
+    // (`T::clone_chain`, `T::clone_iter`), and whether this module declares
+    // a type of its own named as `std`'s `Box` or `Option`.
+    HashSet<String> helper_taken = HashSet::new();
+    bool own_box = false;
+    // Report 022: each struct's place, for the hidden struct of a variant
+    // with fields.
+    HashMap<String, usize> structs = HashMap::new();
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IFn(f)     :
+            {
+                ref<FnDecl, shared> d = Box::get(f);
+                match (&d.assoc_type)
+                {
+                    Some(t) :
+                    {
+                        if (d.name == "clone")
+                        {
+                            HashSet::insert(&mut declared, String::clone(t));
+                        }
+                        if (d.name == "clone_chain" || d.name == "clone_iter" || d.name == "clone_down")
+                        {
+                            HashSet::insert(&mut helper_taken, String::clone(t));
+                        }
+                    },
+                    None    : {},
+                }
+            },
+            Item::IStruct(b) :
+            {
+                ref<String, shared> n = &Box::get(b).name;
+                own_box = own_box || *n == "Box" || *n == "Option" || *n == "Vec";
+                _ = HashMap::insert(&mut structs, String::clone(n), i);
+            },
+            Item::IEnum(b)   :
+            {
+                ref<String, shared> n = &Box::get(b).name;
+                own_box = own_box || *n == "Box" || *n == "Option" || *n == "Vec";
+            },
+            _                : {},
+        }
+    }
+    Vec<Item> made = Vec::new();
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&items[i])
+        {
+            Item::IStruct(b) :
+            {
+                ref<StructDecl, shared> s = Box::get(b);
+                if (Option::is_some(&s.bits))
+                {
+                    Vec::push(&mut made, Item::IFn(Box::new(bitstruct_bits(s))));
+                    Vec::push(&mut made, Item::IFn(Box::new(bitstruct_from_bits(s))));
+                }
+                else if (!s.resource_ && !HashSet::contains(&declared, &s.name) && fields_may_own(&s.fields))
+                {
+                    Option<StructChain> chain = if (own_box || HashSet::contains(&helper_taken, &s.name))
+                    {
+                        None
+                    }
+                    else { struct_chain(s) };
+                    Vec<usize> tree_links = if (own_box || HashSet::contains(&helper_taken, &s.name))
+                    {
+                        Vec::new()
+                    }
+                    else { struct_links(s) };
+                    match (chain)
+                    {
+                        Some(c) :
+                        {
+                            Vec::push(&mut made, Item::IFn(Box::new(chain_entry(&s.name, &s.type_params, s.line, s.export_))));
+                            Vec::push(&mut made, Item::IFn(Box::new(struct_chain_rec(s, &c))));
+                            Vec::push(&mut made, Item::IFn(Box::new(struct_chain_iter(s, &c))));
+                        },
+                        None    :
+                        {
+                            if (Vec::len(&tree_links) > 0)
+                            {
+                                Vec::push(
+                                    &mut made,
+                                    Item::IFn(Box::new(chain_entry(&s.name, &s.type_params, s.line, s.export_))),
+                                );
+                                Vec::push(&mut made, Item::IFn(Box::new(struct_tree_rec(s, &tree_links))));
+                                Vec::push(&mut made, Item::IFn(Box::new(struct_tree_iter(s, &tree_links))));
+                                Vec::push(&mut made, Item::IFn(Box::new(struct_tree_down(s, &tree_links))));
+                            }
+                            else
+                            {
+                                Vec::push(&mut made, Item::IFn(Box::new(struct_clone(s))));
+                            }
+                        },
+                    }
+                }
+            },
+            Item::IEnum(b)   :
+            {
+                ref<EnumDecl, shared> e = Box::get(b);
+                if (!e.resource_ && !HashSet::contains(&declared, &e.name) && payloads_may_own(&e.variants))
+                {
+                    Vec<Option<LinkKind>> links = enum_links(e);
+                    bool any = false;
+                    foreach (l in &links)
+                    {
+                        any = any || Option::is_some(l);
+                    }
+                    // The fields of each variant written with them (its hidden struct's).
+                    Vec<Option<Vec<FieldDecl>>> hidden = Vec::new();
+                    foreach (v in &e.variants)
+                    {
+                        Option<Vec<FieldDecl>> fs = None;
+                        if (v.fields)
+                        {
+                            String hn = sprintf("%s$%s", &e.name, &v.name);
+                            match (HashMap::get(&structs, &hn))
+                            {
+                                Some(k) :
+                                {
+                                    match (&items[*k])
+                                    {
+                                        Item::IStruct(hb) : fs = Some(clone(&Box::get(hb).fields)),
+                                        _                 : {},
+                                    }
+                                },
+                                None    : {},
+                            }
+                        }
+                        Vec::push(&mut hidden, fs);
+                    }
+                    Vec<VariantTree> vts = enum_tree(e, &hidden);
+                    bool tree = Vec::len(&vts) > 0;
+                    if (tree && !own_box && !HashSet::contains(&helper_taken, &e.name))
+                    {
+                        Vec::push(&mut made, Item::IFn(Box::new(chain_entry(&e.name, &e.type_params, e.line, e.export_))));
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_tree_rec(e, &vts))));
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_tree_iter(e, &vts))));
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_tree_down(e, &vts))));
+                    }
+                    else if (any && !own_box && !HashSet::contains(&helper_taken, &e.name))
+                    {
+                        Vec::push(&mut made, Item::IFn(Box::new(chain_entry(&e.name, &e.type_params, e.line, e.export_))));
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_chain_rec(e, &links))));
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_chain_iter(e, &links))));
+                    }
+                    else
+                    {
+                        Vec::push(&mut made, Item::IFn(Box::new(enum_clone(e))));
+                    }
+                }
+            },
+            _                : {},
+        }
+    }
+    Vec::append(items, made);
+    for (usize i = 0; i < Vec::len(items); i += 1)
+    {
+        match (&mut items[i])
+        {
+            Item::IModule(m) : add_in(&mut Box::get_mut(m).items),
+            _                : {},
+        }
+    }
+}
+
+fn fields_may_own(ref<Vec<FieldDecl>, shared> fs) : bool
+{
+    for (usize i = 0; i < Vec::len(fs); i += 1)
+    {
+        if (may_own(&fs[i].ty))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn payloads_may_own(ref<Vec<VariantDecl>, shared> vs) : bool
+{
+    for (usize i = 0; i < Vec::len(vs); i += 1)
+    {
+        match (&vs[i].payload)
+        {
+            Some(t) :
+            {
+                if (may_own(t))
+                {
+                    return true;
+                }
+            },
+            None    : {},
+        }
+    }
+    false
+}
+
+// A field type that may own a resource, so a read is not a copy: a named
+// type (a struct, an enum, `String`, `Vec<…>`, …) or an array of one.
+fn may_own(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TNamed(_) : true,
+        Type::TArray(s) : may_own(&Box::get(s).inner),
+        _               : false,
+    }
+}
+
+fn self_type(ref<String, shared> name, ref<Vec<String>, shared> params) : Type
+{
+    Vec<Type> args = Vec::new();
+    for (usize i = 0; i < Vec::len(params); i += 1)
+    {
+        Vec::push(&mut args, named(&params[i], Vec::new()));
+    }
+    named(name, args)
+}
+
+fn path_of(Vec<String> segs, usize line) : Expr
+{
+    mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = Vec::new() })), line, 0)
+}
+
+fn path_word(StringView w, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::copy(w));
+    path_of(segs, line)
+}
+
+fn call_of(Expr callee, Vec<Expr> args, usize line) : Expr
+{
+    mk(ExprKind::ECall(Box::new(CallExpr { .callee = callee, .args = args })), line, 0)
+}
+
+fn clone_of(Expr arg, usize line) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, arg);
+    call_of(path_word("clone", line), args, line)
+}
+
+fn field_of(Expr e, ref<String, shared> name, usize line) : Expr
+{
+    mk(ExprKind::EField(Box::new(FieldExpr { .e = e, .name = String::clone(name) })), line, 0)
+}
+
+fn header(ref<String, shared> name, ref<Vec<String>, shared> params, usize line, Block body, bool export_) : FnDecl
+{
+    header_of(name, params, "clone", false, line, body, export_)
+}
+
+// A derived function of `name`'s: `fn name::fn_name<P1: clone, …>(ref<name<P1…>, shared> self) : name<P1…>`,
+// with a second parameter `usize $d` when `with_depth`.
+fn header_of(
+    ref<String, shared> name,
+    ref<Vec<String>, shared> params,
+    str fn_name,
+    bool with_depth,
+    usize line,
+    Block body,
+    bool export_,
+) : FnDecl
+{
+    Vec<Option<Bound>> bounds = Vec::new();
+    for (usize i = 0; i < Vec::len(params); i += 1)
+    {
+        Vec::push(&mut bounds, Some(Bound::BClone));
+    }
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl {
+        .ty = Type::TRef(Box::new(ModedTy { .inner = self_type(name, params), .mode = Mode::Shared })),
+        .name = "self",
+    });
+    if (with_depth)
+    {
+        Vec::push(&mut ps, ParamDecl { .ty = Type::TInt(IntTy::Usize), .name = "$d" });
+    }
+    FnDecl {
+        .export_ = export_,
+        .assoc_type = Some(String::clone(name)),
+        .name = String::copy(fn_name),
+        .type_params = Vec::clone(params),
+        .type_bounds = bounds,
+        .params = ps,
+        .ret = self_type(name, params),
+        .body = body,
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+        .source = Vec::new(),
+        .requires = Vec::new(),
+        // D-0303: the language's own code; a use in it never counts.
+        .retired = Retired::Live,
+    }
+}
+
+// D-0118: `fn Name::bits(Name v) : uN { widen<uN>(v.f0) << 0 | … }` and
+// `fn Name::from_bits(uN b) : Name { Name { .f0 = narrow<t0>(b & m0), … } }`,
+// the fields low bit first; a field as wide as the backing type is taken
+// as it is.
+fn lit_of(u128 v, IntTy ty, usize line) : Expr
+{
+    mk(ExprKind::EInt(Box::new(IntLit { .v = v, .sfx = Some(String::copy(int_ty_name(ty))) })), line, 0)
+}
+
+fn call_generic(str name, Type targ, Expr arg, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::copy(name));
+    Vec<Type> targs = Vec::new();
+    Vec::push(&mut targs, targ);
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, arg);
+    call_of(mk(ExprKind::EPath(Box::new(PathExpr { .segs = segs, .targs = targs })), line, 0), args, line)
+}
+
+fn bin(BinOp op, Expr a, Expr b, usize line) : Expr
+{
+    binary(op, a, b, line, 0)
+}
+
+fn is_int(ref<Type, shared> t, IntTy it) : bool
+{
+    match (t)
+    {
+        Type::TInt(i) : *i == it,
+        _             : false,
+    }
+}
+
+fn bitstruct_bits(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    IntTy backing = Option::expect(s.bits, "bitstruct");
+    Option<Expr> acc = None;
+    u32 off = 0;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<FieldDecl, shared> f = &s.fields[i];
+        u32 w = Option::expect(f.width, "width");
+        Expr field = field_of(path_word("v", line), &f.name, line);
+        Expr wide = if (is_int(
+            &f.ty,
+            backing,
+        )) { field } else { call_generic("widen", Type::TInt(backing), field, line) };
+        Expr placed = if (off == 0) { wide } else
+        {
+            bin(
+                BinOp::Shl,
+                wide,
+                lit_of(widen<u128>(off), IntTy::U32, line),
+                line,
+            )
+        };
+        acc = match (acc)
+        {
+            None    : Some(placed),
+            Some(a) : Some(bin(BinOp::BitOr, a, placed, line)),
+        };
+        off += w;
+    }
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl { .ty = self_type(&s.name, &Vec::new()), .name = "v" });
+    FnDecl {
+        .export_ = s.export_,
+        .assoc_type = Some(String::clone(&s.name)),
+        .name = "bits",
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = ps,
+        .ret = Type::TInt(backing),
+        .body = block_of(Vec::new(), Some(Option::expect(acc, "a bitstruct has fields"))),
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+        .source = Vec::new(),
+        .requires = Vec::new(),
+        // D-0303: the language's own code; a use in it never counts.
+        .retired = Retired::Live,
+    }
+}
+
+fn bitstruct_from_bits(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    IntTy backing = Option::expect(s.bits, "bitstruct");
+    Vec<FieldInit> fields = Vec::new();
+    u32 off = 0;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<FieldDecl, shared> f = &s.fields[i];
+        u32 w = Option::expect(f.width, "width");
+        u128 one = 1;
+        u128 mask = if (w >= 128) { max_value<u128>() } else { (one << w) - 1 };
+        Expr shifted = if (off == 0)
+        {
+            path_word(
+                "b",
+                line,
+            )
+        }
+        else { bin(BinOp::Shr, path_word("b", line), lit_of(widen<u128>(off), IntTy::U32, line), line) };
+        Expr masked = bin(BinOp::BitAnd, shifted, lit_of(mask, backing, line), line);
+        Expr value = if (is_int(&f.ty, backing)) { masked } else { call_generic("narrow", clone(&f.ty), masked, line) };
+        Vec::push(&mut fields, FieldInit { .name = String::clone(&f.name), .value = value });
+        off += w;
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    Expr lit = mk(
+        ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })),
+        line,
+        0,
+    );
+    Vec<ParamDecl> ps = Vec::new();
+    Vec::push(&mut ps, ParamDecl { .ty = Type::TInt(backing), .name = "b" });
+    FnDecl {
+        .export_ = s.export_,
+        .assoc_type = Some(String::clone(&s.name)),
+        .name = "from_bits",
+        .type_params = Vec::new(),
+        .type_bounds = Vec::new(),
+        .params = ps,
+        .ret = self_type(&s.name, &Vec::new()),
+        .body = block_of(Vec::new(), Some(lit)),
+        .line = line,
+        .is_const = false,
+        .auto_type = false,
+        .derived = true,
+        .c_entry = false,
+        .source = Vec::new(),
+        .requires = Vec::new(),
+        // D-0303: the language's own code; a use in it never counts.
+        .retired = Retired::Live,
+    }
+}
+
+fn struct_clone(ref<StructDecl, shared> s) : FnDecl
+{
+    usize line = s.line;
+    Vec<FieldInit> fields = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<String, shared> name = &s.fields[i].name;
+        Expr place = field_of(path_word("self", line), name, line);
+        Expr borrowed = mk(ExprKind::EBorrow(Box::new(BorrowExpr { .mode = Mode::Shared, .e = place })), line, 0);
+        Vec::push(&mut fields, FieldInit { .name = String::clone(name), .value = clone_of(borrowed, line) });
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    Expr lit = mk(
+        ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })),
+        line,
+        0,
+    );
+    header(&s.name, &s.type_params, line, block_of(Vec::new(), Some(lit)), s.export_)
+}
+
+fn enum_clone(ref<EnumDecl, shared> e) : FnDecl
+{
+    usize line = e.line;
+    Expr m = mk(ExprKind::EMatch(Box::new(MatchExpr { .scrut = path_word("self", line), .arms = enum_clone_arms(e) })), line, 0);
+    header(&e.name, &e.type_params, line, block_of(Vec::new(), Some(m)), e.export_)
+}
+
+// The arms of spec/16 §4a's match: `V1(p) : N::V1(clone(p)), V2 : N::V2, …`.
+fn enum_clone_arms(ref<EnumDecl, shared> e) : Vec<Arm>
+{
+    usize line = e.line;
+    Vec<Arm> arms = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[i];
+        Vec<String> segs = Vec::new();
+        Vec::push(&mut segs, String::clone(&e.name));
+        Vec::push(&mut segs, String::clone(&v.name));
+        Expr make = path_of(segs, line);
+        if (Option::is_some(&v.payload))
+        {
+            Vec<Expr> args = Vec::new();
+            Vec::push(&mut args, clone_of(path_word("p", line), line));
+            Vec::push(&mut arms, Arm {
+                .variant = Some(String::clone(&v.name)),
+                .nested = Vec::new(),
+                .binder = Some("p"),
+                .lit = None,
+                .body = Box::new(call_of(make, args, line)),
+                .quals = Vec::new(),
+            });
+        }
+        else
+        {
+            Vec::push(&mut arms, Arm {
+                .variant = Some(String::clone(&v.name)),
+                .nested = Vec::new(),
+                .binder = None,
+                .lit = None,
+                .body = Box::new(make),
+                .quals = Vec::new(),
+            });
+        }
+    }
+    arms
+}
+
+// ---- CHG-0475 (022): the derived `clone` of a chain ----
+//
+// A type whose value links to one more of it, through a field of a struct
+// or the payload of a variant of type `Box<N<P…>>` or `Option<Box<N<P…>>>`,
+// one such link in each value, is a chain: a list, a tree of one child.
+// Copied as spec/16 §4a writes its `clone`, it recurses once a link, so a
+// chain of millions of links exhausts the stack while its destruction is a
+// loop. Its derived `clone` is three functions with the same effects in the
+// same order (each field that may own something copied by `clone`, in
+// declaration order, across the whole chain):
+//   N::clone(self)           N::clone$chain(self, 0)
+//   N::clone$chain(self, $d) §4a's body, a link copied by calling itself at
+//                            $d + 1; past 1024 links the rest of the chain
+//                            is N::clone$iter's
+//   N::clone$iter(self)      a loop down the chain, and the copy built from
+//                            its end back
+// A struct's link is an `Option`. Its fields that may own something are all
+// before the link (copied on the way down) or all after it (on the way
+// back). A type in a module that declares its own `Box`, `Option` or `Vec`,
+// or its own `N::clone_chain` or `N::clone_iter` (the helpers' C names),
+// keeps §4a's body.
+//
+// Report 022: a struct with more than one link (a tree of two
+// children), or with fields that may own something on both sides of its
+// one link, is a tree: its `N::clone$chain` is §4a's body with every link
+// copied by calling itself at `$d + 1`, its `N::clone$iter` a loop over an
+// explicit stack that makes the same calls in the same order, and its
+// `N::clone$down` the step down a link (below); the same for an enum with
+// a variant whose fields link to it. A type declaring `N::clone_down` keeps
+// §4a's body.
+
+enum LinkKind
+{
+    Boxed,
+    Optional,
+}
+
+struct StructChain
+{
+    usize link;
+    // The fields that may own something are after the link.
+    bool back;
+}
+
+fn link_kind(ref<Type, shared> t, ref<String, shared> name, ref<Vec<String>, shared> params) : Option<LinkKind>
+{
+    Vec<Type> one = Vec::new();
+    Vec::push(&mut one, self_type(name, params));
+    Type boxed = named("Box", one);
+    if (type_eq(t, &boxed))
+    {
+        return Some(LinkKind::Boxed);
+    }
+    Vec<Type> inner = Vec::new();
+    Vec::push(&mut inner, boxed);
+    if (type_eq(t, &named("Option", inner)))
+    {
+        return Some(LinkKind::Optional);
+    }
+    None
+}
+
+fn struct_chain(ref<StructDecl, shared> s) : Option<StructChain>
+{
+    Option<usize> link = None;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        match (link_kind(&s.fields[i].ty, &s.name, &s.type_params))
+        {
+            Some(LinkKind::Optional) :
+            {
+                if (Option::is_some(&link))
+                {
+                    return None;
+                }
+                link = Some(i);
+            },
+            Some(LinkKind::Boxed)    : return None,
+            None                     : {},
+        }
+    }
+    usize l = match (link)
+    {
+        Some(l) : l,
+        None    : return None,
+    };
+    bool before = false;
+    bool after = false;
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        if (i != l && may_own(&s.fields[i].ty))
+        {
+            if (i < l)
+            {
+                before = true;
+            }
+            else
+            {
+                after = true;
+            }
+        }
+    }
+    if (before && after)
+    {
+        return None;
+    }
+    Some(StructChain { .link = l, .back = after })
+}
+
+// Each variant's link, if its payload is one.
+fn enum_links(ref<EnumDecl, shared> e) : Vec<Option<LinkKind>>
+{
+    Vec<Option<LinkKind>> out = Vec::new();
+    foreach (v in &e.variants)
+    {
+        Option<LinkKind> k = match (&v.payload)
+        {
+            Some(t) : if (v.fields) { None } else { link_kind(t, &e.name, &e.type_params) },
+            None    : None,
+        };
+        Vec::push(&mut out, k);
+    }
+    out
+}
+
+fn segs2(ref<String, shared> a, str b) : Vec<String>
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(a));
+    Vec::push(&mut segs, String::copy(b));
+    segs
+}
+
+// `std::a::b`.
+fn std_path(str a, str b, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, "std");
+    Vec::push(&mut segs, String::copy(a));
+    Vec::push(&mut segs, String::copy(b));
+    path_of(segs, line)
+}
+
+fn call1(Expr callee, Expr x, usize line) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, x);
+    call_of(callee, args, line)
+}
+
+fn call2(Expr callee, Expr x, Expr y, usize line) : Expr
+{
+    Vec<Expr> args = Vec::new();
+    Vec::push(&mut args, x);
+    Vec::push(&mut args, y);
+    call_of(callee, args, line)
+}
+
+fn borrow_of(Mode m, Expr e, usize line) : Expr
+{
+    mk(ExprKind::EBorrow(Box::new(BorrowExpr { .mode = m, .e = e })), line, 0)
+}
+
+fn arm_of(Option<String> variant, Option<String> binder, Expr body) : Arm
+{
+    Arm {
+        .variant = variant,
+        .nested = Vec::new(),
+        .binder = binder,
+        .lit = None,
+        .body = Box::new(body),
+        .quals = Vec::new(),
+    }
+}
+
+fn match_of(Expr scrut, Vec<Arm> arms, usize line) : Expr
+{
+    mk(ExprKind::EMatch(Box::new(MatchExpr { .scrut = scrut, .arms = arms })), line, 0)
+}
+
+fn block_expr(Vec<Stmt> stmts, Option<Expr> tail, usize line) : Expr
+{
+    mk(ExprKind::EBlock(block_of(stmts, tail)), line, 0)
+}
+
+fn stmt_of(Expr e) : Stmt
+{
+    Stmt::SExpr(Box::new(e))
+}
+
+// `while (true) { body }`, as a statement.
+fn loop_of(Vec<Stmt> body, usize line) : Stmt
+{
+    Expr cond = mk(ExprKind::EBool(true), line, 0);
+    Stmt::SBlockLike(Box::new(mk(
+        ExprKind::EWhile(Box::new(WhileExpr { .cond = cond, .body = block_of(body, None), .step = None })),
+        line,
+        0,
+    )))
+}
+
+fn break_of(usize line) : Expr
+{
+    mk(ExprKind::EBreak, line, 0)
+}
+
+fn some_of(Expr x, usize line) : Expr
+{
+    call1(std_path("Option", "Some", line), x, line)
+}
+
+fn box_new(Expr x, usize line) : Expr
+{
+    call1(std_path("Box", "new", line), x, line)
+}
+
+fn box_get(Expr r, usize line) : Expr
+{
+    call1(std_path("Box", "get", line), r, line)
+}
+
+fn vec_push(StringView v, Expr x, usize line) : Stmt
+{
+    stmt_of(call2(std_path("Vec", "push", line), borrow_of(Mode::Exclusive, path_word(v, line), line), x, line))
+}
+
+fn vec_pop(StringView v, usize line) : Expr
+{
+    call1(std_path("Vec", "pop", line), borrow_of(Mode::Exclusive, path_word(v, line), line), line)
+}
+
+fn vec_new(usize line) : Expr
+{
+    call_of(std_path("Vec", "new", line), Vec::new(), line)
+}
+
+fn ref_ty(Type t) : Type
+{
+    Type::TRef(Box::new(ModedTy { .inner = t, .mode = Mode::Shared }))
+}
+
+fn vec_ty(Type t) : Type
+{
+    Vec<Type> args = Vec::new();
+    Vec::push(&mut args, t);
+    named("std::Vec", args)
+}
+
+// `N::clone(self) : N { N::clone$chain(self, 0) }`.
+fn chain_entry(ref<String, shared> name, ref<Vec<String>, shared> params, usize line, bool export_) : FnDecl
+{
+    Expr c = call2(path_of(segs2(name, "clone$chain"), line), path_word("self", line), int_lit(0, line, 0), line);
+    header_of(name, params, "clone", false, line, block_of(Vec::new(), Some(c)), export_)
+}
+
+// A link's copy, `r` a reference to it: `std::Box::new(N::clone$chain(std::Box::get(r), $d + 1))`,
+// in `match (r) { Some($b) : std::Option::Some(…), None : std::Option::None }` for an `Option`.
+fn link_copy(LinkKind k, Expr r, ref<String, shared> name, usize line) : Expr
+{
+    Expr deeper = binary(BinOp::Add, path_word("$d", line), int_lit(1, line, 0), line, 0);
+    match (k)
+    {
+        LinkKind::Boxed    :
+        {
+            box_new(call2(path_of(segs2(name, "clone$chain"), line), box_get(r, line), deeper, line), line)
+        },
+        LinkKind::Optional :
+        {
+            Expr inner = box_new(
+                call2(path_of(segs2(name, "clone$chain"), line), box_get(path_word("$b", line), line), deeper, line),
+                line,
+            );
+            Vec<Arm> arms = Vec::new();
+            Vec::push(&mut arms, arm_of(Some("Some"), Some("$b"), some_of(inner, line)));
+            Vec::push(&mut arms, arm_of(Some("None"), None, std_path("Option", "None", line)));
+            match_of(r, arms, line)
+        },
+    }
+}
+
+// `if ($d >= 1024) { return N::clone$iter(self); }`.
+fn depth_guard(ref<String, shared> name, usize line) : Stmt
+{
+    Expr cond = binary(BinOp::Ge, path_word("$d", line), int_lit(1024, line, 0), line, 0);
+    Expr give = call1(path_of(segs2(name, "clone$iter"), line), path_word("self", line), line);
+    Vec<Stmt> then_ = Vec::new();
+    Vec::push(&mut then_, stmt_of(mk(ExprKind::EReturn(Some(Box::new(give))), line, 0)));
+    Stmt::SBlockLike(Box::new(mk(
+        ExprKind::EIf(Box::new(IfExpr { .cond = cond, .then_ = block_of(then_, None), .else_ = None })),
+        line,
+        0,
+    )))
+}
+
+// `N { .f = clone(&x.f), … }`, the link `link_value` where one is given.
+fn struct_lit_of(ref<StructDecl, shared> s, str x, Option<usize> link, Option<Expr> link_value, usize line) : Expr
+{
+    Option<Expr> lv = link_value;
+    Vec<FieldInit> fields = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<String, shared> name = &s.fields[i].name;
+        bool at_link = match (link)
+        {
+            Some(l) : l == i,
+            None    : false,
+        };
+        Expr value = if (at_link && Option::is_some(&lv))
+        {
+            Option::expect(replace(&mut lv, None), "the link's value")
+        }
+        else
+        {
+            clone_of(borrow_of(Mode::Shared, field_of(path_word(x, line), name, line), line), line)
+        };
+        Vec::push(&mut fields, FieldInit { .name = String::clone(name), .value = value });
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    mk(ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })), line, 0)
+}
+
+fn struct_chain_rec(ref<StructDecl, shared> s, ref<StructChain, shared> c) : FnDecl
+{
+    usize line = s.line;
+    Expr r = borrow_of(Mode::Shared, field_of(path_word("self", line), &s.fields[c.link].name, line), line);
+    Expr lit = struct_lit_of(s, "self", Some(c.link), Some(link_copy(LinkKind::Optional, r, &s.name, line)), line);
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, depth_guard(&s.name, line));
+    header_of(&s.name, &s.type_params, "clone$chain", true, line, block_of(stmts, Some(lit)), s.export_)
+}
+
+// `match (&$cur.link) { Some($b) : { [std::Vec::push(&mut $spine, $cur);] $cur = std::Box::get($b); }, None : break }`
+fn step_down(ref<StructDecl, shared> s, ref<StructChain, shared> c, bool keep, usize line) : Stmt
+{
+    Expr r = borrow_of(Mode::Shared, field_of(path_word("$cur", line), &s.fields[c.link].name, line), line);
+    Vec<Stmt> down = Vec::new();
+    if (keep)
+    {
+        Vec::push(&mut down, vec_push("$spine", path_word("$cur", line), line));
+    }
+    Vec::push(&mut down, stmt_of(assign(path_word("$cur", line), box_get(path_word("$b", line), line), line, 0)));
+    Vec<Arm> arms = Vec::new();
+    Vec::push(&mut arms, arm_of(Some("Some"), Some("$b"), block_expr(down, None, line)));
+    Vec::push(&mut arms, arm_of(Some("None"), None, break_of(line)));
+    Stmt::SBlockLike(Box::new(match_of(r, arms, line)))
+}
+
+// `loop { match (std::Vec::pop(&mut v)) { Some(binder) : { body }, None : break } }`.
+fn pop_loop(str v, str binder, Vec<Stmt> body, usize line) : Stmt
+{
+    Vec<Arm> arms = Vec::new();
+    Vec::push(&mut arms, arm_of(Some("Some"), Some(String::copy(binder)), block_expr(body, None, line)));
+    Vec::push(&mut arms, arm_of(Some("None"), None, break_of(line)));
+    Vec<Stmt> back = Vec::new();
+    Vec::push(&mut back, Stmt::SBlockLike(Box::new(match_of(vec_pop(v, line), arms, line))));
+    loop_of(back, line)
+}
+
+fn struct_chain_iter(ref<StructDecl, shared> s, ref<StructChain, shared> c) : FnDecl
+{
+    usize line = s.line;
+    Type me = self_type(&s.name, &s.type_params);
+    ref<String, shared> lname = &s.fields[c.link].name;
+    Vec<Stmt> stmts = Vec::new();
+    if (!c.back)
+    {
+        // Each link's copy without its link, on the way down; linked from
+        // the end back.
+        Vec::push(&mut stmts, let_stmt(Some(vec_ty(clone(&me))), "$parts", Some(vec_new(line)), line, 0));
+        Vec::push(&mut stmts, let_stmt(Some(ref_ty(clone(&me))), "$cur", Some(path_word("self", line)), line, 0));
+        Vec<Stmt> walk = Vec::new();
+        Expr part = struct_lit_of(s, "$cur", Some(c.link), Some(std_path("Option", "None", line)), line);
+        Vec::push(&mut walk, vec_push("$parts", part, line));
+        Vec::push(&mut walk, step_down(s, c, false, line));
+        Vec::push(&mut stmts, loop_of(walk, line));
+        Expr last = call1(std_path("Option", "unwrap", line), vec_pop("$parts", line), line);
+        Vec::push(&mut stmts, let_stmt(Some(clone(&me)), "$acc", Some(last), line, 0));
+        Vec<Stmt> relink = Vec::new();
+        Vec::push(&mut relink, let_stmt(Some(clone(&me)), "$n", Some(path_word("$q", line)), line, 0));
+        Vec::push(&mut relink, stmt_of(assign(
+            field_of(path_word("$n", line), lname, line),
+            some_of(box_new(path_word("$acc", line), line), line),
+            line,
+            0,
+        )));
+        Vec::push(&mut relink, stmt_of(assign(path_word("$acc", line), path_word("$n", line), line, 0)));
+        Vec::push(&mut stmts, pop_loop("$parts", "$q", relink, line));
+    }
+    else
+    {
+        // The links kept on the way down; each copied whole on the way
+        // back, around the copy of the rest.
+        Vec::push(&mut stmts, let_stmt(Some(vec_ty(ref_ty(clone(&me)))), "$spine", Some(vec_new(line)), line, 0));
+        Vec::push(&mut stmts, let_stmt(Some(ref_ty(clone(&me))), "$cur", Some(path_word("self", line)), line, 0));
+        Vec<Stmt> walk = Vec::new();
+        Vec::push(&mut walk, step_down(s, c, true, line));
+        Vec::push(&mut stmts, loop_of(walk, line));
+        Vec::push(&mut stmts, let_stmt(Some(clone(&me)), "$acc", Some(struct_lit_of(s, "$cur", None, None, line)), line, 0));
+        Expr whole = struct_lit_of(
+            s,
+            "$n",
+            Some(c.link),
+            Some(some_of(box_new(path_word("$acc", line), line), line)),
+            line,
+        );
+        Vec<Stmt> relink = Vec::new();
+        Vec::push(&mut relink, stmt_of(assign(path_word("$acc", line), whole, line, 0)));
+        Vec::push(&mut stmts, pop_loop("$spine", "$n", relink, line));
+    }
+    header_of(&s.name, &s.type_params, "clone$iter", false, line, block_of(stmts, Some(path_word("$acc", line))), s.export_)
+}
+
+// ---- report 022: the derived `clone` of a tree ----
+//
+// The struct's links (fields of type `Option<Box<N<P…>>>`) when it is not a
+// chain: two or more of them, or one with fields that may own something on
+// both sides of it. Empty when it has a `Box<N<P…>>` field or no link.
+fn struct_links(ref<StructDecl, shared> s) : Vec<usize>
+{
+    Vec<usize> links = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        match (link_kind(&s.fields[i].ty, &s.name, &s.type_params))
+        {
+            Some(LinkKind::Optional) : Vec::push(&mut links, i),
+            Some(LinkKind::Boxed)    : return Vec::new(),
+            None                     : {},
+        }
+    }
+    links
+}
+
+fn is_link(ref<Vec<usize>, shared> links, usize i) : bool
+{
+    foreach (l in links)
+    {
+        if (*l == i)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// `$v<i>`, the stack of field `i`'s copies in `N::clone$iter`.
+fn stack_name(usize i) : String
+{
+    sprintf("$v%v", i)
+}
+
+fn usize_lit(usize v, usize line) : Expr
+{
+    int_lit(widen<u128>(v), line, 0)
+}
+
+fn if_stmt(Expr cond, Vec<Stmt> then_, Option<Expr> else_, usize line) : Stmt
+{
+    Stmt::SBlockLike(Box::new(if_expr(cond, then_, else_, line)))
+}
+
+fn if_expr(Expr cond, Vec<Stmt> then_, Option<Expr> else_, usize line) : Expr
+{
+    mk(ExprKind::EIf(Box::new(IfExpr { .cond = cond, .then_ = block_of(then_, None), .else_ = else_ })), line, 0)
+}
+
+// `N::clone$down($cur, n)`: the value the link of step `n` refers to.
+fn down_call(ref<String, shared> name, usize n, usize line) : Expr
+{
+    call2(path_of(segs2(name, "clone$down"), line), path_word("$cur", line), usize_lit(n, line), line)
+}
+
+// `fn N::clone$down(ref<N, shared> self, usize $k) : std::Option<ref<N, shared>> from self { body }`.
+// `N::clone$iter` goes down a link through it, not by reading the field
+// itself: the reference it gives comes from `self` alone, so the checker's
+// facts of `$cur` stay those of a chain however many links a value has.
+fn header_down(ref<String, shared> name, ref<Vec<String>, shared> params, usize line, Expr body, bool export_) : FnDecl
+{
+    FnDecl d = header_of(name, params, "clone$down", false, line, block_of(Vec::new(), Some(body)), export_);
+    Vec::push(&mut d.params, ParamDecl { .ty = Type::TInt(IntTy::Usize), .name = "$k" });
+    Vec<Type> one = Vec::new();
+    Vec::push(&mut one, ref_ty(self_type(name, params)));
+    d.ret = named("std::Option", one);
+    Vec::push(&mut d.source, "self");
+    d
+}
+
+// `std::Option::Some(std::Box::get(r))` for a `Box` that `r` refers to;
+// `match (r) { Some($b) : std::Option::Some(std::Box::get($b)), None : std::Option::None }`
+// for an `Option<Box<…>>`.
+fn link_ref(LinkKind k, Expr r, usize line) : Expr
+{
+    match (k)
+    {
+        LinkKind::Boxed    : some_of(box_get(r, line), line),
+        LinkKind::Optional :
+        {
+            Vec<Arm> arms = Vec::new();
+            Vec::push(&mut arms, arm_of(Some("Some"), Some("$b"), some_of(box_get(path_word("$b", line), line), line)));
+            Vec::push(&mut arms, arm_of(Some("None"), None, std_path("Option", "None", line)));
+            match_of(r, arms, line)
+        },
+    }
+}
+
+// `if ($k == j1) { link 1 } else if … else { the last link }`, over the
+// steps that are links.
+fn struct_tree_down(ref<StructDecl, shared> s, ref<Vec<usize>, shared> links) : FnDecl
+{
+    usize line = s.line;
+    usize last = links[Vec::len(links) - 1];
+    Vec<usize> steps = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        if (is_link(links, i) || (i < last && may_own(&s.fields[i].ty)))
+        {
+            Vec::push(&mut steps, i);
+        }
+    }
+    Option<Expr> body = None;
+    for (usize n = Vec::len(&steps); n > 0; n -= 1)
+    {
+        usize j = n - 1;
+        usize f = steps[j];
+        if (is_link(links, f))
+        {
+            Expr r = borrow_of(Mode::Shared, field_of(path_word("self", line), &s.fields[f].name, line), line);
+            Expr one = link_ref(LinkKind::Optional, r, line);
+            body = match (body)
+            {
+                None    : Some(one),
+                Some(b) : Some(if_value(binary(BinOp::Eq, path_word("$k", line), usize_lit(j, line), line, 0), one, b, line)),
+            };
+        }
+    }
+    header_down(&s.name, &s.type_params, line, Option::expect(body, "a tree has a link"), s.export_)
+}
+
+// `if (cond) { a } else { b }`, a value.
+fn if_value(Expr cond, Expr a, Expr b, usize line) : Expr
+{
+    mk(
+        ExprKind::EIf(Box::new(IfExpr {
+            .cond = cond,
+            .then_ = block_of(Vec::new(), Some(a)),
+            .else_ = Some(block_expr(Vec::new(), Some(b), line)),
+        })),
+        line,
+        0,
+    )
+}
+
+fn struct_tree_rec(ref<StructDecl, shared> s, ref<Vec<usize>, shared> links) : FnDecl
+{
+    usize line = s.line;
+    Vec<FieldInit> fields = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<String, shared> name = &s.fields[i].name;
+        Expr r = borrow_of(Mode::Shared, field_of(path_word("self", line), name, line), line);
+        Expr value = if (is_link(links, i)) { link_copy(LinkKind::Optional, r, &s.name, line) } else { clone_of(r, line) };
+        Vec::push(&mut fields, FieldInit { .name = String::clone(name), .value = value });
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    Expr lit = mk(
+        ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })),
+        line,
+        0,
+    );
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, depth_guard(&s.name, line));
+    header_of(&s.name, &s.type_params, "clone$chain", true, line, block_of(stmts, Some(lit)), s.export_)
+}
+
+// `N { … }` made from `$cur`: a field with a stack (`stacked`) takes its
+// top, `std::Option::unwrap(std::Vec::pop(&mut $v<i>))`; the others are
+// copied by `clone` here.
+fn tree_lit(ref<StructDecl, shared> s, ref<Vec<bool>, shared> stacked, usize line) : Expr
+{
+    Vec<FieldInit> fields = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        ref<String, shared> name = &s.fields[i].name;
+        Expr value = if (stacked[i])
+        {
+            call1(std_path("Option", "unwrap", line), vec_pop(&stack_name(i), line), line)
+        }
+        else
+        {
+            clone_of(borrow_of(Mode::Shared, field_of(path_word("$cur", line), name, line), line), line)
+        };
+        Vec::push(&mut fields, FieldInit { .name = String::clone(name), .value = value });
+    }
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&s.name));
+    mk(ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })), line, 0)
+}
+
+// §4a's body run over an explicit stack. The steps of a value are its
+// links and the fields before its last link that may own something, in
+// declaration order; `$k` is the next step of `$cur`. A field's step pushes
+// its copy on the field's stack `$v<i>`; a link's step pushes `None`, or
+// keeps `$cur` and its step on `$spine` and `$at` and goes down to the
+// linked value. A value whose steps are done is made from the tops of its
+// stacks (the other fields copied there, after its last link's as §4a
+// copies them) and given to the value kept on top of `$spine` as that
+// link's copy:
+//
+//   std::Vec<ref<N, shared>> $spine = …; std::Vec<usize> $at = …;
+//   std::Vec<τi> $v<i> = …;                     (for each step's field)
+//   ref<N, shared> $cur = self; usize $k = 0;
+//   while (true)
+//   {
+//       if ($k == 0) { std::Vec::push(&mut $v<a>, clone(&$cur.a)); $k = 1; }
+//       else if ($k == 1)
+//       {
+//           match (&$cur.l)
+//           {
+//               Some($b) : { push $cur and 1; $cur = std::Box::get($b); $k = 0; },
+//               None     : { std::Vec::push(&mut $v<l>, std::Option::None); $k = 2; },
+//           }
+//       }
+//       else
+//       {
+//           if (std::Vec::len(&$spine) == 0) { break; }
+//           N $made = N { … };
+//           $cur = pop $spine; $k = pop $at;
+//           if ($k == 1) { std::Vec::push(&mut $v<l>, Some(Box::new($made))); } else …
+//           $k = $k + 1;
+//       }
+//   }
+//   N { … }
+fn struct_tree_iter(ref<StructDecl, shared> s, ref<Vec<usize>, shared> links) : FnDecl
+{
+    usize line = s.line;
+    Type me = self_type(&s.name, &s.type_params);
+    usize last = links[Vec::len(links) - 1];
+    Vec<usize> steps = Vec::new();
+    Vec<bool> stacked = Vec::new();
+    for (usize i = 0; i < Vec::len(&s.fields); i += 1)
+    {
+        bool step = is_link(links, i) || (i < last && may_own(&s.fields[i].ty));
+        if (step)
+        {
+            Vec::push(&mut steps, i);
+        }
+        Vec::push(&mut stacked, step);
+    }
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, let_stmt(Some(vec_ty(ref_ty(clone(&me)))), "$spine", Some(vec_new(line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(vec_ty(Type::TInt(IntTy::Usize))), "$at", Some(vec_new(line)), line, 0));
+    foreach (i in &steps)
+    {
+        Vec::push(
+            &mut stmts,
+            let_stmt(Some(vec_ty(clone(&s.fields[*i].ty))), &stack_name(*i), Some(vec_new(line)), line, 0),
+        );
+    }
+    Vec::push(&mut stmts, let_stmt(Some(ref_ty(clone(&me))), "$cur", Some(path_word("self", line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(Type::TInt(IntTy::Usize)), "$k", Some(usize_lit(0, line)), line, 0));
+    // The value done: made, and given to the one kept above it.
+    Vec<Stmt> done = Vec::new();
+    Vec<Stmt> top = Vec::new();
+    Vec::push(&mut top, stmt_of(break_of(line)));
+    Vec::push(&mut done, if_stmt(
+        binary(
+            BinOp::Eq,
+            call1(std_path("Vec", "len", line), borrow_of(Mode::Shared, path_word("$spine", line), line), line),
+            usize_lit(0, line),
+            line,
+            0,
+        ),
+        top,
+        None,
+        line,
+    ));
+    Vec::push(&mut done, let_stmt(Some(clone(&me)), "$made", Some(tree_lit(s, &stacked, line)), line, 0));
+    Expr up = call1(std_path("Option", "unwrap", line), vec_pop("$spine", line), line);
+    Vec::push(&mut done, stmt_of(assign(path_word("$cur", line), up, line, 0)));
+    Expr at = call1(std_path("Option", "unwrap", line), vec_pop("$at", line), line);
+    Vec::push(&mut done, stmt_of(assign(path_word("$k", line), at, line, 0)));
+    // `if ($k == j1) { push l1 } else if … else { push the last link }`, built from the last back.
+    Option<Expr> give = None;
+    for (usize n = Vec::len(&steps); n > 0; n -= 1)
+    {
+        usize j = n - 1;
+        usize f = steps[j];
+        if (is_link(links, f))
+        {
+            Vec<Stmt> push = Vec::new();
+            Vec::push(&mut push, vec_push(&stack_name(f), some_of(box_new(path_word("$made", line), line), line), line));
+            give = match (give)
+            {
+                None    : Some(block_expr(push, None, line)),
+                Some(e) :
+                {
+                    Expr cond = binary(BinOp::Eq, path_word("$k", line), usize_lit(j, line), line, 0);
+                    Some(if_expr(cond, push, Some(e), line))
+                },
+            };
+        }
+    }
+    Vec::push(&mut done, stmt_of(Option::expect(give, "a tree has a link")));
+    Expr next = binary(BinOp::Add, path_word("$k", line), usize_lit(1, line), line, 0);
+    Vec::push(&mut done, stmt_of(assign(path_word("$k", line), next, line, 0)));
+    // The steps, from the last back, each `if ($k == j) { … } else …`.
+    Option<Expr> chain = Some(block_expr(done, None, line));
+    for (usize n = Vec::len(&steps); n > 0; n -= 1)
+    {
+        usize j = n - 1;
+        usize f = steps[j];
+        ref<String, shared> fname = &s.fields[f].name;
+        Expr after = assign(path_word("$k", line), usize_lit(j + 1, line), line, 0);
+        Vec<Stmt> body = Vec::new();
+        if (is_link(links, f))
+        {
+            Vec<Stmt> down = Vec::new();
+            Vec::push(&mut down, vec_push("$spine", path_word("$cur", line), line));
+            Vec::push(&mut down, vec_push("$at", usize_lit(j, line), line));
+            Vec::push(&mut down, stmt_of(assign(path_word("$cur", line), path_word("$c", line), line, 0)));
+            Vec::push(&mut down, stmt_of(assign(path_word("$k", line), usize_lit(0, line), line, 0)));
+            Vec<Stmt> none = Vec::new();
+            Vec::push(&mut none, vec_push(&stack_name(f), std_path("Option", "None", line), line));
+            Vec::push(&mut none, stmt_of(after));
+            Vec<Arm> arms = Vec::new();
+            Vec::push(&mut arms, arm_of(Some("Some"), Some("$c"), block_expr(down, None, line)));
+            Vec::push(&mut arms, arm_of(Some("None"), None, block_expr(none, None, line)));
+            Vec::push(&mut body, Stmt::SBlockLike(Box::new(match_of(down_call(&s.name, j, line), arms, line))));
+        }
+        else
+        {
+            Expr copy = clone_of(borrow_of(Mode::Shared, field_of(path_word("$cur", line), fname, line), line), line);
+            Vec::push(&mut body, vec_push(&stack_name(f), copy, line));
+            Vec::push(&mut body, stmt_of(after));
+        }
+        Expr cond = binary(BinOp::Eq, path_word("$k", line), usize_lit(j, line), line, 0);
+        chain = Some(if_expr(cond, body, chain, line));
+    }
+    Vec<Stmt> walk = Vec::new();
+    Vec::push(&mut walk, Stmt::SBlockLike(Box::new(Option::expect(chain, "the steps"))));
+    Vec::push(&mut stmts, loop_of(walk, line));
+    header_of(&s.name, &s.type_params, "clone$iter", false, line, block_of(stmts, Some(tree_lit(s, &stacked, line))), s.export_)
+}
+
+fn variant_path(ref<EnumDecl, shared> e, ref<VariantDecl, shared> v, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&e.name));
+    Vec::push(&mut segs, String::clone(&v.name));
+    path_of(segs, line)
+}
+
+fn enum_chain_rec(ref<EnumDecl, shared> e, ref<Vec<Option<LinkKind>>, shared> links) : FnDecl
+{
+    usize line = e.line;
+    Vec<Arm> arms = enum_clone_arms(e);
+    for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+    {
+        match (links[i])
+        {
+            Some(k) :
+            {
+                ref<VariantDecl, shared> v = &e.variants[i];
+                Expr made = call1(variant_path(e, v, line), link_copy(k, path_word("$p", line), &e.name, line), line);
+                arms[i] = arm_of(Some(String::clone(&v.name)), Some("$p"), made);
+            },
+            None    : {},
+        }
+    }
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, depth_guard(&e.name, line));
+    Expr m = match_of(path_word("self", line), arms, line);
+    header_of(&e.name, &e.type_params, "clone$chain", true, line, block_of(stmts, Some(m)), e.export_)
+}
+
+fn enum_chain_iter(ref<EnumDecl, shared> e, ref<Vec<Option<LinkKind>>, shared> links) : FnDecl
+{
+    usize line = e.line;
+    Type me = self_type(&e.name, &e.type_params);
+    bool all_links = true;
+    foreach (l in links)
+    {
+        all_links = all_links && Option::is_some(l);
+    }
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, let_stmt(Some(vec_ty(ref_ty(clone(&me)))), "$spine", Some(vec_new(line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(ref_ty(clone(&me))), "$cur", Some(path_word("self", line)), line, 0));
+    // Down: each link kept, to the value that links to nothing; up: each
+    // kept link's variant around the copy of the rest.
+    Vec<Arm> down = Vec::new();
+    Vec<Arm> up = Vec::new();
+    for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[i];
+        match (links[i])
+        {
+            Some(k) :
+            {
+                Vec<Stmt> step = Vec::new();
+                Vec::push(&mut step, vec_push("$spine", path_word("$cur", line), line));
+                match (k)
+                {
+                    LinkKind::Boxed    :
+                    {
+                        Vec::push(
+                            &mut step,
+                            stmt_of(assign(path_word("$cur", line), box_get(path_word("$p", line), line), line, 0)),
+                        );
+                        Vec::push(&mut down, arm_of(Some(String::clone(&v.name)), Some("$p"), block_expr(step, None, line)));
+                        Expr made = call1(variant_path(e, v, line), box_new(path_word("$acc", line), line), line);
+                        Vec::push(&mut up, arm_of(Some(String::clone(&v.name)), None, made));
+                    },
+                    LinkKind::Optional :
+                    {
+                        Vec::push(
+                            &mut step,
+                            stmt_of(assign(path_word("$cur", line), box_get(path_word("$b", line), line), line, 0)),
+                        );
+                        Vec<Arm> inner = Vec::new();
+                        Vec::push(&mut inner, arm_of(Some("Some"), Some("$b"), block_expr(step, None, line)));
+                        Vec::push(&mut inner, arm_of(Some("None"), None, break_of(line)));
+                        Expr m = match_of(path_word("$p", line), inner, line);
+                        Vec::push(&mut down, arm_of(Some(String::clone(&v.name)), Some("$p"), m));
+                        Expr made = call1(
+                            variant_path(e, v, line),
+                            some_of(box_new(path_word("$acc", line), line), line),
+                            line,
+                        );
+                        Vec::push(&mut up, arm_of(Some(String::clone(&v.name)), None, made));
+                    },
+                }
+            },
+            None    : {},
+        }
+    }
+    if (!all_links)
+    {
+        Vec::push(&mut down, arm_of(None, None, break_of(line)));
+        Vec::push(&mut up, arm_of(None, None, path_word("$acc", line)));
+    }
+    Vec<Stmt> walk = Vec::new();
+    Vec::push(&mut walk, Stmt::SBlockLike(Box::new(match_of(path_word("$cur", line), down, line))));
+    Vec::push(&mut stmts, loop_of(walk, line));
+    // The value the chain ends with, copied as §4a copies it.
+    Expr last = match_of(path_word("$cur", line), enum_clone_arms(e), line);
+    Vec::push(&mut stmts, let_stmt(Some(clone(&me)), "$acc", Some(last), line, 0));
+    Vec<Stmt> relink = Vec::new();
+    Vec::push(&mut relink, stmt_of(assign(path_word("$acc", line), match_of(path_word("$n", line), up, line), line, 0)));
+    Vec::push(&mut stmts, pop_loop("$spine", "$n", relink, line));
+    header_of(&e.name, &e.type_params, "clone$iter", false, line, block_of(stmts, Some(path_word("$acc", line))), e.export_)
+}
+
+// ---- report 022: the derived `clone` of an enum tree ----
+//
+// An enum one of whose variants written with fields (D-0324) has a field of
+// type `Box<E<P…>>` or `Option<Box<E<P…>>>`: an expression tree's `Add {
+// Box<Expr> a; Box<Expr> b; }`. §4a copies such a variant through its
+// hidden struct's `clone`, which copies each link by `E::clone`; the copy
+// below makes the same calls in the same order, a variant's payload link
+// taken as a chain's (`Branch(Box<Tree>)`) is. Each step of each variant
+// has a number of its own, from 1, so that `$at` alone says which link a
+// copy is for; `$k == 0` is a value not yet begun.
+
+struct VariantTree
+{
+    // The variant written with fields: its hidden struct's name; else
+    // empty.
+    String hidden;
+    // Each field's (the payload's, for a variant without fields) link to
+    // the enum, its type, its name and whether its copy is kept on a stack.
+    Vec<Option<LinkKind>> links;
+    Vec<Type> tys;
+    Vec<String> names;
+    Vec<bool> stacked;
+    // The fields with a step, in order (`[0]`, the payload, for a variant
+    // without fields), and the number of the first.
+    Vec<usize> steps;
+    usize base;
+}
+
+// One per variant; empty when no variant with fields links to the enum.
+fn enum_tree(ref<EnumDecl, shared> e, ref<Vec<Option<Vec<FieldDecl>>>, shared> hidden) : Vec<VariantTree>
+{
+    Vec<VariantTree> out = Vec::new();
+    bool any = false;
+    usize next = 1;
+    for (usize vi = 0; vi < Vec::len(&e.variants); vi += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[vi];
+        VariantTree vt = VariantTree {
+            .hidden = String::new(),
+            .links = Vec::new(),
+            .tys = Vec::new(),
+            .names = Vec::new(),
+            .stacked = Vec::new(),
+            .steps = Vec::new(),
+            .base = next,
+        };
+        match (&hidden[vi])
+        {
+            Some(fs) :
+            {
+                vt.hidden = sprintf("%s$%s", &e.name, &v.name);
+                usize last = 0;
+                bool linked = false;
+                for (usize i = 0; i < Vec::len(fs); i += 1)
+                {
+                    Option<LinkKind> k = link_kind(&fs[i].ty, &e.name, &e.type_params);
+                    if (Option::is_some(&k))
+                    {
+                        last = i;
+                        linked = true;
+                    }
+                    Vec::push(&mut vt.links, k);
+                    Vec::push(&mut vt.tys, clone(&fs[i].ty));
+                    Vec::push(&mut vt.names, String::clone(&fs[i].name));
+                }
+                any = any || linked;
+                for (usize i = 0; i < Vec::len(fs); i += 1)
+                {
+                    bool step = linked && (Option::is_some(&vt.links[i]) || (i < last && may_own(&fs[i].ty)));
+                    if (step)
+                    {
+                        Vec::push(&mut vt.steps, i);
+                    }
+                    Vec::push(&mut vt.stacked, step);
+                }
+            },
+            None     :
+            {
+                match (&v.payload)
+                {
+                    Some(t) :
+                    {
+                        Option<LinkKind> k = link_kind(t, &e.name, &e.type_params);
+                        if (Option::is_some(&k))
+                        {
+                            Vec::push(&mut vt.steps, 0);
+                            Vec::push(&mut vt.stacked, true);
+                        }
+                        Vec::push(&mut vt.links, k);
+                        Vec::push(&mut vt.tys, clone(t));
+                        Vec::push(&mut vt.names, String::new());
+                    },
+                    None    : {},
+                }
+            },
+        }
+        next += Vec::len(&vt.steps);
+        Vec::push(&mut out, vt);
+    }
+    if (!any)
+    {
+        return Vec::new();
+    }
+    out
+}
+
+fn hidden_lit(ref<VariantTree, shared> vt, Vec<FieldInit> fields, usize line) : Expr
+{
+    Vec<String> segs = Vec::new();
+    Vec::push(&mut segs, String::clone(&vt.hidden));
+    mk(ExprKind::EStructLit(Box::new(StructLitExpr { .segs = segs, .targs = Vec::new(), .fields = fields })), line, 0)
+}
+
+fn enum_tree_rec(ref<EnumDecl, shared> e, ref<Vec<VariantTree>, shared> vts) : FnDecl
+{
+    usize line = e.line;
+    Vec<Arm> arms = enum_clone_arms(e);
+    for (usize i = 0; i < Vec::len(&e.variants); i += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[i];
+        ref<VariantTree, shared> vt = &vts[i];
+        if (Vec::len(&vt.steps) > 0)
+        {
+            Expr payload = if (StringView::len(&vt.hidden) == 0)
+            {
+                link_copy(Option::expect(vt.links[0], "the payload's link"), path_word("$p", line), &e.name, line)
+            }
+            else
+            {
+                Vec<FieldInit> fields = Vec::new();
+                for (usize f = 0; f < Vec::len(&vt.names); f += 1)
+                {
+                    Expr r = borrow_of(Mode::Shared, field_of(path_word("$p", line), &vt.names[f], line), line);
+                    Expr value = match (vt.links[f])
+                    {
+                        Some(k) : link_copy(k, r, &e.name, line),
+                        None    : clone_of(r, line),
+                    };
+                    Vec::push(&mut fields, FieldInit { .name = String::clone(&vt.names[f]), .value = value });
+                }
+                hidden_lit(vt, fields, line)
+            };
+            arms[i] = arm_of(Some(String::clone(&v.name)), Some("$p"), call1(variant_path(e, v, line), payload, line));
+        }
+    }
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, depth_guard(&e.name, line));
+    Expr m = match_of(path_word("self", line), arms, line);
+    header_of(&e.name, &e.type_params, "clone$chain", true, line, block_of(stmts, Some(m)), e.export_)
+}
+
+// `std::Option::unwrap(std::Vec::pop(&mut $v<n>))`.
+fn stack_top(usize n, usize line) : Expr
+{
+    call1(std_path("Option", "unwrap", line), vec_pop(&stack_name(n), line), line)
+}
+
+fn eq_k(usize n, usize line) : Expr
+{
+    binary(BinOp::Eq, path_word("$k", line), usize_lit(n, line), line, 0)
+}
+
+fn set_k(Expr x, usize line) : Stmt
+{
+    stmt_of(assign(path_word("$k", line), x, line, 0))
+}
+
+fn set_done(bool b, usize line) : Expr
+{
+    assign(path_word("$done", line), mk(ExprKind::EBool(b), line, 0), line, 0)
+}
+
+// Going down a link to `to`: `$cur` and the step `n` kept, `to` begun.
+fn go_down(usize n, Expr to, usize line) : Vec<Stmt>
+{
+    Vec<Stmt> down = Vec::new();
+    Vec::push(&mut down, vec_push("$spine", path_word("$cur", line), line));
+    Vec::push(&mut down, vec_push("$at", usize_lit(n, line), line));
+    Vec::push(&mut down, stmt_of(assign(path_word("$cur", line), to, line, 0)));
+    Vec::push(&mut down, set_k(usize_lit(0, line), line));
+    down
+}
+
+// The step `n` of a link, gone down through `E::clone$down($cur, n)`.
+fn link_step(LinkKind k, ref<String, shared> name, usize n, usize line) : Stmt
+{
+    match (k)
+    {
+        LinkKind::Boxed    :
+        {
+            Expr to = call1(std_path("Option", "unwrap", line), down_call(name, n, line), line);
+            Stmt::SBlockLike(Box::new(block_expr(go_down(n, to, line), None, line)))
+        },
+        LinkKind::Optional :
+        {
+            Vec<Stmt> none = Vec::new();
+            Vec::push(&mut none, vec_push(&stack_name(n), std_path("Option", "None", line), line));
+            Vec::push(&mut none, set_k(usize_lit(n + 1, line), line));
+            Vec<Arm> arms = Vec::new();
+            Vec::push(&mut arms, arm_of(Some("Some"), Some("$c"), block_expr(go_down(n, path_word("$c", line), line), None, line)));
+            Vec::push(&mut arms, arm_of(Some("None"), None, block_expr(none, None, line)));
+            Stmt::SBlockLike(Box::new(match_of(down_call(name, n, line), arms, line)))
+        },
+    }
+}
+
+// `E::clone$down(self, $k)`: `match (self) { V($p) : if ($k == n) { link n } else … , _ : std::Option::None }`
+// over the steps that are links.
+fn enum_tree_down(ref<EnumDecl, shared> e, ref<Vec<VariantTree>, shared> vts) : FnDecl
+{
+    usize line = e.line;
+    Vec<Arm> arms = Vec::new();
+    bool all = true;
+    for (usize vi = 0; vi < Vec::len(&e.variants); vi += 1)
+    {
+        ref<VariantTree, shared> vt = &vts[vi];
+        bool fielded = StringView::len(&vt.hidden) > 0;
+        Expr body = std_path("Option", "None", line);
+        bool any = false;
+        for (usize jj = Vec::len(&vt.steps); jj > 0; jj -= 1)
+        {
+            usize j = jj - 1;
+            usize f = vt.steps[j];
+            match (vt.links[f])
+            {
+                Some(k) :
+                {
+                    Expr r = if (fielded)
+                    {
+                        borrow_of(Mode::Shared, field_of(path_word("$p", line), &vt.names[f], line), line)
+                    }
+                    else { path_word("$p", line) };
+                    body = if_value(eq_k(vt.base + j, line), link_ref(k, r, line), body, line);
+                    any = true;
+                },
+                None    : {},
+            }
+        }
+        if (any)
+        {
+            Vec::push(&mut arms, arm_of(Some(String::clone(&e.variants[vi].name)), Some("$p"), body));
+        }
+        else
+        {
+            all = false;
+        }
+    }
+    if (!all)
+    {
+        Vec::push(&mut arms, arm_of(None, None, std_path("Option", "None", line)));
+    }
+    header_down(&e.name, &e.type_params, line, match_of(path_word("self", line), arms, line), e.export_)
+}
+
+//   std::Vec<ref<E, shared>> $spine = …; std::Vec<usize> $at = …;
+//   std::Vec<τ> $v<n> = …;                         (for each step n)
+//   ref<E, shared> $cur = self; usize $k = 0; bool $done = false;
+//   std::Option<E> $out = std::Option::None;
+//   while (true)
+//   {
+//       $done = false;
+//       match ($cur)
+//       {
+//           V($p) : { if ($k == 0) { $k = n; } if ($k == n) { step n } else if … else { $done = true; } },
+//           …
+//           _     : $done = true,
+//       }
+//       if ($done)
+//       {
+//           E $made = match ($cur) { V($p) : E::V(E$V { … }), … };
+//           match (std::Vec::pop(&mut $spine))
+//           {
+//               Some($q) : { $cur = $q; $k = pop $at; give $made to the link $k; $k = $k + 1; },
+//               None     : { $out = std::Option::Some($made); break; },
+//           }
+//       }
+//   }
+//   std::Option::unwrap($out)
+fn enum_tree_iter(ref<EnumDecl, shared> e, ref<Vec<VariantTree>, shared> vts) : FnDecl
+{
+    usize line = e.line;
+    Type me = self_type(&e.name, &e.type_params);
+    Vec<Stmt> stmts = Vec::new();
+    Vec::push(&mut stmts, let_stmt(Some(vec_ty(ref_ty(clone(&me)))), "$spine", Some(vec_new(line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(vec_ty(Type::TInt(IntTy::Usize))), "$at", Some(vec_new(line)), line, 0));
+    bool all = true;
+    foreach (vt in vts)
+    {
+        all = all && Vec::len(&vt.steps) > 0;
+        for (usize j = 0; j < Vec::len(&vt.steps); j += 1)
+        {
+            Type t = clone(&vt.tys[vt.steps[j]]);
+            Vec::push(&mut stmts, let_stmt(Some(vec_ty(t)), &stack_name(vt.base + j), Some(vec_new(line)), line, 0));
+        }
+    }
+    Vec::push(&mut stmts, let_stmt(Some(ref_ty(clone(&me))), "$cur", Some(path_word("self", line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(Type::TInt(IntTy::Usize)), "$k", Some(usize_lit(0, line)), line, 0));
+    Vec::push(&mut stmts, let_stmt(Some(Type::TBool), "$done", Some(mk(ExprKind::EBool(false), line, 0)), line, 0));
+    Vec<Type> one = Vec::new();
+    Vec::push(&mut one, clone(&me));
+    Vec::push(&mut stmts, let_stmt(Some(named("std::Option", one)), "$out", Some(std_path("Option", "None", line)), line, 0));
+    // Each variant's steps, and its copy made from the stacks' tops.
+    Vec<Arm> walk_arms = Vec::new();
+    Vec<Arm> make_arms = enum_clone_arms(e);
+    // `if ($k == n) { push the copy } else …` for each link, from the last back.
+    Option<Expr> give = None;
+    for (usize vi = 0; vi < Vec::len(&e.variants); vi += 1)
+    {
+        ref<VariantDecl, shared> v = &e.variants[vi];
+        ref<VariantTree, shared> vt = &vts[vi];
+        usize m = Vec::len(&vt.steps);
+        if (m > 0)
+        {
+            bool fielded = StringView::len(&vt.hidden) > 0;
+            // The steps from the last back, each `if ($k == n) { … } else …`.
+            Vec<Stmt> fin = Vec::new();
+            Vec::push(&mut fin, stmt_of(set_done(true, line)));
+            Option<Expr> chain = Some(block_expr(fin, None, line));
+            for (usize jj = m; jj > 0; jj -= 1)
+            {
+                usize j = jj - 1;
+                usize f = vt.steps[j];
+                usize n = vt.base + j;
+                Expr r = if (fielded)
+                {
+                    borrow_of(Mode::Shared, field_of(path_word("$p", line), &vt.names[f], line), line)
+                }
+                else { path_word("$p", line) };
+                Vec<Stmt> body = Vec::new();
+                match (vt.links[f])
+                {
+                    Some(k) :
+                    {
+                        Vec::push(&mut body, link_step(k, &e.name, n, line));
+                        Vec<Stmt> push = Vec::new();
+                        Expr boxed = box_new(path_word("$made", line), line);
+                        Expr copy = match (k)
+                        {
+                            LinkKind::Boxed    : boxed,
+                            LinkKind::Optional : some_of(boxed, line),
+                        };
+                        Vec::push(&mut push, vec_push(&stack_name(n), copy, line));
+                        give = match (give)
+                        {
+                            None    : Some(block_expr(push, None, line)),
+                            Some(g) : Some(if_expr(eq_k(n, line), push, Some(g), line)),
+                        };
+                    },
+                    None    :
+                    {
+                        Vec::push(&mut body, vec_push(&stack_name(n), clone_of(r, line), line));
+                        Vec::push(&mut body, set_k(usize_lit(n + 1, line), line));
+                    },
+                }
+                chain = Some(if_expr(eq_k(n, line), body, chain, line));
+            }
+            Vec<Stmt> begin = Vec::new();
+            Vec::push(&mut begin, set_k(usize_lit(vt.base, line), line));
+            Vec<Stmt> arm_body = Vec::new();
+            Vec::push(&mut arm_body, if_stmt(eq_k(0, line), begin, None, line));
+            Vec::push(&mut arm_body, Stmt::SBlockLike(Box::new(Option::expect(chain, "the steps"))));
+            // A variant whose steps are all links goes down through
+            // `E::clone$down` alone and binds nothing.
+            bool reads = false;
+            foreach (f in &vt.steps)
+            {
+                reads = reads || Option::is_none(&vt.links[*f]);
+            }
+            Option<String> binder = if (reads) { Some("$p") } else { None };
+            Vec::push(&mut walk_arms, arm_of(Some(String::clone(&v.name)), binder, block_expr(arm_body, None, line)));
+            // The copy made.
+            Expr payload = if (fielded)
+            {
+                Vec<FieldInit> fields = Vec::new();
+                usize j = 0;
+                for (usize f = 0; f < Vec::len(&vt.names); f += 1)
+                {
+                    Expr value = if (vt.stacked[f])
+                    {
+                        j += 1;
+                        stack_top(vt.base + j - 1, line)
+                    }
+                    else
+                    {
+                        clone_of(borrow_of(Mode::Shared, field_of(path_word("$p", line), &vt.names[f], line), line), line)
+                    };
+                    Vec::push(&mut fields, FieldInit { .name = String::clone(&vt.names[f]), .value = value });
+                }
+                hidden_lit(vt, fields, line)
+            }
+            else { stack_top(vt.base, line) };
+            make_arms[vi] = arm_of(Some(String::clone(&v.name)), Some("$p"), call1(variant_path(e, v, line), payload, line));
+        }
+    }
+    if (!all)
+    {
+        Vec::push(&mut walk_arms, arm_of(None, None, set_done(true, line)));
+    }
+    Vec<Stmt> walk = Vec::new();
+    Vec::push(&mut walk, stmt_of(set_done(false, line)));
+    Vec::push(&mut walk, Stmt::SBlockLike(Box::new(match_of(path_word("$cur", line), walk_arms, line))));
+    // The value done: made, and given to the one kept above it.
+    Vec<Stmt> done = Vec::new();
+    Vec::push(&mut done, let_stmt(Some(clone(&me)), "$made", Some(match_of(path_word("$cur", line), make_arms, line)), line, 0));
+    Vec<Stmt> up = Vec::new();
+    Vec::push(&mut up, stmt_of(assign(path_word("$cur", line), path_word("$q", line), line, 0)));
+    Vec::push(&mut up, set_k(call1(std_path("Option", "unwrap", line), vec_pop("$at", line), line), line));
+    Vec::push(&mut up, stmt_of(Option::expect(give, "a tree has a link")));
+    Vec::push(&mut up, set_k(binary(BinOp::Add, path_word("$k", line), usize_lit(1, line), line, 0), line));
+    Vec<Stmt> root = Vec::new();
+    Vec::push(&mut root, stmt_of(assign(path_word("$out", line), some_of(path_word("$made", line), line), line, 0)));
+    Vec::push(&mut root, stmt_of(break_of(line)));
+    Vec<Arm> arms = Vec::new();
+    Vec::push(&mut arms, arm_of(Some("Some"), Some("$q"), block_expr(up, None, line)));
+    Vec::push(&mut arms, arm_of(Some("None"), None, block_expr(root, None, line)));
+    Vec::push(&mut done, Stmt::SBlockLike(Box::new(match_of(vec_pop("$spine", line), arms, line))));
+    Vec::push(&mut walk, if_stmt(path_word("$done", line), done, None, line));
+    Vec::push(&mut stmts, loop_of(walk, line));
+    Expr out = call1(std_path("Option", "unwrap", line), path_word("$out", line), line);
+    header_of(&e.name, &e.type_params, "clone$iter", false, line, block_of(stmts, Some(out)), e.export_)
+}

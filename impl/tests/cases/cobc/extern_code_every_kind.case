@@ -1,0 +1,78 @@
+# `extern "…";` (spec/20 `rule.trust.extern-code`, D-0030) as `cobc` reads it
+# (impl/cobc/link.cb): every kind of file (a C file, an object, a static and a
+# shared library, a library name), a path in a module file relative to that
+# file (lib/), two modules naming the same file linking it once, duplicates,
+# and a shared library found through the rpath from another working
+# directory: cobc is run from `/`, as is the program.
+platform unix
+file vendor/shapes.c
+#include <stdint.h>
+int32_t area(int32_t w, int32_t h) { return w * h; }
+end
+file vendor/twice.c
+#include <stdint.h>
+int64_t twice(int64_t x) { return 2 * x; }
+end
+file vendor/plus1.c
+#include <stdint.h>
+int64_t plus1(int64_t x) { return x + 1; }
+end
+file vendor/neg.c
+#include <stdint.h>
+int64_t neg(int64_t x) { return -x; }
+end
+run $CC -c vendor/twice.c -o vendor/twice.o
+status 0
+run $CC -c vendor/plus1.c -o vendor/plus1.o
+status 0
+run ar rcs vendor/libplus1.a vendor/plus1.o
+status 0
+run $CC -shared -fPIC vendor/neg.c -o vendor/libneg.so
+status 0
+file lib/geo.cb
+import std;
+
+extern "../vendor/shapes.c";
+
+unsafe extern fn area(i32 w, i32 h) : i32;
+
+export fn rect(u8 w, u8 h) : i32
+{
+    unsafe { area(widen<i32>(w), widen<i32>(h)) }
+}
+end
+file lib/geo2.cb
+extern "../vendor/shapes.c";
+end
+file main.cb
+import std;
+
+module geo "./lib/geo.cb";
+module geo2 "./lib/geo2.cb";
+
+extern "./vendor/twice.o";
+extern "./vendor/libplus1.a";
+extern "./vendor/libneg.so";
+extern "m";
+extern "m";
+
+unsafe extern fn twice(i64 x) : i64;
+unsafe extern fn plus1(i64 x) : i64;
+unsafe extern fn neg(i64 x) : i64;
+unsafe extern fn sqrt(f64 x) : f64;
+
+fn main()
+{
+    printf("%v", geo::rect(6, 7));
+    printf(" ");
+    printf("%v", unsafe { neg(plus1(twice(20))) });
+    printf(" ");
+    printf("%v", unsafe { sqrt(2.25) });
+    printf("\n");
+}
+end
+run sh -c "cd / && exec $COBC --cc $CC -o $DIR/main.bin $DIR/main.cb"
+status 0
+run sh -c "cd / && exec $DIR/main.bin"
+status 0
+stdout-is 42 -41 1.5\n

@@ -1,0 +1,72 @@
+// CONFORMANCE-CASE
+// spec: 17-modules
+// facility: rule.module.static [Static-Decl] [Static-Use] [Ref-Form-Static] (D-0258); spec/19 §2a; conf.static-atomic
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 323030302032303030202d33207472756520333030300a
+//
+// A `static` is one atomic for the program's whole run, reached by name
+// from any function and any thread: workers count in it without being
+// handed a reference; the main thread waits on a static flag; a module's
+// own static is reached as `m::HITS`; a static may start below zero.
+
+import std;
+
+static Atomic<u64> COUNT = 0;
+static AtomicBool DONE = false;
+static Atomic<i32> LOW = -5;
+
+module m
+{
+    import std;
+
+    export static Atomic<u32> HITS = 0;
+
+    export fn hit()
+    {
+        _ = Atomic::fetch_add(&HITS, 1);
+    }
+}
+
+fn worker(u64 n) : u64
+{
+    for (u64 i = 0; i < n; i += 1)
+    {
+        _ = Atomic::fetch_add(&COUNT, 1);
+        m::hit();
+    }
+    _ = Atomic::fetch_add(&LOW, 1);
+    n
+}
+
+fn waiter() : u64
+{
+    while (!AtomicBool::load(&DONE))
+    {
+        AtomicBool::wait(&DONE, false);
+    }
+    Atomic::load(&COUNT)
+}
+
+fn main()
+{
+    u64 seen = 0;
+    {
+        auto w = spawn(waiter);
+        auto a = spawn(worker, 1000);
+        _ = worker(1000) + join(a);
+        AtomicBool::store(&DONE, true);
+        AtomicBool::notify_all(&DONE);
+        seen = join(w);
+    }
+    ref<Atomic<u64>, shared> r = &COUNT;
+    _ = Atomic::fetch_add(&m::HITS, 1000);
+    printf(
+        "%v %v %v %v %v\n",
+        Atomic::load(r),
+        seen,
+        Atomic::load(&LOW),
+        AtomicBool::load(&DONE),
+        Atomic::load(&m::HITS),
+    );
+}

@@ -1,0 +1,348 @@
+// The typer (CIR step T1): the type of an expression, computed without
+// lowering it. The lowering (`impl/back`) asks it wherever it needs a type
+// before the expression is lowered (`gen::probe_type` and its siblings, a
+// block's value, the result of a closure that writes none): a pure query,
+// from the lowering's own rules, and the source of the types of core CIR
+// (`stress/cir/DESIGN.md`).
+//
+// `type_of(g, x, e, expected)` mirrors `lower_expr(g, x, e, expected).ty`:
+// the bindings in scope are `x`'s, the expected type flows down as it does
+// in the lowering, and a diverging expression's type is `never`. `None`
+// means the typer does not type this construct yet (`Gen::typer_why` says
+// which); nothing but that is ever `None` for a program the lowering
+// accepts.
+//
+// `COBALTC_TYPER=check` (`Gen::typer_check`): `lower_expr` asks the typer
+// first, lowers, and compares (`typer_compare`); every difference is
+// printed, and the constructs not typed yet are counted (`typer_report`).
+
+import std;
+import ast;
+import items;
+import state;
+import cnames;
+import typeops;
+import gen;
+import typer_place;
+import typer_call;
+import typer_flow;
+import reach;
+
+// No answer: `why` names the construct, for the count of what is left.
+export fn typer_gap(ref<Gen, exclusive> g, str why) : Option<Type>
+{
+    g.typer_why = String::copy(why);
+    if (g.reach_on)
+    {
+        note_gap(g, why);
+    }
+    None
+}
+
+export fn kind_name(ref<Expr, shared> e) : str
+{
+    match (&e.kind)
+    {
+        ExprKind::EInt(_)         : "EInt",
+        ExprKind::EFloat(_)       : "EFloat",
+        ExprKind::EStr(_)         : "EStr",
+        ExprKind::EBool(_)        : "EBool",
+        ExprKind::EUnit           : "EUnit",
+        ExprKind::EPath(_)        : "EPath",
+        ExprKind::EStructLit(_)   : "EStructLit",
+        ExprKind::EArrayLit(_)    : "EArrayLit",
+        ExprKind::EArrayRepeat(_) : "EArrayRepeat",
+        ExprKind::EUnary(_)       : "EUnary",
+        ExprKind::EBinary(_)      : "EBinary",
+        ExprKind::EBorrow(_)      : "EBorrow",
+        ExprKind::ESliceOf(_)     : "ESliceOf",
+        ExprKind::EDollar         : "EDollar",
+        ExprKind::EDeref(_)       : "EDeref",
+        ExprKind::EField(_)       : "EField",
+        ExprKind::EIndex(_)       : "EIndex",
+        ExprKind::ECall(_)        : "ECall",
+        ExprKind::EAssign(_)      : "EAssign",
+        ExprKind::EPropagate(_)   : "EPropagate",
+        ExprKind::EBlock(_)       : "EBlock",
+        ExprKind::EUnsafe(_)      : "EUnsafe",
+        ExprKind::EIf(_)          : "EIf",
+        ExprKind::EWhile(_)       : "EWhile",
+        ExprKind::EMatch(_)       : "EMatch",
+        ExprKind::EReturn(_)      : "EReturn",
+        ExprKind::EBreak          : "EBreak",
+        ExprKind::EContinue       : "EContinue",
+        ExprKind::EClosure(_)     : "EClosure",
+        ExprKind::EParen(_)       : "EParen",
+    }
+}
+
+// A type the typer gives outside `type_of` (a binding's): the walk
+// (`reach.cb`) keeps it.
+export fn typer_saw(ref<Gen, exclusive> g, ref<Type, shared> t)
+{
+    if (g.reach_on)
+    {
+        note_type(g, t);
+    }
+}
+
+// The memo key of a query: the expression and what is expected of it.
+fn memo_key(ref<Expr, shared> e, Option<ref<Type, shared>> expected) : String
+{
+    match (expected)
+    {
+        Some(t) : sprintf("%v %s", e.id, &type_code(t)),
+        None    : sprintf("%v", e.id),
+    }
+}
+
+// The type `lower_expr` gives `e` where `expected` is what its context
+// expects.
+export fn type_of(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    // D-0340 section 9, as `lower_expr`: where nothing gives a type, the one
+    // the checker settled.
+    Option<Type> settled = match (expected)
+    {
+        Some(_) : None,
+        None : match (HashMap::get(&g.prog.facts.settled, e.id))
+        {
+            Some(t) : Some(clone(t)),
+            None    : None,
+        },
+    };
+    match (&settled)
+    {
+        Some(t) : type_of_expecting(g, x, e, Some(t)),
+        None    : type_of_expecting(g, x, e, expected),
+    }
+}
+
+fn type_of_expecting(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    String key = memo_key(e, expected);
+    // An answer first given inside a probe-mirroring query is computed again
+    // by the first query outside one, so that what it resolves is seen there.
+    if (e.id != 0 && (g.typer_probing > 0 || HashSet::contains(&x.tmemo_real, &key)))
+    {
+        match (HashMap::get(&x.tmemo, &key))
+        {
+            Some(t) : return Some(clone(t)),
+            None    : {},
+        }
+    }
+    Option<Type> inner = type_inner(g, x, e, expected);
+    if (Option::is_none(&inner))
+    {
+        return None;
+    }
+    Type t = Option::unwrap(inner);
+    // A closure where a `fn` value is expected is boxed as that `fn` type
+    // (`lower_expr`).
+    bool boxed = match (&t)
+    {
+        Type::TClosure(_) : match (expected)
+        {
+            Some(et) : match (et)
+            {
+                Type::TFn(_) : true,
+                _            : false,
+            },
+            None : false,
+        },
+        _ : false,
+    };
+    Type out = if (boxed) { clone(Option::unwrap(expected)) } else { t };
+    // The walk (`reach.cb`) keeps every type answered.
+    if (g.reach_on)
+    {
+        note_type(g, &out);
+    }
+    if (e.id != 0)
+    {
+        if (g.typer_probing == 0)
+        {
+            HashSet::insert(&mut x.tmemo_real, String::clone(&key));
+            if (g.cir_on)
+            {
+                HashMap::insert(&mut x.tnotes, e.id, type_display(&out));
+            }
+        }
+        HashMap::insert(&mut x.tmemo, key, clone(&out));
+    }
+    Some(out)
+}
+
+// `type_of` for a question of the lowering asked before it lowers
+// (`probe_type`, `probe_try`, `probe_raw`, `probe_block_type`,
+// `probe_type_arm`, a closure's result): the same answer; what the
+// query resolves on its way (a callee's instance, a closure) is not part of
+// the program unless a query outside a probe resolves it too.
+export fn type_probe(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    g.typer_probing += 1;
+    Option<Type> t = type_of(g, x, e, expected);
+    g.typer_probing -= 1;
+    t
+}
+
+// One expression kind each, as `lower_expr_inner` dispatches.
+fn type_inner(
+    ref<Gen, exclusive> g,
+    ref<Fx, exclusive> x,
+    ref<Expr, shared> e,
+    Option<ref<Type, shared>> expected,
+) : Option<Type>
+{
+    match (&e.kind)
+    {
+        ExprKind::EFloat(fl)      :
+        {
+            bool single = match (&Box::get(fl).sfx)
+            {
+                Some(sx) : *sx == "f32",
+                None : match (expected)
+                {
+                    Some(t) : match (t)
+                    {
+                        Type::TF32 : true,
+                        _          : false,
+                    },
+                    None : false,
+                },
+            };
+            Some(if (single) { Type::TF32 } else { Type::TF64 })
+        },
+        ExprKind::EInt(l)         :
+        {
+            // D-0090: `T x = 0` with `T` a floating-point type.
+            match (float_literal(g, e, &Box::get(l).sfx, expected))
+            {
+                Some(single) : return Some(if (single) { Type::TF32 } else { Type::TF64 }),
+                None         : {},
+            }
+            Some(Type::TInt(int_lit_type(&Box::get(l).sfx, expected)))
+        },
+        ExprKind::EBool(_)        : Some(Type::TBool),
+        ExprKind::EUnit           : Some(Type::TVoid),
+        ExprKind::EStr(_)         : Some(Type::TStr),
+        ExprKind::EDollar         : Some(Type::TInt(IntTy::Usize)),
+        ExprKind::EParen(i)       : type_of(g, x, Box::get(i), expected),
+        ExprKind::EReturn(r)      : type_return(g, x, r),
+        ExprKind::EBreak          : Some(Type::TNever),
+        ExprKind::EContinue       : Some(Type::TNever),
+        // Places, operators, literals of aggregates (`typer_place.cb`).
+        ExprKind::EPath(_)        : type_path(g, x, e, expected),
+        ExprKind::EField(_)       : type_place_value(g, x, e, expected),
+        ExprKind::EIndex(_)       : type_place_value(g, x, e, expected),
+        ExprKind::EDeref(_)       : type_place_value(g, x, e, expected),
+        ExprKind::EBorrow(_)      : type_borrow(g, x, e, expected),
+        ExprKind::ESliceOf(_)     : type_slice(g, x, e, expected),
+        ExprKind::EUnary(_)       : type_unary(g, x, e, expected),
+        ExprKind::EBinary(_)      : type_binary(g, x, e, expected),
+        ExprKind::EAssign(_)      : type_assign(g, x, e, expected),
+        ExprKind::EArrayLit(_)    : type_array_lit(g, x, e, expected),
+        ExprKind::EArrayRepeat(_) : type_array_repeat(g, x, e, expected),
+        ExprKind::EStructLit(_)   : type_struct_lit(g, x, e, expected),
+        // Calls and closures (`typer_call.cb`).
+        ExprKind::ECall(_)        : type_call(g, x, e, expected),
+        ExprKind::EClosure(_)     : type_closure(g, x, e, expected),
+        // Control flow and blocks (`typer_flow.cb`).
+        ExprKind::EIf(_)          : type_if(g, x, e, expected),
+        ExprKind::EBlock(b)       : type_block(g, x, b, expected),
+        ExprKind::EUnsafe(b)      : type_block(g, x, b, expected),
+        ExprKind::EWhile(_)       : type_while(g, x, e, expected),
+        ExprKind::EMatch(_)       : type_match(g, x, e, expected),
+        ExprKind::EPropagate(_)   : type_propagate(g, x, e, expected),
+    }
+}
+
+// Whether the typer's answer and the lowering's are the same type. A
+// closure's id is the lowering's counter at the moment it lowers the
+// closure, which the typer cannot know: two types that differ only in
+// closure ids are the same here.
+fn same_type(ref<Type, shared> a, ref<Type, shared> b) : bool
+{
+    if (type_code(a) == type_code(b))
+    {
+        return true;
+    }
+    String da = type_display(a);
+    StringView::contains(&da, "closure") && da == type_display(b)
+}
+
+// `COBALTC_TYPER=check`: the typer's answer `want` for `e` (asked before
+// `e` was lowered; `why` its reason when it had none) against the type
+// `got` the lowering computed.
+export fn typer_compare(
+    ref<Gen, exclusive> g,
+    ref<Fx, shared> x,
+    ref<Expr, shared> e,
+    ref<Option<Type>, shared> want,
+    ref<String, shared> why,
+    ref<Type, shared> got,
+)
+{
+    g.typer_n += 1;
+    match (want)
+    {
+        Some(t) :
+        {
+            if (same_type(t, got))
+            {
+                g.typer_same += 1;
+            }
+            else
+            {
+                g.typer_diff += 1;
+                eprintf(
+                    "TYPER-DIFF\t%s\t%v\t%v\t%s\ttyper %s\tlowering %s\n",
+                    &x.fn_name,
+                    e.id,
+                    e.line,
+                    kind_name(e),
+                    &type_code(t),
+                    &type_code(got)
+                );
+            }
+        },
+        None    :
+        {
+            usize n = match (HashMap::get(&g.typer_gap, why))
+            {
+                Some(c) : *c,
+                None    : 0,
+            };
+            HashMap::insert(&mut g.typer_gap, String::clone(why), n + 1);
+            eprintf("TYPER-GAPAT\t%s\t%v\t%v\t%s\t%s\n", &x.fn_name, e.id, e.line, kind_name(e), why);
+        },
+    }
+}
+
+// The count of one lowering's comparisons, and what the typer does not type
+// yet, by reason.
+export fn typer_report(ref<Gen, shared> g)
+{
+    usize gaps = g.typer_n - g.typer_same - g.typer_diff;
+    eprintf("TYPER-SUM\t%v\tchecked %v\tsame %v\tdiff %v\tgap %v\n", g.decided, g.typer_n, g.typer_same, g.typer_diff, gaps);
+    eprintf("TYPER-ANS\t%v\tanswered %v\n", g.decided, g.typer_pans);
+    for (usize i = 0; i < HashMap::len(&g.typer_gap); i += 1)
+    {
+        eprintf("TYPER-GAP\t%s\t%v\n", HashMap::key_at(&g.typer_gap, i), *HashMap::value_at(&g.typer_gap, i));
+    }
+}

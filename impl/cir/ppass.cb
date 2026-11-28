@@ -1,0 +1,819 @@
+// Protocol CIR (step T4): the passes over a finished body, on its nodes. A
+// node is one statement of the body's C (`ind` spaces, then the node's
+// text). A pass reads one buffer and builds another: it asks a node its
+// kind, its runtime entry and its parts where the lowering stated them
+// (`pemit.cb`), and reads its text in place with the recognisers of
+// `back/passes.cb` where it did not. `gen::node_passes` runs them in their
+// order.
+//
+// Here: the passes that keep or drop whole statements. `ppass_loops.cb` has
+// those that rewrite loops and blocks.
+
+import std;
+import proto;
+import rt;
+import passes;
+
+// D-0200: the shared checks on a quiet local's root (`Gen::quiet_locals`):
+// `cb_read(R, …)` and `cb_borrow_check(R, …, CB_SHARED, …)`, each a
+// statement of its own, removed. No held exclusive path to the local
+// exists in the function's own code, it is initialized where declared and
+// never moved, so neither can fault.
+export fn drop_quiet_checks_nodes(ref<PBuf, shared> src, ref<HashSet<String>, shared> roots) : PBuf
+{
+    if (HashSet::len(roots) == 0)
+    {
+        return pbuf_clone(src);
+    }
+    PBuf keep = pbuf_like(src);
+    for (usize i = 0; i < pbuf_count(src); i += 1)
+    {
+        // The node says it: a statement that is a call of `cb_read`, or of
+        // `cb_borrow_check` in the shared mode; its root is its first
+        // argument.
+        u16 entry = pbuf_stmt_rt(src, i);
+        bool drop = entry == RT_READ
+            || (entry == RT_BORROW_CHECK && StringView::contains(pbuf_part_c(src, i), ", CB_SHARED, "));
+        if (drop)
+        {
+            StringView args = pbuf_part_c(src, i);
+            StringView first = match (StringView::find(args, ","))
+            {
+                Some(k) : &args[0..k],
+                None    : args,
+            };
+            drop = HashSet::contains(roots, &String::copy(StringView::trim(first)));
+        }
+        if (!drop)
+        {
+            pbuf_copy(&mut keep, src, i);
+        }
+    }
+    keep
+}
+
+// D-0200: the checks through a token known to be 0 (the no-path token,
+// `spec/14` §6), removed. A token variable is known 0 when its one
+// assignment, its declaration, is `0`, `cb_borrow` of a token known 0 (which
+// returns 0), or the `.tok` of a reference built with one, and its address
+// is never taken. Then `cb_read`, `cb_write`, `cb_borrow_unminted`,
+// `cb_borrow_check`, `cb_frame_hold` and `cb_frame_unhold` through it, each
+// a statement of its own whose other arguments are constants and
+// projection literals, return at once (`cbrt`): the statements go; and
+// `cb_borrow` of it is 0. Repeated until nothing changes, as one fold
+// makes the next token known.
+export fn fold_zero_tokens_nodes(ref<PBuf, shared> src) : PBuf
+{
+    Vec<StringView> drop_names = StringView::split(ZERO_DROP, " ");
+    bool any = false;
+    foreach (d in &drop_names)
+    {
+        if (pbuf_has(src, *d))
+        {
+            any = true;
+        }
+    }
+    if (!any)
+    {
+        return pbuf_clone(src);
+    }
+    PBuf lines = pbuf_clone(src);
+    HashSet<String> zero = HashSet::new();
+    HashSet<String> zref = HashSet::new();
+    while (true)
+    {
+        Scan sc = scan_new();
+        for (usize li = 0; li < pbuf_count(&lines); li += 1)
+        {
+            scan_line(pbuf_view(&lines, li), &mut sc);
+        }
+        bool changed = false;
+        PBuf keep = pbuf_like(&lines);
+        for (usize li = 0; li < pbuf_count(&lines); li += 1)
+        {
+            StringView l = pbuf_view(&lines, li);
+            usize ind = pbuf_ind(&lines, li);
+            StringView t = StringView::trim(l);
+            // A check through a token known 0: the statement goes.
+            // The node says whether it is a call of one of `ZERO_DROP`'s
+            // entries, a statement of its own; its arguments are its part.
+            bool dropped = false;
+            if (rt_is(pbuf_stmt_rt(&lines, li), RP_ZERO_DROP))
+            {
+                Vec<StringView> parts = arg_parts(pbuf_part_c(&lines, li));
+                dropped = is_zero(parts[0], &zero, &zref) && rest_inert(&parts);
+            }
+            if (dropped)
+            {
+                // After anything but a statement's or block's end (a
+                // braceless `if`'s condition, a label) an empty statement
+                // stands in its place.
+                bool ended = true;
+                usize k = pbuf_count(&keep);
+                while (k > 0)
+                {
+                    k -= 1;
+                    StringView kt = StringView::trim(pbuf_view(&keep, k));
+                    if (StringView::len(kt) > 0)
+                    {
+                        ended = StringView::ends_with(kt, ";") || StringView::ends_with(kt, "{")
+                            || StringView::ends_with(kt, "}");
+                        break;
+                    }
+                }
+                if (!ended)
+                {
+                    pbuf_push(&mut keep, ind, ";");
+                }
+                changed = true;
+                continue;
+            }
+            match (if (StringView::starts_with(t, "uint64_t ")) { decl_of(t, "uint64_t ") } else { None })
+            {
+                Some(dc) :
+                {
+                    StringView xv = StringView::trim(dc.x);
+                    String x = String::copy(xv);
+                    if (all_ident(xv) && once(&sc, &x))
+                    {
+                        StringView e = StringView::trim(dc.e);
+                        // `cb_borrow(0, …)` and `cb_borrow_range(0, …)` are 0.
+                        Option<StringView> got = call_args(e, "cb_borrow", false);
+                        match (got)
+                        {
+                            Some(_) : {},
+                            None    :
+                            {
+                                match (call_args(e, "cb_borrow_range", false))
+                                {
+                                    Some(a) :
+                                    {
+                                        Vec<StringView> parts = arg_parts(a);
+                                        if (rest_inert(&parts))
+                                        {
+                                            got = Some(a);
+                                        }
+                                    },
+                                    None    : {},
+                                }
+                            },
+                        }
+                        match (got)
+                        {
+                            Some(args) :
+                            {
+                                if (is_zero(first_arg(args), &zero, &zref))
+                                {
+                                    pbuf_push(&mut keep, ind, &sprintf("uint64_t %s = 0;", &x));
+                                    HashSet::insert(&mut zero, x);
+                                    changed = true;
+                                    continue;
+                                }
+                            },
+                            None       : {},
+                        }
+                        if (!HashSet::contains(&zero, &x) && is_zero(e, &zero, &zref))
+                        {
+                            HashSet::insert(&mut zero, x);
+                            changed = true;
+                        }
+                    }
+                },
+                None     : {},
+            }
+            // `cb_ref R = ((cb_ref){ p, tok });` with the token known 0.
+            match (if (StringView::starts_with(t, "cb_ref ")) { decl_of(t, "cb_ref ") } else { None })
+            {
+                Some(dc) :
+                {
+                    StringView xv = StringView::trim(dc.x);
+                    String x = String::copy(xv);
+                    if (all_ident(xv) && once(&sc, &x) && !HashSet::contains(&zref, &x))
+                    {
+                        match (StringView::strip_prefix(StringView::trim(dc.e), "((cb_ref){"))
+                        {
+                            Some(r) :
+                            {
+                                match (StringView::strip_suffix(r, "})"))
+                                {
+                                    Some(inner) :
+                                    {
+                                        if (is_zero(last_arg(inner), &zero, &zref))
+                                        {
+                                            HashSet::insert(&mut zref, x);
+                                            changed = true;
+                                        }
+                                    },
+                                    None        : {},
+                                }
+                            },
+                            None    : {},
+                        }
+                    }
+                },
+                None     : {},
+            }
+            pbuf_copy(&mut keep, &lines, li);
+        }
+        lines = keep;
+        if (!changed)
+        {
+            break;
+        }
+    }
+    // Of a body whose every line went, an empty line is left.
+    if (pbuf_count(&lines) == 0 && pbuf_count(src) > 0)
+    {
+        pbuf_push(&mut lines, 0, "");
+    }
+    lines
+}
+
+// D-0294: in a decided program a record that nothing reads is not kept. An
+// object made (`uint64_t o = cb_new(&v, …);`), perhaps bound and taken back
+// (`cb_bind`, `cb_take`), moved (`cb_move_to`), promoted (`cb_result`) and
+// ended (`cb_forget_obj`, `cb_absorb`, `cb_raw_move_in`) in one straight
+// run of statements -- no branch, no call that could fault (a destructor
+// run at the fault is observable) and no frame's end between, a scope's end
+// only once the object was promoted past it or is bound -- with its ids
+// named nowhere else, is a record no check reads (every path entry is a
+// constant there) whose end comes before any scope's that could destroy
+// the value: a struct or variant literal that leaves as a result or an
+// argument, a `std` body's result bound and taken back. The statements go.
+// Run before the scopes are resolved, so they open no scope for it.
+export fn elide_record_chains_nodes(ref<PBuf, shared> src) : PBuf
+{
+    Vec<StringView> lines = pbuf_views(src);
+    usize n = Vec::len(&lines);
+    Vec<usize> drop = Vec::new();
+    // Each line's function: its `{` and `}` lines at column 0.
+    Vec<usize> fn_lo = Vec::filled(n, 0);
+    Vec<usize> fn_hi = Vec::filled(n, if (n > 0) { n - 1 } else { 0 });
+    usize open_at = 0;
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (pbuf_ind(src, k) == 0 && lines[k] == "{")
+        {
+            open_at = k;
+        }
+        fn_lo[k] = open_at;
+    }
+    usize close_at = if (n > 0) { n - 1 } else { 0 };
+    for (usize k = n; k > 0; k -= 1)
+    {
+        if (pbuf_ind(src, k - 1) == 0 && lines[k - 1] == "}")
+        {
+            close_at = k - 1;
+        }
+        fn_hi[k - 1] = close_at;
+    }
+    HashMap<usize, HashMap<String, usize>> fn_counts = HashMap::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        // A chain starts at an object made, `uint64_t o = cb_new(…);`: a
+        // declaration from a call of that entry, which the node says.
+        if (pbuf_kind(src, i) != PK_DECL_CALL || pbuf_rt(src, i) != RT_NEW)
+        {
+            continue;
+        }
+        Option<ChainDecl> first = record_decl(StringView::trim(lines[i]), "cb_new");
+        if (Option::is_none(&first))
+        {
+            continue;
+        }
+        ChainDecl d0 = Option::unwrap(first);
+        ChainDecl { name, .. } = d0;
+        String start = name;
+        String live = String::clone(&start);
+        Vec<String> ids = Vec::new();
+        Vec::push(&mut ids, String::clone(&start));
+        Vec<usize> chain = Vec::new();
+        Vec::push(&mut chain, i);
+        Option<String> root = None;
+        bool promoted = false;
+        bool ok = false;
+        for (usize j = i + 1; j < n; j += 1)
+        {
+            StringView t = StringView::trim(lines[j]);
+            if (StringView::len(t) == 0 || StringView::starts_with(t, "#line"))
+            {
+                continue;
+            }
+            bool named = false;
+            foreach (x in &ids)
+            {
+                if (count_in(t, x) > 0)
+                {
+                    named = true;
+                }
+            }
+            if (!named)
+            {
+                if (t == "cb_stmt_pop();")
+                {
+                    if (Option::is_none(&root) && !promoted)
+                    {
+                        break;
+                    }
+                    promoted = false;
+                    continue;
+                }
+                // A statement that could fault (any call) ends the run; a
+                // plain store or declaration, a position, a scope's start
+                // cannot.
+                bool plain = !StringView::contains(t, "(") || StringView::starts_with(t, "cb_at(")
+                    || StringView::starts_with(t, "cb_stmt_push_at(");
+                bool control = false;
+                foreach (k in [
+                    "if ", "if(", "while ", "while(", "for ", "for(", "switch", "case ", "default:", "do ", "do{",
+                    "return", "goto ", "break;", "continue;", "else",
+                ])
+                {
+                    control = control || StringView::starts_with(t, k);
+                }
+                if (!plain || StringView::contains(t, "{") || StringView::contains(t, "}")
+                    || !StringView::ends_with(t, ";") || control)
+                {
+                    break;
+                }
+                continue;
+            }
+            match (record_decl(t, "cb_bind"))
+            {
+                Some(d) :
+                {
+                    if (Option::is_some(&root) || d.args != live)
+                    {
+                        break;
+                    }
+                    root = Some(String::clone(&d.name));
+                    Vec::push(&mut ids, String::clone(&d.name));
+                    Vec::push(&mut chain, j);
+                    continue;
+                },
+                None    : {},
+            }
+            match (record_decl(t, "cb_take"))
+            {
+                Some(d) :
+                {
+                    bool from_root = match (&root)
+                    {
+                        Some(r) : (r == first_arg_of(&d.args)),
+                        None    : false,
+                    };
+                    if (!from_root)
+                    {
+                        break;
+                    }
+                    root = None;
+                    live = String::clone(&d.name);
+                    Vec::push(&mut ids, String::clone(&d.name));
+                    promoted = false;
+                    Vec::push(&mut chain, j);
+                    continue;
+                },
+                None    : {},
+            }
+            if (Option::is_some(&root))
+            {
+                break;
+            }
+            if ((t == sprintf("cb_result(%s);", &live)))
+            {
+                promoted = true;
+                Vec::push(&mut chain, j);
+                continue;
+            }
+            bool moved = match (stmt_args(t, "cb_move_to("))
+            {
+                Some(a) : (first_arg_of(a) == live) && StringView::contains(a, ", &"),
+                None    : false,
+            };
+            if (moved)
+            {
+                Vec::push(&mut chain, j);
+                continue;
+            }
+            bool raw_in = match (stmt_args(t, "cb_raw_move_in("))
+            {
+                Some(a) : (first_arg_of(a) == live),
+                None    : false,
+            };
+            if ((t == sprintf("cb_forget_obj(%s);", &live)) || (t == sprintf("cb_absorb(%s);", &live)) || raw_in)
+            {
+                Vec::push(&mut chain, j);
+                ok = true;
+                break;
+            }
+            break;
+        }
+        if (!ok)
+        {
+            continue;
+        }
+        // Every id named only in the chain's own statements, within the
+        // function the chain is in.
+        usize lo = fn_lo[i];
+        usize hi = fn_hi[i];
+        if (!HashMap::contains(&fn_counts, lo))
+        {
+            HashMap<String, usize> cs = HashMap::new();
+            for (usize k = lo; k <= hi; k += 1)
+            {
+                count_idents(lines[k], &mut cs);
+            }
+            HashMap::insert(&mut fn_counts, lo, cs);
+        }
+        ref<HashMap<String, usize>, shared> counts = Option::unwrap(HashMap::get(&fn_counts, lo));
+        bool elsewhere = false;
+        foreach (x in &ids)
+        {
+            usize in_chain = 0;
+            foreach (k in &chain)
+            {
+                in_chain += count_in(lines[*k], x);
+            }
+            usize in_fn = match (HashMap::get(counts, x))
+            {
+                Some(c) : *c,
+                None    : 0,
+            };
+            if (in_fn != in_chain)
+            {
+                elsewhere = true;
+            }
+        }
+        if (elsewhere)
+        {
+            continue;
+        }
+        foreach (k in &chain)
+        {
+            Vec::push(&mut drop, *k);
+        }
+    }
+    if (Vec::len(&drop) == 0)
+    {
+        return pbuf_clone(src);
+    }
+    // A dropped statement leaves an empty one, at column 0.
+    Vec<bool> gone = Vec::filled(n, false);
+    foreach (i in &drop)
+    {
+        gone[*i] = true;
+    }
+    PBuf res = pbuf_like(src);
+    for (usize i = 0; i < n; i += 1)
+    {
+        if (gone[i])
+        {
+            pbuf_push(&mut res, 0, ";");
+        }
+        else
+        {
+            pbuf_copy(&mut res, src, i);
+        }
+    }
+    res
+}
+
+// Scope markers as pushes and pops, each only where its scope or frame
+// holds something (a binding, a temporary, a path), else nothing. `sets`:
+// the name sets of the program's form (`passes::scope_name_sets`). A decided
+// program's (D-0285) know the entries `cbrt.h` makes constants there
+// (`CB_PATHLESS`, `CB_DECIDED`), which record nothing in any scope, and that
+// an element's reference (`_pre`) has no path.
+export fn resolve_scopes_nodes(ref<PBuf, shared> src, ref<NameSets, shared> sets) : PBuf
+{
+    usize n = pbuf_count(src);
+    Vec<Open> open = Vec::new();
+    HashSet<u32> used = HashSet::new();
+    Vec<Eff> effs = Vec::new();
+    for (usize i = 0; i < n; i += 1)
+    {
+        StringView line = pbuf_view(src, i);
+        // A scope marker is a node of its own kind.
+        Option<Marker> mark = if (pbuf_kind(src, i) == PK_MARK) { marker(line) } else { None };
+        match (mark)
+        {
+            Some(m) :
+            {
+                if (m.kind == b'F' || m.kind == b'G' || m.kind == b'S')
+                {
+                    Vec::push(&mut open, Open { .frame = m.kind != b'S', .id = m.id });
+                }
+                else if (m.kind == b'R')
+                {
+                    // D-0292: a recording body's frame is always emitted.
+                    Vec::push(&mut open, Open { .frame = true, .id = m.id });
+                    HashSet::insert(&mut used, m.id);
+                }
+                else if (m.kind == b'f' || m.kind == b's' || m.kind == b'e')
+                {
+                    match (Vec::pop(&mut open))
+                    {
+                        Some(top) : assert(top.id == m.id, "cobc: scope markers out of order"),
+                        None      : assert(false, "cobc: scope markers out of order"),
+                    }
+                }
+            },
+            None    :
+            {
+                Vec::clear(&mut effs);
+                effects(line, sets, &mut effs);
+                foreach (e in &effs)
+                {
+                    match (*e)
+                    {
+                        Eff::EScope : mark_innermost(&open, false, &mut used),
+                        Eff::EFrame : mark_innermost(&open, true, &mut used),
+                        Eff::EAll   :
+                        {
+                            foreach (o in &open)
+                            {
+                                HashSet::insert(&mut used, o.id);
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    }
+    assert(Vec::len(&open) == 0, "cobc: scope markers left open");
+    PBuf res = pbuf_like(src);
+    for (usize i = 0; i < n; i += 1)
+    {
+        StringView line = pbuf_view(src, i);
+        usize ind = pbuf_ind(src, i);
+        Option<Marker> mark = if (pbuf_kind(src, i) == PK_MARK) { marker(line) } else { None };
+        match (mark)
+        {
+            Some(m) :
+            {
+                // The push at the marker's location, when it carries one.
+                String at_call = String::new();
+                match (marker_loc(line))
+                {
+                    Some(l) :
+                    {
+                        if (m.kind == b'F')
+                        {
+                            at_call = sprintf("cb_frame_push_at(%v);", l);
+                        }
+                        else if (m.kind == b'S')
+                        {
+                            at_call = sprintf("cb_stmt_push_at(%v);", l);
+                        }
+                    },
+                    None    : {},
+                }
+                StringView call = "";
+                if (StringView::len(&at_call) > 0)
+                {
+                    call = &at_call;
+                }
+                else if (m.kind == b'F')
+                {
+                    call = "cb_frame_push();";
+                }
+                else if (m.kind == b'G')
+                {
+                    call = "cb_frame_push_fn();";
+                }
+                else if (m.kind == b'R')
+                {
+                    call = "cb_frame_push_rec();";
+                }
+                else if (m.kind == b'S')
+                {
+                    call = "cb_stmt_push();";
+                }
+                else if (m.kind == b'f' || m.kind == b'g')
+                {
+                    call = "cb_frame_pop();";
+                }
+                else if (m.kind == b's' || m.kind == b't')
+                {
+                    call = "cb_stmt_pop();";
+                }
+                else
+                {
+                    continue;
+                }
+                if (HashSet::contains(&used, m.id))
+                {
+                    pbuf_push(&mut res, ind, call);
+                }
+                // D-0293: a decided body's borrows from vouched tokens are
+                // light inline (`cbrt.h`'s `cb_lf`), frame or no frame.
+                if (m.kind == b'G')
+                {
+                    pbuf_push(&mut res, ind, "enum { cb_lf = 1 };");
+                }
+            },
+            None    : pbuf_copy(&mut res, src, i),
+        }
+    }
+    res
+}
+
+// The executing statement's location (`cb_at`) is read only by a fault
+// raised without a location of its own (`CB_NOLOC`), and inside the
+// runtime (pops, destructors, the checks it faults from): any call of
+// anything but the pure helpers. A `cb_at` no path from which reaches
+// such a line before the next `cb_at` is dropped (`dead_locations_flow`,
+// or in straight-line code only, `dead_locations_straight`, where the
+// body's flow is not followed).
+// `marks`: a location dropped is kept as a `LINE_MARK` comment at column 0
+// for `pprog::line_directives_nodes`, which removes it; it reads as nothing
+// to the one pass that runs between (`elide_implied_checks_nodes`: no call
+// in it).
+// `tail_entry`: for a body a self tail call jumps back into, whether the
+// prologue between `self_tail` and the body may read the location.
+export fn drop_dead_locations_nodes(ref<PBuf, shared> src, bool marks, Option<bool> tail_entry) : PBuf
+{
+    HashSet<String> pure = name_set(LOCATION_PURE);
+    Vec<StringView> lines = pbuf_views(src);
+    Vec<bool> dead = match (dead_locations_flow(&lines, &pure, &pure, tail_entry))
+    {
+        Some(d) : d,
+        None    : dead_locations_straight(&lines, &pure),
+    };
+    PBuf res = pbuf_like(src);
+    for (usize i = 0; i < Vec::len(&lines); i += 1)
+    {
+        if (dead[i])
+        {
+            if (marks)
+            {
+                match (line_mark_for(StringView::trim_start(lines[i])))
+                {
+                    Some(mark) : pbuf_push(&mut res, 0, &mark),
+                    None       : {},
+                }
+            }
+            continue;
+        }
+        pbuf_copy(&mut res, src, i);
+    }
+    res
+}
+
+// Checks implied by an earlier one (a pass over a body's statements). Within a
+// run of lines with no other runtime call and no join (a label, a `}`,
+// an `else`, a loop's head), the runtime's state cannot change, and a
+// check is a pure function of it, so (a label is written `L:;` or `L: ;`:
+// a jump to it passes over the checks before it, as the false left operand
+// of `&&` passes over the right one's):
+// - after an exclusive check through `base` with projection `P`
+//   (`cb_borrow_unminted`/`cb_borrow_check` with `CB_EXCLUSIVE`), a read
+//   or exclusive check through `base` under `P` cannot fail on a clash;
+// - after a read or shared check under `P`, a read under `P` cannot;
+// - after any check that tests initialization (`cb_read`,
+//   `cb_borrow_check`) through `base`, none can fail on it (it is the
+//   object's, and only a write changes it).
+// Such a later `cb_read` / `cb_borrow_unminted` / `cb_borrow_check` is
+// dropped. A projection with a range (a slice), and any base not written
+// identically, are left alone.
+export fn elide_implied_checks_nodes(ref<PBuf, shared> src) : PBuf
+{
+    // (base, projection, exclusive) checked, and bases whose object's
+    // initialization was checked.
+    Vec<Seen> seen = Vec::new();
+    HashSet<String> inited = HashSet::new();
+    HashSet<String> pure = name_set(IMPLIED_PURE);
+    // `uint64_t tkN = <token>;` copies: a check through either names one path.
+    HashMap<String, String> alias = HashMap::new();
+    PBuf res = pbuf_like(src);
+    for (usize i = 0; i < pbuf_count(src); i += 1)
+    {
+        StringView t = StringView::trim_start(pbuf_view(src, i));
+        // A join, or control arriving from elsewhere: forget everything. The
+        // node says it where it has a kind: a block's close, an `else`, a
+        // label, a loop's head. A line of no kind, one that opens another
+        // block and a tagged one are read by their text, and so is any line
+        // that starts `else`, `case` or `default`.
+        u8 kind = pbuf_kind(src, i);
+        bool by_kind = !pbuf_tagged(src, i) && (kind == PK_CLOSE || kind == PK_ELSE || kind == PK_ELSE_IF
+            || kind == PK_LABEL || kind == PK_LOOP);
+        bool by_text = StringView::starts_with(t, "else") || StringView::starts_with(t, "case ")
+            || StringView::starts_with(t, "default")
+            || ((kind == PK_RAW || kind == PK_OPEN || pbuf_tagged(src, i))
+                && (StringView::starts_with(t, "}") || (StringView::ends_with(t, ":") && !StringView::contains(t, " "))
+                    || Option::is_some(&label_of(t)) || loop_head(t)));
+        if (by_kind || by_text)
+        {
+            Vec::clear(&mut seen);
+            HashSet::clear(&mut inited);
+            pbuf_copy(&mut res, src, i);
+            continue;
+        }
+        match (decl_of(t, "uint64_t "))
+        {
+            Some(dc) :
+            {
+                StringView val = dc.e;
+                bool digit_first = StringView::len(val) == 0
+                    || (StringView::as_bytes(val)[0] >= b'0' && StringView::as_bytes(val)[0] <= b'9');
+                if (!StringView::contains(dc.x, " ") && simple_val(val)
+                    && !StringView::contains(val, "()") && !digit_first)
+                {
+                    String key = String::copy(val);
+                    String canon = match (HashMap::get(&alias, &key))
+                    {
+                        Some(c) : String::clone(c),
+                        None    : String::clone(&key),
+                    };
+                    HashMap::insert(&mut alias, String::copy(dc.x), canon);
+                }
+            },
+            None     : {},
+        }
+        Vec<String> cs = calls(t);
+        // A path check, a statement of its own: the node names its entry
+        // and holds its arguments.
+        u16 entry = pbuf_stmt_rt(src, i);
+        if (rt_is(entry, RP_PATH_CHECK))
+        {
+            Vec<String> args = split_args(pbuf_part_c(src, i));
+            String base0 = if (Vec::len(&args) > 0) { String::clone(&args[0]) } else { String::new() };
+            String base = match (HashMap::get(&alias, &base0))
+            {
+                Some(c) : String::clone(c),
+                None    : String::clone(&base0),
+            };
+            Option<Vec<String>> pr = if (Vec::len(&args) > 1) { projs(&args[1]) } else { None };
+            bool excl = if (entry == RT_READ)
+            {
+                false
+            }
+            else
+            {
+                Vec::len(&args) > 3 && args[3] == "CB_EXCLUSIVE"
+            };
+            bool tests_init = entry != RT_BORROW_UNMINTED;
+            match (pr)
+            {
+                Some(p) :
+                {
+                    bool covered = false;
+                    foreach (s in &seen)
+                    {
+                        if ((s.base == base) && steps_start(&p, &s.proj) && (s.excl || !excl))
+                        {
+                            covered = true;
+                        }
+                    }
+                    bool init_ok = !tests_init || HashSet::contains(&inited, &base);
+                    if (covered && init_ok)
+                    {
+                        continue;
+                    }
+                    Vec::push(&mut seen, Seen { .base = String::clone(&base), .proj = p, .excl = excl });
+                    if (tests_init)
+                    {
+                        HashSet::insert(&mut inited, base);
+                    }
+                },
+                None    : {},
+            }
+            pbuf_copy(&mut res, src, i);
+            continue;
+        }
+        // Any other call may change the runtime's state.
+        bool other = false;
+        foreach (c in &cs)
+        {
+            if (!HashSet::contains(&pure, c) && !StringView::starts_with(c, "__builtin")
+                && !(*c == "if" || *c == "while" || *c == "for"
+                    || *c == "switch" || *c == "sizeof" || *c == "return"))
+            {
+                other = true;
+            }
+        }
+        if (other)
+        {
+            Vec::clear(&mut seen);
+            HashSet::clear(&mut inited);
+        }
+        pbuf_copy(&mut res, src, i);
+    }
+    res
+}
+
+// `passes::calls_nothing` of a body's nodes: whether no statement calls
+// anything that could call back into the program. A call's name and its `(`
+// are on one line.
+export fn calls_nothing_nodes(ref<PBuf, shared> src) : bool
+{
+    HashSet<String> leaf = name_set(LEAF_NAMES);
+    for (usize i = 0; i < pbuf_count(src); i += 1)
+    {
+        if (!calls_nothing_in(pbuf_view(src, i), &leaf))
+        {
+            return false;
+        }
+    }
+    true
+}

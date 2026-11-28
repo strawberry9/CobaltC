@@ -1,0 +1,351 @@
+// Writes a fragment program as CobaltC, in the house style `cobfmt` keeps
+// (four-space indentation, Allman braces), one statement per line, so that
+// a diagnostic's line names one statement.
+
+import std;
+import ast;
+
+fn exprs_joined(ref<Vec<Expr>, shared> xs) : String
+{
+    String s = String::new();
+    for (usize i = 0; i < Vec::len(xs); i += 1)
+    {
+        if (i > 0)
+        {
+            String::append(&mut s, ", ");
+        }
+        String::append(&mut s, &expr(&xs[i]));
+    }
+    s
+}
+
+fn mut_word(Mode m) : str
+{
+    if (m == Mode::Excl)
+    {
+        return "mut ";
+    }
+    ""
+}
+
+export fn expr(ref<Expr, shared> e) : String
+{
+    match (&e.k)
+    {
+        ExprK::Int(k)                 : sprintf("%d", *k),
+        ExprK::Var(n)                 : clone(n),
+        ExprK::Deref(a)               : sprintf("*%s", &atom(Box::get(a))),
+        ExprK::Field(a)               : sprintf("%s.r", &atom(Box::get(a))),
+        ExprK::Index { v, k }         : sprintf("%s[%d]", v, *k),
+        ExprK::Borrow { m, e: a }     : sprintf("&%s%s", mut_word(*m), &atom(Box::get(a))),
+        ExprK::Add { a, b }           : sprintf("%s + %s", &expr(Box::get(a)), &expr(Box::get(b))),
+        ExprK::Gt { a, b }            : sprintf("%s > %s", &expr(Box::get(a)), &expr(Box::get(b))),
+        ExprK::Call { f, xs }         : sprintf("%s(%s)", f, &exprs_joined(xs)),
+        ExprK::Spawn { f, xs }        :
+        {
+            String s = sprintf("spawn(%s", f);
+            foreach (x in xs)
+            {
+                String::append(&mut s, ", ");
+                String::append(&mut s, &expr(x));
+            }
+            String::push_ascii(&mut s, b')');
+            s
+        },
+        ExprK::Join(t)                : sprintf("join(%s)", t),
+        ExprK::HoldLit(a)             : sprintf("Hold { .r = %s }", &expr(Box::get(a))),
+        ExprK::JobLit(a)              : sprintf("Job { .h = %s }", &expr(Box::get(a))),
+        ExprK::ArrLit(xs)             : sprintf("[%s]", &exprs_joined(xs)),
+        ExprK::Slice { m, v, lo, hi } : sprintf("&%s%s[%d .. %d]", mut_word(*m), v, *lo, *hi),
+        ExprK::Closure(cb)            :
+        {
+            ref<Clo, shared> c = Box::get(cb);
+            String caps = String::join(&c.caps, ", ");
+            String ret = String::new();
+            if (!ty_eq(&c.ret, &Ty::Unit))
+            {
+                ret = sprintf(" : %s", &Ty::text(&c.ret));
+            }
+            str mv = "";
+            if (c.mv)
+            {
+                mv = "move ";
+            }
+            sprintf("%s[%s]()%s %s", mv, &caps, &ret, &inline_tail(&c.body))
+        },
+        ExprK::CallVal(a) : match (&Box::get(a).k)
+        {
+            ExprK::Var(n) : sprintf("%s()", n),
+            _             : sprintf("(%s)()", &expr(Box::get(a))),
+        },
+        ExprK::SpawnClo(a)            : sprintf("spawn(%s)", &expr(Box::get(a))),
+    }
+}
+
+// A closure's body on one line, as `cobfmt` keeps it: `{ s1; s2; e }`.
+fn inline_tail(ref<Block, shared> b) : String
+{
+    Vec<String> parts = Vec::new();
+    foreach (s in &b.stmts)
+    {
+        String o = String::new();
+        stmt(s, 0, &mut o);
+        Vec::push(&mut parts, String::copy(StringView::trim(&o)));
+    }
+    match (&b.tail)
+    {
+        Some(t) : Vec::push(&mut parts, expr(t)),
+        None    : {},
+    }
+    if (Vec::len(&parts) == 0)
+    {
+        return "{}";
+    }
+    sprintf("{ %s }", &String::join(&parts, " "))
+}
+
+// An operand of a prefix or postfix operator: parenthesized when it is
+// itself a prefix form under a postfix one (`(*s).r` is written `s.r`).
+fn atom(ref<Expr, shared> e) : String
+{
+    match (&e.k)
+    {
+        ExprK::Add { .. } : sprintf("(%s)", &expr(e)),
+        ExprK::Gt { .. }  : sprintf("(%s)", &expr(e)),
+        _                 : expr(e),
+    }
+}
+
+fn ind(ref<String, exclusive> out, usize n)
+{
+    for (usize i = 0; i < n; i += 1)
+    {
+        String::append(out, "    ");
+    }
+}
+
+export fn block(ref<Block, shared> b, usize depth, ref<String, exclusive> out)
+{
+    ind(out, depth);
+    String::append(out, "{\n");
+    foreach (s in &b.stmts)
+    {
+        stmt(s, depth + 1, out);
+    }
+    match (&b.tail)
+    {
+        Some(t) :
+        {
+            ind(out, depth + 1);
+            String::append(out, &expr(t));
+            String::push_ascii(out, b'\n');
+        },
+        None    : {},
+    }
+    ind(out, depth);
+    String::append(out, "}\n");
+}
+
+export fn stmt(ref<Stmt, shared> s, usize depth, ref<String, exclusive> out)
+{
+    match (&s.k)
+    {
+        StmtK::Let { name, ty, init }              :
+        {
+            ind(out, depth);
+            String t = match (ty)
+            {
+                Some(x) : Ty::text(x),
+                None    : "auto",
+            };
+            String::appendf(out, "%s %s = %s;\n", &t, name, &expr(init));
+        },
+        StmtK::Assign { place, value }             :
+        {
+            ind(out, depth);
+            String::appendf(out, "%s = %s;\n", &expr(place), &expr(value));
+        },
+        StmtK::Expr(e)                             :
+        {
+            ind(out, depth);
+            String::appendf(out, "%s;\n", &expr(e));
+        },
+        StmtK::Print(e)                            :
+        {
+            ind(out, depth);
+            String::appendf(out, "printf(\"%%v\\n\", %s);\n", &expr(e));
+        },
+        StmtK::Block(b)                            : block(b, depth, out),
+        StmtK::Discard(e)                          :
+        {
+            ind(out, depth);
+            String::appendf(out, "_ = %s;\n", &expr(e));
+        },
+        StmtK::Match { scrut, binder, some, none } :
+        {
+            ind(out, depth);
+            String::appendf(out, "match (%s)\n", &expr(scrut));
+            ind(out, depth);
+            String::append(out, "{\n");
+            ind(out, depth + 1);
+            String::appendf(out, "Some(%s) : %s,\n", binder, &inline(some));
+            ind(out, depth + 1);
+            String::append(out, "None");
+            for (usize i = 0; i < StringView::len(binder) + 2; i += 1)
+            {
+                String::push_ascii(out, b' ');
+            }
+            String::appendf(out, " : %s,\n", &inline(none));
+            ind(out, depth);
+            String::append(out, "}\n");
+        },
+        StmtK::Break                               :
+        {
+            ind(out, depth);
+            String::append(out, "break;\n");
+        },
+        StmtK::Continue                            :
+        {
+            ind(out, depth);
+            String::append(out, "continue;\n");
+        },
+        StmtK::While { cond, body }                :
+        {
+            ind(out, depth);
+            String::appendf(out, "while (%s)\n", &expr(cond));
+            block(body, depth, out);
+        },
+        StmtK::If { cond, thn, els }               :
+        {
+            ind(out, depth);
+            String::appendf(out, "if (%s)\n", &expr(cond));
+            block(thn, depth, out);
+            match (els)
+            {
+                Some(b) :
+                {
+                    ind(out, depth);
+                    String::append(out, "else\n");
+                    block(b, depth, out);
+                },
+                None    : {},
+            }
+        },
+    }
+}
+
+// An arm's block on one line: `{ s1; s2; }`, `{}` when empty.
+fn inline(ref<Block, shared> b) : String
+{
+    if (Vec::len(&b.stmts) == 0)
+    {
+        return "{}";
+    }
+    Vec<String> parts = Vec::new();
+    foreach (s in &b.stmts)
+    {
+        String o = String::new();
+        stmt(s, 0, &mut o);
+        Vec::push(&mut parts, String::copy(StringView::trim(&o)));
+    }
+    sprintf("{ %s }", &String::join(&parts, " "))
+}
+
+export fn func(ref<Func, shared> f, ref<String, exclusive> out)
+{
+    Vec<String> ps = Vec::new();
+    foreach (p in &f.params)
+    {
+        Vec::push(&mut ps, sprintf("%s %s", &Ty::text(&p.ty), &p.name));
+    }
+    String::appendf(out, "fn %s(%s)", &f.name, &String::join(&ps, ", "));
+    if (!ty_eq(&f.ret, &Ty::Unit))
+    {
+        String::appendf(out, " : %s", &Ty::text(&f.ret));
+    }
+    String::push_ascii(out, b'\n');
+    block(&f.body, 0, out);
+}
+
+export fn program(ref<Program, shared> p, StringView header) : String
+{
+    String out = String::new();
+    String::append(&mut out, header);
+    String::append(&mut out, "import std;\n");
+    if (p.hold)
+    {
+        String::append(&mut out, "\nstruct Hold\n{\n    ref<i32, exclusive> r;\n}\n");
+    }
+    if (p.job)
+    {
+        String::append(&mut out, "\nstruct Job\n{\n    handle<void> h;\n}\n");
+    }
+    foreach (s in &p.statics)
+    {
+        String::appendf(&mut out, "\nstatic Atomic<i32> %s = %d;\n", &s.name, s.k);
+    }
+    foreach (f in &p.funcs)
+    {
+        String::push_ascii(&mut out, b'\n');
+        func(f, &mut out);
+    }
+    out
+}
+
+// The helpers a generated program may call, as CobaltC. A program includes
+// the ones it calls; the model reads them back with the parser, so their
+// bodies run through the same rules as `main`'s.
+export const usize NHELPERS = 18;
+
+export fn helper_name(usize i) : str
+{
+    [
+        "bump",
+        "peek",
+        "two",
+        "pass",
+        "bump_hold",
+        "read_hold",
+        "add_locked",
+        "read_locked",
+        "lock_add_hold",
+        "bump_first",
+        "swap_first",
+        "take_one",
+        "call_val",
+        "call_shared",
+        "bump_slice",
+        "first",
+        "take_slice",
+        "call_twice",
+    ][i]
+}
+
+export fn helper_src(usize i) : str
+{
+    [
+        "fn bump(ref<i32, exclusive> p)\n{\n    *p = *p + 1;\n}\n",
+        "fn peek(ref<i32, shared> p) : i32\n{\n    *p\n}\n",
+        "fn two(ref<i32, exclusive> a, ref<i32, exclusive> b)\n{\n    *a = *a + 1;\n    *b = *b + 10;\n}\n",
+        "fn pass(ref<i32, exclusive> p) : ref<i32, exclusive>\n{\n    p\n}\n",
+        "fn bump_hold(Hold h)\n{\n    *h.r = *h.r + 1;\n}\n",
+        "fn read_hold(ref<Hold, shared> h) : i32\n{\n    *h.r\n}\n",
+        "fn add_locked(ref<mutex<i32>, shared> m)\n{\n    auto g = lock(m);\n    *g = *g + 1;\n}\n",
+        "fn read_locked(ref<mutex<i32>, shared> m) : i32\n{\n    auto g = lock(m);\n    *g\n}\n",
+        "fn lock_add_hold(ref<mutex<i32>, shared> m, ref<Hold, shared> h)\n{\n    auto g = lock(m);\n    *g = *g + *h.r;\n}\n",
+        "fn bump_first(Vec<ref<i32, exclusive>> w)\n{\n    *w[0] = 9;\n}\n",
+        "fn swap_first(Vec<ref<i32, exclusive>> w)\n{\n    i32 z = 100;\n    swap(*Vec::index_exclusive(&mut w, 0), &mut z);\n}\n",
+        "fn take_one(ref<Channel<ref<i32, exclusive>>, shared> ch)\n{\n    match (Channel::recv(ch))\n    {\n        Some(r) : { *r = *r + 100; },\n        None    : {},\n    }\n}\n",
+        "fn call_val(fn() : void f)\n{\n    f();\n}\n",
+        "fn call_shared(ref<fn() : void, shared> f)\n{\n    (*f)();\n}\n",
+        "fn bump_slice(slice<i32, exclusive> s)\n{\n    s[0] = s[0] + 1;\n}\n",
+        "fn first(slice<i32, shared> s) : i32\n{\n    s[0]\n}\n",
+        "fn take_slice(ref<Channel<slice<i32, exclusive>>, shared> ch)\n{\n    match (Channel::recv(ch))\n    {\n        Some(s) : { s[0] = s[0] + 100; },\n        None    : {},\n    }\n}\n",
+        "fn call_twice(fn() : void f)\n{\n    auto g = f;\n    g();\n    f();\n}\n",
+    ][i]
+}
+
+export fn helper_needs_hold(StringView name) : bool
+{
+    StringView::contains(name, "hold")
+}

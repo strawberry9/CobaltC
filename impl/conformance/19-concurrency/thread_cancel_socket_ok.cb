@@ -1,0 +1,58 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.cancel [Cancel]; rule.stdlib.net; D-0204; conf.thread-cancel-socket
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6163636570746f723a20646961672e7468726561642d63616e63656c6c65640a7265616465723a20646961672e7468726561642d63616e63656c6c65640a717569636b3a20747275650a
+//
+// Two threads wait on sockets -- one in `accept`, one reading a connection
+// nobody writes to; both are cancelled, and each wait ends at once with
+// `diag.thread-cancelled`.
+
+import std;
+
+fn acceptor(TcpListener l) : u8
+{
+    match (TcpListener::accept(&mut l))
+    {
+        Ok(s)  : 1,
+        Err(e) : 2,
+    }
+}
+
+fn reader(TcpStream s) : usize
+{
+    Vec<u8> buf = Vec::new();
+    match (TcpStream::read(&mut s, &mut buf, 100))
+    {
+        Ok(n)  : n,
+        Err(e) : 0,
+    }
+}
+
+fn main()
+{
+    u64 t0 = monotonic_ns();
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at = TcpListener::local_addr(&l);
+    TcpListener l2 = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    SocketAddr at2 = TcpListener::local_addr(&l2);
+    TcpStream c = Result::unwrap(TcpStream::connect(at2));
+    TcpStream s = Result::unwrap(TcpListener::accept(&mut l2));
+    auto a = spawn(acceptor, l);
+    auto r = spawn(reader, s);
+    sleep_ms(200);
+    cancel(&a);
+    cancel(&r);
+    match (try_join(a))
+    {
+        Ok(v)  : printf("acceptor %v\n", v),
+        Err(e) : printf("acceptor: %s\n", &ThreadFailure::diagnostic(&e)),
+    }
+    match (try_join(r))
+    {
+        Ok(v)  : printf("reader %v\n", v),
+        Err(e) : printf("reader: %s\n", &ThreadFailure::diagnostic(&e)),
+    }
+    printf("quick: %v\n", monotonic_ns() - t0 < 3000000000);
+}

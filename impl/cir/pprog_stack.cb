@@ -1,0 +1,380 @@
+// Protocol CIR (step T4): the passes of the stack-check rule over the
+// program's C, on the units' nodes (see `pprog.cb`): a frame's notes where
+// nothing spawns a thread, the stack check where the depth of calls cannot
+// grow, a decided program's small functions inline. The scans of a line, the
+// rule that decides which function keeps its check and the prototypes' part
+// of each pass are `back/stack_checks.cb`'s.
+
+import std;
+import proto;
+import rt;
+import passes;
+import stack_checks;
+import state;
+
+// The definitions of program functions (`f_…`) in a unit's nodes: a line at
+// the left margin ending in `)` whose next line (past `#line` directives) is
+// `{`, to the next `}` at the left margin.
+fn defs_in_nodes(usize unit, ref<PBuf, shared> b, ref<Vec<StackDef>, exclusive> out)
+{
+    usize n = pbuf_count(b);
+    usize i = 0;
+    while (i < n)
+    {
+        bool starts = false;
+        if (pbuf_ind(b, i) == 0)
+        {
+            StringView l = pbuf_view(b, i);
+            slice<u8, shared> lb = StringView::as_bytes(l);
+            starts = slice_len(lb) > 0 && lb[0] != b'{' && lb[0] != b'}' && lb[0] != b'#'
+                && StringView::ends_with(l, ")");
+        }
+        if (starts)
+        {
+            usize j = i + 1;
+            while (j < n && pbuf_line_starts(b, j, "#line"))
+            {
+                j += 1;
+            }
+            if (j < n && pbuf_line_is(b, j, "{"))
+            {
+                match (def_name(pbuf_view(b, i)))
+                {
+                    Some(name) :
+                    {
+                        // Only a program function (`f_…`) takes part.
+                        if (StringView::starts_with(name, "f_"))
+                        {
+                            usize k = j + 1;
+                            while (k < n && !pbuf_line_is(b, k, "}"))
+                            {
+                                k += 1;
+                            }
+                            Option<usize> check = None;
+                            for (usize m = j + 1; m < k; m += 1)
+                            {
+                                // The stack check is a node that says so.
+                                if (pbuf_stmt_rt(b, m) == RT_STACK_CHECK)
+                                {
+                                    check = Some(m);
+                                    break;
+                                }
+                            }
+                            Vec::push(
+                                out,
+                                StackDef {
+                                    .unit = unit,
+                                    .name = String::copy(name),
+                                    .open = j,
+                                    .close = k,
+                                    .check = check,
+                                },
+                            );
+                            i = k + 1;
+                            continue;
+                        }
+                    },
+                    None       : {},
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+// D-0309 (1b): `cb_stack_check();` taken out of every function of `units`
+// the rule lets go without one (`stack_checks::prune_decide`), and (D-0315,
+// step 6) the location stores only a quiet callee could read
+// (`stack_checks::quiet_locations_in`). `others`: the rest of the program's
+// C, read for addresses taken; `types`: where the structs' sizes are stated;
+// `fresh`: the program's `main` (empty for a library).
+export fn prune_stack_checks_nodes(
+    ref<Vec<Unit>, exclusive> units,
+    ref<Vec<String>, shared> others,
+    ref<String, shared> types,
+    StringView fresh,
+)
+{
+    HashMap<String, u64> sizes = struct_sizes(types);
+    Vec<StackDef> defs = Vec::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        defs_in_nodes(u, &units[u].nodes, &mut defs);
+    }
+    Option<HashMap<String, usize>> ids = def_ids(&defs);
+    if (Option::is_none(&ids))
+    {
+        return;
+    }
+    HashMap<String, usize> id = Option::unwrap(ids);
+    usize n = Vec::len(&defs);
+    StackScan s = stack_scan_new(n);
+    Vec<u64> frame = Vec::filled(n, 0);
+    // D-0315: each unit's definitions, in order (each unit visits its own).
+    Vec<Vec<usize>> by_unit = Vec::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        Vec::push(&mut by_unit, Vec::new());
+    }
+    for (usize k = 0; k < n; k += 1)
+    {
+        if (defs[k].unit < Vec::len(&by_unit))
+        {
+            Vec::push(&mut by_unit[defs[k].unit], k);
+        }
+    }
+    Vec<bool> checked = Vec::new();
+    Vec<HashSet<usize>> quiet_gone = Vec::new();
+    {
+        // Every unit's lines, each node's text in place.
+        Vec<Vec<StringView>> unit_lines = Vec::new();
+        for (usize u = 0; u < Vec::len(units); u += 1)
+        {
+            Vec::push(&mut unit_lines, pbuf_views(&units[u].nodes));
+        }
+        for (usize u = 0; u < Vec::len(units); u += 1)
+        {
+            ref<Vec<StringView>, shared> lines = &unit_lines[u];
+            Vec<bool> inside = Vec::filled(Vec::len(lines), false);
+            foreach (kk in &by_unit[u])
+            {
+                usize k = *kk;
+                for (usize m = defs[k].open + 1; m < defs[k].close; m += 1)
+                {
+                    scan_idents(lines[m], &id, &mut s, Some(k), fresh);
+                }
+                frame[k] = frame_of(lines, defs[k].open + 1, defs[k].close, &sizes);
+                for (usize m = defs[k].open; m <= defs[k].close && m < Vec::len(lines); m += 1)
+                {
+                    inside[m] = true;
+                }
+            }
+            for (usize m = 0; m < Vec::len(lines); m += 1)
+            {
+                if (!inside[m])
+                {
+                    scan_idents(lines[m], &id, &mut s, None, "");
+                }
+            }
+            // `stack_checks::foreign_calls`: a node's view has no
+            // indentation, so the margin is read from the node.
+            Vec<bool> margin = Vec::new();
+            for (usize m = 0; m < Vec::len(lines); m += 1)
+            {
+                Vec::push(&mut margin, pbuf_ind(&units[u].nodes, m) == 0 && StringView::len(lines[m]) > 0);
+            }
+            foreign_calls(lines, &margin, &inside, &defs, &id, &sizes, &mut s, fresh);
+        }
+        foreach (t in others)
+        {
+            scan_idents(t, &id, &mut s, None, fresh);
+            other_calls(t, &defs, &id, &sizes, &mut s, fresh);
+        }
+        checked = prune_decide(&defs, &s, &frame, fresh);
+        // D-0315 (step 6): and a location stored only for a quiet callee goes.
+        quiet_gone = quiet_locations_in(&unit_lines, &defs, &s.edges, &checked);
+    }
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        HashSet<usize> gone = replace(&mut quiet_gone[u], HashSet::new());
+        foreach (kk in &by_unit[u])
+        {
+            usize k = *kk;
+            if (!checked[k])
+            {
+                match (defs[k].check)
+                {
+                    Some(line) :
+                    {
+                        HashSet::insert(&mut gone, line);
+                    },
+                    None       : {},
+                }
+            }
+        }
+        if (HashSet::len(&gone) == 0)
+        {
+            continue;
+        }
+        Vec<bool> marks = Vec::filled(pbuf_count(&units[u].nodes), false);
+        foreach (m in &gone)
+        {
+            if (*m < Vec::len(&marks))
+            {
+                marks[*m] = true;
+            }
+        }
+        pbuf_drop_marked(&mut units[u].nodes, &marks);
+    }
+}
+
+// CHG-0430: in a decided program, a small function of its own, in a unit
+// that is not pure `std`, is defined `CB_SMALL`, and its prototype with it
+// (the rule is stated at `stack_checks::INLINE_LINES`).
+export fn inline_small_nodes(ref<Vec<Unit>, exclusive> units, ref<String, exclusive> protos)
+{
+    HashSet<String> names = HashSet::new();
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        // CHG-0433: not a pure `std` unit's.
+        if (units[u].pure_std)
+        {
+            continue;
+        }
+        Vec<StackDef> defs = Vec::new();
+        defs_in_nodes(0, &units[u].nodes, &mut defs);
+        Vec<usize> heads = Vec::new();
+        foreach (d in &defs)
+        {
+            ref<PBuf, shared> b = &units[u].nodes;
+            // The definition's own line: the last before `{` that is no `#line`.
+            usize i = d.open;
+            bool found = false;
+            while (i > 0)
+            {
+                i -= 1;
+                if (!pbuf_line_starts(b, i, "#line"))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found || pbuf_ind(b, i) != 0)
+            {
+                continue;
+            }
+            StringView l = pbuf_view(b, i);
+            if (!StringView::starts_with(l, "static ") || StringView::contains(l, "__attribute__")
+                || StringView::starts_with(l, "static inline"))
+            {
+                continue;
+            }
+            usize count = 0;
+            bool bad = false;
+            for (usize m = d.open + 1; m < d.close; m += 1)
+            {
+                if (!pbuf_line_starts(b, m, "#line"))
+                {
+                    count += 1;
+                }
+                if (inline_bad(pbuf_view(b, m)))
+                {
+                    bad = true;
+                }
+            }
+            if (bad || count > INLINE_LINES)
+            {
+                continue;
+            }
+            Vec::push(&mut heads, i);
+            HashSet::insert(&mut names, String::clone(&d.name));
+        }
+        foreach (h in &heads)
+        {
+            String line = pbuf_text(&units[u].nodes, *h);
+            StringView whole = &line;
+            pbuf_replace(&mut units[u].nodes, *h, 0, &sprintf("%s%v", ALWAYS_INLINE, &whole[7..$]));
+        }
+    }
+    inline_small_protos(protos, &names);
+}
+
+// Whether a line of `b` calls `cb_spawn` (`stack_checks::spawns`).
+fn spawns_nodes(ref<PBuf, shared> b) : bool
+{
+    if (!StringView::contains(&b.pool, "cb_spawn("))
+    {
+        return false;
+    }
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        if (spawns_line(pbuf_view(b, i)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether the text of `b` has the line `NOTES_ALWAYS` (a statement four
+// columns in): the statement at four columns or more, or the whole of it
+// within a line.
+fn notes_always_nodes(ref<PBuf, shared> b) : bool
+{
+    StringView whole = NOTES_ALWAYS;
+    StringView stmt = StringView::trim_start(whole);
+    usize lead = StringView::len(whole) - StringView::len(stmt);
+    if (!StringView::contains(&b.pool, stmt))
+    {
+        return false;
+    }
+    for (usize i = 0; i < pbuf_count(b); i += 1)
+    {
+        StringView v = pbuf_view(b, i);
+        if ((pbuf_ind(b, i) >= lead && StringView::starts_with(v, stmt)) || StringView::contains(v, whole))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// D-0309: a frame's notes (D-0269, `cb_nt`) go where no part of the program
+// calls `cb_spawn`; a table registered on every call (D-0315, step 4) stays.
+export fn drop_unused_notes_nodes(ref<Vec<Unit>, exclusive> units, ref<Vec<String>, shared> others)
+{
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        if (spawns_nodes(&units[u].nodes))
+        {
+            return;
+        }
+    }
+    foreach (t in others)
+    {
+        if (spawns(t))
+        {
+            return;
+        }
+    }
+    for (usize u = 0; u < Vec::len(units); u += 1)
+    {
+        if (!pbuf_has(&units[u].nodes, "cb_nt") || notes_always_nodes(&units[u].nodes))
+        {
+            continue;
+        }
+        PBuf res = pbuf_like(&units[u].nodes);
+        for (usize i = 0; i < pbuf_count(&units[u].nodes); i += 1)
+        {
+            StringView l = pbuf_view(&units[u].nodes, i);
+            if (note_line(StringView::trim_start(l)))
+            {
+                continue;
+            }
+            if (!StringView::contains(l, "cb_nt["))
+            {
+                pbuf_copy(&mut res, &units[u].nodes, i);
+                continue;
+            }
+            // The line without its ` cb_nt[k].live = 0;` (the end of a drop).
+            String kept = String::new();
+            append_without_live(&mut kept, l);
+            usize ind = pbuf_ind(&units[u].nodes, i);
+            // The space before the statement goes with it: before a node's
+            // first statement that space is the last of the node's
+            // indentation.
+            if (ind > 0 && StringView::starts_with(l, "cb_nt["))
+            {
+                String spaced = sprintf(" %v", l);
+                String probe = String::new();
+                append_without_live(&mut probe, &spaced);
+                if (StringView::len(&probe) == StringView::len(&kept))
+                {
+                    ind -= 1;
+                }
+            }
+            pbuf_push(&mut res, ind, &kept);
+        }
+        units[u].nodes = res;
+    }
+}

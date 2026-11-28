@@ -1,0 +1,60 @@
+# Bug 032: a frame too large for what is left of the stack (a big array
+# local, or one passed by value) is `diag.stack-exhausted`, contained in a
+# spawned thread as deep recursion is; it was SIGSEGV, which ended the whole
+# process. After it, the next thread's deep recursion is still caught (the
+# floor lifted while the fault unwound is put back).
+platform unix
+file big.cb
+import std;
+
+fn depth(u64 n) : u64
+{
+    if (n == 0)
+    {
+        return 0;
+    }
+    depth(n - 1) + 1
+}
+
+fn main()
+{
+    handle<u8> h = spawn(move []() { array<u8, 100000000> a = [3; 100000000]; usize i = arg_count() + 99999999; a[i] });
+    match (try_join(h))
+    {
+        Ok(v)  : printf("%v\n", v),
+        Err(f) : printf("thread failed: %v\n", &ThreadFailure::diagnostic(&f)),
+    }
+    handle<u64> d = spawn(move []() { depth(100000000 + widen<u64>(arg_count())) });
+    match (try_join(d))
+    {
+        Ok(v)  : printf("%v\n", v),
+        Err(f) : printf("thread failed: %v\n", &ThreadFailure::diagnostic(&f)),
+    }
+    printf("main continues\n");
+}
+end
+file byvalue.cb
+import std;
+
+fn sum(array<u8, 400000000> a) : u64
+{
+    u64 t = 0;
+    foreach (x in &a)
+    {
+        t += widen<u64>(*x);
+    }
+    t
+}
+
+fn main()
+{
+    array<u8, 400000000> a = [1; 400000000];
+    printf("%v\n", sum(a));
+}
+end
+run $COBC --cc $CC --run big.cb
+status 0
+stdout-is thread failed: diag.stack-exhausted\nthread failed: diag.stack-exhausted\nmain continues\n
+run $COBC --cc $CC --run byvalue.cb
+status 1
+stderr-starts fault[diag.stack-exhausted]

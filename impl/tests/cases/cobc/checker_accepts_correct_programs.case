@@ -1,0 +1,351 @@
+# Correct programs the checker refused, or accepted and then faulted on,
+# from the push after Update 206 (reports 049, 052, 056, 075, 082, 092,
+# 113, 135, 161, 180, 181, 185, 190, 229), each run in the default form and
+# with --all-checks; and the refusals that stay beside them (108, 234, a
+# binder used after the write in 052's shape).
+#
+# 052: a `match` binder ends after its last use in the arm's block, in the
+# checker and in the run.
+file binder.cb
+import std;
+
+enum T
+{
+    Num(f64),
+    Name(String),
+    End,
+}
+
+struct P
+{
+    T cur;
+    u32 n;
+}
+
+fn advance(ref<P, exclusive> p)
+{
+    overwrite(&mut p.cur, T::End);
+    p.n += 1;
+}
+
+fn num(ref<P, exclusive> p) : f64
+{
+    match (&p.cur)
+    {
+        T::Num(x) :
+        {
+            f64 v = *x;
+            advance(p);
+            v
+        },
+        _         : 0.0,
+    }
+}
+
+fn name(ref<P, exclusive> p) : String
+{
+    if (T::Name(s) = &p.cur)
+    {
+        String c = String::clone(s);
+        advance(p);
+        return c;
+    }
+    String::new()
+}
+
+fn main()
+{
+    P p = P { .cur = T::Num(2.5), .n = 0 };
+    P q = P { .cur = T::Name("ab"), .n = 0 };
+    Vec<Option<i32>> v = Vec::new();
+    Vec::push(&mut v, Some(4));
+    match (&v[0])
+    {
+        Some(x) :
+        {
+            i32 c = *x;
+            Vec::push(&mut v, Some(c));
+        },
+        None    : {},
+    }
+    printf("%v %v %v %v\n", num(&mut p), &name(&mut q), p.n + q.n, Vec::len(&v));
+}
+end
+run $COBC --run binder.cb
+status 0
+stdout-is 2.5 ab 2 2\n
+run $COBC --all-checks --run binder.cb
+status 0
+stdout-is 2.5 ab 2 2\n
+file binder_late.cb
+import std;
+
+enum T
+{
+    Num(f64),
+    End,
+}
+
+fn main()
+{
+    T t = T::Num(1.0);
+    match (&t)
+    {
+        T::Num(x) :
+        {
+            overwrite(&mut t, T::End);
+            printf("%v\n", *x);
+        },
+        _         : {},
+    }
+}
+end
+run $COBC --check binder_late.cb
+status 1
+stderr-has still borrows
+# 049, 075, 082, 113, 190, 229: references the checker kept too long or
+# too widely.
+file refs.cb
+import std;
+
+struct Cur
+{
+    StringView text;
+    usize pos;
+}
+
+struct Node
+{
+    String name;
+    u32 n;
+    Vec<Node> kids;
+}
+
+fn skip_spaces(ref<Cur, exclusive> c)
+{
+    slice<u8, shared> b = StringView::as_bytes(c.text);
+    while (c.pos < slice_len(b) && b[c.pos] == b' ')
+    {
+        c.pos += 1;
+    }
+}
+
+fn find_mut(ref<Node, exclusive> n, StringView name) : Option<ref<Node, exclusive>> from n
+{
+    if (n.name == name)
+    {
+        return Some(n);
+    }
+    for (usize i = 0; i < Vec::len(&n.kids); i += 1)
+    {
+        match (find_mut(&mut n.kids[i], name))
+        {
+            Some(r) : return Some(r),
+            None    : {},
+        }
+    }
+    None
+}
+
+fn bump(ref<HashMap<String, u32>, exclusive> m, StringView k) : Option<ref<u32, exclusive>> from m
+{
+    HashMap::get_mut(m, k)
+}
+
+fn filter<T: clone>(slice<T, shared> xs, fn(ref<T, shared>) : bool keep) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    foreach (x in xs)
+    {
+        if (keep(x))
+        {
+            Vec::push(&mut out, clone(x));
+        }
+    }
+    out
+}
+
+enum Kind
+{
+    Red,
+    Blue,
+}
+
+fn main()
+{
+    String src = "   x";
+    Cur c = Cur { .text = &src, .pos = 0 };
+    skip_spaces(&mut c);
+    Node t = Node { .name = "root", .n = 0, .kids = Vec::new() };
+    Vec::push(&mut t.kids, Node { .name = "leaf", .n = 1, .kids = Vec::new() });
+    if (Some(r) = find_mut(&mut t, "leaf"))
+    {
+        r.n += 10;
+    }
+    HashMap<String, u32> m = HashMap::new();
+    HashMap::insert(&mut m, "a", 1);
+    if (Some(s) = bump(&mut m, "a"))
+    {
+        *s += 1;
+    }
+    HashMap<Kind, u32> kinds = HashMap::new();
+    *HashMap::entry(&mut kinds, &Red, 0) += 1;
+    Vec<String> words = Vec::new();
+    Vec::push(&mut words, "ab");
+    Vec::push(&mut words, "c");
+    Vec::push(&mut words, "de");
+    Vec<String> long = filter(&words[0..$], [](ref<String, shared> w) : bool { StringView::len(w) > 1 });
+    printf("%v %v %v %v %v %v\n", c.pos, t.kids[0].n, *Option::unwrap(HashMap::get(&m, "a")), *Option::unwrap(HashMap::get(&kinds, &Red)), Vec::len(&long), Vec::len(&unsafe { Vec::from_slice(&[1, 2]) }));
+}
+end
+run $COBC --run refs.cb
+status 0
+stdout-is 3 11 2 1 2 2\n
+run $COBC --all-checks --run refs.cb
+status 0
+stdout-is 3 11 2 1 2 2\n
+# 056: a local's known value is not folded into a branch its guard
+# excludes; unguarded, it is refused.
+file guard.cb
+import std;
+
+fn main()
+{
+    i32 d = 0;
+    i32 r = if (d != 0) { 10 / d } else { 0 };
+    usize n = 0;
+    usize m = if (n > 0) { n - 1 } else { 7 };
+    u8 x = 255;
+    u8 y = if (x < 255) { x + 1 } else { x };
+    printf("%v %v %v %v\n", r, d != 0 && 10 / d > 1, m, y);
+}
+end
+run $COBC --run guard.cb
+status 0
+stdout-is 0 false 7 255\n
+file unguarded.cb
+import std;
+
+fn main()
+{
+    i32 d = 0;
+    printf("%v\n", 10 / d);
+}
+end
+run $COBC --check unguarded.cb
+status 1
+stderr-has diag.div-by-zero
+# 092, 161: a `Weak`, and a `Vec` of views, are quiet: assigned over.
+file quiet.cb
+import std;
+
+struct Node
+{
+    i32 value;
+    Option<Weak<Node>> parent;
+}
+
+fn detach(ref<Node, exclusive> n)
+{
+    n.parent = None;
+}
+
+fn main()
+{
+    Rc<Node> root = Rc::new(Node { .value = 1, .parent = None });
+    Node child = Node { .value = 2, .parent = Some(Rc::downgrade(&root)) };
+    detach(&mut child);
+    String line = "a,b c";
+    Vec<StringView> fields = StringView::split(&line, ",");
+    fields = StringView::split(&line, " ");
+    printf("%v %v\n", Option::is_none(&child.parent), Vec::len(&fields));
+}
+end
+run $COBC --run quiet.cb
+status 0
+stdout-is true 2\n
+run $COBC --all-checks --run quiet.cb
+status 0
+stdout-is true 2\n
+# 135, 180, 181, 185: spawn arguments typed by the function, a closure in a
+# scrutinee ended before the arms, `?` giving `ok_or` its error type, `..`
+# skipping a private field.
+file misc.cb
+import std;
+
+module bank
+{
+    export struct Account
+    {
+        export u32 id;
+        i64 balance;
+    }
+
+    export fn Account::open(u32 id) : Account
+    {
+        Account { .id = id, .balance = 100 }
+    }
+}
+
+fn work(u64 n) : u64
+{
+    n * 2
+}
+
+fn half(i32 x) : Result<i32, String>
+{
+    i32 h = Option::ok_or(checked_div(x, 2), "cannot halve")?;
+    Ok(h)
+}
+
+fn main()
+{
+    auto t = spawn(work, 1000 * 1000);
+    u64 w = join(t);
+    Vec<String> names = Vec::new();
+    String key = "lin";
+    match (Vec::position(&names, [key](ref<String, shared> n) : bool { *n == key }))
+    {
+        Some(i) : printf("found at %v\n", i),
+        None    : Vec::push(&mut names, key),
+    }
+    bank::Account a = bank::Account::open(7);
+    match (&a)
+    {
+        bank::Account { id, .. } : std::printf("%v %v %v %v\n", w, Vec::len(&names), Result::unwrap(half(10)), *id),
+    }
+}
+end
+run $COBC --run misc.cb
+status 0
+stdout-is 2000000 1 5 7\n
+run $COBC --all-checks --run misc.cb
+status 0
+stdout-is 2000000 1 5 7\n
+# 108 and 234: refused statically.
+file refused.cb
+import std;
+
+struct Person
+{
+    String name;
+}
+
+fn name_of(ref<Person, shared> p) : String
+{
+    p.name
+}
+
+fn main()
+{
+    i64 a = to_int<i64>(9223372036854775807.0);
+    u128 b = to_int<u128>(2.0e38);
+    Person p = Person { .name = "x" };
+    printf("%v %v %v\n", a, b, &name_of(&p));
+}
+end
+run $COBC --check refused.cb
+status 1
+stderr-has `p.name` is reached through a reference, so it cannot be moved out
+stderr-has `to_int<i64>` of 9223372036854776000 does not fit
+stderr-lacks `to_int<u128>`

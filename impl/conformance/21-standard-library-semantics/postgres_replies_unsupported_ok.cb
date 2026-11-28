@@ -1,0 +1,311 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.postgres [Pg-Connect] [Pg-Query] [Pg-Error] (D-0180); conf.postgres-replies-unsupported
+// kind: positive
+// expect: ok
+//
+// Hermetic: a mock PostgreSQL backend on a loopback port (trust
+// authentication) in one thread, the client in the main thread, with a
+// 300 ms timeout (`set_timeout_ms` after connecting). A URL with `%00`
+// in the database, the user or the password is `BadConnectionUrl`. A reply that does not come in time: the client sends
+// a CancelRequest (with the backend's key) on a connection of its own and
+// waits once more, so a cancelled statement is the server's `57014` error,
+// one that completed first its result, and the connection stays usable;
+// a server that stays silent after the cancel too is `timed out`, and the
+// connection closed. `COPY ... TO STDOUT` (its data read past) and `COPY
+// ... FROM STDIN` (answered with CopyFail and a Sync) are `Unsupported`, the
+// connection usable; a `client_encoding` changed to LATIN1 is
+// `Unsupported` and closes the connection. A FATAL error before the server
+// ends the session is given as the server's error, not as a closed
+// connection. `saslprep`, which the SCRAM exchange applies to the
+// password, maps, removes, normalises and refuses as RFC 4013 says (an
+// unassigned code point refused, as PostgreSQL does).
+
+import std;
+
+// ---- the mock backend ----
+
+struct ClientMsg
+{
+    u8 kind;
+    Vec<u8> body;
+}
+
+fn read_client(ref<TcpStream, exclusive> t) : Option<ClientMsg>
+{
+    Vec<u8> head = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut head, 5)))
+    {
+        return None;
+    }
+    usize len = widen<usize>(read_be<u32>(&head, 1));
+    if (len < 4)
+    {
+        return None;
+    }
+    Vec<u8> body = Vec::new();
+    if (Result::is_err(&TcpStream::read_exact(t, &mut body, len - 4)))
+    {
+        return None;
+    }
+    Some(ClientMsg { .kind = head[0], .body = body })
+}
+
+fn msg(u8 kind, slice<u8, shared> body) : Vec<u8>
+{
+    Vec<u8> out = Vec::new();
+    Vec::push(&mut out, kind);
+    Vec::push_be(&mut out, narrow<u32>(slice_len(body) + 4));
+    Vec::extend_from(&mut out, body);
+    out
+}
+
+fn push_cstr(ref<Vec<u8>, exclusive> out, str s)
+{
+    Vec::extend_from(out, StringView::as_bytes(StringView::of(s)));
+    Vec::push(out, 0);
+}
+
+fn report(str severity, str code, str message) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, b'S');
+    push_cstr(&mut b, severity);
+    Vec::push(&mut b, b'C');
+    push_cstr(&mut b, code);
+    Vec::push(&mut b, b'M');
+    push_cstr(&mut b, message);
+    Vec::push(&mut b, 0);
+    msg(b'E', &b)
+}
+
+fn status(str name, str value) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    push_cstr(&mut b, name);
+    push_cstr(&mut b, value);
+    msg(b'S', &b)
+}
+
+fn complete(str tag) : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    push_cstr(&mut b, tag);
+    msg(b'C', &b)
+}
+
+fn ready() : Vec<u8>
+{
+    Vec<u8> b = Vec::new();
+    Vec::push(&mut b, b'I');
+    msg(b'Z', &b)
+}
+
+fn send(ref<TcpStream, exclusive> t, slice<Vec<u8>, shared> ms)
+{
+    Vec<u8> out = Vec::new();
+    foreach (m in ms)
+    {
+        Vec::extend_from(&mut out, m);
+    }
+    _ = TcpStream::write(t, &out);
+}
+
+// The next connection's first message: a StartupMessage (true) or a
+// CancelRequest for backend 7 with key 9 (false); `log` says which.
+fn first_message(ref<TcpListener, exclusive> l, ref<String, exclusive> log) : Option<TcpStream>
+{
+    TcpStream t = Result::unwrap(TcpListener::accept(l));
+    Vec<u8> head = Vec::new();
+    _ = TcpStream::read_exact(&mut t, &mut head, 8);
+    usize len = widen<usize>(read_be<u32>(&head, 0));
+    u32 code = read_be<u32>(&head, 4);
+    Vec<u8> rest = Vec::new();
+    _ = TcpStream::read_exact(&mut t, &mut rest, len - 8);
+    if (code == 80877102)
+    {
+        String::append(log, &sprintf("  a CancelRequest for backend %v key %v\n", read_be<u32>(&rest, 0), read_be<u32>(&rest, 4)));
+        return None;
+    }
+    Some(t)
+}
+
+// One session: trust authentication, then statements answered by their
+// text until the client ends it or the answer ends it.
+fn session(ref<TcpListener, exclusive> l, ref<TcpStream, exclusive> t, ref<String, exclusive> log)
+{
+    Vec<u8> key = Vec::new();
+    Vec::push_be<u32>(&mut key, 7);
+    Vec::push_be<u32>(&mut key, 9);
+    Vec<u8> ok = Vec::new();
+    Vec::push_be<u32>(&mut ok, 0);
+    send(t, &[msg(b'R', &ok), status("client_encoding", "UTF8"), msg(b'K', &key), ready()]);
+    Vec<u8> none = Vec::new();
+    while (true)
+    {
+        ClientMsg m = match (read_client(t))
+        {
+            Some(m) : m,
+            None    : return,
+        };
+        if (m.kind == b'X')
+        {
+            String::append(log, "  Terminate\n");
+            return;
+        }
+        // The statement: a Parse's (then up to the Sync) or a Query's.
+        usize at = if (m.kind == b'P') { 1 } else { 0 };
+        usize end = at;
+        while (end < Vec::len(&m.body) && m.body[end] != 0)
+        {
+            end += 1;
+        }
+        String sql = Result::unwrap_or(String::from_utf8(Vec::from_slice(&m.body[at..end])), String::new());
+        if (m.kind == b'P')
+        {
+            while (true)
+            {
+                match (read_client(t))
+                {
+                    Some(n) : if (n.kind == b'S') { break; },
+                    None    : return,
+                }
+            }
+        }
+        String::append(log, &sprintf("  %s\n", &sql));
+        if (sql == "SELECT slow_cancelled")
+        {
+            _ = first_message(l, log);
+            send(t, &[report("ERROR", "57014", "canceling statement due to user request"), ready()]);
+        }
+        else if (sql == "INSERT slow_completed")
+        {
+            _ = first_message(l, log);
+            send(t, &[msg(b'1', &none), msg(b'2', &none), msg(b'n', &none), complete("INSERT 0 1"), ready()]);
+        }
+        else if (sql == "SELECT silent")
+        {
+            _ = first_message(l, log);
+            sleep_ms(1500);
+            return;
+        }
+        else if (sql == "COPY t TO STDOUT")
+        {
+            Vec<u8> h = Vec::new();
+            Vec::push(&mut h, 0);
+            Vec::push_be<u16>(&mut h, 1);
+            Vec::push_be<u16>(&mut h, 0);
+            send(t, &[msg(b'1', &none), msg(b'2', &none), msg(b'H', &h), msg(b'd', b"1\n"), msg(b'c', &none), complete("COPY 1"), ready()]);
+        }
+        else if (sql == "COPY t FROM STDIN")
+        {
+            Vec<u8> g = Vec::new();
+            Vec::push(&mut g, 0);
+            Vec::push_be<u16>(&mut g, 1);
+            Vec::push_be<u16>(&mut g, 0);
+            send(t, &[msg(b'1', &none), msg(b'2', &none), msg(b'G', &g)]);
+            ClientMsg fail = match (read_client(t))
+            {
+                Some(f) : f,
+                None    : return,
+            };
+            ClientMsg sync = match (read_client(t))
+            {
+                Some(s) : s,
+                None    : return,
+            };
+            String::append(log, &sprintf("  then %s and %s\n", if (fail.kind == b'f') { "CopyFail" } else { "?" }, if (sync.kind == b'S') { "Sync" } else { "?" }));
+            send(t, &[report("ERROR", "57014", "COPY from stdin failed"), ready()]);
+        }
+        else if (sql == "SET client_encoding TO 'LATIN1'")
+        {
+            send(t, &[status("client_encoding", "LATIN1"), complete("SET"), ready()]);
+        }
+        else if (sql == "SELECT pg_terminate_backend(pg_backend_pid())")
+        {
+            send(t, &[report("FATAL", "57P01", "terminating connection due to administrator command")]);
+            return;
+        }
+        else
+        {
+            send(t, &[msg(b'1', &none), msg(b'2', &none), msg(b'n', &none), complete("SELECT 0"), ready()]);
+        }
+    }
+}
+
+fn backend(TcpListener l) : String
+{
+    String log = String::new();
+    for (usize k = 0; k < 3; k += 1)
+    {
+        String::append(&mut log, &sprintf("session %v\n", k + 1));
+        match (first_message(&mut l, &mut log))
+        {
+            Some(t) : session(&mut l, &mut t, &mut log),
+            None    : {},
+        }
+    }
+    log
+}
+
+// ---- the client ----
+
+fn show(str what, Result<PgResult, PgError> r)
+{
+    match (r)
+    {
+        Ok(res) : printf("%s: %s\n", what, &res.tag),
+        Err(e)  :
+        {
+            str kind = match (&e)
+            {
+                PgError::Unsupported(_) : "Unsupported",
+                _                       : "error",
+            };
+            printf("%s: %s: %s\n", what, kind, &PgError::text(&e));
+        },
+    }
+}
+
+fn main() : u8
+{
+    foreach (u in ["postgres://me@h/testdb%00options%00-c%20search_path=evil", "postgres://me%00x@h/db", "postgres://me:p%00w@h/db"])
+    {
+        printf("%s: %v\n", u, Result::is_err(&PgUrl::parse(StringView::of(u))));
+    }
+    // SASLprep, which the SCRAM exchange applies to the password.
+    foreach (p in ["a\u{A0}b", "I\u{AD}X", "\u{2168}", "e\u{301}", "\u{221}\u{A0}x", "\u{627}1"])
+    {
+        match (saslprep(StringView::of(p)))
+        {
+            Some(s) : printf("saslprep %s: %s\n", &to_hex(StringView::as_bytes(StringView::of(p))), &to_hex(StringView::as_bytes(&s))),
+            None    : printf("saslprep %s: refused\n", &to_hex(StringView::as_bytes(StringView::of(p)))),
+        }
+    }
+    TcpListener l = Result::unwrap(TcpListener::bind(SocketAddr::new(IpAddr::localhost_v4(), 0)));
+    String url = sprintf("postgres://me@127.0.0.1:%u/db?sslmode=disable", TcpListener::local_addr(&l).port);
+    auto h = spawn(backend, l);
+    TrustStore none = TrustStore::new();
+    array<PgValue, 0> no = [];
+    PgConnection c = Result::unwrap(PgConnection::connect_with(&url, &none, 30000));
+    PgConnection::set_timeout_ms(&mut c, 300);
+    show("cancelled after the timeout", PgConnection::query(&mut c, "SELECT slow_cancelled", &no));
+    show("completed before the cancel", PgConnection::query(&mut c, "INSERT slow_completed", &no));
+    show("copy out", PgConnection::query(&mut c, "COPY t TO STDOUT", &no));
+    show("copy in", PgConnection::query(&mut c, "COPY t FROM STDIN", &no));
+    show("then", PgConnection::query(&mut c, "SELECT 1", &no));
+    match (PgConnection::run_script(&mut c, "SET client_encoding TO 'LATIN1'"))
+    {
+        Ok(_)  : printf("client_encoding: ok\n"),
+        Err(e) : printf("client_encoding: %s\n", &PgError::text(&e)),
+    }
+    show("then", PgConnection::query(&mut c, "SELECT 1", &no));
+    PgConnection d = Result::unwrap(PgConnection::connect_with(&url, &none, 300));
+    show("terminated", PgConnection::query(&mut d, "SELECT pg_terminate_backend(pg_backend_pid())", &no));
+    show("then", PgConnection::query(&mut d, "SELECT 1", &no));
+    PgConnection e = Result::unwrap(PgConnection::connect_with(&url, &none, 300));
+    show("silent after the cancel", PgConnection::query(&mut e, "SELECT silent", &no));
+    show("then", PgConnection::query(&mut e, "SELECT 1", &no));
+    printf("the backend saw:\n%s", &join(h));
+    0
+}

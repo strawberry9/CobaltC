@@ -1,0 +1,97 @@
+# Reports 166, 170 (`[Fault-Unwind]`, `[Terminate-Exit]`, `[Fault-Contain]`).
+# Exhausting the stack runs the destructors of the frames it unwinds, in the
+# main thread and in a spawned one, whose fault `try_join` then receives. A
+# destructor that faults during an unwind (an `exit`'s or a fault's) leaves
+# the unwind going: every later destructor runs, and the faults are reported
+# in the order they happened. Under each C compiler.
+file se.cb
+import std;
+
+resource struct Lock
+{
+    str name;
+}
+
+fn Lock::drop(ref<Lock, exclusive> self)
+{
+    eprintf("released %s\n", self.name);
+}
+
+fn deep(u64 n) : u64
+{
+    if (n == 0) { 0 } else { 1 + deep(n - 1) }
+}
+
+fn worker(u64 n) : u64
+{
+    Lock l = Lock { .name = "worker lock" };
+    deep(n)
+}
+
+fn main()
+{
+    Lock l = Lock { .name = "main lock" };
+    String a = Result::unwrap(arg(0));
+    if (a == "main")
+    {
+        eprintf("%v\n", worker(100000000));
+    }
+    else
+    {
+        match (try_join(spawn(worker, 100000000: u64)))
+        {
+            Ok(v)  : eprintf("%v\n", v),
+            Err(f) : eprintf("thread failed: %v\n", &ThreadFailure::diagnostic(&f)),
+        }
+        eprintf("main continues\n");
+    }
+}
+end
+file fd.cb
+import std;
+
+resource struct Conn
+{
+    i32 id;
+    bool bad;
+}
+
+fn Conn::drop(ref<Conn, exclusive> self)
+{
+    eprintf("close %v\n", self.id);
+    if (self.bad)
+    {
+        Option<i32> none = None;
+        _ = Option::unwrap(none);
+    }
+}
+
+fn main()
+{
+    String mode = Result::unwrap(arg(0));
+    Conn a = Conn { .id = 1, .bad = false };
+    Conn b = Conn { .id = 2, .bad = true };
+    if (mode == "exit") { exit(5); }
+    if (mode == "fault") { fault(assert_failed, "first fault"); }
+}
+end
+run $COBC --cc $CC -o se se.cb
+status 0
+run ./se main
+status 1
+stderr-starts released worker lock\nreleased main lock\nfault[diag.stack-exhausted]
+run ./se thread
+status 0
+stderr-is released worker lock\nthread failed: diag.stack-exhausted\nmain continues\nreleased main lock\n
+run $COBC --cc $CC -o fd fd.cb
+status 0
+run ./fd normal
+status 1
+stderr-starts close 2\nclose 1\nfault[diag.unwrap-failed]
+run ./fd exit
+status 1
+stderr-starts close 2\nclose 1\nfault[diag.unwrap-failed]
+run ./fd fault
+status 1
+stderr-starts close 2\nclose 1\nfault[diag.assert-failed]: first fault
+stderr-has fault[diag.unwrap-failed]

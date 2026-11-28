@@ -1,0 +1,431 @@
+# Generic programs the checker accepted that the compiler crashed on or built
+# invalid C for, and correct generic programs it refused (reports 242, 264,
+# 280-282, 288, 289, 307, 335, 336, 338-342 of the push after Update 207),
+# each in the default form and with --all-checks.
+#
+# 264, 336: one comparison in a generic body instantiated for `StringView`
+# and for another type: each instantiation compares as its own type.
+file view_and_other.cb
+import std;
+
+fn count_eq<T: eq>(ref<Vec<T>, shared> v, ref<T, shared> x) : usize
+{
+    usize n = 0;
+    foreach (e in v)
+    {
+        if (*e == *x)
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn larger<T: ordered>(T a, T b) : T
+{
+    if (a > b) { a } else { b }
+}
+
+fn main()
+{
+    Vec<StringView> words = StringView::split("b c b", " ");
+    StringView b = "b";
+    Vec<u32> nums = Vec::from_slice(&[3: u32, 1, 3]);
+    u32 t = 3;
+    Vec<String> names = Vec::new();
+    Vec::push(&mut names, "x");
+    Vec::push(&mut names, "x");
+    String x = "x";
+    printf("%v %v %v\n", count_eq(&words, &b), count_eq(&nums, &t), count_eq(&names, &x));
+    Vec::dedup(&mut names);
+    Vec::dedup(&mut nums);
+    Vec<StringView> ws = StringView::split("b b a", " ");
+    Vec::dedup(&mut ws);
+    printf("%v %v %v\n", Vec::len(&names), Vec::len(&nums), Vec::len(&ws));
+    printf("%v %v %v\n", larger(3: u32, 9), larger(StringView::trim(" b "), StringView::trim("a")), larger("p", "q"));
+}
+end
+run $COBC --run view_and_other.cb
+status 0
+stdout-is 2 2 2\n1 3 2\n9 b q\n
+run $COBC --all-checks --run view_and_other.cb
+status 0
+stdout-is 2 2 2\n1 3 2\n9 b q\n
+# 281: a program's types named as std's type parameters (`K`, `V`, `T`),
+# and a user generic whose parameter is named as one of its types.
+file param_names.cb
+import std;
+
+struct K
+{
+    u32 id;
+}
+
+struct V
+{
+    u32 id;
+}
+
+struct T
+{
+    u32 id;
+}
+
+struct Item
+{
+    u32 id;
+}
+
+resource struct Stack<Item>
+{
+    Vec<Item> items;
+}
+
+fn Stack::new<Item>() : Stack<Item>
+{
+    Stack { .items = Vec::new() }
+}
+
+fn Stack::push<Item>(ref<Stack<Item>, exclusive> s, Item x)
+{
+    Vec::push(&mut s.items, x);
+}
+
+fn main()
+{
+    HashMap<K, u32> m = HashMap::new();
+    _ = HashMap::insert(&mut m, K { .id = 1 }, 5);
+    HashMap<V, u32> n = HashMap::new();
+    _ = HashMap::insert(&mut n, V { .id = 1 }, 5);
+    Queue<T> q = Queue::new();
+    Queue::push_back(&mut q, T { .id = 1 });
+    Stack<Item> s = Stack::new();
+    Stack::push(&mut s, Item { .id = 3 });
+    Stack<u32> u = Stack::new();
+    Stack::push(&mut u, 4);
+    printf("%v %v %v %v %v\n", HashMap::len(&m), HashMap::len(&n), Queue::len(&q), s.items[0].id, u.items[0]);
+}
+end
+run $COBC --run param_names.cb
+status 0
+stdout-is 1 1 1 3 4\n
+run $COBC --all-checks --run param_names.cb
+status 0
+stdout-is 1 1 1 3 4\n
+# 282: `Vec::binary_search` on a `Vec<str>`.
+file search_str.cb
+import std;
+
+fn main()
+{
+    Vec<str> keywords = Vec::from_slice(&["break", "fn", "if", "while"]);
+    match (Vec::binary_search(&keywords, "if"))
+    {
+        Ok(i)  : printf("found at %v\n", i),
+        Err(i) : printf("would go at %v\n", i),
+    }
+    match (Vec::binary_search(&keywords, "else"))
+    {
+        Ok(i)  : printf("found at %v\n", i),
+        Err(i) : printf("would go at %v\n", i),
+    }
+}
+end
+run $COBC --run search_str.cb
+status 0
+stdout-is found at 2\nwould go at 1\n
+run $COBC --all-checks --run search_str.cb
+status 0
+stdout-is found at 2\nwould go at 1\n
+# 289: `*a` and `**a` of a `ref<ref<T, shared>, shared>` closure parameter
+# (`Vec::sort_by` over a `Vec` of references).
+file deref_ref_ref.cb
+import std;
+
+struct Emp
+{
+    String name;
+    u32 salary;
+}
+
+fn richer(ref<Emp, shared> a, ref<Emp, shared> b) : bool
+{
+    a.salary > b.salary
+}
+
+fn main()
+{
+    Vec<Emp> staff = Vec::new();
+    Vec::push(&mut staff, Emp { .name = "ada", .salary = 50 });
+    Vec::push(&mut staff, Emp { .name = "lin", .salary = 70 });
+    Vec<ref<Emp, shared>> view = Vec::new();
+    foreach (e in &staff)
+    {
+        Vec::push(&mut view, e);
+    }
+    Vec::sort_by(&mut view, [](ref<ref<Emp, shared>, shared> a, ref<ref<Emp, shared>, shared> b) : bool { richer(*a, *b) });
+    Vec<i32> nums = Vec::from_slice(&[3, 1, 2]);
+    Vec<ref<i32, shared>> rs = Vec::new();
+    foreach (n in &nums)
+    {
+        Vec::push(&mut rs, n);
+    }
+    Vec::sort_by(&mut rs, [](ref<ref<i32, shared>, shared> a, ref<ref<i32, shared>, shared> b) : bool { **a < **b });
+    i32 k = 7;
+    ref<i32, shared> rk = &k;
+    auto f = [](ref<ref<i32, shared>, shared> a) : ref<i32, shared> { *a };
+    printf("%s %v %v %v %v\n", &view[0].name, *rs[0], *rs[1], *rs[2], *f(&rk));
+}
+end
+run $COBC --run deref_ref_ref.cb
+status 0
+stdout-is lin 1 2 3 7\n
+run $COBC --all-checks --run deref_ref_ref.cb
+status 0
+stdout-is lin 1 2 3 7\n
+# 335: a generic function passed by name where a generic callee expects a
+# `fn` value that an earlier argument fixes.
+file generic_fn_value.cb
+import std;
+
+fn desc<T: ordered>(ref<T, shared> a, ref<T, shared> b) : bool
+{
+    *a > *b
+}
+
+fn is_zero<T: number>(ref<T, shared> x) : bool
+{
+    *x == 0
+}
+
+fn double<T: number>(T x) : T
+{
+    x + x
+}
+
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[3, 0, 2]);
+    Vec::sort_by(&mut v, desc);
+    Option<usize> z = Vec::position(&v, is_zero);
+    Vec<fn(i64) : i64> fs = Vec::new();
+    Vec::push(&mut fs, double);
+    printf("%v %v %v %v %v\n", v[0], v[1], v[2], Option::unwrap(z), (fs[0])(21));
+}
+end
+run $COBC --run generic_fn_value.cb
+status 0
+stdout-is 3 2 0 2 42\n
+run $COBC --all-checks --run generic_fn_value.cb
+status 0
+stdout-is 3 2 0 2 42\n
+# 338: `[T-Bound-Literal]` for a call's arguments in a generic body, at a
+# floating-point and an integer instantiation.
+file bound_literal_args.cb
+import std;
+
+fn clamp_low<T: number>(T x) : T
+{
+    max(x, 0)
+}
+
+fn pad<T: number>(ref<Vec<T>, exclusive> v, usize n)
+{
+    while (Vec::len(v) < n)
+    {
+        Vec::push(v, 0);
+    }
+}
+
+fn zeros<T: number>(usize n) : Vec<T>
+{
+    Vec<T> v = Vec::filled(n, 0);
+    v
+}
+
+fn dec<T: integer>(T v) : T
+{
+    wrapping_sub(v, 1)
+}
+
+fn main()
+{
+    Vec<f64> v = Vec::new();
+    pad(&mut v, 2);
+    Vec<i32> w = Vec::new();
+    pad(&mut w, 3);
+    Vec<f64> z = zeros(2);
+    Vec<u8> y = zeros(1);
+    printf("%v %v %v %v\n", clamp_low(-7), clamp_low(-1.5), clamp_low(2.5), clamp_low(4: u8));
+    printf("%v %v %v %v %v %v\n", Vec::len(&v), Vec::len(&w), Vec::len(&z), Vec::len(&y), dec(0: u8), dec(5: i64));
+}
+end
+run $COBC --run bound_literal_args.cb
+status 0
+stdout-is 0 0.0 2.5 4\n2 3 2 1 255 4\n
+run $COBC --all-checks --run bound_literal_args.cb
+status 0
+stdout-is 0 0.0 2.5 4\n2 3 2 1 255 4\n
+# 339, 340: a variant or struct literal compared with an `Option<String>`
+# or a generic struct holding text, and a literal nested in a generic
+# call's argument, take the other operand's (or the declared) type.
+file literal_types.cb
+import std;
+
+struct Pair<A, B>
+{
+    A first;
+    B second;
+}
+
+enum Tree<T>
+{
+    Leaf(T),
+    Pair { Box<Tree<T>> l; Box<Tree<T>> r; },
+}
+
+fn sum(ref<Tree<i64>, shared> t) : i64
+{
+    match (t)
+    {
+        Tree::Leaf(v)       : *v,
+        Tree::Pair { l, r } : sum(Box::get(l)) + sum(Box::get(r)),
+    }
+}
+
+fn main()
+{
+    Option<String> o = Some("a");
+    Pair<String, i32> q = Pair { .first = "a", .second = 2 };
+    printf("%v %v %v %v\n", o == Some("a"), Some("b") == o, q == Pair { .first = "a", .second = 2 }, o != None);
+    Box<Option<u64>> c = Box::new(Some(3));
+    Tree<i64> t = Tree::Pair { .l = Box::new(Leaf(1)), .r = Box::new(Leaf(2)) };
+    i64 s = sum(&t);
+    printf("%v %v\n", Option::unwrap(*Box::get(&c)), s);
+}
+end
+run $COBC --run literal_types.cb
+status 0
+stdout-is true false true true\n3 3\n
+run $COBC --all-checks --run literal_types.cb
+status 0
+stdout-is true false true true\n3 3\n
+# 288, 341, 342: in generic code, a `Vec<T>` field reset, `clone` of a field
+# or an element of a `foreach` variable, and a count by key with
+# `HashMap::entry_owned`.
+file generic_bodies.cb
+import std;
+
+struct Stack<T>
+{
+    Vec<T> items;
+}
+
+fn Stack::reset<T>(ref<Stack<T>, exclusive> s)
+{
+    s.items = Vec::new();
+}
+
+struct Pair<T>
+{
+    T a;
+    T b;
+}
+
+fn firsts<T: clone>(ref<Vec<Pair<T>>, shared> v) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    foreach (p in v)
+    {
+        Vec::push(&mut out, clone(&p.a));
+    }
+    out
+}
+
+fn column<T: clone>(ref<Vec<Vec<T>>, shared> m, usize j) : Vec<T>
+{
+    Vec<T> out = Vec::new();
+    foreach (row in m)
+    {
+        Vec::push(&mut out, clone(&row[j]));
+    }
+    out
+}
+
+fn count_by<T, K: eq>(ref<Vec<T>, shared> v, fn(ref<T, shared>) : K key) : HashMap<K, usize>
+{
+    HashMap<K, usize> out = HashMap::new();
+    foreach (x in v)
+    {
+        K k = key(x);
+        *HashMap::entry_owned(&mut out, k, 0) += 1;
+    }
+    out
+}
+
+fn main()
+{
+    Stack<String> s = Stack { .items = Vec::new() };
+    Vec::push(&mut s.items, "a");
+    Stack::reset(&mut s);
+    Vec<Pair<String>> v = Vec::new();
+    Vec::push(&mut v, Pair { .a = "x", .b = "y" });
+    Vec<Vec<i32>> m = Vec::new();
+    Vec::push(&mut m, Vec::from_slice(&[1, 2, 3]));
+    printf("%v %s %v\n", Vec::len(&s.items), &firsts(&v)[0], column(&m, 2)[0]);
+    Vec<String> words = Vec::new();
+    Vec::push(&mut words, "tea");
+    Vec::push(&mut words, "jam");
+    Vec::push(&mut words, "tea");
+    HashMap<String, usize> a = count_by(&words, [](ref<String, shared> w) : String { String::clone(w) });
+    HashMap<usize, usize> b = count_by(&words, [](ref<String, shared> w) : usize { StringView::len(w) });
+    printf("%v %v %v %v\n", HashMap::len(&a), HashMap::len(&b), *Option::unwrap(HashMap::get(&a, "tea")), *Option::unwrap(HashMap::get(&b, 3)));
+}
+end
+run $COBC --run generic_bodies.cb
+status 0
+stdout-is 0 x 3\n2 1 2 3\n
+run $COBC --all-checks --run generic_bodies.cb
+status 0
+stdout-is 0 x 3\n2 1 2 3\n
+# 242, 280, 307: a literal looked up in a `Vec<StringView>`, a `foreach`
+# over `split` with a separator that is not a literal, and `&Vec::new()`
+# for a slice parameter.
+file text_args.cb
+import std;
+
+fn count_fields(StringView line, StringView sep) : usize
+{
+    usize n = 0;
+    foreach (field in StringView::split(line, sep))
+    {
+        n += StringView::len(field);
+    }
+    n
+}
+
+fn total(slice<u32, shared> hs) : usize
+{
+    slice_len(hs)
+}
+
+fn main()
+{
+    String line = "apple fig pear";
+    Vec<StringView> words = StringView::split(&line, " ");
+    String semi = ";";
+    printf(
+        "%v %v %v %v\n",
+        Vec::contains(&words, "fig"),
+        Option::unwrap(Vec::index_of(&words, "pear")),
+        count_fields("a;bb;c", &semi),
+        total(&Vec::new()),
+    );
+}
+end
+run $COBC --run text_args.cb
+status 0
+stdout-is true 2 4 0\n
+run $COBC --all-checks --run text_args.cb
+status 0
+stdout-is true 2 4 0\n

@@ -1,0 +1,120 @@
+# Reports 134, 169, 070, 236, 238. A thread that holds its own handle
+# (through an `Arc` it owns) is waited for at the program's end, and dropping
+# its own handle is no wait on itself. A consumer whose producer faulted is
+# told the producer's fault with `diag.channel-deadlock`. A mutex poisoned by
+# a deadlock names it. Threads joined one after another leave no record, and
+# failures handled and dropped leave no text: a hundred thousand of each
+# run in a few seconds. Under each C compiler.
+file own.cb
+import std;
+
+struct Registry
+{
+    mutex<Vec<handle<void>>> tasks;
+}
+
+fn task(Arc<Registry> reg)
+{
+    sleep_ms(100);
+    printf("task finished\n");
+}
+
+fn main()
+{
+    Arc<Registry> reg = Arc::new(Registry { .tasks = Mutex::new(Vec::new()) });
+    handle<void> h = spawn(task, clone(&reg));
+    {
+        auto g = lock(&Arc::get(&reg).tasks);
+        Vec::push(&mut *g, h);
+    }
+    drop(reg);
+    printf("main done\n");
+}
+end
+file pc.cb
+import std;
+
+fn producer(ref<Channel<i32>, shared> ch) : i32
+{
+    Vec<i32> data = Vec::new();
+    Vec::push(&mut data, 10);
+    Vec::push(&mut data, 20);
+    for (usize i = 0; i < 3; i += 1)
+    {
+        _ = Channel::send(ch, data[i]);
+    }
+    Channel::close(ch);
+    0
+}
+
+fn main()
+{
+    Channel<i32> ch = Channel::new(8);
+    auto h = spawn(producer, &ch);
+    while (true)
+    {
+        match (Channel::recv(&ch))
+        {
+            Some(x) : printf("got %v\n", x),
+            None    : break,
+        }
+    }
+    _ = try_join(h);
+}
+end
+file many.cb
+import std;
+
+fn work(u64 x) : u64
+{
+    x + 1
+}
+
+fn bad(usize x) : u64
+{
+    Vec<u64> v = Vec::new();
+    v[x]
+}
+
+fn main()
+{
+    u64 total = 0;
+    foreach (i in 0..100000: u64)
+    {
+        total += join(spawn(work, i));
+    }
+    u64 failed = 0;
+    foreach (i in 0..100000: u64)
+    {
+        match (try_join(spawn(bad, narrow<usize>(i))))
+        {
+            Ok(_)  : {},
+            Err(f) :
+            {
+                if (ThreadFailure::diagnostic(&f) == "diag.index-out-of-bounds")
+                {
+                    failed += 1;
+                }
+            },
+        }
+    }
+    printf("%v %v\n", total, failed);
+}
+end
+run $COBC --cc $CC -o own own.cb
+status 0
+run ./own
+status 0
+stdout-is main done\ntask finished\n
+run $COBC --cc $CC -o pc pc.cb
+status 0
+run ./pc
+status 1
+stdout-is got 10\ngot 20\n
+stderr-has fault[diag.channel-deadlock]: the only running thread waits on a channel nothing else can change: a thread that could have changed it failed first: `diag.index-out-of-bounds`
+stderr-has at pc.cb:10
+run $COBC --cc $CC -o many many.cb
+status 0
+run timeout 60 ./many
+status 0
+stdout-is 5000050000 100000\n

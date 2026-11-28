@@ -1,0 +1,132 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.waiting `Barrier`, [Gzip], [Args-Finish], `BigUint`, [CRC32], `StringView::replace` (reports 054, 100, 133, 146, 147, 220); conf.barrier-gunzip-args-numbers
+// kind: positive
+// expect: ok
+//
+// A thread cancelled in `Barrier::wait` takes its arrival back, so a lone
+// later arrival still waits. `gunzip` decodes each member apart (a distance
+// into the previous member's bytes is `Corrupt`) and reads zero padding
+// after the last member as the end. `Args::finish` names a declared option
+// written in a form it does not read, with the form to write. `BigUint`
+// reads and writes many digits, nine at a time; `crc32`, eight bytes at a
+// time, agrees with the bit-by-bit definition; `replace` finds each
+// occurrence as `find` does.
+
+import std;
+
+fn meet(ref<Barrier, shared> b) : bool
+{
+    Barrier::wait(b)
+}
+
+fn crc_bits(slice<u8, shared> d) : u32
+{
+    u32 c = 0xFFFFFFFF;
+    foreach (x in d)
+    {
+        c = c ^ widen<u32>(*x);
+        for (u32 k = 0; k < 8; k += 1)
+        {
+            c = if ((c & 1) == 1) { (c >> 1) ^ 0xEDB88320 } else { c >> 1 };
+        }
+    }
+    c ^ 0xFFFFFFFF
+}
+
+fn finish(Vec<String> items) : String
+{
+    Args a = Args::from(items, "tool");
+    _ = Args::flag(&mut a, "verbose", "v", "say more");
+    _ = Args::option(&mut a, "output", "o", "PATH", "where");
+    _ = Args::options(&mut a, "include", "I", "DIR", "a directory");
+    match (Args::finish(&mut a))
+    {
+        Ok(rest) : sprintf("ok, %v left", Vec::len(&rest)),
+        Err(m)   : m,
+    }
+}
+
+fn one(str s) : Vec<String>
+{
+    Vec<String> v = Vec::new();
+    Vec::push(&mut v, String::copy(s));
+    v
+}
+
+fn main()
+{
+    Barrier b = Barrier::new(2);
+    {
+        auto h = spawn(meet, &b);
+        sleep_ms(50);
+        cancel(&h);
+        match (try_join(h))
+        {
+            Ok(_)  : printf("not cancelled\n"),
+            Err(f) : printf("cancelled: %v\n", ThreadFailure::is_cancelled(&f)),
+        }
+    }
+    auto h = spawn(meet, &b);
+    sleep_ms(50);
+    printf("a lone arrival waits: %v\n", !is_finished(&h));
+    printf("the second is the leader: %v\n", meet(&b) != join(h));
+
+    // Two members; the second's one match reaches 24 bytes back, into the first.
+    Vec<u8> first = gzip(b"hello world, hello world");
+    Vec<u8> data = Vec::clone(&first);
+    match (gunzip(&first, 1000))
+    {
+        Ok(v)  : printf("one member: %v bytes\n", Vec::len(&v)),
+        Err(e) : printf("one member: %s\n", CompressError::text(&e)),
+    }
+    Vec::extend_from(&mut data, &first);
+    printf("two members: %v bytes\n", Vec::len(&Result::unwrap(gunzip(&data, 1000))));
+    Vec<u8> padded = Vec::clone(&first);
+    Vec::extend_from(&mut padded, &[0: u8, 0, 0, 0, 0, 0, 0, 0]);
+    printf("zero padding: %v\n", Result::is_ok(&gunzip(&padded, 1000)));
+    Vec<u8> junk = Vec::clone(&first);
+    Vec::extend_from(&mut junk, &[0: u8, 0, 7]);
+    printf("other bytes after: %v\n", Result::is_err(&gunzip(&junk, 1000)));
+    // The second member alone (a match before any byte) is refused, and
+    // after a first member too.
+    Vec<u8> m2 = Vec::new();
+    Vec::extend_from(&mut m2, &[0x1F: u8, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF]);
+    // A fixed-code block: a match of length 24 at distance 24, then the end.
+    Vec::extend_from(&mut m2, &[0xC3: u8, 0x25, 0x0E, 0x00]);
+    // The trailer of the 24 bytes it would copy: their CRC-32 and length.
+    Vec::extend_from(&mut m2, &[0x51: u8, 0x32, 0xAD, 0xB3, 24, 0, 0, 0]);
+    printf("a distance alone: %v\n", Result::is_err(&gunzip(&m2, 1000)));
+    Vec<u8> both = Vec::clone(&first);
+    Vec::extend_from(&mut both, &m2);
+    printf("a distance into the first member: %v\n", Result::is_err(&gunzip(&both, 1000)));
+
+    printf("%s\n", &finish(one("-Iinc")));
+    printf("%s\n", &finish(one("-vo")));
+    printf("%s\n", &finish(one("--verbose=yes")));
+    printf("%s\n", &finish(one("--bogus")));
+    printf("%s\n", &finish(one("-x")));
+
+    String digits = String::new();
+    for (u32 i = 0; i < 20000; i += 1)
+    {
+        String::push_ascii(&mut digits, b'0' + narrow<u8>(i * 7 % 10));
+    }
+    BigUint n = Result::unwrap(BigUint::parse(&digits));
+    String back = BigUint::text(&n);
+    printf("20000 digits back: %v (%v digits)\n", &back[0..StringView::len(&back)] == &digits[1..20000], StringView::len(&back));
+    printf("small: %s %s\n", &BigUint::text(&Result::unwrap(BigUint::parse("0"))), &BigUint::text(&Result::unwrap(BigUint::parse("000123456789012345678"))));
+
+    Vec<u8> bytes = Vec::new();
+    bool same = true;
+    for (u32 i = 0; i < 300; i += 1)
+    {
+        same = same && crc32(&bytes) == crc_bits(&bytes);
+        Vec::push(&mut bytes, narrow_wrapping<u8>(i * 131 + 7));
+    }
+    printf("crc32 as bit by bit: %v, check %v\n", same, crc32(b"123456789") == 0xCBF43926);
+
+    printf("%s\n", &StringView::replace("the cat and the hat", "the", "a"));
+    printf("%s\n", &StringView::replace("aaaa", "aa", "b"));
+    printf("%s\n", &StringView::replace("no match here", "xyz", "q"));
+}

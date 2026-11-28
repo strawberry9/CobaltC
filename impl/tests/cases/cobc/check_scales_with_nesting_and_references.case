@@ -1,0 +1,78 @@
+# Bugs 020, 021 and 044: what cobc does grows about as the program does.
+# - 020: 200 `if`s one inside another, 200 blocks as an expression and 200
+#   as statements: the C nests a brace for each, within Clang's default
+#   limit of 256 (the C is compiled here with no flag), and the program runs.
+# - 021: 4,000 references live at once, each to a local of its own or to an
+#   element of one vector, are checked in seconds (it took minutes).
+# - 044: `Some(` 100,000 deep and an array literal 100,000 deep are
+#   checked in seconds (each took hours).
+# Each run has a CPU limit far above what it takes and far below what it
+# took. Since D-0340 `--check` also runs the lowering, which does not yet scale
+# on 100,000-deep types or 4,000 element references (CHG-0484): those three
+# are timed through `--certificate FILE --check`, the static pass alone.
+platform unix
+file gen.sh
+awk -v n=200 'BEGIN {
+    printf "import std;\n\nfn main()\n{\n    i32 x = 0;\n    ";
+    for (i = 0; i < n; i++) printf "if (x >= 0) { ";
+    printf "x = 1;";
+    for (i = 0; i < n; i++) printf " }";
+    printf "\n    i32 y = ";
+    for (i = 0; i < n; i++) printf "{ ";
+    printf "2";
+    for (i = 0; i < n; i++) printf " }";
+    printf ";\n    i32 z = 0;\n    ";
+    for (i = 0; i < n; i++) printf "{ ";
+    printf "z = 3;";
+    for (i = 0; i < n; i++) printf " }";
+    printf "\n    printf(\"%%v %%v %%v\\n\", x, y, z);\n}\n";
+}' > nest.cb
+awk -v n=4000 'BEGIN {
+    printf "import std;\n\nfn main()\n{\n";
+    for (i = 0; i < n; i++) printf "    String s%d = \"s\";\n", i;
+    for (i = 0; i < n; i++) printf "    ref<String, shared> r%d = &s%d;\n", i, i;
+    printf "    usize t = 0;\n";
+    for (i = 0; i < n; i++) printf "    t += StringView::len(r%d);\n", i;
+    printf "    printf(\"%%v\\n\", t);\n}\n";
+}' > refs_locals.cb
+awk -v n=4000 'BEGIN {
+    printf "import std;\n\nfn main()\n{\n    Vec<String> v = Vec::new();\n";
+    for (i = 0; i < n; i++) printf "    Vec::push(&mut v, \"s%d\");\n", i;
+    for (i = 0; i < n; i++) printf "    ref<String, shared> r%d = &v[%d];\n", i, i;
+    printf "    usize t = 0;\n";
+    for (i = 0; i < n; i++) printf "    t += StringView::len(r%d);\n", i;
+    printf "    printf(\"%%v\\n\", t);\n}\n";
+}' > refs_vec.cb
+awk -v n=100000 'BEGIN {
+    printf "import std;\n\nfn main()\n{\n    auto o = ";
+    for (i = 0; i < n; i++) printf "Some(";
+    printf "1";
+    for (i = 0; i < n; i++) printf ")";
+    printf ";\n    printf(\"ok\\n\");\n}\n";
+}' > some.cb
+awk -v n=100000 'BEGIN {
+    printf "import std;\n\nfn main()\n{\n    auto a = ";
+    for (i = 0; i < n; i++) printf "[";
+    printf "1";
+    for (i = 0; i < n; i++) printf "]";
+    printf ";\n    printf(\"ok\\n\");\n}\n";
+}' > array.cb
+end
+run sh gen.sh
+status 0
+run $COBC --emit-c -o nest.c nest.cb
+status 0
+run $CC -fsyntax-only -w nest.c
+status 0
+run $COBC --cc $CC -o nest nest.cb
+status 0
+run ./nest
+stdout-is 1 2 3\n
+run sh -c "ulimit -t 20; exec $COBC --check refs_locals.cb"
+status 0
+run sh -c "ulimit -t 20; exec $COBC --certificate refs_vec.cert --check refs_vec.cb"
+status 0
+run sh -c "ulimit -t 20; exec $COBC --certificate some.cert --check some.cb"
+status 0
+run sh -c "ulimit -t 20; exec $COBC --certificate array.cert --check array.cb"
+status 0

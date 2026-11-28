@@ -1,0 +1,97 @@
+# D-0309 (`[Call-Self-Tail]`, spec/15 §2a): a self tail call is not a level of
+# nesting. `down(100000000)` and a 20 000-node list appended to and walked
+# through reference parameters (each step a call whose argument comes from a
+# `match` on the parameter's field) complete under gcc and clang, the calls
+# lowered as jumps (`goto self_tail;`, three at least: down, append and
+# length); mutual recursion, a frame holding a `String`, and one whose local
+# is borrowed still fault `diag.stack-exhausted`.
+file t.cb
+import std;
+import std::env;
+
+struct Node
+{
+    i64 key;
+    Option<Box<Node>> next;
+}
+
+fn down(u64 n) : bool
+{
+    if (n == 0) { true } else { down(n - 1) }
+}
+
+fn append(ref<Node, exclusive> n, i64 k)
+{
+    match (&mut n.next)
+    {
+        Some(b) : append(Box::get_mut(b), k),
+        None    : n.next = Some(Box::new(Node { .key = k, .next = None })),
+    }
+}
+
+fn length(ref<Node, shared> n, u64 acc) : u64
+{
+    match (&n.next)
+    {
+        Some(b) : length(Box::get(b), acc + 1),
+        None    : acc + 1,
+    }
+}
+
+fn even(u64 n) : bool
+{
+    if (n == 0) { true } else { odd(n - 1) }
+}
+
+fn odd(u64 n) : bool
+{
+    if (n == 0) { false } else { even(n - 1) }
+}
+
+fn with_string(u64 n) : u64
+{
+    String s = String::new();
+    if (n == 0) { 0 } else { with_string(n - 1) }
+}
+
+fn with_borrow(u64 n) : u64
+{
+    u64 x = n;
+    ref<u64, shared> r = &x;
+    if (*r == 0) { 0 } else { with_borrow(n - 1) }
+}
+
+fn main() : u8
+{
+    String m = Result::unwrap_or(arg(0), String::new());
+    if (m == "down") { printf("%v\n", down(100000000)); }
+    if (m == "list")
+    {
+        Node head = Node { .key = 0, .next = None };
+        for (i64 i = 1; i < 20000; i += 1)
+        {
+            append(&mut head, i);
+        }
+        printf("%v\n", length(&head, 0));
+    }
+    if (m == "mutual") { printf("%v\n", even(100000000)); }
+    if (m == "string") { printf("%v\n", with_string(100000000)); }
+    if (m == "borrow") { printf("%v\n", with_borrow(100000000)); }
+    0
+}
+end
+run $COBC --emit-c -o t.c t.cb
+status 0
+file-count t.c 3+ "goto self_tail;"
+run $COBC --cc $CC -o t t.cb
+status 0
+run ./t down
+stdout-is true\n
+run ./t list
+stdout-is 20000\n
+run ./t mutual
+stderr-starts fault[diag.stack-exhausted]
+run ./t string
+stderr-starts fault[diag.stack-exhausted]
+run ./t borrow
+stderr-starts fault[diag.stack-exhausted]

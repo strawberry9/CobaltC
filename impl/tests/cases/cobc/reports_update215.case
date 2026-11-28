@@ -1,0 +1,166 @@
+# CHG-0487: a copy of an expression keeps the record by which a view of a
+# text is known as one. `clone` lowers a copy of its argument; with a map
+# lookup by a text key in it (a `foreach` element, a temporary text) the
+# compiler stopped on an internal assert.
+file m1.cb
+import std;
+
+struct NF
+{
+    i64 v;
+    i64 i;
+}
+
+fn by_element(ref<HashMap<String, NF>, shared> m, ref<Vec<String>, shared> all) : i64
+{
+    i64 t = 0;
+    foreach (n in all)
+    {
+        NF tn = clone(Option::unwrap(HashMap::get(m, n)));
+        t += tn.v;
+    }
+    t
+}
+
+fn by_temporary_in_loop(ref<HashMap<String, NF>, shared> m, ref<Vec<String>, shared> all) : i64
+{
+    i64 t = 0;
+    foreach (n in all)
+    {
+        NF tn = clone(Option::unwrap(HashMap::get(m, &String::clone(n))));
+        t += tn.v;
+    }
+    t
+}
+
+fn by_temporary(ref<HashMap<String, NF>, shared> m, ref<String, shared> k) : i64
+{
+    NF tn = clone(Option::unwrap(HashMap::get(m, &String::clone(k))));
+    tn.v
+}
+
+fn main()
+{
+    HashMap<String, NF> b = HashMap::new();
+    HashMap::insert(&mut b, "x", NF { .v = 4, .i = 0 });
+    Vec<String> all = Vec::new();
+    Vec::push(&mut all, "x");
+    String k = "x";
+    printf("%v\n", by_element(&b, &all));
+    printf("%v\n", by_temporary_in_loop(&b, &all));
+    printf("%v\n", by_temporary(&b, &k));
+}
+end
+run $COBC --cc $CC --run m1.cb
+status 0
+stdout-is 4\n4\n4\n
+
+# CHG-0487: the names of a function's anchored zero-sized locals end with
+# the function. A `u32 z` and a zero-sized `Z z` in two blocks of a function
+# lowered in two forms: the C did not compile.
+file z1.cb
+import std;
+
+struct Z {}
+
+struct P
+{
+    u32 a;
+    u32 b;
+}
+
+fn touch(ref<Z, shared> z) : u32
+{
+    7
+}
+
+fn mix(ref<P, exclusive> a) : u32
+{
+    a.a = a.a + a.b;
+    u32 r = a.b;
+    {
+        u32 z = a.b;
+        r = r + z;
+    }
+    {
+        Z z = Z {};
+        r = r + touch(&z);
+    }
+    r
+}
+
+fn main()
+{
+    P x = P { .a = 1, .b = 2 };
+    printf("%v\n", mix(&mut x));
+    printf("%v\n", x.a);
+}
+end
+run $COBC --cc $CC --run z1.cb
+status 0
+stdout-is 11\n3\n
+
+# CHG-0487: a function entered from outside the program's functions keeps
+# its stack check. `work` is an `extern fn` that `main` calls too: C enters
+# it through its stub on a stack of any depth.
+file w1.cb
+import std;
+
+fn leaf(u32 n) : u32
+{
+    printf("%v\n", n);
+    n + 1
+}
+
+extern fn work(u32 n) : u32
+{
+    leaf(n) + 1
+}
+
+fn main()
+{
+    printf("%v\n", work(3));
+}
+end
+run $COBC --emit-c -o w1.c w1.cb
+status 0
+cut w1.c work.c "f_work(uint32_t p_n)\n" "\n}\n"
+file-has work.c cb_stack_check();
+run $COBC --cc $CC --run w1.cb
+status 0
+stdout-is 3\n5\n
+
+# CHG-0487: a closure's frame counts against the budget of what it calls.
+# `leafy` (30 KB) is called from `main` and from a closure whose frame is
+# 48 KB: below the closure's check the two use more than the 64 KB a chain
+# without a check may, so `leafy` keeps its own.
+file c1.cb
+import std;
+
+fn leafy(usize n) : usize
+{
+    array<u8, 30000> pad = [0; 30000];
+    pad[n] = 1;
+    printf("%v\n", pad[1]);
+    n + 1
+}
+
+fn main()
+{
+    auto big = [](usize n) : usize
+    {
+        array<u8, 48000> room = [0; 48000];
+        room[n] = 1;
+        leafy(n) + widen<usize>(room[2])
+    };
+    printf("%v\n", leafy(1));
+    printf("%v\n", big(2));
+}
+end
+run $COBC --emit-c -o c1.c c1.cb
+status 0
+cut c1.c leafy.c "f_leafy(uint64_t p_n)\n" "\n}\n"
+file-has leafy.c cb_stack_check();
+run $COBC --cc $CC --run c1.cb
+status 0
+stdout-is 1\n2\n0\n4\n

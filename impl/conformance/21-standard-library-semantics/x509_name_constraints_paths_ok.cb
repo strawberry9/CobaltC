@@ -1,0 +1,273 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.x509 [Verify-Chain] (D-0160); conf.x509-name-constraints-and-paths
+// kind: positive
+// expect: ok
+//
+// `verify_chain`'s name constraints, its search over candidate issuers and
+// the constraints of an anchor and of an issuer's usage, on certificates
+// made with Python's `cryptography` (valid 2025 to 2045, checked at
+// 2030-01-01). An intermediate whose critical name constraints permit
+// `good.test` and 10.0.0.0/8 and exclude `bad.good.test`: names inside are
+// accepted, `evil.example`, `bad.good.test`, a wildcard verified for the
+// excluded host, and an address outside are `NotAuthority`; one whose constraint is a
+// directoryName is `UnhandledCritical`. An expired and a renewed
+// intermediate of the same name and key, in either order: the renewed one
+// is found. A root with path length 0: a leaf under it directly verifies,
+// one under an intermediate is `NotAuthority`. An intermediate whose
+// extended key usage is clientAuth only: `WrongUsage`.
+
+import std;
+
+const str ROOT =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBMjCB2aADAgECAhRph6fQqaFYg/okJ8YE6c96qRx8HjAKBggqhkjOPQQDAjAP\n"
+    "MQ0wCwYDVQQDDARSb290MB4XDTI1MDEwMTAwMDAwMFoXDTQ1MDEwMTAwMDAwMFow\n"
+    "DzENMAsGA1UEAwwEUm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABNxmXTFB\n"
+    "y/yhkf13zpDVfEy0Ob7c47Vz2Ej/g6abj9ixNcwh3nk+Dh1qhvP4pNvzIUn2OADH\n"
+    "puNBBkdHjSAF8gmjEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAw\n"
+    "RQIgaWiEOEDDrf9uhhp3Kf2pqSA8cFAbtNMpzEx4k3DI6QYCIQDhqqcgLJXidSUI\n"
+    "/M9Bui9hQvY7cmVH+7RCrnoDvN+LDg==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_NC =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBbjCCAROgAwIBAgIUCys0IG1dUrY9ttfUJYF1HUxUCwUwCgYIKoZIzj0EAwIw\n"
+    "DzENMAsGA1UEAwwEUm9vdDAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MA0xCzAJBgNVBAMMAk5DMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2GPZ+dFy\n"
+    "fCvV3rKh2xNRu0WVAYqIjDVxYJZZZ6Et/2dWtnDeObS7jq9axrQDxmwzmtX9iGmX\n"
+    "j3F4wxRnNN7EAKNPME0wDwYDVR0TAQH/BAUwAwEB/zA6BgNVHR4BAf8EMDAuoBkw\n"
+    "C4IJZ29vZC50ZXN0MAqHCAoAAAD/AAAAoREwD4INYmFkLmdvb2QudGVzdDAKBggq\n"
+    "hkjOPQQDAgNJADBGAiEA+0RSjKpPEjqt/zi+Hh+ckDS/18SBxqF5elqkHS9iZVIC\n"
+    "IQCOD1+LYT3erD7/yueo12SDSUxrqHOwPDU+FD+M8UEUdg==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_GOOD =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBRzCB7qADAgECAhQ55bL3WucGvAp4OzcG2qhWEAbrJzAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMBQx\n"
+    "EjAQBgNVBAMMCWdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD4Y\n"
+    "MZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBreVuX2\n"
+    "EywwRkT2WAFBWQa49t6jJTAjMCEGA1UdEQQaMBiCCWdvb2QudGVzdIILYS5nb29k\n"
+    "LnRlc3QwCgYIKoZIzj0EAwIDSAAwRQIhANd0WFyVjdYogYoOtNH1Ibs9E9CVCRQT\n"
+    "GmOoRXqJ7/fOAiBV6MV/jiz7N7Q8xiX3PUWMfMRYKJsNO3ZW+0tlNxK/vQ==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_EVIL =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBQTCB56ADAgECAhRXxDcuS9MK8cm2pLJYJf3Mrvnz3TAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMBcx\n"
+    "FTATBgNVBAMMDGV2aWwuZXhhbXBsZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IA\n"
+    "BD4YMZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBre\n"
+    "VuX2EywwRkT2WAFBWQa49t6jGzAZMBcGA1UdEQQQMA6CDGV2aWwuZXhhbXBsZTAK\n"
+    "BggqhkjOPQQDAgNJADBGAiEA1LYOGF+mLCG+Bt+soFdtD/Cl6VK/tMKt2/GwFuXj\n"
+    "p9cCIQCtLwpHfTNJgUjF8S+Bbx5AT1+XA1nYinqlDxEzch7roQ==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_EXCLUDED =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBQjCB6aADAgECAhQgDiCtXSaNj6HKVmk/QjRKvE/Y5DAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMBgx\n"
+    "FjAUBgNVBAMMDWJhZC5nb29kLnRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n"
+    "AAQ+GDGQ8Cxca/NA4da5KSWmM9/wpL/jdtvkjjhjBS5VI+Ufhgqw3y9Ajt12HQga\n"
+    "3lbl9hMsMEZE9lgBQVkGuPbeoxwwGjAYBgNVHREEETAPgg1iYWQuZ29vZC50ZXN0\n"
+    "MAoGCCqGSM49BAMCA0gAMEUCIEDMoldYEqHHfUinCdJ1rSOZo4w1PkD8YFelT5pg\n"
+    "705YAiEAjDNhILPucx96ZLdfGd+CbySOutjFfyoQ1HC+CuCpEVM=\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_WILDCARD =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBNTCB26ADAgECAhQPsB5ZBQDl46Tatf+DniWnXWmMTDAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMAwx\n"
+    "CjAIBgNVBAMMAXgwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ+GDGQ8Cxca/NA\n"
+    "4da5KSWmM9/wpL/jdtvkjjhjBS5VI+Ufhgqw3y9Ajt12HQga3lbl9hMsMEZE9lgB\n"
+    "QVkGuPbeoxowGDAWBgNVHREEDzANggsqLmdvb2QudGVzdDAKBggqhkjOPQQDAgNJ\n"
+    "ADBGAiEA/3OeJWT1dwbVIoX+zj3EhLmBKx+v9TG6YAtW7mYfyEQCIQD/EsUKSShU\n"
+    "TUrcwFLarWljD+zr5kITvUgEyIYSzz+ZGg==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_IP_IN =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBODCB36ADAgECAhRRsnNVie1B0/ljx1OLEWpNyXDJMzAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMAwx\n"
+    "CjAIBgNVBAMMAXgwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ+GDGQ8Cxca/NA\n"
+    "4da5KSWmM9/wpL/jdtvkjjhjBS5VI+Ufhgqw3y9Ajt12HQga3lbl9hMsMEZE9lgB\n"
+    "QVkGuPbeox4wHDAaBgNVHREEEzARgglnb29kLnRlc3SHBAoBAgMwCgYIKoZIzj0E\n"
+    "AwIDSAAwRQIgCLs3HWcFgdpt6xGUOkLw/0zgIG5qYIm5DEZQP3cB6u8CIQDjYGh0\n"
+    "ol5qeR3blIcsZ1m1y+ZsOZMxB2K6UvJJ5/lAuQ==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str NC_IP_OUT =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBNzCB36ADAgECAhQ1j6YOQ2DaUbC4ab9LJ38X8cMZFjAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJOQzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMAwx\n"
+    "CjAIBgNVBAMMAXgwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ+GDGQ8Cxca/NA\n"
+    "4da5KSWmM9/wpL/jdtvkjjhjBS5VI+Ufhgqw3y9Ajt12HQga3lbl9hMsMEZE9lgB\n"
+    "QVkGuPbeox4wHDAaBgNVHREEEzARgglnb29kLnRlc3SHBMCoAQEwCgYIKoZIzj0E\n"
+    "AwIDRwAwRAIgZTdcqMYMWlq6etN42lmw7KzrbZiOW0lkcNbvmCyM5bQCIEL011y6\n"
+    "0+th8rxClQrG1IWcbKVNwjxygHEBWpOhvpmM\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_DN =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBWjCCAQGgAwIBAgIUITdTA/Qwe224vcw1rKtgiWT+eCwwCgYIKoZIzj0EAwIw\n"
+    "DzENMAsGA1UEAwwEUm9vdDAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MA0xCzAJBgNVBAMMAkROMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE26gYncnZ\n"
+    "hn/kQ9NoQzZytLFX9nrcneouu07rnxMGca3VLWn8zGLsXNNqsI2IuxFfGe8LlsFf\n"
+    "gIuwLifcxCs6UaM9MDswDwYDVR0TAQH/BAUwAwEB/zAoBgNVHR4BAf8EHjAcoBow\n"
+    "GKQWMBQxEjAQBgNVBAMMCVNvbWV3aGVyZTAKBggqhkjOPQQDAgNHADBEAiBa3bxl\n"
+    "WKhtIamSF+KX1K8IJMoXxKLbg2EjCwGF/K3ckQIgPBleCmjWAs340ua+ifSSmExQ\n"
+    "yGhwRLjWxFkf8WBiTro=\n"
+    "-----END CERTIFICATE-----\n";
+
+const str DN_LEAF =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBOzCB4aADAgECAhQDkW1jiBMd1BnPtLS3qS9oFZQj1zAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJETjAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMBQx\n"
+    "EjAQBgNVBAMMCWdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD4Y\n"
+    "MZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBreVuX2\n"
+    "EywwRkT2WAFBWQa49t6jGDAWMBQGA1UdEQQNMAuCCWdvb2QudGVzdDAKBggqhkjO\n"
+    "PQQDAgNJADBGAiEAm7CSPd8j4tJIbGhkeAiweZn6B8zr0pvznqAPf1DY3NUCIQDE\n"
+    "0FuKBBJJRzByuLl/BtKv3cKAdi1xaVMV1TKQTRHiQA==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_EXPIRED =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBMjCB2qADAgECAhRh7aZXr9OaM07s46xZPARPQ81zYjAKBggqhkjOPQQDAjAP\n"
+    "MQ0wCwYDVQQDDARSb290MB4XDTIwMDEwMTAwMDAwMFoXDTI0MDEwMTAwMDAwMFow\n"
+    "EDEOMAwGA1UEAwwFSW50ZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATSINup\n"
+    "4L+ZQF7Ak0guH+/tVKMG9M76k3/X8R4vSdX+9ZxCdogqJrLyfZeUCAcA2/PlLD3n\n"
+    "oUC9jsj8cOijU6K3oxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cA\n"
+    "MEQCIHSY2ZChBebwfWXmdJWjYzdNj84yPJth7lrik6fWeg9fAiBeWKgOlqLVFShO\n"
+    "QQqSjpaw1dMdKccjB5A5wZY8RAJspA==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_RENEWED =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBMjCB2qADAgECAhQs1mntyLUPsHv5sa2JsEuL+WbOmDAKBggqhkjOPQQDAjAP\n"
+    "MQ0wCwYDVQQDDARSb290MB4XDTI1MDEwMTAwMDAwMFoXDTQ1MDEwMTAwMDAwMFow\n"
+    "EDEOMAwGA1UEAwwFSW50ZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATSINup\n"
+    "4L+ZQF7Ak0guH+/tVKMG9M76k3/X8R4vSdX+9ZxCdogqJrLyfZeUCAcA2/PlLD3n\n"
+    "oUC9jsj8cOijU6K3oxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cA\n"
+    "MEQCIBn+hJhXL8n5ZZWq0RXQElkCHKd46pM0hzlYbnkbOxXsAiAxDX14WKKnsbDB\n"
+    "0nuE/rXSN3xTGIgp+5/VqEEyLtOatQ==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str EK_LEAF =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBPTCB5KADAgECAhRrTEo26Qti4qNLKPN4x8xT09lg5TAKBggqhkjOPQQDAjAQ\n"
+    "MQ4wDAYDVQQDDAVJbnRlcjAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MBQxEjAQBgNVBAMMCWdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IA\n"
+    "BD4YMZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBre\n"
+    "VuX2EywwRkT2WAFBWQa49t6jGDAWMBQGA1UdEQQNMAuCCWdvb2QudGVzdDAKBggq\n"
+    "hkjOPQQDAgNIADBFAiEArU8wiVauo14GaSYDdZf8hBl5DGHVHUTKkPOBnmipbBsC\n"
+    "IG1uC8w62cq9UjdBEGrUjW7sDQ24VNth0iLlxnnn4FON\n"
+    "-----END CERTIFICATE-----\n";
+
+const str ROOT_PL0 =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBNjCB3qADAgECAhRwkmFyLB+CmXK+nzOJIU7xLX8uoTAKBggqhkjOPQQDAjAQ\n"
+    "MQ4wDAYDVQQDDAVSb290MzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MBAxDjAMBgNVBAMMBVJvb3QzMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECaU7\n"
+    "MHpQdXR6pCVf/zgyHbvfiRyjO0ReRyy9FW7zGdnD3AhZ3U/UMVfPb71IFaNmynzh\n"
+    "+z9fsxRWnz3xTi/xGKMWMBQwEgYDVR0TAQH/BAgwBgEB/wIBADAKBggqhkjOPQQD\n"
+    "AgNHADBEAiAEcxayFp2JQrW3xiXxAyX/1CjOjxemL+XFgP+jCSLJugIgcSQwFnTQ\n"
+    "dus7G1zhUrefxZK+z+3l54PFGgKvieriKYY=\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_UNDER_PL0 =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBNTCB3KADAgECAhQQCgWfdshm6tj4F8fzaMivqFFsRzAKBggqhkjOPQQDAjAQ\n"
+    "MQ4wDAYDVQQDDAVSb290MzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MBExDzANBgNVBAMMBkludGVyMzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHjV\n"
+    "olIlW6WTUYs/brpjJ2nr6rNo3ncvbFqv6CFLjUHOefKC7JH1lhfgmDcVa2mVCP6Y\n"
+    "Cfa1vbxrCZZq+fcrSEajEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwID\n"
+    "SAAwRQIhAMwXz0Hc6S6yeItt4Tx9hAWB5juTREKuOkIb/htemL0nAiBeCHLUcWR9\n"
+    "ORZ5L9EWVFLT+k1RN2UEs2DrFOjVvtKhcA==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str PL0_DEEP_LEAF =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBPzCB5aADAgECAhRg8vGM9xmMyraMph8twFD+vhA1kDAKBggqhkjOPQQDAjAR\n"
+    "MQ8wDQYDVQQDDAZJbnRlcjMwHhcNMjUwMTAxMDAwMDAwWhcNNDUwMTAxMDAwMDAw\n"
+    "WjAUMRIwEAYDVQQDDAlnb29kLnRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n"
+    "AAQ+GDGQ8Cxca/NA4da5KSWmM9/wpL/jdtvkjjhjBS5VI+Ufhgqw3y9Ajt12HQga\n"
+    "3lbl9hMsMEZE9lgBQVkGuPbeoxgwFjAUBgNVHREEDTALgglnb29kLnRlc3QwCgYI\n"
+    "KoZIzj0EAwIDSQAwRgIhAL5kDTO1LJPJtoIKyWPq25L+ri/ITvbpNXH4pIea5Il7\n"
+    "AiEA3rlLEjtMcJGjAlG/lHULkIEHL3kfoabLOv47ohQVrIM=\n"
+    "-----END CERTIFICATE-----\n";
+
+const str PL0_LEAF =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBPjCB5KADAgECAhQzTyb4bwJP86nuKL2QH5hvcfLOcTAKBggqhkjOPQQDAjAQ\n"
+    "MQ4wDAYDVQQDDAVSb290MzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBa\n"
+    "MBQxEjAQBgNVBAMMCWdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IA\n"
+    "BD4YMZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBre\n"
+    "VuX2EywwRkT2WAFBWQa49t6jGDAWMBQGA1UdEQQNMAuCCWdvb2QudGVzdDAKBggq\n"
+    "hkjOPQQDAgNJADBGAiEA1YE7SvNBoc5utoO2nGfvF/DSZ77vXZiJUp6gbkzUPwYC\n"
+    "IQDggYTOrgAsh9je9yUajgfL7/VJho41m3y7/FTlE4Uf+Q==\n"
+    "-----END CERTIFICATE-----\n";
+
+const str INT_CLIENT_ONLY =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBRTCB7KADAgECAhQKO6cg81F5q7xCMyQPkuNrwA0NPjAKBggqhkjOPQQDAjAP\n"
+    "MQ0wCwYDVQQDDARSb290MB4XDTI1MDEwMTAwMDAwMFoXDTQ1MDEwMTAwMDAwMFow\n"
+    "DTELMAkGA1UEAwwCRUswWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAT0XgqktG9P\n"
+    "D6z9EwbnO6m1CFZW7MNUAnPUc97MDt7wEd2zxd1DM2/0PiSc9oBNqyLkazbdLhS2\n"
+    "tVE3HPKqOz34oygwJjAPBgNVHRMBAf8EBTADAQH/MBMGA1UdJQQMMAoGCCsGAQUF\n"
+    "BwMCMAoGCCqGSM49BAMCA0gAMEUCIHkEqLzYmiEkDn4w5TLeaeyaysvSPxTXQOj+\n"
+    "SYDbPMizAiEA6YnwwGjPgIhCvOYnNSL+wR+xBTTv6sTTqZy3cL+xp84=\n"
+    "-----END CERTIFICATE-----\n";
+
+const str CLIENT_ONLY_LEAF =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBOTCB4aADAgECAhQEZZDXdiMuxjkzpAeSX/mw2f/b9TAKBggqhkjOPQQDAjAN\n"
+    "MQswCQYDVQQDDAJFSzAeFw0yNTAxMDEwMDAwMDBaFw00NTAxMDEwMDAwMDBaMBQx\n"
+    "EjAQBgNVBAMMCWdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD4Y\n"
+    "MZDwLFxr80Dh1rkpJaYz3/Ckv+N22+SOOGMFLlUj5R+GCrDfL0CO3XYdCBreVuX2\n"
+    "EywwRkT2WAFBWQa49t6jGDAWMBQGA1UdEQQNMAuCCWdvb2QudGVzdDAKBggqhkjO\n"
+    "PQQDAgNHADBEAiAWqu55OzayJfR0xiwTLSxde4Mel7aRqp8PuDT4KV4GQAIgfqhC\n"
+    "GD5HQ+fhYtC7I1rOHjb22mOJTP65UCpTSiDv4eM=\n"
+    "-----END CERTIFICATE-----\n";
+fn cert(str pem) : Certificate
+{
+    Vec<Certificate> v = certificates_from_pem(StringView::of(pem));
+    Vec::remove(&mut v, 0)
+}
+
+fn check(str what, str leaf, slice<str, shared> mids, str root, str host)
+{
+    Vec<Certificate> ms = Vec::new();
+    foreach (m in mids)
+    {
+        Vec::push(&mut ms, cert(*m));
+    }
+    TrustStore roots = TrustStore { .roots = Vec::new() };
+    Vec::push(&mut roots.roots, cert(root));
+    DateTime now = Option::unwrap(DateTime::new(2030, 1, 1, 0, 0, 0));
+    match (verify_chain(&cert(leaf), &ms, &roots, StringView::of(host), &now))
+    {
+        Ok(_)  : printf("%-44s ok\n", what),
+        Err(e) : printf("%-44s %s\n", what, CertError::text(&e)),
+    }
+}
+
+fn main() : u8
+{
+    array<str, 0> none = [];
+    check("names inside the constraints", NC_GOOD, &[INT_NC], ROOT, "a.good.test");
+    check("a name outside the permitted subtree", NC_EVIL, &[INT_NC], ROOT, "evil.example");
+    check("a name in the excluded subtree", NC_EXCLUDED, &[INT_NC], ROOT, "bad.good.test");
+    check("a wildcard, for a host inside", NC_WILDCARD, &[INT_NC], ROOT, "x.good.test");
+    check("the wildcard, for the excluded host", NC_WILDCARD, &[INT_NC], ROOT, "bad.good.test");
+    check("an address inside the permitted range", NC_IP_IN, &[INT_NC], ROOT, "10.1.2.3");
+    check("an address outside it", NC_IP_OUT, &[INT_NC], ROOT, "good.test");
+    check("a directoryName constraint", DN_LEAF, &[INT_DN], ROOT, "good.test");
+    check("the expired intermediate first", EK_LEAF, &[INT_EXPIRED, INT_RENEWED], ROOT, "good.test");
+    check("the renewed intermediate first", EK_LEAF, &[INT_RENEWED, INT_EXPIRED], ROOT, "good.test");
+    check("the expired intermediate alone", EK_LEAF, &[INT_EXPIRED], ROOT, "good.test");
+    check("a root with path length 0, directly", PL0_LEAF, &none, ROOT_PL0, "good.test");
+    check("a root with path length 0, one below", PL0_DEEP_LEAF, &[INT_UNDER_PL0], ROOT_PL0, "good.test");
+    check("an intermediate for clientAuth only", CLIENT_ONLY_LEAF, &[INT_CLIENT_ONLY], ROOT, "good.test");
+    0
+}

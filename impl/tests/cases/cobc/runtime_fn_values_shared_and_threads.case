@@ -1,0 +1,93 @@
+# Reports 155, 148, 132. A stack of 20,000 wrapping closures built by moves
+# (`replace`, `overwrite`, a `move` capture) takes no time per step that
+# grows with the stack (copies of a closure that owns no resource and
+# writes none of its captures share its box); copies stay independent where
+# they must (a closure that writes its captures). Calls through a shared
+# reference and of capturing closures give the same results. Four threads
+# each lock their own mutex and use their own channel (the runtime keeps
+# each one's state apart from the others'). Under each C compiler.
+file chain.cb
+import std;
+
+fn ident(i64 x) : i64
+{
+    x
+}
+
+fn main()
+{
+    fn(i64) : i64 f = ident;
+    foreach (i in 0..20000: u32)
+    {
+        fn(i64) : i64 prev = replace(&mut f, ident);
+        overwrite(&mut f, move [prev](i64 x) : i64 { prev(x) + 1 });
+    }
+    fn(i64) : i64 g = f;
+    printf("%v %v\n", f(0), g(1));
+    Vec<fn(i64) : i64> hs = Vec::new();
+    Vec::push(&mut hs, [](i64 x) : i64 { x * 2 });
+    i64 k = 3;
+    Vec::push(&mut hs, move [k](i64 x) : i64 { x * k });
+    i64 s = 0;
+    foreach (h in &hs)
+    {
+        s += (*h)(5);
+    }
+    printf("%v\n", s);
+    i32 n = 0;
+    fn() : i32 c = move [n]() : i32
+    {
+        n = n + 1;
+        n
+    };
+    fn() : i32 d = c;
+    printf("%v %v %v\n", c(), c(), d());
+}
+end
+file own.cb
+import std;
+
+fn worker(u64 n) : u64
+{
+    mutex<u64> m = Mutex::new(0: u64);
+    Channel<u64> c = Channel::new(4);
+    u64 got = 0;
+    foreach (i in 0..n)
+    {
+        {
+            auto g = lock(&m);
+            *g += 1;
+        }
+        _ = Channel::send(&c, i);
+        got += Option::unwrap(Channel::recv(&c));
+    }
+    *lock(&m) + got
+}
+
+fn main()
+{
+    u64 total = 0;
+    {
+        Vec<handle<u64>> hs = Vec::new();
+        foreach (t in 0..4: u64)
+        {
+            Vec::push(&mut hs, spawn(worker, 100000));
+        }
+        foreach (h in hs)
+        {
+            total += join(h);
+        }
+    }
+    printf("%v\n", total);
+}
+end
+run $COBC --cc $CC -o chain chain.cb
+status 0
+run timeout 20 ./chain
+status 0
+stdout-is 20000 20001\n25\n1 2 1\n
+run $COBC --cc $CC -o own own.cb
+status 0
+run timeout 60 ./own
+status 0
+stdout-is 20000200000\n

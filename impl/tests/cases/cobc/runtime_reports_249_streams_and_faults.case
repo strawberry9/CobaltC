@@ -1,0 +1,180 @@
+# Reports 279, 323, 324, 252, 321, 337, 319 (group R, the push after
+# Update 207): `%u` beside other specifiers prints unsigned; a line filter
+# piped into `head` ends at once, also when the refused write is the flush
+# before `read_line` or `eprintf`; a line filter writes its output in
+# pieces, not a write a line; a run-time fault's caret is under the operator
+# or the indexed name the line has once, and an unsigned `0 - 1` names the
+# count-down form; a lone waiter's deadlock says it waits alone; a long `Rc`
+# chain is destroyed in constant stack (Update 209), under `--all-checks` too
+# (D-0339); an `exit` while a thread holds a reference to a
+# local exits with its status.
+# Under each C compiler.
+platform unix
+file pu.cb
+import std;
+
+fn main()
+{
+    i32 n = 0 - 1;
+    printf("%u %o\n", n, 8);
+    String s = sprintf("bits=%u width=%8.3f", n, 1.5);
+    printf("%s\n", &s);
+}
+end
+file filter.cb
+import std;
+
+fn main() : u8
+{
+    u64 n = 0;
+    while (Some(line) = Result::unwrap(read_line()))
+    {
+        printf("%s\n", &line);
+        n += 1;
+    }
+    eprintf("filter: read %v lines\n", n);
+    0
+}
+end
+file progress.cb
+import std;
+
+fn main() : u8
+{
+    u64 n = 0;
+    while (true)
+    {
+        printf("record %v\n", n);
+        n += 1;
+        if (n % 100 == 0)
+        {
+            eprintf("processed %v\n", n);
+        }
+    }
+    0
+}
+end
+file loc.cb
+import std;
+
+fn main()
+{
+    usize n = widen<usize>(arg_count());
+    Vec<u32> v = Vec::new();
+    if (n == 1)
+    {
+        u32 x = v[n] + 1;
+        printf("%v\n", x);
+    }
+    for (usize i = n; i != 99; i -= 1)
+    {
+        printf("%v\n", i);
+    }
+}
+end
+file alone.cb
+import std;
+
+fn main()
+{
+    Semaphore s = Semaphore::new(0);
+    Semaphore::acquire(&s);
+}
+end
+file chain.cb
+import std;
+
+struct Node
+{
+    i64 v;
+    Option<Rc<Node>> next;
+}
+
+fn main()
+{
+    Option<Rc<Node>> head = None;
+    foreach (i in 0..300000: i64)
+    {
+        head = Some(Rc::new(Node { .v = i, .next = head }));
+    }
+    printf("built\n");
+    drop(head);
+    printf("dropped\n");
+}
+end
+file ex.cb
+import std;
+
+fn reader(ref<Vec<u64>, shared> v) : usize
+{
+    sleep_ms(1000);
+    Vec::len(v)
+}
+
+fn main()
+{
+    Vec<u64> v = Vec::from_slice(&[1: u64, 2, 3]);
+    auto h = spawn(reader, &v);
+    if (arg_count() == 0)
+    {
+        eprintf("bad usage\n");
+        exit(64);
+    }
+    printf("%v\n", join(h));
+}
+end
+run $COBC --cc $CC -o pu pu.cb
+status 0
+run ./pu
+status 0
+stdout-is 4294967295 10\nbits=4294967295 width=   1.500\n
+run $COBC --cc $CC -o filter filter.cb
+status 0
+run sh -c "{ yes | timeout 20 ./filter; echo $? > st.txt; } 2> err.txt | head -n 1"
+stdout-is y\n
+file-is st.txt 1\n
+run sh -c "{ seq 200000 | ./filter; echo $? > st.txt; } 2> err.txt | head -n 1"
+stdout-is 1\n
+file-is st.txt 1\n
+file-lacks err.txt filter: read
+run sh -c "seq 20000 | ./filter > out.txt 2> /dev/null; grep -c . out.txt"
+stdout-is 20000\n
+run $COBC --cc $CC -o progress progress.cb
+status 0
+run sh -c "{ timeout 20 ./progress; echo $? > st.txt; } 2> /dev/null | head -n 1"
+stdout-is record 0\n
+file-is st.txt 1\n
+run $COBC --cc $CC -o loc loc.cb
+status 0
+run ./loc x
+status 1
+stderr-has --> loc.cb:9:17
+stderr-has fault[diag.index-out-of-bounds]: index 1 is out of bounds for length 0
+run ./loc
+status 1
+stderr-has fault[diag.arith-overflow]: 0 - 1 is outside `usize`
+stderr-has --> loc.cb:12:34
+stderr-has = note: counting an unsigned value down to 0, test before the step: `while (i > 0) { i -= 1; ... }`
+run $COBC --cc $CC -o alone alone.cb
+status 0
+run ./alone
+status 1
+stderr-has fault[diag.deadlock]: `main` waits here forever: no other thread can end this wait (each has ended or waits too)
+run $COBC --cc $CC -o chain chain.cb
+status 0
+run sh -c "./chain 2> err.txt; grep -c '^fault' err.txt"
+stdout-is built\ndropped\n0\n
+run $COBC --all-checks --cc $CC -o chainx chain.cb
+status 0
+run sh -c "./chainx 2> err.txt; grep -c '^fault' err.txt"
+stdout-is built\ndropped\n0\n
+run $COBC --cc $CC -o ex ex.cb
+status 0
+run ./ex
+status 64
+stderr-has bad usage
+run $COBC --all-checks --cc $CC -o exx ex.cb
+status 0
+run ./exx
+status 64
+stderr-has bad usage

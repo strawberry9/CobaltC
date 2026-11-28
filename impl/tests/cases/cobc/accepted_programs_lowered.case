@@ -1,0 +1,198 @@
+# Programs the checker accepts that the compiler crashed on, built invalid C
+# for, or computed wrongly (reports 074, 079, 112, 144, 145, 210 of the
+# push after Update 206), each in the default form and with --all-checks.
+#
+# 074: a reference bound to `&v[$ - 1]` and passed on: `$` stood for no
+# length in the element-reference `let`'s lowering.
+file dollar.cb
+import std;
+
+struct Section
+{
+    String name;
+    Vec<String> keys;
+}
+
+fn show(ref<i32, shared> r)
+{
+    printf("%d\n", *r);
+}
+
+fn add_key(ref<Section, exclusive> s, StringView k)
+{
+    Vec::push(&mut s.keys, String::copy(k));
+}
+
+fn main()
+{
+    Vec<i32> v = Vec::from_slice(&[1, 2, 3]);
+    ref<i32, shared> last = &v[$ - 1];
+    show(last);
+    Vec<Section> out = Vec::new();
+    Vec::push(&mut out, Section { .name = "a", .keys = Vec::new() });
+    Vec::push(&mut out, Section { .name = "b", .keys = Vec::new() });
+    ref<Section, exclusive> cur = &mut out[$ - 1];
+    add_key(cur, "k");
+    Vec<Vec<i32>> vv = Vec::new();
+    Vec::push(&mut vv, Vec::from_slice(&[4, 5]));
+    ref<i32, shared> inner = &vv[0][$ - 1];
+    show(inner);
+    printf("%v %v\n", Vec::len(&out[1].keys), Vec::len(&out[0].keys));
+}
+end
+run $COBC --run dollar.cb
+status 0
+stdout-is 3\n5\n1 0\n
+run $COBC --all-checks --run dollar.cb
+status 0
+stdout-is 3\n5\n1 0\n
+# 079: an `auto`-bound closure given to a generic parameter `T` that another
+# argument fixes as a `fn` type is boxed as that type.
+file auto_closure.cb
+import std;
+
+struct Slot<T>
+{
+    T value;
+}
+
+fn Slot::set<T>(ref<Slot<T>, exclusive> s, T v)
+{
+    s.value = v;
+}
+
+fn main()
+{
+    auto dbl = [](i32 x) : i32 { x * 2 };
+    Vec<fn(i32) : i32> v = Vec::new();
+    Vec::push(&mut v, dbl);
+    fn(i32) : i32 h = [](i32 x) : i32 { x };
+    overwrite(&mut h, dbl);
+    HashMap<u32, fn(i32) : i32> m = HashMap::new();
+    HashMap::insert(&mut m, 1, dbl);
+    Slot<fn(i32) : i32> s = Slot<fn(i32) : i32> { .value = [](i32 x) : i32 { x } };
+    Slot::set(&mut s, dbl);
+    printf("%v %v %v %v\n", (v[0])(1), h(1), (*Option::unwrap(HashMap::get(&m, 1)))(1), (s.value)(5));
+}
+end
+run $COBC --run auto_closure.cb
+status 0
+stdout-is 2 2 2 10\n
+run $COBC --all-checks --run auto_closure.cb
+status 0
+stdout-is 2 2 2 10\n
+# 112: a field read through `ref<ref<S, shared>, shared>` in a closure.
+file refref.cb
+import std;
+
+struct Emp
+{
+    u32 salary;
+}
+
+fn main()
+{
+    Emp a = Emp { .salary = 50 };
+    Emp b = Emp { .salary = 70 };
+    Vec<ref<Emp, shared>> refs = Vec::new();
+    Vec::push(&mut refs, &a);
+    Vec::push(&mut refs, &b);
+    Vec::sort_by(&mut refs, [](ref<ref<Emp, shared>, shared> x, ref<ref<Emp, shared>, shared> y) : bool { x.salary > y.salary });
+    auto get = [](ref<ref<Emp, shared>, shared> e) : u32 { e.salary };
+    printf("%v %v\n", refs[0].salary, get(&refs[1]));
+}
+end
+run $COBC --run refref.cb
+status 0
+stdout-is 70 50\n
+run $COBC --all-checks --run refref.cb
+status 0
+stdout-is 70 50\n
+# 144: an `auto`-bound `move` closure capturing a `fn` value, or a struct
+# holding one, called here or after being returned.
+file wrap.cb
+import std;
+
+struct Handler
+{
+    fn(i32) : i32 f;
+}
+
+fn make(i32 k) : fn(i32) : i32
+{
+    Handler h = Handler { .f = move [k](i32 x) : i32 { x + k } };
+    auto wrapped = move [h](i32 x) : i32 { (h.f)(x) * 2 };
+    wrapped
+}
+
+fn main()
+{
+    i32 k = 4;
+    fn(i32) : i32 f = move [k](i32 x) : i32 { x + k };
+    auto w1 = move [f](i32 x) : i32 { f(x) * 2 };
+    Handler h = Handler { .f = move [k](i32 x) : i32 { x + k } };
+    auto w2 = move [h](i32 x) : i32 { (h.f)(x) * 2 };
+    printf("%v %v %v\n", w1(3), w2(3), make(4)(3));
+}
+end
+run $COBC --run wrap.cb
+status 0
+stdout-is 14 14 14\n
+run $COBC --all-checks --run wrap.cb
+status 0
+stdout-is 14 14 14\n
+# 145: a `fn` value whose parameter is `void`: its call thunk takes a
+# `cb_unit`, as the function it calls does.
+file unitparam.cb
+import std;
+
+fn five(void x) : i32
+{
+    5
+}
+
+fn main()
+{
+    fn(void) : i32 f = five;
+    fn(void) : i32 h = [](void x) : i32 { 6 };
+    Vec<fn(void) : void> slots = Vec::new();
+    Vec::push(&mut slots, [](void v) { printf("clicked\n"); });
+    foreach (s in &slots)
+    {
+        (*s)(());
+    }
+    printf("%v %v\n", f(()), h(()));
+}
+end
+run $COBC --run unitparam.cb
+status 0
+stdout-is clicked\n5 6\n
+run $COBC --all-checks --run unitparam.cb
+status 0
+stdout-is clicked\n5 6\n
+# 210: a borrowed array literal of unit variants only, given as a slice.
+file unitslice.cb
+import std;
+
+enum V
+{
+    Nothing,
+    Num(i64),
+}
+
+fn count(slice<V, shared> ps) : usize
+{
+    slice_len(ps)
+}
+
+fn main()
+{
+    printf("%v %v\n", count(&[Nothing]), count(&[Nothing, Nothing]));
+}
+end
+run $COBC --run unitslice.cb
+status 0
+stdout-is 1 2\n
+run $COBC --all-checks --run unitslice.cb
+status 0
+stdout-is 1 2\n

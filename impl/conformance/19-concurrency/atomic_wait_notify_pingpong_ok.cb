@@ -1,0 +1,41 @@
+// CONFORMANCE-CASE
+// spec: 19-concurrency
+// facility: rule.conc.atomic [Atomic-Wait], [Atomic-Notify]; rule.stdlib.atomic `Atomic::wait`, `notify_one`; D-0253; conf.atomic-wait-pingpong
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 6d6f766573203430300a
+//
+// Two threads hand a turn back and forth through one atomic, each sleeping
+// in `Atomic::wait` until the other stores its number and notifies. A
+// notification lost between a waiter's check and its sleep would hang the
+// program; under `--explore` every schedule gives the same count.
+
+import std;
+
+// Two threads take turns 200 times each through one atomic: turn 0 is
+// main's, turn 1 the other's. A lost wake-up would hang.
+fn player(ref<Atomic<u32>, shared> turn, ref<Atomic<u64>, shared> moves, u32 me, u32 rounds)
+{
+    for (u32 i = 0; i < rounds; i += 1)
+    {
+        while (Atomic::load(turn) != me)
+        {
+            Atomic::wait(turn, 1 - me);
+        }
+        _ = Atomic::fetch_add(moves, 1);
+        Atomic::store(turn, 1 - me);
+        Atomic::notify_one(turn);
+    }
+}
+
+fn main()
+{
+    Atomic<u32> turn = Atomic::new(0: u32);
+    Atomic<u64> moves = Atomic::new(0: u64);
+    {
+        handle<void> h = spawn(player, &turn, &moves, 1: u32, 200: u32);
+        player(&turn, &moves, 0, 200);
+        join(h);
+    }
+    printf("moves %d\n", Atomic::load(&moves));
+}

@@ -1,0 +1,88 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.fs [Rename] [Copy-File], rule.stdlib.file [File-Read-Line] (reports 326, 327, 334); conf.fs-errors-named-more, conf.copy-file-stream, conf.file-read-line-with-end
+// kind: positive
+// expect: ok
+// platform: unix
+// args: $TMP
+//
+// More failures named (Linux): a rename to another file system
+// (`/dev/shm` is a tmpfs) is `CrossDevice`, a 300-byte name `NameTooLong`,
+// a directory renamed into itself and a name holding NUL `InvalidName`, a
+// write to a file opened for reading `NotOpenForThat`, a command with
+// 200 000 arguments `ArgsTooLong`. `copy_file` of a source that is not a
+// regular file (`/dev/null`, a pipe) reads it to its end. And
+// `File::read_line_with_end` tells a line still being written from a
+// whole one.
+
+import std;
+
+fn say(str what, Result<void, FileError> r)
+{
+    match (r)
+    {
+        Ok(_)  : printf("%s: ok\n", what),
+        Err(e) : printf("%s: %s\n", what, FileError::text(&e)),
+    }
+}
+
+fn many_args() : Result<void, FileError>
+{
+    Command c = Command::new("/bin/echo");
+    foreach (i in 0..200000: u32)
+    {
+        Command::arg(&mut c, "some-file-name-in-a-big-directory.txt");
+    }
+    _ = Command::output(&c)?;
+    Ok(())
+}
+
+fn write_opened(StringView path) : Result<void, FileError>
+{
+    write_file(path, "abc\n")?;
+    File f = File::open(path)?;
+    File::write_text(&mut f, "more\n")?;
+    Ok(())
+}
+
+fn main()
+{
+    String dir = path_join(&Result::unwrap(arg(0)), &sprintf("cb-fs249-%v", process_id()));
+    _ = make_dir_all(&dir);
+    String src = path_join(&dir, "src.txt");
+    Result::unwrap(write_file(&src, "hello\n"));
+    String shm = sprintf("/dev/shm/cb-fs249-%v.txt", process_id());
+    say("rename to another file system", rename(&src, &shm));
+    _ = remove_file(&shm);
+    String long = String::new();
+    foreach (i in 0..300: u32)
+    {
+        String::push_ascii(&mut long, b'n');
+    }
+    say("a 300-byte name", write_file(&path_join(&dir, &long), "x"));
+    String d = path_join(&dir, "d");
+    _ = make_dir(&d);
+    say("a directory into itself", rename(&d, &path_join(&d, "inside")));
+    say("a name holding NUL", write_file(&path_join(&dir, "a\u{0}b"), "x"));
+    say("200000 arguments", many_args());
+    say("a write to a file from File::open", write_opened(&path_join(&dir, "ro.txt")));
+    String copy = path_join(&dir, "copy.txt");
+    match (copy_file("/dev/null", &copy))
+    {
+        Ok(n)  : printf("copy of /dev/null: %v bytes\n", n),
+        Err(e) : printf("copy of /dev/null: %s\n", FileError::text(&e)),
+    }
+    String log = path_join(&dir, "log.txt");
+    Result::unwrap(write_file(&log, "first\npart"));
+    File f = Result::unwrap(File::open(&log));
+    while (true)
+    {
+        match (Result::unwrap(File::read_line_with_end(&mut f)))
+        {
+            Some(line) : printf("line %v bytes, ended %v\n", StringView::len(&line), StringView::ends_with(&line, "\n")),
+            None       : break,
+        }
+    }
+    _ = File::close(f);
+    _ = remove_dir_all(&dir);
+}

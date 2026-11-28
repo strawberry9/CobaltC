@@ -1,0 +1,88 @@
+// CONFORMANCE-CASE
+// spec: 14-control-flow
+// facility: rule.agg.match [If-Pattern], [Propagate], [Block-Exit], [Fault-Contain] (D-0315); conf.noted-payload-binders-end-in-order
+// kind: positive
+// expect: ok
+// expect-stdout-hex: 5b7061745d5b66697273745d20380a5b66697273745d20300a5b6d5d206d6174636820310a5b725d5b715d206f6b20320a206d6174636820370a2065727220726566757365640a5b6d5d206d61746368206661696c65640a5b725d5b715d206661696c65640a
+//
+// A value whose type has a destructor of its own, taken out of a call's
+// `Option` or `Result` by an `if`-pattern, a `match` and `?`, and bound by a
+// `let`: each ends once, last bound first, at a block's end, at an early
+// `return`, at a `?` that leaves, and in a thread whose fault is contained
+// after the binding; the program goes on.
+
+import std;
+
+resource struct Noisy
+{
+    String name;
+}
+
+fn Noisy::drop(ref<Noisy, exclusive> self)
+{
+    printf("[%v]", &self.name);
+}
+
+fn maybe(StringView name, bool give) : Option<Noisy>
+{
+    if (give)
+    {
+        return Some(Noisy { .name = String::copy(name) });
+    }
+    None
+}
+
+fn open(StringView name, u8 at) : Result<Noisy, String>
+{
+    if (at == 1)
+    {
+        return Err(String::copy("refused"));
+    }
+    Ok(Noisy { .name = String::copy(name) })
+}
+
+fn by_pattern(bool give) : usize
+{
+    Noisy first = Noisy { .name = String::copy("first") };
+    Noisy n = if (Some(x) = maybe("pat", give)) { x } else { return 0; };
+    StringView::len(&n.name) + StringView::len(&first.name)
+}
+
+fn by_match(u8 at) : usize
+{
+    Noisy f = match (open("m", at))
+    {
+        Ok(v)  : v,
+        Err(_) : return 7,
+    };
+    assert(at != 2, "after the match");
+    StringView::len(&f.name)
+}
+
+fn by_propagate(u8 at) : Result<usize, String>
+{
+    Noisy g = open("q", at)?;
+    Noisy h = open("r", 0)?;
+    assert(at != 2, "after the binding");
+    Ok(StringView::len(&g.name) + StringView::len(&h.name))
+}
+
+fn main()
+{
+    printf(" %v\n", by_pattern(true));
+    printf(" %v\n", by_pattern(false));
+    foreach (at in [0: u8, 1, 2])
+    {
+        match (try_join(spawn(by_match, at)))
+        {
+            Ok(v)  : printf(" match %v\n", v),
+            Err(_) : printf(" match failed\n"),
+        }
+        match (try_join(spawn(by_propagate, at)))
+        {
+            Ok(Ok(v))  : printf(" ok %v\n", v),
+            Ok(Err(e)) : printf(" err %v\n", &e),
+            Err(_)     : printf(" failed\n"),
+        }
+    }
+}

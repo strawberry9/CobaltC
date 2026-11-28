@@ -1,0 +1,114 @@
+// A program run as a test runs it (host.c): arguments that need not be
+// UTF-8, the standard input given, the standard output and error gathered,
+// a CPU limit and a wall-clock limit that ends the program and everything it
+// started.
+
+import std;
+
+extern "./host.c";
+
+unsafe extern fn cbtest_host_reset();
+unsafe extern fn cbtest_host_arg_byte(i64 b);
+unsafe extern fn cbtest_host_env_byte(i64 b);
+unsafe extern fn cbtest_host_cwd_byte(i64 b);
+unsafe extern fn cbtest_host_input_byte(i64 b);
+unsafe extern fn cbtest_host_run(i64 cpu_secs, i64 wall_secs) : i64;
+unsafe extern fn cbtest_host_out_len() : u64;
+unsafe extern fn cbtest_host_out_byte(u64 i) : i64;
+unsafe extern fn cbtest_host_err_len() : u64;
+unsafe extern fn cbtest_host_err_byte(u64 i) : i64;
+unsafe extern fn cbtest_host_timed_out() : i64;
+
+// What to run: the program and its arguments (bytes), environment entries
+// added to this program's (`NAME=VALUE`), the directory to run in (empty:
+// this program's), the standard input, and the limits in seconds (0: none).
+export struct Spec
+{
+    export Vec<Vec<u8>> argv;
+    export Vec<String> env;
+    export String cwd;
+    export Vec<u8> input;
+    export i64 cpu_secs;
+    export i64 wall_secs;
+}
+
+// How a run ended: its exit status (128 + the signal that ended it; -1 when
+// it could not start), what it wrote, and whether its wall-clock limit ended
+// it.
+export struct Run
+{
+    export i64 status;
+    export Vec<u8> out;
+    export Vec<u8> err;
+    export bool timed_out;
+}
+
+export fn Spec::new() : Spec
+{
+    Spec {
+        .argv = Vec::new(),
+        .env = Vec::new(),
+        .cwd = "",
+        .input = Vec::new(),
+        .cpu_secs = 300,
+        .wall_secs = 600,
+    }
+}
+
+// Appends one argument given as text.
+export fn Spec::arg(ref<Spec, exclusive> s, StringView a)
+{
+    Vec<u8> b = Vec::new();
+    Vec::extend_from(&mut b, StringView::as_bytes(a));
+    Vec::push(&mut s.argv, b);
+}
+
+// trusted: [Extern-Call] each host call copies the bytes it is given into
+// host.c's own buffers and reads none of this program's memory.
+export fn run(ref<Spec, shared> s) : Run
+{
+    unsafe
+    {
+        cbtest_host_reset();
+        foreach (a in &s.argv)
+        {
+            foreach (b in a)
+            {
+                cbtest_host_arg_byte(widen<i64>(*b));
+            }
+            cbtest_host_arg_byte(-1);
+        }
+        foreach (e in &s.env)
+        {
+            slice<u8, shared> eb = StringView::as_bytes(e);
+            for (usize i = 0; i < slice_len(eb); i += 1)
+            {
+                cbtest_host_env_byte(widen<i64>(eb[i]));
+            }
+            cbtest_host_env_byte(-1);
+        }
+        slice<u8, shared> cb = StringView::as_bytes(&s.cwd);
+        for (usize i = 0; i < slice_len(cb); i += 1)
+        {
+            cbtest_host_cwd_byte(widen<i64>(cb[i]));
+        }
+        foreach (b in &s.input)
+        {
+            cbtest_host_input_byte(widen<i64>(*b));
+        }
+        i64 status = cbtest_host_run(s.cpu_secs, s.wall_secs);
+        Vec<u8> out = Vec::new();
+        u64 no = cbtest_host_out_len();
+        for (u64 i = 0; i < no; i += 1)
+        {
+            Vec::push(&mut out, narrow<u8>(cbtest_host_out_byte(i)));
+        }
+        Vec<u8> err = Vec::new();
+        u64 ne = cbtest_host_err_len();
+        for (u64 i = 0; i < ne; i += 1)
+        {
+            Vec::push(&mut err, narrow<u8>(cbtest_host_err_byte(i)));
+        }
+        Run { .status = status, .out = out, .err = err, .timed_out = cbtest_host_timed_out() != 0 }
+    }
+}

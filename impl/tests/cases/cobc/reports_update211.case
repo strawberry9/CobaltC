@@ -1,0 +1,388 @@
+# The left items of D-0339 (D-0340): a fault certain on a path is refused at
+# the check (`[Certain-Fault-Refused]`, spec/18), not left to the run.
+# 384: a literal expression with no expected type is folded.
+file f384.cb
+import std;
+
+fn main()
+{
+    printf("expect %v\n", 100 * 99999 * 100000 / 2);
+}
+end
+run $COBC --check f384.cb
+status 1
+stderr-has diag.arith-overflow
+# 384: a division by a nested known zero.
+file f384b.cb
+import std;
+
+fn main()
+{
+    i32 x = 7;
+    if (x != 7)
+    {
+        printf("%v\n", 1 / (1 - 1));
+    }
+}
+end
+run $COBC --check f384b.cb
+status 1
+stderr-has diag.div-by-zero
+# 395: a view of a local returned through a binding.
+file f395.cb
+import std;
+
+fn low() : StringView
+{
+    String s = "Hello";
+    StringView w = StringView::trim(&s);
+    w
+}
+
+fn main()
+{
+    printf("%s\n", low());
+}
+end
+run $COBC --check f395.cb
+status 1
+stderr-has diag.reference-escapes-scope
+# 414: a closure without `move` returned through a binding; with `move` it is fine.
+file f414.cb
+import std;
+
+fn adder(i32 k) : fn(i32) : i32
+{
+    auto f = [k](i32 x) : i32 { x + k };
+    f
+}
+
+fn main()
+{
+    printf("%v\n", adder(2)(3));
+}
+end
+run $COBC --check f414.cb
+status 1
+stderr-has diag.reference-escapes-scope
+file f414m.cb
+import std;
+
+fn adder(i32 k) : fn(i32) : i32
+{
+    auto f = move [k](i32 x) : i32 { x + k };
+    f
+}
+
+fn main()
+{
+    printf("%v\n", adder(2)(3));
+}
+end
+run $COBC --run f414m.cb
+status 0
+stdout-is 5\n
+# 394: views of a loop-local text kept after the loop.
+file f394.cb
+import std;
+
+fn main()
+{
+    Vec<StringView> words = Vec::new();
+    foreach (n in 0..2)
+    {
+        String line = sprintf("a b %v", n);
+        foreach (w in StringView::split_whitespace(&line))
+        {
+            Vec::push(&mut words, w);
+        }
+    }
+    printf("%v\n", Vec::len(&words));
+}
+end
+run $COBC --check f394.cb
+status 1
+stderr-has diag.destroy-while-aliased
+# 392: a Vec of views of a text, then the text changed, then an element read:
+# refused at the check (D-0341 §2.2: the read faults whatever the Vec holds).
+file f392.cb
+import std;
+
+fn main()
+{
+    String text = "first line\nsecond line\n";
+    Vec<StringView> lines = StringView::lines(&text);
+    String::append(&mut text, "a much longer tail, so that the buffer grows\n");
+    printf("%s\n", lines[0]);
+}
+end
+run $COBC --check f392.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 413: `Option<R>` assigned in a loop; the first assignment after `= None` is fine.
+file f413.cb
+import std;
+
+resource struct Conn
+{
+    usize id;
+}
+
+fn Conn::drop(ref<Conn, exclusive> self)
+{
+    printf("close %v\n", self.id);
+}
+
+fn main()
+{
+    Option<Conn> current = None;
+    current = Some(Conn { .id = 0 });
+    foreach (i in 1..3)
+    {
+        current = Some(Conn { .id = i });
+    }
+}
+end
+run $COBC --check f413.cb
+status 1
+stderr-has diag.overwrite-of-live-resource
+file f413ok.cb
+import std;
+
+resource struct Conn
+{
+    usize id;
+}
+
+fn Conn::drop(ref<Conn, exclusive> self)
+{
+    printf("close %v\n", self.id);
+}
+
+fn main()
+{
+    Option<Conn> current = None;
+    current = Some(Conn { .id = 1 });
+    foreach (i in 2..4)
+    {
+        overwrite(&mut current, Some(Conn { .id = i }));
+    }
+}
+end
+run $COBC --run f413ok.cb
+status 0
+stdout-has close 3
+# 380: a handle whose thread gives a Result, ending unjoined.
+file f380.cb
+import std;
+
+fn save(i32 n) : Result<void, String>
+{
+    if (n > 0)
+    {
+        return Err("disk full");
+    }
+    Ok(())
+}
+
+fn main()
+{
+    {
+        auto h = spawn(save, 2);
+    }
+    printf("all saved\n");
+}
+end
+run $COBC --check f380.cb
+status 1
+stderr-has diag.result-discarded
+# 380: one in a Vec ends unjoined after Err: the run faults.
+file f380v.cb
+import std;
+
+fn save(i32 n) : Result<void, String>
+{
+    if (n > 0)
+    {
+        return Err("disk full");
+    }
+    Ok(())
+}
+
+fn main()
+{
+    {
+        Vec<handle<Result<void, String>>> hs = Vec::new();
+        Vec::push(&mut hs, spawn(save, 2));
+    }
+    printf("all saved\n");
+}
+end
+run $COBC --run f380v.cb
+status 1
+stderr-has diag.result-discarded
+# 382: a returned handle whose thread borrows a local.
+file f382.cb
+import std;
+
+fn count(ref<Atomic<u64>, shared> c) : u64
+{
+    Atomic::fetch_add(c, 1)
+}
+
+fn start() : handle<u64>
+{
+    Atomic<u64> c = Atomic::new(0: u64);
+    spawn(count, &c)
+}
+
+fn main()
+{
+    handle<u64> h = start();
+    printf("%v\n", join(h));
+}
+end
+run $COBC --check f382.cb
+status 1
+stderr-has diag.reference-escapes-scope
+# 381: the same `&mut` element lent to threads on each round.
+file f381.cb
+import std;
+
+fn worker(ref<u64, exclusive> c)
+{
+    *c += 1;
+}
+
+fn main()
+{
+    Vec<u64> counts = Vec::filled(2, 0: u64);
+    {
+        Vec<handle<void>> hs = Vec::new();
+        foreach (i in 0..4)
+        {
+            Vec::push(&mut hs, spawn(worker, &mut counts[0]));
+        }
+    }
+    printf("count %v\n", counts[0]);
+}
+end
+run $COBC --check f381.cb
+status 1
+stderr-has diag.aliasing-conflict
+# 390: a guard passed to spawn.
+file f390.cb
+import std;
+
+fn finish(guard<Vec<str>> g)
+{
+    Vec::push(&mut *g, "done");
+}
+
+fn main()
+{
+    mutex<Vec<str>> m = Mutex::new(Vec::new());
+    auto h = spawn(finish, lock(&m));
+    join(h);
+}
+end
+run $COBC --check f390.cb
+status 1
+stderr-has diag.thread-affine-moved
+# 409: a variant fixed only by a later element compiles.
+file f409.cb
+import std;
+
+fn main()
+{
+    Vec<Option<u8>> v = Vec::from_slice(&[None, Some(1: u8)]);
+    printf("%v\n", Vec::len(&v));
+}
+end
+run $COBC --run f409.cb
+status 0
+stdout-is 2\n
+# 409: an `auto` `if` whose branches each fix one type argument compiles (D-0341 §2.3).
+file f409b.cb
+import std;
+
+fn main()
+{
+    usize n = 3;
+    auto r = if (n > 1) { Ok(true) } else { Err("short") };
+    match (r)
+    {
+        Ok(b)  : printf("%v\n", b),
+        Err(e) : printf("%s\n", e),
+    }
+}
+end
+run $COBC --run f409b.cb
+status 0
+stdout-is true\n
+# 410: a type argument nothing fixes is refused at the check.
+file f410.cb
+import std;
+
+fn main()
+{
+    u8 x = Result::unwrap_or(Ok(5), 7);
+    printf("%v\n", x);
+}
+end
+run $COBC --check f410.cb
+status 1
+stderr-has diag.type-annotation-needed
+# 412: a temporary of an `if` condition ends before the branch.
+file f412.cb
+import std;
+
+fn main()
+{
+    String s = "abc";
+    if (StringView::as_bytes(&s)[0] == b'a')
+    {
+        String::push_ascii(&mut s, b'!');
+    }
+    printf("%s\n", &s);
+}
+end
+run $COBC --all-checks --run f412.cb
+status 0
+stdout-is abc!\n
+# 399: `: never` as a function's result.
+file f399.cb
+import std;
+
+fn die(StringView msg) : never
+{
+    eprintf("%s\n", msg);
+    exit(2);
+}
+
+fn main()
+{
+    i32 n = 3;
+    String name = if (n > 5) { "big" } else { die("usage: f399 NAME") };
+    printf("%s\n", &name);
+}
+end
+run $COBC --run f399.cb
+status 2
+stderr-has usage: f399 NAME
+file f399r.cb
+import std;
+
+fn die(StringView msg) : never
+{
+    eprintf("%s\n", msg);
+}
+
+fn main()
+{
+    die("x");
+}
+end
+run $COBC --check f399r.cb
+status 1
+stderr-has diag.never-returns

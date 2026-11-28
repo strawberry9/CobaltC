@@ -1,0 +1,80 @@
+// CONFORMANCE-CASE
+// spec: 21-standard-library-semantics
+// facility: rule.stdlib.rc (D-0125, report 111); conf.rc-weak-inside-own-value
+// kind: positive
+// expect: ok
+//
+// The last `Weak` to a box may live inside that box's own value: a child's
+// parent pointer, a list's `prev` link. Destroying the value then ends the
+// `Weak` while `Rc::drop` is still using the box; the strong handles' own
+// hold on the box keeps it until the value is gone, so the box is freed
+// once, after it (an AddressSanitizer run of this case reports nothing).
+
+import std;
+
+struct Dir
+{
+    i32 id;
+    Option<Weak<mutex<Dir>>> parent;
+    Vec<Rc<mutex<Dir>>> kids;
+}
+
+struct Link
+{
+    i32 val;
+    Option<Rc<mutex<Link>>> next;
+    Option<Weak<mutex<Link>>> prev;
+}
+
+fn tree()
+{
+    Rc<mutex<Dir>> root = Rc::new(Mutex::new(Dir { .id = 0, .parent = None, .kids = Vec::new() }));
+    foreach (i in 1..4: i32)
+    {
+        Rc<mutex<Dir>> c = Rc::new(Mutex::new(Dir { .id = i, .parent = Some(Rc::downgrade(&root)), .kids = Vec::new() }));
+        Rc<mutex<Dir>> g = Rc::new(Mutex::new(Dir { .id = i * 10, .parent = Some(Rc::downgrade(&c)), .kids = Vec::new() }));
+        {
+            guard<Dir> gc = lock(Rc::get(&c));
+            Vec::push(&mut gc.kids, g);
+        }
+        guard<Dir> gr = lock(Rc::get(&root));
+        Vec::push(&mut gr.kids, c);
+    }
+    guard<Dir> gr = lock(Rc::get(&root));
+    printf("root has %v children\n", Vec::len(&gr.kids));
+}
+
+fn list()
+{
+    Rc<mutex<Link>> head = Rc::new(Mutex::new(Link { .val = 1, .next = None, .prev = None }));
+    Rc<mutex<Link>> tail = Rc::clone(&head);
+    foreach (i in 2..6: i32)
+    {
+        Rc<mutex<Link>> n = Rc::new(Mutex::new(Link { .val = i, .next = None, .prev = Some(Rc::downgrade(&tail)) }));
+        {
+            guard<Link> g = lock(Rc::get(&tail));
+            overwrite(&mut g.next, Some(Rc::clone(&n)));
+        }
+        overwrite(&mut tail, n);
+    }
+    i32 s = 0;
+    Option<Rc<mutex<Link>>> cur = Some(Rc::clone(&head));
+    while (Some(c) = cur)
+    {
+        guard<Link> g = lock(Rc::get(&c));
+        s += g.val;
+        cur = match (&g.next) { Some(n) : Some(Rc::clone(n)), None : None, };
+    }
+    printf("sum %v\n", s);
+}
+
+fn main()
+{
+    tree();
+    list();
+    // A Weak outliving every Rc upgrades to None, and frees the box.
+    Rc<String> a = Rc::new("shared");
+    Weak<String> w = Rc::downgrade(&a);
+    drop(a);
+    printf("after the last Rc: %v\n", Option::is_none(&Weak::upgrade(&w)));
+}

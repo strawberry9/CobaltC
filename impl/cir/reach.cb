@@ -1,0 +1,678 @@
+// The typing-only walk (CIR step T3): what the program reaches, found
+// before any lowering, and from it the verdict the first lowering ends with
+// (`program::pathless_blocker`): whether the program keeps its paths.
+//
+// `walk_program` runs in a `Gen` of its own (`Gen::reach_on`), which no
+// lowering uses: from the roots `generate_parts` requests, each function
+// instance's plain body is typed by the typer in real mode
+// (`typer_flow::walk_block`, as `emit_fn_body` lowers it with
+// `lower_block_body`), under the bindings `emit_fn_body` makes for the
+// parameters. The typer records what its queries resolve (`note_call`,
+// `note_type`, `note_site`, `note_gap`, and its closure records
+// `Gen::tclosures`); `Gen::queue` is the work list. A function with a native
+// body (`natives::lower_native`) is not walked: its native text is written
+// into this `Gen`, which requests the helpers it calls.
+//
+// `COBALTC_VERDICT=check` (`gen::generate_program`): the walk first, then
+// the first lowering as ever, then `verdict_report` compares the two.
+
+import std;
+import ast;
+import items;
+import typecheck;
+import state;
+import typeops;
+import layout;
+import uses;
+import stage1a;
+import natives;
+import program;
+import gen;
+import typer;
+import typer_flow;
+import proto;
+import dump;
+
+// What the walk found: the instances reached (by `body_key`, in the order
+// reached), those resolved only in queries that mirror a probe, the closure
+// records, the types seen with their parts, the call sites with point
+// checks, the queries the typer had no answer to (`function<TAB>reason`),
+// the verdict predicted and the walk's time.
+export struct Walked
+{
+    export Vec<String> fns;
+    export Vec<String> probed;
+    export HashMap<u64, ClosureInfo> closures;
+    export Vec<Type> types;
+    export Vec<String> sites;
+    export Vec<String> gaps;
+    export Option<String> blocker;
+    export u64 ms;
+}
+
+// How many functions the lowering `g` requested plainly that the walk `w` did
+// not reach: where it is not zero the walk's verdict does not cover `g`.
+export fn walk_misses(ref<Gen, shared> g, ref<Walked, shared> w) : usize
+{
+    HashSet<String> reached = HashSet::new();
+    foreach (k in &w.fns)
+    {
+        _ = HashSet::insert(&mut reached, String::clone(k));
+    }
+    HashSet<String> seen = HashSet::new();
+    usize n = 0;
+    foreach (r in &g.queue)
+    {
+        if (r.mask != 0)
+        {
+            continue;
+        }
+        String key = body_key(&r.name, &r.targs);
+        if (HashSet::insert(&mut seen, String::clone(&key)) && !HashSet::contains(&reached, &key))
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+// ---- what the typer records (only where `Gen::reach_on`) ----
+
+// A callee's instance the typer resolved (`type_user_call` as
+// `lower_user_call_access` requests it, `fn_item_type` as `lower_fn_item`):
+// requested, unless the query mirrors a probe.
+export fn note_call(ref<Gen, exclusive> g, ref<String, shared> name, ref<Vec<Type>, shared> inst)
+{
+    if (g.typer_probing > 0)
+    {
+        _ = HashSet::insert(&mut g.reach_probed, body_key(name, inst));
+        return;
+    }
+    if (g.cir_on)
+    {
+        Vec::push(&mut g.cir_calls, body_key(name, inst));
+    }
+    _ = request_fn(g, name, clone(inst));
+}
+
+// `cobc --emit-cir=core`: the instance just walked, as text: its key and
+// result type, its parameters, the instances its calls resolved to, and its
+// body with every expression's type (`dump::dump_block_typed`); a native
+// body (`native`) has no tree.
+fn core_fn(
+    ref<Gen, exclusive> g,
+    ref<FnRequest, shared> r,
+    ref<FnDecl, shared> f,
+    ref<HashMap<String, Type>, shared> subst,
+    ref<HashMap<usize, String>, shared> tys,
+    bool native,
+)
+{
+    String o = String::new();
+    String::appendf(
+        &mut o,
+        "(fn %s : %s%s\n",
+        &body_key(&r.name, &r.targs),
+        &type_display(&apply(&f.ret, subst)),
+        if (native) { " native" } else { "" }
+    );
+    foreach (p in &f.params)
+    {
+        String::appendf(&mut o, " (param %s : %s)\n", &p.name, &type_display(&apply(&p.ty, subst)));
+    }
+    Vec<String> calls = replace(&mut g.cir_calls, Vec::new());
+    Vec::sort(&mut calls);
+    for (usize i = 0; i < Vec::len(&calls); i += 1)
+    {
+        if (i == 0 || calls[i] != calls[i - 1])
+        {
+            String::appendf(&mut o, " (resolves %s)\n", &calls[i]);
+        }
+    }
+    if (!native)
+    {
+        String::append(&mut o, &dump_block_typed(&f.body, 1, tys));
+    }
+    String::append(&mut o, ")\n");
+    String::append(&mut g.cir_out, &o);
+}
+
+// The site of a call of a function (`lower_call` sets `Fx::pc_site`): kept
+// where it has point checks, which `lower_user_call_access` then emits.
+export fn note_site(ref<Gen, exclusive> g, usize line, usize col)
+{
+    if (g.typer_probing > 0 || !g.prog.table.any_point_checks)
+    {
+        return;
+    }
+    String sk = site_key(line, col);
+    if (HashMap::contains(&g.prog.table.point_checks, &sk))
+    {
+        _ = HashSet::insert(&mut g.reach_sites, sk);
+    }
+}
+
+// A query the typer has no answer to. A reason that starts `error:` stands
+// for a probe of the lowering that fails, which is an answer.
+export fn note_gap(ref<Gen, exclusive> g, StringView why)
+{
+    if (StringView::starts_with(why, "error:"))
+    {
+        return;
+    }
+    String line = sprintf("%s\t%v", &g.reach_cur, why);
+    Vec::push(&mut g.reach_gaps, line);
+}
+
+fn is_scalar(ref<Type, shared> t) : bool
+{
+    match (t)
+    {
+        Type::TInt(_) : true,
+        Type::TF32    : true,
+        Type::TF64    : true,
+        Type::TBool   : true,
+        Type::TStr    : true,
+        Type::TVoid   : true,
+        Type::TNever  : true,
+        _             : false,
+    }
+}
+
+// A type the walk sees (an expression's, a binding's, a parameter's, a
+// result's), kept with its parts: the fields of a struct, the payloads of an
+// enum, type arguments, element and referent types, a `fn` type's parameter
+// and result types, a closure's captures and signature. A named type with a
+// destructor of its own asks for it, as its descriptor does
+// (`layout::named_desc`).
+export fn note_type(ref<Gen, exclusive> g, ref<Type, shared> t)
+{
+    if (is_scalar(t))
+    {
+        return;
+    }
+    String key = type_code(t);
+    if (HashMap::contains(&g.reach_types, &key))
+    {
+        return;
+    }
+    HashMap::insert(&mut g.reach_types, key, clone(t));
+    Vec<Type> parts = Vec::new();
+    match (t)
+    {
+        Type::TRef(m)      : Vec::push(&mut parts, clone(&Box::get(m).inner)),
+        Type::TSlice(m)    : Vec::push(&mut parts, clone(&Box::get(m).inner)),
+        Type::TRawptr(i)   : Vec::push(&mut parts, clone(Box::get(i))),
+        Type::TArray(a)    : Vec::push(&mut parts, clone(&Box::get(a).inner)),
+        Type::TSimd(a)     : Vec::push(&mut parts, clone(&Box::get(a).inner)),
+        Type::THandle(i)   : Vec::push(&mut parts, clone(Box::get(i))),
+        Type::TMutex(i)    : Vec::push(&mut parts, clone(Box::get(i))),
+        Type::TGuard(i)    : Vec::push(&mut parts, clone(Box::get(i))),
+        Type::TFn(f)       :
+        {
+            foreach (p in &Box::get(f).params)
+            {
+                Vec::push(&mut parts, clone(p));
+            }
+            Vec::push(&mut parts, clone(&Box::get(f).ret));
+        },
+        Type::TClosure(id) :
+        {
+            match (closure_info(g, *id))
+            {
+                Some(c) :
+                {
+                    foreach (f in &c.fields)
+                    {
+                        Vec::push(&mut parts, clone(&f.ty));
+                    }
+                    foreach (p in &c.params)
+                    {
+                        Vec::push(&mut parts, clone(p));
+                    }
+                    Vec::push(&mut parts, clone(&c.ret));
+                },
+                None    : {},
+            }
+        },
+        Type::TNamed(nb)   :
+        {
+            ref<NamedTy, shared> n = Box::get(nb);
+            foreach (a in &n.args)
+            {
+                Vec::push(&mut parts, clone(a));
+            }
+            match (HashMap::get(&g.prog.table.structs, &n.name))
+            {
+                Some(sd) :
+                {
+                    HashMap<String, Type> sub = subst_of(&sd.type_params, &n.args);
+                    if (Option::is_none(&sd.bits))
+                    {
+                        foreach (f in &sd.fields)
+                        {
+                            Vec::push(&mut parts, apply(&f.ty, &sub));
+                        }
+                    }
+                },
+                None     : {},
+            }
+            match (HashMap::get(&g.prog.table.enums, &n.name))
+            {
+                Some(ed) :
+                {
+                    HashMap<String, Type> sub = subst_of(&ed.type_params, &n.args);
+                    foreach (v in &ed.variants)
+                    {
+                        match (&v.payload)
+                        {
+                            Some(p) : Vec::push(&mut parts, apply(p, &sub)),
+                            None    : {},
+                        }
+                    }
+                },
+                None     : {},
+            }
+            String dname = sprintf("%s::drop", &n.name);
+            if (HashMap::contains(&g.prog.table.fns, &dname))
+            {
+                _ = request_fn(g, &dname, clone(&n.args));
+            }
+        },
+        _                  : {},
+    }
+    foreach (p in &parts)
+    {
+        note_type(g, p);
+    }
+}
+
+// ---- the walk ----
+
+fn names_closure(ref<Vec<Type>, shared> ts) : bool
+{
+    foreach (t in ts)
+    {
+        if (StringView::contains(&type_display(t), "closure"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// One instance: `lower_fn` without the lowering. The function is checked
+// first where the static pass has not (`check_more`), which gives its facts
+// and its entry in `Items::tracking_needed`.
+fn walk_fn(ref<Gen, exclusive> g, ref<FnRequest, shared> r)
+{
+    g.reach_cur = body_key(&r.name, &r.targs);
+    if (!HashMap::contains(&g.prog.facts.checked_fns, &work_code(&r.name, &r.targs)))
+    {
+        match (check_more(&mut g.prog.table, &g.prog.front, &mut g.prog.facts, &r.name, &r.targs))
+        {
+            Ok(_)  : {},
+            Err(_) :
+            {
+                note_gap(g, "check:a reached function does not check");
+                return;
+            },
+        }
+    }
+    FnDecl f = Option::expect(get_fn(g, &r.name), "a reached function");
+    walk_decl(g, r, &f);
+    give_fn(g, &r.name, f);
+}
+
+// `lower_fn_decl` and `emit_fn_body` without the lowering: a native body
+// where one exists (written into this `Gen` for the helpers it requests);
+// else the plain body typed under its parameters' bindings. The other forms
+// of a body (`lower_fn_bodies`, the `__raw` form) lower the same block.
+fn walk_decl(ref<Gen, exclusive> g, ref<FnRequest, shared> r, ref<FnDecl, shared> f)
+{
+    // A native body is a `std` function's; one at a closure type has no C
+    // type the walk could name, and is walked as the prelude writes it.
+    if (!boot(g, 5) && StringView::starts_with(&r.name, "std::") && !names_closure(&r.targs))
+    {
+        ReqHead h = request_head(g, r, f);
+        if (lower_native(g, &r.name, f, &r.targs, &h.cname, &h.ret_c, &h.sig))
+        {
+            if (g.cir_on)
+            {
+                HashMap<String, Type> nsubst = subst_of(&f.type_params, &r.targs);
+                HashMap<usize, String> none = HashMap::new();
+                core_fn(g, r, f, &nsubst, &none, true);
+            }
+            return;
+        }
+    }
+    HashMap<String, Type> subst = subst_of(&f.type_params, &r.targs);
+    Type ret = apply(&f.ret, &subst);
+    PinScope ps = pin_scope(f, &subst);
+    bool tracked = body_tracked(g, &r.name, f, &subst);
+    HashSet<String> pinned = resolve_pinned(g, pinned_names(&f.body), &ps.bound, &ps.views, false);
+    // No tail target: a self tail call is typed as the call it is, never as
+    // the jump one form of the body may make of it (the walk needs its
+    // callee and its result type).
+    Fx x = new_fx(&r.name, &subst, &ret, tracked, pinned, HashSet::new(), assigned_names(&f.body));
+    Vec::push(&mut x.scopes, HashMap::new());
+    note_type(g, &ret);
+    foreach (p in &f.params)
+    {
+        Type pty = apply(&p.ty, &subst);
+        note_type(g, &pty);
+        bind_in_scope(
+            &mut x,
+            &p.name,
+            Binding { .c = String::new(), .ty = pty, .root = String::new(), .kind = BindKind::Local },
+        );
+    }
+    g.typer_why = String::new();
+    Option<Type> t = walk_block(g, &mut x, &f.body, Some(&ret));
+    if (Option::is_none(&t))
+    {
+        // An `error:` reason at a body's top is no failed probe.
+        String why = sprintf("body:%s", &g.typer_why);
+        note_gap(g, &why);
+    }
+    if (g.cir_on)
+    {
+        core_fn(g, r, f, &subst, &x.tnotes, false);
+    }
+}
+
+// The walk of the program from `generate_parts`' roots: `main`, the entry
+// points, and whatever each instance reached asks for in turn.
+export fn walk_program(ref<Gen, exclusive> g, bool lib) : Walked
+{
+    u64 start = monotonic_ns();
+    g.reach_on = true;
+    g.lib = lib;
+    if (!lib)
+    {
+        _ = request_fn(g, "main", Vec::new());
+    }
+    _ = request_entries(g, lib);
+    // The types this `Gen` gave a descriptor (a native body's, a fallback
+    // body's) are seen too; one with a destructor asks for it, so the two
+    // are taken in turn until neither adds anything.
+    usize ids_seen = 0;
+    while (g.queue_head < Vec::len(&g.queue) || ids_seen < Vec::len(&g.id_types))
+    {
+        while (g.queue_head < Vec::len(&g.queue))
+        {
+            FnRequest r = clone(&g.queue[g.queue_head]);
+            g.queue_head += 1;
+            if (r.mask != 0)
+            {
+                // A variant a native's fallback asked for: its plain form.
+                _ = request_fn(g, &r.name, clone(&r.targs));
+                continue;
+            }
+            walk_fn(g, &r);
+        }
+        while (ids_seen < Vec::len(&g.id_types))
+        {
+            Type t = clone(&g.id_types[ids_seen]);
+            ids_seen += 1;
+            note_type(g, &t);
+        }
+    }
+    // The closures a fallback body lowered here count with the typer's.
+    for (usize i = 0; i < HashMap::len(&g.closures); i += 1)
+    {
+        u64 id = *HashMap::key_at(&g.closures, i);
+        ClosureInfo c = clone(HashMap::value_at(&g.closures, i));
+        HashMap::insert(&mut g.tclosures, id, c);
+    }
+    Option<String> blocker = predict_blocker(g);
+    Vec<String> fns = Vec::new();
+    HashSet<String> seen = HashSet::new();
+    foreach (r in &g.queue)
+    {
+        String key = body_key(&r.name, &r.targs);
+        if (HashSet::insert(&mut seen, String::clone(&key)))
+        {
+            Vec::push(&mut fns, key);
+        }
+    }
+    Vec<String> probed = Vec::new();
+    foreach (k in &g.reach_probed)
+    {
+        Vec::push(&mut probed, String::clone(k));
+    }
+    Vec<String> sites = Vec::new();
+    foreach (k in &g.reach_sites)
+    {
+        Vec::push(&mut sites, String::clone(k));
+    }
+    Vec<Type> types = Vec::new();
+    for (usize i = 0; i < HashMap::len(&g.reach_types); i += 1)
+    {
+        Vec::push(&mut types, clone(HashMap::value_at(&g.reach_types, i)));
+    }
+    Walked {
+        .fns = fns,
+        .probed = probed,
+        .closures = replace(&mut g.tclosures, HashMap::new()),
+        .types = types,
+        .sites = sites,
+        .gaps = replace(&mut g.reach_gaps, Vec::new()),
+        .blocker = blocker,
+        .ms = (monotonic_ns() - start) / 1_000_000,
+    }
+}
+
+// `pathless_blocker`'s rule over the walk's sets, in the walk's own `Gen`:
+// the instances reached, the typer's closure records, the types seen, and
+// the call sites reached that have point checks.
+export fn predict_blocker(ref<Gen, shared> g) : Option<String>
+{
+    Vec<String> fns = Vec::new();
+    foreach (r in &g.queue)
+    {
+        Vec::push(&mut fns, body_key(&r.name, &r.targs));
+    }
+    Vec<Type> types = Vec::new();
+    for (usize i = 0; i < HashMap::len(&g.reach_types); i += 1)
+    {
+        Vec::push(&mut types, clone(HashMap::value_at(&g.reach_types, i)));
+    }
+    match (blocker_of(g, fns, &g.tclosures, &types))
+    {
+        Some(why) : return Some(why),
+        None      : {},
+    }
+    if (HashSet::len(&g.reach_sites) > 0)
+    {
+        return Some(POINT_BLOCKER);
+    }
+    None
+}
+
+// ---- the check ----
+
+// A type's name for the comparison: its code, but its display where it
+// names a closure (a closure's id is the lowering's counter, or the
+// typer's own).
+fn compared_name(ref<Type, shared> t) : String
+{
+    String d = type_display(t);
+    if (StringView::contains(&d, "closure"))
+    {
+        return d;
+    }
+    type_code(t)
+}
+
+fn sig_name(ref<FnSig, shared> s) : String
+{
+    Vec<String> ps = Vec::new();
+    foreach (p in &s.params)
+    {
+        Vec::push(&mut ps, type_display(p));
+    }
+    sprintf("fn(%s) : %s", &String::join(&ps, ", "), &type_display(&s.ret))
+}
+
+fn verdict_text(ref<Option<String>, shared> b) : String
+{
+    match (b)
+    {
+        Some(t) : String::clone(t),
+        None    : "none",
+    }
+}
+
+// `COBALTC_VERDICT=check`: the walk `w` against the first lowering `first`
+// (its parts taken out into `gen`; it took `lower_ms`). On stderr: a
+// `VERDICT-MISS` for each function requested plainly, closure signature
+// kept, type that keeps the paths, or point check the lowering has and the
+// walk has not; a `VERDICT-DIFF` where one verdict is a blocker and the
+// other is none; `VERDICT-EXTRA` for each instance only the walk reached;
+// `VERDICT-GAP` for each query the typer had no answer to; `VERDICT-SUM`.
+export fn verdict_report(ref<Gen, shared> first, ref<Generated, shared> gen, ref<Walked, shared> w, u64 lower_ms)
+{
+    HashSet<String> reached = HashSet::new();
+    foreach (k in &w.fns)
+    {
+        _ = HashSet::insert(&mut reached, String::clone(k));
+    }
+    HashSet<String> probed = HashSet::new();
+    foreach (k in &w.probed)
+    {
+        _ = HashSet::insert(&mut probed, String::clone(k));
+    }
+    HashSet<String> requested = HashSet::new();
+    Vec<String> fns = Vec::new();
+    foreach (r in &first.queue)
+    {
+        if (r.mask != 0)
+        {
+            continue;
+        }
+        String key = body_key(&r.name, &r.targs);
+        if (!HashSet::insert(&mut requested, String::clone(&key)))
+        {
+            continue;
+        }
+        if (!HashSet::contains(&reached, &key))
+        {
+            eprintf(
+                "VERDICT-MISS\tfn\t%s%s\n",
+                &key,
+                if (HashSet::contains(&probed, &key)) { "\tresolved in a probe only" } else { "" }
+            );
+        }
+        Vec::push(&mut fns, key);
+    }
+    // A function requested only as a variant (`request_variant`, a mask)
+    // that `Items::tracking_needed` names: `pathless_blocker` reads the plain
+    // requests alone.
+    HashSet<String> variant_seen = HashSet::new();
+    foreach (r in &first.queue)
+    {
+        if (r.mask == 0)
+        {
+            continue;
+        }
+        String key = body_key(&r.name, &r.targs);
+        if (!HashSet::contains(&requested, &key) && HashMap::contains(
+            &first.prog.table.tracking_needed,
+            &key,
+        ) && HashSet::insert(&mut variant_seen, String::clone(&key)))
+        {
+            eprintf("VERDICT-NOTE\tvariant-only\t%s\n", &key);
+        }
+    }
+    usize extra = 0;
+    foreach (k in &w.fns)
+    {
+        if (!HashSet::contains(&requested, k))
+        {
+            extra += 1;
+            eprintf("VERDICT-EXTRA\tfn\t%s\n", k);
+        }
+    }
+    // Closures: the signatures kept.
+    Vec<FnSig> sigs = kept_sigs(first, &first.closures);
+    Vec<FnSig> wsigs = kept_sigs(first, &w.closures);
+    HashSet<String> wsig_names = HashSet::new();
+    foreach (s in &wsigs)
+    {
+        _ = HashSet::insert(&mut wsig_names, sig_name(s));
+    }
+    HashSet<String> sig_seen = HashSet::new();
+    foreach (s in &sigs)
+    {
+        String n = sig_name(s);
+        if (!HashSet::contains(&wsig_names, &n) && HashSet::insert(&mut sig_seen, String::clone(&n)))
+        {
+            eprintf("VERDICT-MISS\tclosure\t%s\n", &n);
+        }
+    }
+    // Types: those that keep the paths.
+    HashSet<String> wtypes = HashSet::new();
+    foreach (t in &w.types)
+    {
+        _ = HashSet::insert(&mut wtypes, compared_name(t));
+    }
+    foreach (t in &first.id_types)
+    {
+        if (type_blocks(first, t, &sigs) && !HashSet::contains(&wtypes, &compared_name(t)))
+        {
+            eprintf("VERDICT-MISS\ttype\t%s\n", &type_display(t));
+        }
+    }
+    // Point checks.
+    bool pointed = false;
+    foreach (u in &gen.units)
+    {
+        pointed = pointed || pbuf_has(&u.nodes, "cb_point_check(");
+    }
+    if (pointed && Vec::len(&w.sites) == 0)
+    {
+        eprintf("VERDICT-MISS\tpoint\n");
+    }
+    // The verdicts.
+    Option<String> actual = match (blocker_of(first, fns, &first.closures, &first.id_types))
+    {
+        Some(why) : Some(why),
+        None      : if (pointed) { Some(POINT_BLOCKER) } else { None },
+    };
+    String verdict = "same";
+    if (Option::is_some(&actual) != Option::is_some(&w.blocker))
+    {
+        verdict = "DIFF";
+        eprintf("VERDICT-DIFF\tpredicted %s\tactual %s\n", &verdict_text(&w.blocker), &verdict_text(&actual));
+    }
+    else if (verdict_text(&actual) != verdict_text(&w.blocker))
+    {
+        verdict = "text";
+        eprintf("VERDICT-TEXT\tpredicted %s\tactual %s\n", &verdict_text(&w.blocker), &verdict_text(&actual));
+    }
+    // The gaps, each reason once per function.
+    HashSet<String> gap_seen = HashSet::new();
+    foreach (gp in &w.gaps)
+    {
+        if (HashSet::insert(&mut gap_seen, String::clone(gp)))
+        {
+            eprintf("VERDICT-GAP\t%s\n", gp);
+        }
+    }
+    eprintf(
+        "VERDICT-SUM\tfns %v reached %v extra %v\tclosures %v walked %v\ttypes %v walked %v\twalk-ms %v\tlower-ms %v\tgaps %v\tverdict %s %s\n",
+        HashSet::len(&requested),
+        Vec::len(&w.fns),
+        extra,
+        HashMap::len(&first.closures),
+        HashMap::len(&w.closures),
+        Vec::len(&first.id_types),
+        Vec::len(&w.types),
+        w.ms,
+        lower_ms,
+        HashSet::len(&gap_seen),
+        if (Option::is_some(&actual)) { "kept" } else { "decided" },
+        &verdict
+    );
+}
